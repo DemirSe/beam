@@ -1,0 +1,10 @@
+[package]
+name = "beam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+beam-core.workspace = true
+beam-sys.workspace = true
