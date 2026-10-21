@@ -118,6 +118,7 @@ Exit criteria:
 | Risk | Mitigation |
 |---|---|
 | REALITY/TLS behavior differs from stock | Spike first; compare record-level traces; keep a compatibility test |
+| Stock REALITY reuses the cover's ServerHello and certificate shape | If rustls/BoringSSL cannot expose this, implement a minimal TLS 1.3 handshake/record layer in `beam-core`; budget extra time and test against the captured stock ClientHello |
 | Rust async complexity slows the data path | Keep the hot path in a dedicated splice loop; isolate async at the edges |
 | UDP session semantics diverge | Reuse the compatibility matrix and fuzz XUDP |
 | Performance gates fail on 1 vCPU | Measure early; optimize buffers and syscalls; evaluate io_uring |
