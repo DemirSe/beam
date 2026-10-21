@@ -1,0 +1,26 @@
+# Example beam configuration.
+#
+# This file contains a sample key and user id. Replace every value before use.
+# Keep the real file readable only by the service user.
+
+[server]
+listen = "0.0.0.0:443"
+
+[user]
+id = "00000000-0000-0000-0000-000000000000"
+flow = "xtls-rprx-vision"
+
+[reality]
+private_key = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo"
+short_ids = ["0123456789abcdef"]
+server_names = ["whatsapp.net"]
+dest = "whatsapp.net:443"
+
+[log]
+level = "warn"
+
+[limits]
+max_connections = 1024
+max_udp_destinations = 2048
+handshake_timeout_ms = 60000
+idle_timeout_ms = 300000

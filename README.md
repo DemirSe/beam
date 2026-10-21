@@ -35,6 +35,15 @@ cargo build --release
 
 The toolchain is pinned in `rust-toolchain.toml`.
 
+## Configuration check
+
+```bash
+cargo run -- --check -c config.example.toml
+```
+
+`config.example.toml` contains a sample key and a nil user id. Replace every
+value before deployment.
+
 ## Documents
 
 - [`docs/00-scope.md`](docs/00-scope.md)
