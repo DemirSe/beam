@@ -13,7 +13,7 @@ Updated: 2026-10-22.
 - Performance acceptance is relative: aggregate better than stock, no
   regression in any tested condition.
 
-## Implemented
+## Implemented and merged
 
 | Area | State |
 |---|---|
@@ -25,19 +25,26 @@ Updated: 2026-10-22.
 | REALITY envelope authentication | Done |
 | VLESS request/response header codec | Done |
 | Vision block framing codec | Done |
+| Vision padding/direct state machine | Done |
 | XUDP frame codec | Done |
 | Linux fd/socket/splice primitives | Done |
+| REALITY TLS server adapter (rustls) | Done |
+| Cover fallback (byte-exact ClientHello) | Done |
+| CLI accept loop + VLESS user validation | Done |
+| Stock Xray no-flow TCP interop | **HTTP 200** |
+| Stock Xray Vision TCP interop | In progress |
 | Stock Xray baseline + test fixture | Done |
 | Benchmark harness design | Done |
-| TLS server adapter (rustls + cover fallback) | In progress |
+
+## In progress
+
+- Vision server integration (end-to-end stock Vision client).
+- Splice relay loop.
+- XUDP session layer and UDP relay.
 
 ## Not started
 
-- Vision state machine: TLS detection, long/short padding, Direct transition,
-  read-ahead preservation.
-- XUDP session table and UDP relay.
-- TCP relay with `splice`.
-- Config-to-runtime wiring.
+- Vision Direct transition to raw sockets, including TLS read-ahead.
 - Full TUN interoperability tests (DNS, QUIC, IPv6).
 - Cover-parity harness for the authenticated flight.
 - Performance matrix.
@@ -50,6 +57,7 @@ Updated: 2026-10-22.
 - `docs/09-tls-stack-spike.md`: rustls/BoringSSL measurements.
 - `docs/10-cover-parity.md`: whatsapp.net cover measurements.
 - `docs/06-benchmark-harness.md`: local benchmark topology and gates.
+- `docs/12-custom-tls-design.md`: reference-only exact-mirroring design.
 
 ## Current verification
 
@@ -59,6 +67,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The workspace currently has 115 `beam-core` unit tests, one stock-ClientHello
-integration test, and 10 `beam-sys` tests. The TLS server adapter adds its own
-tests when merged.
+The workspace currently has 145 `beam-core` unit tests, two integration tests,
+and 10 `beam-sys` tests. The stock no-flow Xray client completes a REALITY
+handshake and an HTTP request through the `beam` binary.
