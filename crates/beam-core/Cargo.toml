@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 aes-gcm = "0.10"
 base64 = "0.22"
+beam-sys = { workspace = true }
 bytes = "1"
 hex = "0.4"
 hkdf = "0.12"
