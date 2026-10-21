@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed. Blocked on the TLS stack spike.
+Proposed. Spike complete; provider and cover-parity decision pending the
+cover probe and the owner's definition of "1:1".
 
 ## Context
 

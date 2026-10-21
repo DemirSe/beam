@@ -55,6 +55,7 @@ value before deployment.
 - [`docs/06-benchmark-harness.md`](docs/06-benchmark-harness.md)
 - [`docs/07-reality-spec.md`](docs/07-reality-spec.md)
 - [`docs/08-vision-xudp-spec.md`](docs/08-vision-xudp-spec.md)
+- [`docs/09-tls-stack-spike.md`](docs/09-tls-stack-spike.md)
 
 ## Repository layout
 
