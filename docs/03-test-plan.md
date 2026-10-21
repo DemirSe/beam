@@ -39,6 +39,21 @@ Loopback-only fixtures:
 - UDP echo, DNS-shaped payloads, and many destinations.
 - Half-close, reset, idle, and reconnect cases.
 
+### Local stock baseline
+
+A working stock Xray v26.3.27 baseline has been validated locally:
+
+- Server: VLESS + REALITY + Vision on `127.0.0.1:18443`, cover
+  `whatsapp.net:443`.
+- Client: SOCKS5 on `127.0.0.1:11080`, REALITY outbound with
+  `xtls-rprx-vision`.
+- Target: Python `http.server` on `127.0.0.1:18080`.
+- Probe:
+  `curl --socks5-hostname 127.0.0.1:11080 http://127.0.0.1:18080/index.txt`.
+
+Generate a fresh X25519 keypair with `xray x25519` for every run. Never commit
+the generated server config or keys; keep them under `/tmp`.
+
 ### Interoperability tests
 
 Run the real clients from `docs/01-compatibility.md`:
