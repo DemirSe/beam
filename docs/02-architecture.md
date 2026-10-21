@@ -86,7 +86,10 @@ fastest option that meets the gates. The choice is recorded in an ADR and in
 
 The wire details of the stock REALITY envelope, cover mirroring, target-flight
 parsing, certificate HMAC, and record shaping are recorded in
-`docs/07-reality-spec.md`. That document is the reference for the adapter.
+`docs/07-reality-spec.md`. The VLESS request/response, Vision framing, XUDP
+frames, legacy UDP, and packetaddr details are in
+`docs/08-vision-xudp-spec.md`. Those documents are the reference for the
+protocol modules.
 
 The initial ClientHello parser handles one TLS record carrying one complete
 ClientHello. It rejects fragmentation across records. Key-share entries expose

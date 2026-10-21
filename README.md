@@ -54,6 +54,7 @@ value before deployment.
 - [`docs/05-roadmap.md`](docs/05-roadmap.md)
 - [`docs/06-benchmark-harness.md`](docs/06-benchmark-harness.md)
 - [`docs/07-reality-spec.md`](docs/07-reality-spec.md)
+- [`docs/08-vision-xudp-spec.md`](docs/08-vision-xudp-spec.md)
 
 ## Repository layout
 
