@@ -25,8 +25,9 @@ Deliverables:
 - Minimal TLS 1.3 server with ClientHello parsing.
 - REALITY authentication and cover forwarding.
 - Test against a stock Xray client.
-- Measured comparison of rustls, BoringSSL, and a custom record layer.
-- ADR for the chosen TLS stack.
+- rustls + aws-lc-rs (`prefer-post-quantum`) adapter with cover forwarding.
+- Cover-parity harness for ServerHello and encrypted flight sizes.
+- Accepted ADR for the TLS stack.
 
 Exit criteria:
 
@@ -118,7 +119,7 @@ Exit criteria:
 | Risk | Mitigation |
 |---|---|
 | REALITY/TLS behavior differs from stock | Spike first; compare record-level traces; keep a compatibility test |
-| Stock REALITY reuses the cover's ServerHello and certificate shape | If rustls/BoringSSL cannot expose this, implement a minimal TLS 1.3 handshake/record layer in `beam-core`; budget extra time and test against the captured stock ClientHello |
+| Stock REALITY reuses the cover's ServerHello and certificate shape | v1 uses rustls + aws-lc-pq and matches the observable cover shape. Measure encrypted flight sizes with the cover-parity harness; custom TLS is deferred unless the harness shows a reliable distinguisher that matters to the threat model. |
 | Rust async complexity slows the data path | Keep the hot path in a dedicated splice loop; isolate async at the edges |
 | UDP session semantics diverge | Reuse the compatibility matrix and fuzz XUDP |
 | Performance gates fail on 1 vCPU | Measure early; optimize buffers and syscalls; evaluate io_uring |
