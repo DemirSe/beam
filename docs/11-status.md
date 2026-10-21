@@ -28,6 +28,7 @@ Updated: 2026-10-22.
 | Vision padding/direct state machine | Done |
 | XUDP frame codec | Done |
 | Linux fd/socket/splice primitives | Done |
+| Zero-copy splice relay loop | Done |
 | REALITY TLS server adapter (rustls) | Done |
 | Cover fallback (byte-exact ClientHello) | Done |
 | CLI accept loop + VLESS user validation | Done |
@@ -39,8 +40,8 @@ Updated: 2026-10-22.
 ## In progress
 
 - Vision server integration (end-to-end stock Vision client).
-- Splice relay loop.
 - XUDP session layer and UDP relay.
+- Cover-parity harness for the authenticated flight.
 
 ## Not started
 
@@ -67,6 +68,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The workspace currently has 145 `beam-core` unit tests, two integration tests,
-and 10 `beam-sys` tests. The stock no-flow Xray client completes a REALITY
+The workspace currently has 159 `beam-core` unit tests, two integration tests,
+and 22 `beam-sys` tests. The stock no-flow Xray client completes a REALITY
 handshake and an HTTP request through the `beam` binary.
