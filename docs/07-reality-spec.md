@@ -206,13 +206,13 @@ closes the client and returns an error (`R/tls.go:353-368,433-447,451-475`).
   arrays (`X/infra/conf/transport_internet.go:849-894,952-954`), and accepts fewer than three
   dotted version parts, leaving missing bytes zero (`X/infra/conf/transport_internet.go:856-880`).
 ## 5. What beam must implement
-- [ ] Envelope: 32-byte session id at CH offset 39; `ver[3]|rsv|ts_be32|shortid[8]`; AES-256-GCM
+- [x] Envelope: 32-byte session id at CH offset 39; `ver[3]|rsv|ts_be32|shortid[8]`; AES-256-GCM
   with `K = HKDF-SHA256(X25519(static_priv, client_share), salt=random[0:20], info="REALITY",
   32)`, nonce `random[20:32]`, AD = full CH with all 32 session-id bytes zeroed. Test against
   Xray client vectors (`X/.../reality.go:141-175`).
-- [ ] Share selection: standalone X25519 first, else the last 32 bytes of an exactly 1216-byte
+- [x] Share selection: standalone X25519 first, else the last 32 bytes of an exactly 1216-byte
   `X25519MLKEM768` share (`R/tls.go:214-228`); reject low-order X25519.
-- [ ] Checks: TLS 1.3 only; exact SNI set; 24-bit version range; optional `|now-ts| <=
+- [x] Checks: TLS 1.3 only; exact SNI set; 24-bit version range; optional `|now-ts| <=
   MaxTimeDiff`; constant-time short-id compare (do not copy the map lookup). Fail closed to
   cover, never with an alert.
 - [ ] Cover: dial target early; mirror every client byte; optional PROXY header; on failure
