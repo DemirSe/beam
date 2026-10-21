@@ -64,6 +64,9 @@ pub enum ValidationError {
     /// `reality.private_key` is not a 32-byte base64url key.
     #[error("reality.private_key must be 32 bytes encoded as unpadded base64url")]
     PrivateKey,
+    /// No short IDs were configured.
+    #[error("reality.short_ids must not be empty")]
+    ShortIdsEmpty,
     /// A `reality.short_ids` entry is malformed.
     #[error("reality.short_ids[{index}] must be 2 to 16 hexadecimal characters")]
     ShortId {
@@ -184,6 +187,10 @@ fn decode_private_key(encoded: &str) -> Result<Zeroizing<[u8; 32]>, ValidationEr
 }
 
 fn validate_short_ids(short_ids: Vec<String>) -> Result<Vec<String>, ValidationError> {
+    if short_ids.is_empty() {
+        return Err(ValidationError::ShortIdsEmpty);
+    }
+
     for (index, short_id) in short_ids.iter().enumerate() {
         let length_ok = (2..=16).contains(&short_id.len()) && short_id.len().is_multiple_of(2);
         let hex_ok = short_id.bytes().all(|byte| byte.is_ascii_hexdigit());
@@ -426,6 +433,17 @@ idle_timeout_ms = 300000
             ConfigError::Validation(ValidationError::PrivateKey)
         ));
         assert!(!error.to_string().contains(key), "{error}");
+    }
+
+    #[test]
+    fn rejects_empty_short_ids() {
+        let input = config_toml(&private_key())
+            .replace("short_ids = [\"0123456789abcdef\"]", "short_ids = []");
+        let error = Config::from_toml_str(&input).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::Validation(ValidationError::ShortIdsEmpty)
+        ));
     }
 
     #[test]
