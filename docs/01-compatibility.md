@@ -50,6 +50,8 @@ outbound: freedom
 | Wrong short ID / SNI | Treated as unauthenticated; no crash |
 | Replay / malformed frame | Rejected; no panic or unbounded allocation |
 | Concurrent clients | No cross-session data leakage |
+| Full TUN route-all | All client traffic uses the tunnel; DNS, QUIC, and IPv6 work |
+| IPv6 destination | VLESS/XUDP address parsing and freedom dialing work |
 
 ## Wire behaviors to preserve
 

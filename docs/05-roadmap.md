@@ -63,7 +63,7 @@ Deliverables:
 
 Exit criteria:
 
-- DNS and QUIC work through the full-TUN client.
+- Full TUN works end to end: TCP, UDP, DNS, QUIC, and IPv4/IPv6 destinations.
 - Many-destination and reconnect cases pass.
 - No socket or memory leak after churn.
 

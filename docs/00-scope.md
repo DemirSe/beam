@@ -26,6 +26,14 @@ audit and maintain with AI agents.
 The client side is a full-TUN VPN client (Hiddify, sing-box, or stock Xray).
 The server does not implement TUN, DNS, routing, or a GUI.
 
+## Full TUN
+
+The client provides the TUN interface and routes traffic into it. The server
+must carry every TCP and UDP flow the client sends, including DNS and QUIC.
+UDP requires XUDP (and legacy VLESS UDP for clients that select it). IPv4 and
+IPv6 destinations are both in scope. ICMP is not carried by VLESS; stock Xray
+has the same limitation, so this is not a regression.
+
 ## In scope
 
 - VLESS request and response parsing.
@@ -51,7 +59,7 @@ The server does not implement TUN, DNS, routing, or a GUI.
 ## Success criteria
 
 1. An unchanged stock Xray client, sing-box client, and Hiddify client can use
-   the server for TCP and UDP traffic.
+   the server with full TUN: TCP, UDP, DNS, QUIC, and IPv4/IPv6 destinations.
 2. The server survives 24 hours of mixed traffic and 10,000 connection churn
    without leaks, crashes, or unbounded memory growth.
 3. On the same 1 vCPU machine, `beam` is better than stock Xray in the aggregate

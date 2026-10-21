@@ -65,6 +65,20 @@ Run the real clients from `docs/01-compatibility.md`:
 Each client uses the unchanged production profile. Tests cover TCP, UDP, QUIC,
 DNS, small packets, and reconnect.
 
+### Full TUN
+
+Run Hiddify or sing-box in TUN mode in a network namespace and route all
+client traffic through the server:
+
+- TCP bulk and interactive traffic.
+- UDP DNS and QUIC/HTTP3.
+- IPv4 and IPv6 destinations.
+- Reconnect while a transfer is active.
+- TUN MTU 1500; verify no fragmentation or truncation.
+
+The client configuration is unchanged from the stock deployment. This test is
+a release blocker for replacing the production server.
+
 ### Probe resistance tests
 
 - Unauthenticated TLS client is forwarded to the cover.
