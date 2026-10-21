@@ -88,6 +88,7 @@ async fn cover_fallback_test() {
             },
             Duration::from_secs(5),
             TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            [0x22; 16],
         )
         .expect("beam config"),
     );

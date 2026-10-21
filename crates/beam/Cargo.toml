@@ -10,5 +10,6 @@ anyhow = "1"
 beam-core.workspace = true
 beam-sys.workspace = true
 clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

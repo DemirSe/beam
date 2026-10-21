@@ -20,6 +20,7 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfo
 use rustls::sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
 use rustls::{SignatureAlgorithm, SignatureScheme};
 use sha2::Sha512;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -88,6 +89,10 @@ pub enum TlsServerError {
     #[error("authenticated VLESS TCP request has no destination")]
     MissingDestination,
 
+    /// The VLESS user id did not match the configured user.
+    #[error("VLESS user id is not authorized")]
+    UnauthorizedUser,
+
     /// rustls rejected a configuration or handshake.
     #[error("rustls error: {0}")]
     Rustls(#[from] rustls::Error),
@@ -121,6 +126,8 @@ pub struct TlsServerConfig {
     pub handshake_timeout: Duration,
     /// Maximum total ClientHello record size, including its five-byte header.
     pub max_client_hello_bytes: usize,
+    /// The only authorized VLESS user id.
+    pub user_id: [u8; 16],
     provider: Arc<CryptoProvider>,
     certificate: TemporaryCertificate,
 }
@@ -139,6 +146,7 @@ impl TlsServerConfig {
         cover: NetLocation,
         handshake_timeout: Duration,
         max_client_hello_bytes: usize,
+        user_id: [u8; 16],
     ) -> Result<Self, TlsServerError> {
         if handshake_timeout.is_zero() {
             return Err(TlsServerError::InvalidConfig {
@@ -168,6 +176,7 @@ impl TlsServerConfig {
             cover,
             handshake_timeout,
             max_client_hello_bytes,
+            user_id,
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             certificate: TemporaryCertificate::generate()?,
         })
@@ -436,6 +445,9 @@ async fn handle_authenticated(
         })??;
 
     let request = read_vless_request(&mut tls, config.handshake_timeout).await?;
+    if request.user_id.ct_eq(&config.user_id).unwrap_u8() == 0 {
+        return Err(TlsServerError::UnauthorizedUser);
+    }
 
     match request.command {
         Command::Tcp => {
@@ -492,6 +504,7 @@ async fn forward_to_cover(
 }
 
 struct OwnedRequest {
+    user_id: [u8; 16],
     command: Command,
     destination: Option<NetLocation>,
     body: Vec<u8>,
@@ -526,6 +539,7 @@ where
         match RequestHeader::parse(&buffer[..filled]) {
             Ok((header, body)) => {
                 return Ok(OwnedRequest {
+                    user_id: header.user_id,
                     command: header.command,
                     destination: header.destination,
                     body: body.to_vec(),
@@ -646,6 +660,7 @@ mod tests {
             },
             Duration::from_secs(5),
             TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            [0x22; 16],
         )
         .expect("test configuration")
     }
@@ -713,6 +728,7 @@ mod tests {
             },
             Duration::from_secs(5),
             TLS_RECORD_HEADER_LEN - 1,
+            [0x22; 16],
         );
         assert!(matches!(result, Err(TlsServerError::InvalidConfig { .. })));
     }
