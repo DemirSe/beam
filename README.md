@@ -62,6 +62,7 @@ value before deployment.
 - [`docs/10-cover-parity.md`](docs/10-cover-parity.md)
 - [`docs/11-status.md`](docs/11-status.md)
 - [`docs/12-custom-tls-design.md`](docs/12-custom-tls-design.md)
+- [`docs/13-vision-direct-design.md`](docs/13-vision-direct-design.md)
 
 ## Repository layout
 
