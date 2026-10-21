@@ -53,6 +53,7 @@ value before deployment.
 - [`docs/04-benchmark.md`](docs/04-benchmark.md)
 - [`docs/05-roadmap.md`](docs/05-roadmap.md)
 - [`docs/06-benchmark-harness.md`](docs/06-benchmark-harness.md)
+- [`docs/07-reality-spec.md`](docs/07-reality-spec.md)
 
 ## Repository layout
 

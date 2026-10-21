@@ -84,6 +84,10 @@ Decision rule: pass the compatibility and probe tests first; then pick the
 fastest option that meets the gates. The choice is recorded in an ADR and in
 `docs/01-compatibility.md`.
 
+The wire details of the stock REALITY envelope, cover mirroring, target-flight
+parsing, certificate HMAC, and record shaping are recorded in
+`docs/07-reality-spec.md`. That document is the reference for the adapter.
+
 The initial ClientHello parser handles one TLS record carrying one complete
 ClientHello. It rejects fragmentation across records and exposes key-share
 group IDs, not key-exchange bytes. The complete raw record and handshake
