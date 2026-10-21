@@ -8,3 +8,4 @@ pub mod reality;
 pub mod tls;
 pub mod vision;
 pub mod vless;
+pub mod xudp;
