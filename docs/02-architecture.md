@@ -89,11 +89,11 @@ parsing, certificate HMAC, and record shaping are recorded in
 `docs/07-reality-spec.md`. That document is the reference for the adapter.
 
 The initial ClientHello parser handles one TLS record carrying one complete
-ClientHello. It rejects fragmentation across records and exposes key-share
-group IDs, not key-exchange bytes. The complete raw record and handshake
-message remain available, so the TLS adapter can re-parse them or hand them to
-the selected TLS stack. A later change can add multi-record reassembly and
-typed key-share bytes if the spike shows a need.
+ClientHello. It rejects fragmentation across records. Key-share entries expose
+both group IDs and zero-copy key-exchange bytes, with a bounded entry count, so
+the REALITY handler can derive the shared secret directly. The complete raw
+record and handshake message remain available for fallback or auditing. A later
+change can add multi-record reassembly.
 
 ## Data path
 
