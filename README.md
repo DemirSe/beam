@@ -30,10 +30,13 @@ scope for the first release.
 ## Build
 
 ```bash
+source scripts/dev-env.sh
 cargo build --release
 ```
 
-The toolchain is pinned in `rust-toolchain.toml`.
+The toolchain is pinned in `rust-toolchain.toml`. The script adds the local
+portable CMake/Ninja used to build `aws-lc-rs`; on a normal build host it falls
+back to the system tools.
 
 ## Configuration check
 
