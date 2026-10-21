@@ -29,7 +29,15 @@ pub fn set_reuse_addr(fd: RawFd) -> io::Result<()> {
 }
 
 fn duration_secs(value: Duration, name: &str) -> io::Result<libc::c_int> {
-    libc::c_int::try_from(value.as_secs()).map_err(|_| {
+    let seconds = value.as_secs();
+    if seconds == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} duration must be at least one second"),
+        ));
+    }
+
+    libc::c_int::try_from(seconds).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{name} duration does not fit in c_int"),
@@ -111,6 +119,19 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 
         set_reuse_addr(listener.as_raw_fd()).unwrap();
+    }
+
+    #[test]
+    fn keepalive_rejects_zero_duration() {
+        let (client, _server) = loopback_pair();
+
+        let error = set_tcp_keepalive(
+            client.as_raw_fd(),
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
