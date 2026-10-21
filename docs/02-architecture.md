@@ -98,6 +98,14 @@ the REALITY handler can derive the shared secret directly. The complete raw
 record and handshake message remain available for fallback or auditing. A later
 change can add multi-record reassembly.
 
+The TLS server adapter pre-reads one record, authenticates it, and replays it
+into rustls through a prefix stream. Authenticated connections use a
+per-connection Ed25519 certificate whose outer signature is
+`HMAC-SHA512(auth_key, ed25519_public_key)`; unauthenticated connections are
+forwarded to the cover without a TLS alert. Stock Xray Chrome fingerprints omit
+Ed25519 from `signature_algorithms`, so the adapter deliberately forces the
+Ed25519 CertificateVerify scheme to match stock REALITY behavior.
+
 ## Data path
 
 ### TCP
