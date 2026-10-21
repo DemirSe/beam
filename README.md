@@ -61,6 +61,7 @@ value before deployment.
 - [`docs/09-tls-stack-spike.md`](docs/09-tls-stack-spike.md)
 - [`docs/10-cover-parity.md`](docs/10-cover-parity.md)
 - [`docs/11-status.md`](docs/11-status.md)
+- [`docs/12-custom-tls-design.md`](docs/12-custom-tls-design.md)
 
 ## Repository layout
 
