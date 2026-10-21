@@ -60,6 +60,7 @@ value before deployment.
 - [`docs/08-vision-xudp-spec.md`](docs/08-vision-xudp-spec.md)
 - [`docs/09-tls-stack-spike.md`](docs/09-tls-stack-spike.md)
 - [`docs/10-cover-parity.md`](docs/10-cover-parity.md)
+- [`docs/11-status.md`](docs/11-status.md)
 
 ## Repository layout
 
