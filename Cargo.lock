@@ -159,6 +159,7 @@ dependencies = [
  "hex",
  "hkdf",
  "proptest",
+ "rand",
  "rustls",
  "rustls-pki-types",
  "serde",
