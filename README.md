@@ -52,6 +52,7 @@ value before deployment.
 - [`docs/03-test-plan.md`](docs/03-test-plan.md)
 - [`docs/04-benchmark.md`](docs/04-benchmark.md)
 - [`docs/05-roadmap.md`](docs/05-roadmap.md)
+- [`docs/06-benchmark-harness.md`](docs/06-benchmark-harness.md)
 
 ## Repository layout
 
