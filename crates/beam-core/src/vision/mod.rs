@@ -21,6 +21,7 @@
 
 pub mod frame;
 pub mod state;
+pub mod stream;
 
 pub use frame::{
     BLOCK_HEADER_LEN, Block, Command, MAX_BLOCK_LEN, MAX_CONTENT_LEN, MAX_PAYLOAD_LEN, UUID_LEN,
@@ -31,3 +32,4 @@ pub use state::{
     VisionReaderAction, VisionReaderMode, VisionReaderState, VisionStateError, VisionWritePlan,
     VisionWriterState,
 };
+pub use stream::VisionStream;

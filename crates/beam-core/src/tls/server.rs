@@ -4,8 +4,9 @@
 //! authenticated as a REALITY ClientHello. Authenticated connections are handed
 //! to rustls through a [`ReplayStream`] that replays the original record.
 //! Unauthenticated connections are forwarded byte-for-byte to the configured
-//! cover. The adapter implements only the TLS handshake and a minimal TCP VLESS
-//! path; Vision and XUDP are deliberately out of scope.
+//! cover. The adapter implements the TLS handshake, a minimal TCP VLESS path,
+//! and XTLS Vision framing. XUDP and Vision Direct mode are deliberately out of
+//! scope.
 
 use std::fmt;
 use std::io;
@@ -15,6 +16,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer};
 use rustls::sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
@@ -30,6 +33,7 @@ use zeroize::Zeroizing;
 use crate::address::{Address, NetLocation};
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
 use crate::tls::{ClientHello, MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN};
+use crate::vision::VisionStream;
 use crate::vless::{Command, MAX_REQUEST_HEADER_LEN, RequestHeader, ResponseHeader, VlessError};
 
 /// Idle timeout for each relay read, write, and shutdown.
@@ -454,7 +458,7 @@ async fn handle_authenticated(
             let destination = request
                 .destination
                 .ok_or(TlsServerError::MissingDestination)?;
-            let mut target = dial(&destination, config.handshake_timeout).await?;
+            let target = dial(&destination, config.handshake_timeout).await?;
 
             timeout(
                 config.handshake_timeout,
@@ -465,15 +469,22 @@ async fn handle_authenticated(
                 stage: "VLESS response write",
             })??;
 
-            if !request.body.is_empty() {
-                timeout(config.handshake_timeout, target.write_all(&request.body))
-                    .await
-                    .map_err(|_| TlsServerError::Timeout {
-                        stage: "initial VLESS body write",
-                    })??;
+            if request.vision {
+                let rng = SmallRng::seed_from_u64(vision_seed());
+                let vision = VisionStream::new(tls, request.user_id, request.body, rng);
+                relay_bidirectional(vision, target, RELAY_IDLE_TIMEOUT).await?;
+            } else {
+                let mut target = target;
+                if !request.body.is_empty() {
+                    timeout(config.handshake_timeout, target.write_all(&request.body))
+                        .await
+                        .map_err(|_| TlsServerError::Timeout {
+                            stage: "initial VLESS body write",
+                        })??;
+                }
+                relay_bidirectional(tls, target, RELAY_IDLE_TIMEOUT).await?;
             }
 
-            relay_bidirectional(tls, target, RELAY_IDLE_TIMEOUT).await?;
             Ok(ConnectionOutcome::Authenticated {
                 command: Command::Tcp,
             })
@@ -486,6 +497,23 @@ async fn handle_authenticated(
             Ok(ConnectionOutcome::Authenticated { command })
         }
     }
+}
+
+/// Returns a per-connection seed for Vision padding.
+///
+/// Padding lengths are traffic shaping, not authentication material. The seed
+/// mixes the wall clock with a process counter so two connections do not share
+/// the same padding sequence.
+fn vision_seed() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    now ^ count.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 async fn forward_to_cover(
@@ -507,6 +535,7 @@ struct OwnedRequest {
     user_id: [u8; 16],
     command: Command,
     destination: Option<NetLocation>,
+    vision: bool,
     body: Vec<u8>,
 }
 
@@ -542,6 +571,7 @@ where
                     user_id: header.user_id,
                     command: header.command,
                     destination: header.destination,
+                    vision: header.addons.is_vision(),
                     body: body.to_vec(),
                 });
             }
