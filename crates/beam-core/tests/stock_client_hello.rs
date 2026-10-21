@@ -23,5 +23,14 @@ fn parses_stock_xray_client_hello() {
         hello.has_key_share_group(0x001d),
         "stock client must advertise an X25519 key share"
     );
+
+    let shares = hello.key_shares.as_ref().expect("key_share extension");
+    let x25519 = shares.get(0x001d).expect("X25519 key exchange");
+    assert_eq!(
+        x25519.len(),
+        32,
+        "X25519 key exchange must be exactly 32 bytes"
+    );
+
     assert_eq!(hello.raw_record, STOCK_CLIENT_HELLO);
 }

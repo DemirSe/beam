@@ -5,9 +5,10 @@
 //! ignored so a caller can hand over a read buffer that contains more data.
 //!
 //! Every length is checked before it is used. The parser performs no heap
-//! allocation: the record, handshake message, session id, lists, and extension
-//! payloads are borrowed slices of the input. The only copies are the 32-byte
-//! random value and the small, fixed-capacity key share group table.
+//! allocation: the record, handshake message, session id, lists, extension
+//! payloads, and key-exchange bytes are borrowed slices of the input. The only
+//! copies are the 32-byte random value and the small, fixed-capacity key-share
+//! tables.
 //!
 //! Unknown and GREASE values are preserved rather than rejected. Duplicate
 //! extension types are rejected, as are duplicate `server_name` entries and
@@ -305,10 +306,83 @@ impl<'a> Iterator for AlpnIter<'a> {
     }
 }
 
+/// One key share entry from a ClientHello.
+///
+/// `key_exchange` borrows the ClientHello input and is never copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyShareEntry<'a> {
+    /// The named group of the share.
+    pub group: u16,
+    /// The client's key-exchange bytes for `group`.
+    pub key_exchange: &'a [u8],
+}
+
+/// Bounded key share entries advertised by a ClientHello.
+///
+/// Entry order is preserved. Entries live in a fixed-capacity inline array, so
+/// parsing never allocates, and every key-exchange slice borrows the input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyShares<'a> {
+    entries: [KeyShareEntry<'a>; MAX_KEY_SHARE_ENTRIES],
+    len: usize,
+}
+
+impl<'a> KeyShares<'a> {
+    fn new() -> Self {
+        Self {
+            entries: [KeyShareEntry {
+                group: 0,
+                key_exchange: &[],
+            }; MAX_KEY_SHARE_ENTRIES],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, entry: KeyShareEntry<'a>) -> bool {
+        let Some(slot) = self.entries.get_mut(self.len) else {
+            return false;
+        };
+        *slot = entry;
+        self.len += 1;
+        true
+    }
+
+    /// Returns the entries in wire order.
+    pub fn entries(&self) -> &[KeyShareEntry<'a>] {
+        self.entries.get(..self.len).unwrap_or(&[])
+    }
+
+    /// Returns the number of key share entries.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the client sent no key shares.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the key-exchange bytes for `group`, if the client sent them.
+    pub fn get(&self, group: u16) -> Option<&'a [u8]> {
+        for entry in self.entries() {
+            if entry.group == group {
+                return Some(entry.key_exchange);
+            }
+        }
+        None
+    }
+
+    /// Returns `true` if the client sent a share for `group`.
+    pub fn contains(&self, group: u16) -> bool {
+        self.get(group).is_some()
+    }
+}
+
 /// Key share groups advertised by a ClientHello.
 ///
 /// Entry order is preserved. The group identifiers live in a fixed-capacity
-/// inline array, so parsing never allocates.
+/// inline array, so parsing never allocates. This is derived from
+/// [`KeyShares`] and kept for callers that only need group identifiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyShareGroups {
     groups: [u16; MAX_KEY_SHARE_ENTRIES],
@@ -316,6 +390,18 @@ pub struct KeyShareGroups {
 }
 
 impl KeyShareGroups {
+    fn from_shares(shares: &KeyShares<'_>) -> Self {
+        let entries = shares.entries();
+        let mut groups = [0u16; MAX_KEY_SHARE_ENTRIES];
+        for (slot, entry) in groups.iter_mut().zip(entries) {
+            *slot = entry.group;
+        }
+        Self {
+            groups,
+            len: entries.len(),
+        }
+    }
+
     /// Returns the groups in wire order.
     pub fn as_slice(&self) -> &[u16] {
         self.groups.get(..self.len).unwrap_or(&[])
@@ -404,7 +490,13 @@ pub struct ClientHello<'a> {
     pub server_name: Option<&'a str>,
     /// The `supported_versions` list, if the extension was sent.
     pub supported_versions: Option<U16List<'a>>,
+    /// The key share entries, including key-exchange bytes, if the extension
+    /// was sent.
+    pub key_shares: Option<KeyShares<'a>>,
     /// The key share groups, if the extension was sent.
+    ///
+    /// Derived from [`Self::key_shares`] and kept for callers that only need
+    /// group identifiers.
     pub key_share_groups: Option<KeyShareGroups>,
     /// The `signature_algorithms` list, if the extension was sent.
     pub signature_algorithms: Option<U16List<'a>>,
@@ -570,6 +662,7 @@ impl<'a> TryFrom<&'a Bytes> for ClientHello<'a> {
 struct ParsedExtensions<'a> {
     server_name: Option<&'a str>,
     supported_versions: Option<U16List<'a>>,
+    key_shares: Option<KeyShares<'a>>,
     key_share_groups: Option<KeyShareGroups>,
     signature_algorithms: Option<U16List<'a>>,
     alpn: Option<Alpn<'a>>,
@@ -649,6 +742,7 @@ fn parse_client_hello_body<'a>(
         compression_methods,
         server_name: parsed.server_name,
         supported_versions: parsed.supported_versions,
+        key_shares: parsed.key_shares,
         key_share_groups: parsed.key_share_groups,
         signature_algorithms: parsed.signature_algorithms,
         alpn: parsed.alpn,
@@ -666,6 +760,7 @@ fn parse_extensions<'a>(block: &'a [u8]) -> Result<ParsedExtensions<'a>, ClientH
     let mut parsed = ParsedExtensions {
         server_name: None,
         supported_versions: None,
+        key_shares: None,
         key_share_groups: None,
         signature_algorithms: None,
         alpn: None,
@@ -702,7 +797,11 @@ fn parse_extensions<'a>(block: &'a [u8]) -> Result<ParsedExtensions<'a>, ClientH
             EXT_SUPPORTED_VERSIONS => {
                 parsed.supported_versions = Some(parse_supported_versions(data)?);
             }
-            EXT_KEY_SHARE => parsed.key_share_groups = Some(parse_key_share(data)?),
+            EXT_KEY_SHARE => {
+                let (shares, groups) = parse_key_share(data)?;
+                parsed.key_shares = Some(shares);
+                parsed.key_share_groups = Some(groups);
+            }
             EXT_SIGNATURE_ALGORITHMS => {
                 parsed.signature_algorithms = Some(parse_u16_list(data, "signature_algorithms")?);
             }
@@ -777,7 +876,9 @@ fn parse_supported_versions<'a>(data: &'a [u8]) -> Result<U16List<'a>, ClientHel
     Ok(U16List::new(reader.take(list_len)?))
 }
 
-fn parse_key_share(data: &[u8]) -> Result<KeyShareGroups, ClientHelloError> {
+fn parse_key_share<'a>(
+    data: &'a [u8],
+) -> Result<(KeyShares<'a>, KeyShareGroups), ClientHelloError> {
     let mut reader = Reader::new(data);
     let shares_len = usize::from(reader.u16()?);
     let available = reader.remaining_len();
@@ -787,42 +888,46 @@ fn parse_key_share(data: &[u8]) -> Result<KeyShareGroups, ClientHelloError> {
             "client share list length mismatch",
         ));
     }
+    if shares_len == 0 {
+        return Err(malformed_extension("key_share", "empty key share list"));
+    }
 
-    let shares = reader.take(shares_len)?;
-    let mut shares = Reader::new(shares);
-    let mut groups = [0u16; MAX_KEY_SHARE_ENTRIES];
-    let mut count = 0usize;
+    let shares_bytes = reader.take(shares_len)?;
+    let mut reader = Reader::new(shares_bytes);
+    let mut shares = KeyShares::new();
 
-    while shares.remaining_len() > 0 {
-        if count >= MAX_KEY_SHARE_ENTRIES {
+    while reader.remaining_len() > 0 {
+        if shares.len() >= MAX_KEY_SHARE_ENTRIES {
             return Err(ClientHelloError::TooManyKeyShares {
                 max: MAX_KEY_SHARE_ENTRIES,
             });
         }
 
-        let group = shares.u16()?;
-        let key_len = usize::from(shares.u16()?);
-        let _key_exchange = shares.take(key_len)?;
+        let group = reader.u16()?;
+        let key_len = usize::from(reader.u16()?);
+        if key_len == 0 {
+            return Err(malformed_extension("key_share", "empty key exchange"));
+        }
+        let key_exchange = reader.take(key_len)?;
 
-        if groups
-            .get(..count)
-            .is_some_and(|seen| seen.contains(&group))
-        {
+        if shares.contains(group) {
             return Err(malformed_extension(
                 "key_share",
                 "duplicate key share group",
             ));
         }
-        let Some(slot) = groups.get_mut(count) else {
+        if !shares.push(KeyShareEntry {
+            group,
+            key_exchange,
+        }) {
             return Err(ClientHelloError::TooManyKeyShares {
                 max: MAX_KEY_SHARE_ENTRIES,
             });
-        };
-        *slot = group;
-        count += 1;
+        }
     }
 
-    Ok(KeyShareGroups { groups, len: count })
+    let groups = KeyShareGroups::from_shares(&shares);
+    Ok((shares, groups))
 }
 
 fn parse_u16_list<'a>(
@@ -1127,6 +1232,14 @@ mod tests {
                 .map(KeyShareGroups::as_slice),
             Some(&[0x001d][..])
         );
+        let shares = hello.key_shares.as_ref().expect("key share extension");
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares.get(0x001d), Some(&[0x99; 32][..]));
+        assert_eq!(shares.get(0x001e), None);
+        assert_eq!(
+            shares.entries().first().map(|entry| entry.group),
+            Some(0x001d)
+        );
         assert!(hello.has_key_share_group(0x001d));
         assert!(
             hello
@@ -1273,7 +1386,7 @@ mod tests {
         let mut spec = HelloSpec::default();
         spec.cipher_suites = cipher_suite_bytes(&[0x0a0a, 0x1301, 0x1302, 0x1303]);
         spec.extensions[1] = supported_versions(&[0x0a0a, 0x0304, 0x0303]);
-        spec.extensions[2] = key_share(&[(0x0a0a, &[]), (0x001d, &[0x11; 32])]);
+        spec.extensions[2] = key_share(&[(0x0a0a, &[0x00]), (0x001d, &[0x11; 32])]);
         spec.extensions[3] = signature_algorithms(&[0x0a0a, 0x0804, 0x0403]);
         spec.extensions.push(extension(0x1a1a, &[0x00]));
 
@@ -1294,6 +1407,9 @@ mod tests {
                 .map(KeyShareGroups::as_slice),
             Some(&[0x0a0a, 0x001d][..])
         );
+        let shares = hello.key_shares.as_ref().expect("key share extension");
+        assert_eq!(shares.get(0x0a0a), Some(&[0x00][..]));
+        assert_eq!(shares.get(0x001d), Some(&[0x11; 32][..]));
         assert!(
             hello
                 .signature_algorithms
@@ -1305,6 +1421,103 @@ mod tests {
                 .extensions()
                 .any(|extension| extension.extension_type == 0x1a1a)
         );
+    }
+
+    #[test]
+    fn exposes_hybrid_key_share_bytes() {
+        let hybrid_key = vec![0xab; 1216];
+        let mut spec = HelloSpec::default();
+        spec.extensions[2] = key_share(&[(0x11ec, hybrid_key.as_slice()), (0x001d, &[0x11; 32])]);
+
+        let record = spec.build();
+        let hello = ClientHello::parse(&record).expect("hybrid key share must parse");
+        let shares = hello.key_shares.as_ref().expect("key share extension");
+
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares.get(0x11ec), Some(hybrid_key.as_slice()));
+        assert_eq!(shares.get(0x11ec).map(|key| key.len()), Some(1216));
+        assert_eq!(shares.get(0x001d), Some(&[0x11; 32][..]));
+        assert_eq!(
+            shares
+                .entries()
+                .iter()
+                .map(|entry| entry.group)
+                .collect::<Vec<_>>(),
+            vec![0x11ec, 0x001d]
+        );
+        assert_eq!(
+            hello
+                .key_share_groups
+                .as_ref()
+                .map(KeyShareGroups::as_slice),
+            Some(&[0x11ec, 0x001d][..])
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_key_share_entry() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&6u16.to_be_bytes());
+        data.extend_from_slice(&0x001du16.to_be_bytes());
+        data.extend_from_slice(&32u16.to_be_bytes());
+        data.extend_from_slice(&[0xaa, 0xbb]);
+
+        let mut spec = HelloSpec::default();
+        spec.extensions[2] = extension(EXT_KEY_SHARE, &data);
+        assert!(matches!(
+            ClientHello::parse(&spec.build()),
+            Err(ClientHelloError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_key_share_groups() {
+        let mut spec = HelloSpec::default();
+        spec.extensions[2] = key_share(&[(0x001d, &[0x11; 32]), (0x001d, &[0x22; 32])]);
+        assert!(matches!(
+            ClientHello::parse(&spec.build()),
+            Err(ClientHelloError::MalformedExtension {
+                extension: "key_share",
+                reason: "duplicate key share group",
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_too_many_key_share_entries() {
+        let entries: Vec<(u16, &[u8])> = (0..=MAX_KEY_SHARE_ENTRIES)
+            .map(|index| (0x1000 + index as u16, &[0x01u8][..]))
+            .collect();
+        let mut spec = HelloSpec::default();
+        spec.extensions[2] = key_share(&entries);
+        assert!(matches!(
+            ClientHello::parse(&spec.build()),
+            Err(ClientHelloError::TooManyKeyShares {
+                max: MAX_KEY_SHARE_ENTRIES
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_key_share_list_and_key_exchange() {
+        let mut spec = HelloSpec::default();
+        spec.extensions[2] = key_share(&[]);
+        assert!(matches!(
+            ClientHello::parse(&spec.build()),
+            Err(ClientHelloError::MalformedExtension {
+                extension: "key_share",
+                reason: "empty key share list",
+            })
+        ));
+
+        spec.extensions[2] = key_share(&[(0x001d, &[])]);
+        assert!(matches!(
+            ClientHello::parse(&spec.build()),
+            Err(ClientHelloError::MalformedExtension {
+                extension: "key_share",
+                reason: "empty key exchange",
+            })
+        ));
     }
 
     #[test]
