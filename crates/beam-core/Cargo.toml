@@ -12,6 +12,7 @@ bytes = "1"
 hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
+rand = { version = "0.10", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
 rustls-pki-types = "1"

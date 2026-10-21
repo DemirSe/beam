@@ -201,6 +201,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "proptest",
+ "rand",
  "rcgen",
  "rustls",
  "rustls-pki-types",
