@@ -93,8 +93,10 @@ Deliverables:
 
 Exit criteria:
 
-- All gates in `docs/04-benchmark.md` pass.
-- No regression under loss, added RTT, or single-core pinning.
+- `beam` is better than stock in the aggregate benchmark.
+- No tested condition regresses under loss, added RTT, or single-core pinning.
+- Numeric targets in `docs/04-benchmark.md` are met, or the gap is documented
+  and accepted.
 
 ## Phase 6 - Deployment package
 

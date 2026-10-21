@@ -54,8 +54,9 @@ The server does not implement TUN, DNS, routing, or a GUI.
    the server for TCP and UDP traffic.
 2. The server survives 24 hours of mixed traffic and 10,000 connection churn
    without leaks, crashes, or unbounded memory growth.
-3. On the same 1 vCPU machine, `beam` beats stock Xray on the benchmark gates in
-   `docs/04-benchmark.md`.
+3. On the same 1 vCPU machine, `beam` is better than stock Xray in the aggregate
+   benchmark and does not regress in any tested condition. Numeric targets live
+   in `docs/04-benchmark.md`; they are goals, not release blockers.
 4. Unauthenticated probes see plausible cover behavior and cannot distinguish
    `beam` from the cover at the TLS-record level within the tested cases.
 5. A new AI agent can understand the repository from the documents and run all

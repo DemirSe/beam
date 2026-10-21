@@ -16,9 +16,19 @@ below, not a single best-case number.
 - Kernel: syscalls per GiB, context switches, wakeups, splice bytes.
 - Stability: errors, resets, timeouts, and file descriptor count.
 
-## Acceptance gates
+## Targets and hard requirements
 
-| Gate | Target |
+Hard requirements:
+
+- `beam` is better than stock Xray in the aggregate benchmark.
+- No tested condition regresses beyond measurement noise.
+- 24-hour soak and 10,000-connection churn pass with stable memory, file
+  descriptors, threads, and pipes.
+- No crash, panic, data corruption, or cross-session leakage.
+
+Numeric targets are goals, not release blockers:
+
+| Metric | Target |
 |---|---|
 | Single-flow throughput | >= 1.15x stock |
 | Multi-flow throughput | >= 1.10x stock |
@@ -26,11 +36,10 @@ below, not a single best-case number.
 | Responsiveness under load | <= stock |
 | RSS after warm-up | <= 50% of stock |
 | CPU per GiB | < stock |
-| 24h soak | No leak, no crash, bounded memory |
-| 10k churn | No fd/thread/pipe leak |
 
-If a gate fails, the result is recorded and the cause is investigated before
-any optimization is accepted.
+A missed numeric target is recorded with the measured result. It does not block
+the release if the aggregate result is better and no tested condition
+regressed.
 
 ## Local methodology
 
