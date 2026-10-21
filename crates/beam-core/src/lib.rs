@@ -3,3 +3,4 @@
 //! Core protocol and server logic for beam.
 
 pub mod config;
+pub mod tls;
