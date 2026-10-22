@@ -11,6 +11,7 @@
 
 use std::fmt;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -27,12 +28,14 @@ use sha2::Sha512;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
 use crate::address::{Address, NetLocation};
 use crate::prepend_stream::PrependStream;
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
+use crate::relay::{RelayConfig, copy_bidirectional};
 use crate::tls::stream::{TlsStream, TlsStreamError};
 use crate::tls::{ClientHello, MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN};
 use crate::vision::VisionStream;
@@ -501,7 +504,7 @@ async fn handle_authenticated(
             if request.vision {
                 let rng = SmallRng::seed_from_u64(vision_seed());
                 let vision = VisionStream::new(tls, request.user_id, request.body, rng);
-                relay_bidirectional(vision, target, RELAY_IDLE_TIMEOUT).await?;
+                relay_vision(vision, target, RELAY_IDLE_TIMEOUT).await?;
             } else {
                 let mut target = target;
                 if !request.body.is_empty() {
@@ -580,7 +583,7 @@ async fn forward_to_cover(
         .map_err(|_| TlsServerError::Timeout {
             stage: "cover ClientHello write",
         })??;
-    relay_bidirectional(client, cover, RELAY_IDLE_TIMEOUT).await?;
+    relay_splice(client, cover).await?;
     Ok(ConnectionOutcome::CoverForwarded)
 }
 
@@ -669,6 +672,209 @@ where
     let left_to_right = copy_direction(&mut left_read, &mut right_write, idle_timeout);
     let right_to_left = copy_direction(&mut right_read, &mut left_write, idle_timeout);
     tokio::try_join!(left_to_right, right_to_left)?;
+    Ok(())
+}
+
+/// Relays a Vision stream with tokio copy until both directions switch to raw,
+/// then hands the underlying sockets to the splice relay.
+async fn relay_vision(
+    vision: VisionStream<TlsStream>,
+    target: TcpStream,
+    idle_timeout: Duration,
+) -> Result<(), TlsServerError> {
+    let direct = vision.direct_watch();
+    let mut up_direct = direct.clone();
+    let mut down_direct = direct;
+
+    let (mut vision_read, mut vision_write) = tokio::io::split(vision);
+    let (mut target_read, mut target_write) = tokio::io::split(target);
+
+    let up = copy_direction_until(
+        &mut vision_read,
+        &mut target_write,
+        idle_timeout,
+        &mut up_direct,
+    );
+    let down = copy_direction_until(
+        &mut target_read,
+        &mut vision_write,
+        idle_timeout,
+        &mut down_direct,
+    );
+    tokio::try_join!(up, down)?;
+
+    if !*down_direct.borrow() {
+        return Ok(());
+    }
+
+    let vision = vision_read.unsplit(vision_write);
+    let target = target_read.unsplit(target_write);
+    let raw = vision.into_raw()?;
+    tracing::debug!(
+        inbound = raw.inbound.len(),
+        outbound = raw.outbound.len(),
+        "Direct raw handoff"
+    );
+    let mut client = raw.socket;
+    let mut target = target;
+
+    if !write_prefix(
+        &mut client,
+        &raw.outbound,
+        idle_timeout,
+        "Direct client prefix write",
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    if !write_prefix(
+        &mut target,
+        &raw.inbound,
+        idle_timeout,
+        "Direct target prefix write",
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    let config = splice_config(idle_timeout);
+    let result = tokio::task::spawn_blocking(move || {
+        copy_bidirectional(client.as_raw_fd(), target.as_raw_fd(), &config)
+    })
+    .await
+    .map_err(join_error)?;
+    match result {
+        Ok(stats) => {
+            tracing::debug!(bytes = stats.total_bytes(), "Direct splice relay finished");
+        }
+        Err(error) if is_peer_closed(&error) => {
+            tracing::debug!(%error, "Direct splice peer closed");
+        }
+        Err(error) => return Err(TlsServerError::Io(error)),
+    }
+    Ok(())
+}
+
+/// Hands two raw sockets to the blocking splice relay.
+async fn relay_splice(left: TcpStream, right: TcpStream) -> Result<(), TlsServerError> {
+    let config = splice_config(RELAY_IDLE_TIMEOUT);
+    let result = tokio::task::spawn_blocking(move || {
+        copy_bidirectional(left.as_raw_fd(), right.as_raw_fd(), &config)
+    })
+    .await
+    .map_err(join_error)?;
+    match result {
+        Ok(stats) => {
+            tracing::debug!(bytes = stats.total_bytes(), "cover splice relay finished");
+        }
+        Err(error) if is_peer_closed(&error) => {
+            tracing::debug!(%error, "cover splice peer closed");
+        }
+        Err(error) => return Err(TlsServerError::Io(error)),
+    }
+    Ok(())
+}
+
+fn splice_config(idle_timeout: Duration) -> RelayConfig {
+    RelayConfig::new()
+        .with_idle_timeout(idle_timeout)
+        .with_shutdown_timeout(idle_timeout)
+}
+
+/// Writes a Direct handoff prefix, returning `false` if the peer already closed.
+async fn write_prefix(
+    stream: &mut TcpStream,
+    prefix: &[u8],
+    idle_timeout: Duration,
+    stage: &'static str,
+) -> Result<bool, TlsServerError> {
+    if prefix.is_empty() {
+        return Ok(true);
+    }
+    let write = timeout(idle_timeout, stream.write_all(prefix))
+        .await
+        .map_err(|_| TlsServerError::Timeout { stage })?;
+    match write {
+        Ok(()) => {
+            tracing::debug!(bytes = prefix.len(), stage, "Direct prefix written");
+            Ok(true)
+        }
+        Err(error) if is_peer_closed(&error) => Ok(false),
+        Err(error) => Err(TlsServerError::Io(error)),
+    }
+}
+
+fn join_error(error: tokio::task::JoinError) -> TlsServerError {
+    TlsServerError::Io(io::Error::other(error))
+}
+
+/// Copies one direction, returning early when both Vision directions are raw.
+///
+/// The watch future only races reads. A write is always allowed to complete so
+/// a switch cannot drop bytes that were already accepted into the local buffer.
+async fn copy_direction_until<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle_timeout: Duration,
+    direct: &mut watch::Receiver<bool>,
+) -> Result<(), TlsServerError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0u8; RELAY_BUFFER_LEN];
+    loop {
+        if *direct.borrow() {
+            return Ok(());
+        }
+
+        let read = tokio::select! {
+            changed = direct.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                if *direct.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+            read = timeout(idle_timeout, reader.read(&mut buffer)) => read,
+        };
+        let count = read.map_err(|_| TlsServerError::Timeout {
+            stage: "relay read",
+        })??;
+        if count == 0 {
+            break;
+        }
+
+        let write = timeout(idle_timeout, writer.write_all(&buffer[..count]))
+            .await
+            .map_err(|_| TlsServerError::Timeout {
+                stage: "relay write",
+            })?;
+        match write {
+            Ok(()) => {}
+            Err(error) if is_peer_closed(&error) => break,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+
+        if *direct.borrow() {
+            return Ok(());
+        }
+    }
+
+    let shutdown = timeout(idle_timeout, writer.shutdown())
+        .await
+        .map_err(|_| TlsServerError::Timeout {
+            stage: "relay shutdown",
+        })?;
+    match shutdown {
+        Ok(()) => {}
+        Err(error) if is_peer_closed(&error) => {}
+        Err(error) => return Err(TlsServerError::Io(error)),
+    }
     Ok(())
 }
 
