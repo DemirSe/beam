@@ -63,9 +63,26 @@ UDP modes:
 | QUIC / HTTP3 | PASS | PASS | PASS |
 | HTTPS through Vision Direct | PASS | PASS | PASS |
 
+## Performance snapshot
+
+Local full-TUN benchmark, stock Xray v26.3.27 vs beam, client-capped and noisy
+host (headline not valid; see `bench/results/`):
+
+- TCP download throughput: ~0.98x stock; upload: ~1.00x. The sing-box client
+  core is near its limit, so these are not server-capacity numbers.
+- Server CPU per GiB, TCP download: **0.79x** (21% lower); upload: ~1.00x /
+  1.03x (slightly worse).
+- Server RSS after warm-up: **0.24x** (76% lower).
+- UDP echo throughput: **1.22x** (22% higher).
+- HTTPS Vision Direct server CPU per GiB: ~1.5x stock; under investigation.
+- DNS p50/p95 favor beam; p99 is slightly worse. H3 p99 is ~4% worse; both are
+  small absolute values on a noisy host.
+- Syscall/wakeup/splice gates need a privileged, quiet acceptance run.
+
 ## In progress
 
-- Local performance benchmark against stock Xray.
+- Performance optimization: Direct CPU, upload CPU, and a valid server-bound
+  throughput measurement.
 
 ## Known gaps / not started
 
