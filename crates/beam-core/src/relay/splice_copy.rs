@@ -241,7 +241,7 @@ pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Resul
     for fd in [a_pipe_write.as_raw_fd(), b_pipe_write.as_raw_fd()] {
         match beam_sys::set_pipe_size(fd, config.pipe_size) {
             Ok(actual) => tracing::debug!(requested = config.pipe_size, actual, "relay pipe sized"),
-            Err(error) => tracing::debug!(
+            Err(error) => tracing::warn!(
                 ?error,
                 pipe_size = config.pipe_size,
                 "could not resize relay pipe; using the kernel default"
@@ -334,7 +334,7 @@ pub fn copy_one_way(
     let (pipe_read, pipe_write) = pipe()?;
     match beam_sys::set_pipe_size(pipe_write.as_raw_fd(), config.pipe_size) {
         Ok(actual) => tracing::debug!(requested = config.pipe_size, actual, "one-way pipe sized"),
-        Err(error) => tracing::debug!(
+        Err(error) => tracing::warn!(
             ?error,
             pipe_size = config.pipe_size,
             "could not resize one-way relay pipe; using the kernel default"
