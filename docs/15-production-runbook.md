@@ -16,7 +16,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 
 | Item | State |
 |---|---|
-| Host | Debian 13.6, x86_64, 1 vCPU, 1 GiB RAM, 1 GiB swap |
+| Host | Debian 13.6, x86_64, 1 vCPU, 1 GiB RAM, 1 GiB swap; kernel 6.12.113 active |
 | Service | `beam.service`, active and enabled, `User=beam`, `0.0.0.0:443`; cover `whatsapp.net:443`; limits 64 connections / 10 s handshake; systemd exposure 1.7 OK |
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
@@ -235,17 +235,20 @@ Edit only `[limits]`; keep the file root:beam 0640. The example's 1024 default i
   loopback allowed. The provider firewall was not independently verified.
 - SSH is key-only `demir` with passwordless sudo; root and `debian` are
   disabled. The SSH key and provider account are the perimeter.
-- The installed kernel security update is not active until a reboot; `needrestart`
-  reports user-space services. Reboot in a maintenance window and verify 443.
+- Kernel `6.12.113+deb13-cloud-amd64` is active after the 2026-10-22 reboot;
+  `needrestart` reports no pending kernel. Verify 443 and a fresh SSH connection
+  after any future kernel update.
 - `sing-box` is active but disabled at boot; after a reboot there is no tunnel until
   a manual/tray start. Enabling at boot changes host routing and needs a test.
 - Cover parity is incomplete: beam emits `key_share, supported_versions` versus the
   cover's `supported_versions, key_share`, and the encrypted flight is 3 records /
   416 B versus 5 / 3085 B (temporary Ed25519 certificate). See `docs/10-cover-parity.md`.
-- Large HTTP/3 bodies through the production TUN occasionally stall 10–20 s.
-  The local lab reproduces the large-body failure with a gVisor TUN on both beam
-  and stock Xray; a `system` TUN passes 1.3 MiB. Switch the client TUN stack to
-  `system` (or `mixed`) before treating this as a server regression.
+- Large HTTP/3 bodies through the production TUN occasionally stall 20–45 s.
+  The post-hardening soak was 12/14 large-H3 success (two 45 s timeouts) while
+  non-H3 was 87/87. The local lab reproduces the large-body failure with a gVisor
+  TUN on both beam and stock Xray; a `system` TUN passes 1.3 MiB. Switch the
+  client TUN stack to `system` (or `mixed`) before treating this as a server
+  regression.
 - A 5-minute post-hardening soak and the read-only audit are complete; a 24-hour
   soak and privileged syscall/wakeup gates remain open.
 - No per-IP connection cap; the 64-connection global cap, 10 s pre-auth timeout,

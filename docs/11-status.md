@@ -114,8 +114,9 @@ UDP modes:
 - `sudo python3 deploy/update-client.py` or the link import is the only local
   privileged action; the agent's sandbox sets `no_new_privs`.
 - Production hardening applied on 2026-10-22:
-  - 13 pending security updates installed; `needrestart` added. A kernel update
-    is installed but not active; no reboot was forced.
+  - 13 pending security updates installed; `needrestart` added. Kernel
+    `6.12.113+deb13-cloud-amd64` is active after a controlled reboot on
+    2026-10-22.
   - Live limits lowered to `max_connections=64` and
     `handshake_timeout_ms=10000`; unauthenticated cover relays are capped at
     30 s.
@@ -133,17 +134,19 @@ UDP modes:
     `debian` is locked with `nologin` and its sudoers entry removed.
   - systemd-resolved uses DNS-over-TLS and DNSSEC (`allow-downgrade`); LLMNR and
     mDNS are off.
-- A 5-minute post-hardening production soak is running; the previous audit and
-  soak reports are in `/tmp/opencode/`.
+- A 5-minute post-hardening production soak completed: 113/115 requests
+  succeeded; non-H3 was 87/87. Large HTTP/3 was 12/14 with two 45 s timeouts.
+  There was no restart, RSS stayed at ~10.2 MiB, and FDs went 124 → 154 → 134
+  (peak → +60 s). The previous audit and soak reports are in `/tmp/opencode/`.
 
 ## In progress
 
 - Final 24-hour soak and privileged syscall/wakeup acceptance.
-- A reboot window for the installed kernel update.
 - Residual large-HTTP/3 stalls through the production TUN; the local lab shows
   the same failure with a gVisor TUN on both beam and stock Xray, so the client
   TUN stack is a contributing factor. Small H3 requests and large H3 bodies
-  with the `system` stack pass.
+  with the `system` stack pass. Switch the client stack to `system`/`mixed`
+  before treating this as a server regression.
 
 ## Known gaps / not started
 
@@ -156,9 +159,10 @@ UDP modes:
 - The provider L4 firewall/rate limit was not independently verified; the host
   nftables rules are.
 - The local `sing-box` service is not enabled at boot.
-- Large H3 bodies can occasionally stall 10–20 s through the production TUN;
-  switching the client TUN stack from `gvisor` to `system` is the recommended
-  client-side workaround. The server-side 1.3 MiB H3 test passes locally.
+- Large H3 bodies can occasionally stall 20–45 s through the production TUN;
+  the post-hardening soak saw 2 timeouts in 14 attempts. Switching the client
+  TUN stack from `gvisor` to `system` is the recommended client-side workaround.
+  The server-side 1.3 MiB H3 test passes locally with the `system` stack.
 
 ## Evidence
 

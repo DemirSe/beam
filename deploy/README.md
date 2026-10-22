@@ -103,5 +103,6 @@ journalctl -u beam -n 50 --no-pager
 ```
 
 Then run the local client matrix (TCP, UDP, DNS, QUIC, HTTPS Direct, IPv6) and
-a fresh SSH/443 check. The live host has a 5-minute post-hardening soak; the
-24-hour soak and the kernel-update reboot remain open.
+a fresh SSH/443 check. The live host has a 5-minute post-hardening soak and the
+6.12.113 kernel reboot; the 24-hour soak and large-H3 client-TUN validation
+remain open.
