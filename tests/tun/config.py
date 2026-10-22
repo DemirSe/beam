@@ -87,7 +87,9 @@ def _require(mapping: dict, *path: str):
     return value
 
 
-def _render_beam(source: str, listen: str, cover: str, destination: Path) -> None:
+def _render_beam(
+    source: str, listen: str, cover: str, log_level: str, destination: Path
+) -> None:
     text = source
 
     def replace(pattern: str, replacement: str) -> None:
@@ -101,7 +103,7 @@ def _render_beam(source: str, listen: str, cover: str, destination: Path) -> Non
     replace(r"^dest = .*$", f'dest = "{cover}"')
     replace(r"^handshake_timeout_ms = .*$", "handshake_timeout_ms = 15000")
     replace(r"^idle_timeout_ms = .*$", "idle_timeout_ms = 300000")
-    replace(r"^level = .*$", 'level = "debug"')
+    replace(r"^level = .*$", f'level = "{log_level}"')
     destination.write_text(text, encoding="utf-8")
     destination.chmod(0o600)
 
@@ -114,6 +116,12 @@ def main() -> int:
     parser.add_argument("--cover", required=True, help="REALITY cover address")
     parser.add_argument("--singbox", action="store_true", help="also render singbox.json")
     parser.add_argument("--xray", action="store_true", help="also render xray-server.json")
+    parser.add_argument(
+        "--log-level",
+        default="debug",
+        choices=("error", "warn", "info", "debug", "trace"),
+        help="log level for every rendered config (benchmark runs use warn)",
+    )
     args = parser.parse_args()
 
     source = args.test_config.read_text(encoding="utf-8")
@@ -135,11 +143,11 @@ def main() -> int:
     public_key = _public_key(private_key)
     out = args.out_dir
     out.mkdir(parents=True, exist_ok=True)
-    _render_beam(source, args.listen, args.cover, out / "beam.toml")
+    _render_beam(source, args.listen, args.cover, args.log_level, out / "beam.toml")
 
     if args.singbox:
         singbox = {
-            "log": {"level": "debug", "timestamp": True},
+            "log": {"level": args.log_level, "timestamp": True},
             "inbounds": [
                 {
                     "type": "tun",
@@ -181,8 +189,9 @@ def main() -> int:
         (out / "singbox.json").chmod(0o600)
 
     if args.xray:
+        xray_level = "warning" if args.log_level == "warn" else args.log_level
         xray = {
-            "log": {"loglevel": "info"},
+            "log": {"loglevel": xray_level},
             "inbounds": [
                 {
                     "listen": args.listen.rsplit(":", 1)[0],

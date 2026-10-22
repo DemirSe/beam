@@ -11,6 +11,10 @@ One process hosts every target in the target network namespace:
   routing failure (it intentionally does not speak HTTP/3). The harness omits
   the sink when the local HTTP/3 origin owns that address instead.
 
+An optional regular file can be exposed at ``/large.bin`` so the benchmark can
+measure HTTPS throughput through the tunnel. Per-request logging can be
+disabled with ``--quiet`` to keep the target core free for the data path.
+
 This is test-only code and is not part of the beam server.
 """
 
@@ -31,10 +35,16 @@ MARKER = b"beam-tun-ok\n"
 DNS_TARGET = "target.test"
 DNS_V4 = "10.10.2.2"
 DNS_V6 = "fd00:2::2"
+QUIET = False
 
 
 def log(message: str) -> None:
     print(f"target: {message}", file=sys.stderr, flush=True)
+
+
+def request_log(message: str) -> None:
+    if not QUIET:
+        log(message)
 
 
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -49,8 +59,24 @@ class _Server6(_Server):
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "beam-tun-target/1"
     sys_version = ""
+    wbufsize = 1 << 20
+    large_file: Path | None = None
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        path = self.path.split("?", 1)[0]
+        if path == "/large.bin" and self.large_file is not None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(self.large_file.stat().st_size))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            with self.large_file.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            return
         body = MARKER
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -60,7 +86,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt: str, *args) -> None:
-        log(f"http {self.client_address[0]}: {fmt % args}")
+        request_log(f"http {self.client_address[0]}: {fmt % args}")
 
 
 def _serve_http(server: http.server.HTTPServer, label: str) -> None:
@@ -85,7 +111,7 @@ def _udp_loop(sock: socket.socket, label: str, echo: bool) -> None:
             except OSError as error:
                 log(f"{label} send to {peer} failed: {error}")
         else:
-            log(f"{label} received {len(data)} bytes from {peer}: {data[:16].hex()}")
+            request_log(f"{label} received {len(data)} bytes from {peer}: {data[:16].hex()}")
 
 
 def _dns_question(query: bytes):
@@ -135,7 +161,7 @@ def _dns_reply(query: bytes) -> bytes | None:
 
     ancount = 1 if answer else 0
     response = struct.pack("!HHHHHH", qid, flags, 1, ancount, 0, 0) + question + answer
-    log(f"dns {name} type={qtype} -> {'answer' if answer else 'empty'}")
+    request_log(f"dns {name} type={qtype} -> {'answer' if answer else 'empty'}")
     return response
 
 
@@ -177,9 +203,25 @@ def main() -> int:
         default="",
         help="optional UDP sink address; empty when the HTTP/3 origin owns the port",
     )
+    parser.add_argument(
+        "--large-file",
+        default=None,
+        type=Path,
+        help="optional file served at /large.bin for HTTPS throughput",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress per-request logs (benchmark runs)",
+    )
     parser.add_argument("--cert", required=True, type=Path)
     parser.add_argument("--key", required=True, type=Path)
     args = parser.parse_args()
+
+    global QUIET
+    QUIET = args.quiet
+    if args.large_file is not None:
+        Handler.large_file = args.large_file
 
     servers: list[http.server.HTTPServer] = []
     threads: list[threading.Thread] = []
