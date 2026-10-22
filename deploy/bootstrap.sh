@@ -6,13 +6,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HERE/beam"
 CONFIG="$HERE/beam.toml"
 UNIT="$HERE/beam.service"
+SYSCTL="$HERE/99-beam.conf"
 INSTALL_BIN=/usr/local/bin/beam
 INSTALL_CONFIG=/etc/beam/config.toml
 INSTALL_UNIT=/etc/systemd/system/beam.service
+INSTALL_SYSCTL=/etc/sysctl.d/99-beam.conf
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 [ "$(id -u)" -eq 0 ] || { echo "bootstrap: must run as root" >&2; exit 1; }
-for file in "$BIN" "$CONFIG" "$UNIT"; do
+for file in "$BIN" "$CONFIG" "$UNIT" "$SYSCTL"; do
   [ -f "$file" ] || { echo "bootstrap: missing $file" >&2; exit 1; }
 done
 [ "$(uname -m)" = "x86_64" ] || { echo "bootstrap: expected x86_64" >&2; exit 1; }
@@ -42,7 +44,7 @@ if ! id beam >/dev/null 2>&1; then
 fi
 
 install -d -m 0750 -o root -g beam /etc/beam
-for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT"; do
+for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL"; do
   if [ -e "$old" ]; then
     cp -a "$old" "$old.bak-$STAMP"
   fi
@@ -51,11 +53,16 @@ done
 install -m 0755 -o root -g root "$BIN" "$INSTALL_BIN"
 install -m 0640 -o root -g beam "$CONFIG" "$INSTALL_CONFIG"
 install -m 0644 -o root -g root "$UNIT" "$INSTALL_UNIT"
+install -m 0644 -o root -g root "$SYSCTL" "$INSTALL_SYSCTL"
+sysctl --system >/dev/null
 
 runuser -u beam -- "$INSTALL_BIN" --check -c "$INSTALL_CONFIG"
 
 systemctl daemon-reload
-systemctl enable --now beam
+systemctl enable beam
+# Always restart: an already-running process keeps the old binary, config, and
+# unit properties until it is replaced.
+systemctl restart beam
 sleep 2
 systemctl is-active --quiet beam || {
   systemctl status --no-pager -l beam || true
