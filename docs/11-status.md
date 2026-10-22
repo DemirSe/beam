@@ -185,6 +185,11 @@ UDP modes:
 - A 24-hour soak and privileged syscall/wakeup gates remain.
 - No per-IP connection cap; the global 1024-connection cap, 10 s pre-auth
   timeout, 30 s cover timeout and provider firewall are the current mitigation.
+- `max_connections=1024` is admission headroom, not bulk capacity: the 160
+  blocking-thread pool is about 80 active Vision Direct pairs; the listener
+  backlog is 128 and historical `ListenOverflows=102`. The 512/1024×1 MB load
+  logs show 49.7 s median and 937 timeouts respectively. Current normal load is
+  tens of connections.
 - The provider L4 firewall/rate limit was not independently verified; the host
   nftables rules are.
 - The local `sing-box` service is not enabled at boot.

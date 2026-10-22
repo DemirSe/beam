@@ -26,9 +26,9 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Each Vision Direct relay can occupy up to two blocking splice tasks. A
-    // 160-thread pool covers the live 64-connection cap with headroom and
-    // avoids Tokio's 512-thread default on a 1 GiB host.
+    // Each Vision Direct relay can occupy up to two blocking splice tasks.
+    // 160 threads covers about 80 active relay pairs; max_connections is an
+    // admission cap, not a promise of 1024 concurrent bulk relays.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .max_blocking_threads(160)
         .enable_all()

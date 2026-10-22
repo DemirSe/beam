@@ -242,6 +242,20 @@ bssh 'sudo -n systemctl restart beam'
 ```
 Edit only `[limits]`; keep the file root:beam 0640. The example's 1024 default matches the live value.
 
+### Connection admission and relay capacity
+
+`max_connections=1024` is an admission cap, not a promise of 1024 concurrent
+bulk relays. The listener backlog is **128** (Tokio/mio default), the live SYN
+backlog is **128**, and historical load tests recorded **102** accept-queue
+overflows/drops; current 30 s deltas are zero. Each Vision Direct connection
+can pin up to **two** `spawn_blocking` splice tasks, so the 160-thread pool
+supports roughly **80 active relay pairs**. A local 512×1 MB load completed,
+but with a 49.7 s median latency; a 1024×1 MB load produced 937 timeouts and
+927 partial bodies, with 162 threads. Do not raise the blocking pool blindly
+on the 1 GiB host; lower `max_connections` or move the relay to an
+epoll/io_uring design if bulk concurrency matters. The current normal load is
+tens of connections, where the pool is not saturated.
+
 ### Network tuning during the 2026-10-23 hotspot test
 
 `tcp_congestion_control=bbr` and `fq` were measured on the live hotspot path
