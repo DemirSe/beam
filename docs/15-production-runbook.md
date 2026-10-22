@@ -249,8 +249,10 @@ Edit only `[limits]`; keep the file root:beam 0640. The example's 1024 default i
   TUN on both beam and stock Xray; a `system` TUN passes 1.3 MiB. Switch the
   client TUN stack to `system` (or `mixed`) before treating this as a server
   regression.
-- A 5-minute post-hardening soak and the read-only audit are complete; a 24-hour
-  soak and privileged syscall/wakeup gates remain open.
+- A 5-minute post-hardening soak and the read-only audit are complete. A light
+  24-hour background soak started on 2026-10-22 12:52 UTC
+  (`/tmp/opencode/soak-24h-live2/`); the privileged quiet syscall/wakeup gates
+  remain open.
 - No per-IP connection cap; the 64-connection global cap, 10 s pre-auth timeout,
   30 s cover timeout and provider firewall are the current mitigation.
 - HTTPS upload acceleration needs Vision Direct before the body (e.g.
