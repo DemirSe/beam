@@ -43,9 +43,10 @@ ssh -i ~/.ssh/id_ed25519_netlen_demir demir@<server> \
 ```
 
 `bootstrap.sh` stops/disables `xray.service` and `xray-compare.service`, creates
-the `beam` user, installs the binary/config/unit, validates the config as
-`beam`, starts the service, and checks that 443 is listening. Old binary,
-config, and unit are backed up with a timestamp suffix.
+the `beam` user, installs the binary/config/unit, installs the UDP sysctl
+drop-in, validates the config as `beam`, restarts the service (so an active
+process picks up the new binary/unit), and checks that 443 is listening. Old
+binary, config, unit, and sysctl files are backed up with a timestamp suffix.
 
 ## Identity
 
@@ -53,6 +54,36 @@ The new identity was generated locally. The REALITY public key and client
 fields are in `~/.config/beam/client-identity.json`; the private key is in
 `~/.config/beam/beam.toml` (`0600`). Do not commit either file. The old client
 credentials no longer work after this rotation; update the client as above.
+
+## Host hardening
+
+The live host was hardened on 2026-10-22. Reproduce on a fresh Debian 13 host
+after `demir` key access and passwordless sudo work, and keep the provider
+console available:
+
+```bash
+# SSH: key-only demir, no root/debian access.
+sudo install -m 0644 deploy/sshd-60-hardening.conf /etc/ssh/sshd_config.d/60-hardening.conf
+sudo sshd -t && sudo systemctl reload ssh
+sudo rm -f /root/.ssh/authorized_keys /home/debian/.ssh/authorized_keys
+sudo usermod -L -s /usr/sbin/nologin debian
+sudo rm -f /etc/sudoers.d/90-cloud-init-users
+
+# Host firewall: validate before enabling.
+sudo apt-get install -y nftables
+sudo install -m 0644 deploy/nftables.conf /etc/nftables.conf
+sudo nft -c -f /etc/nftables.conf && sudo systemctl enable --now nftables
+
+# Encrypted resolver; verify DNS and cover forwarding.
+sudo install -d -m 0755 /etc/systemd/resolved.conf.d
+sudo install -m 0644 deploy/resolved-99-beam.conf /etc/systemd/resolved.conf.d/99-beam.conf
+sudo systemctl restart systemd-resolved
+resolvectl query example.com
+```
+
+`bootstrap.sh` installs `99-beam.conf` under `/etc/sysctl.d/` and runs
+`sysctl --system`. The SSH/firewall/resolver files are intentionally not
+installed by `bootstrap.sh`: a mistake there can lock out the host.
 
 ## Rollback
 
@@ -72,4 +103,5 @@ journalctl -u beam -n 50 --no-pager
 ```
 
 Then run the local client matrix (TCP, UDP, DNS, QUIC, HTTPS Direct, IPv6) and
-the 24-hour soak/churn acceptance run before treating the cutover as final.
+a fresh SSH/443 check. The live host has a 5-minute post-hardening soak; the
+24-hour soak and the kernel-update reboot remain open.

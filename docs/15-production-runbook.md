@@ -17,17 +17,24 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | Item | State |
 |---|---|
 | Host | Debian 13.6, x86_64, 1 vCPU, 1 GiB RAM, 1 GiB swap |
-| Service | `beam.service`, active and enabled, `User=beam`, `0.0.0.0:443`; cover `whatsapp.net:443` |
+| Service | `beam.service`, active and enabled, `User=beam`, `0.0.0.0:443`; cover `whatsapp.net:443`; limits 64 connections / 10 s handshake |
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
 | Unit / backups | `/etc/systemd/system/beam.service` 0644; `*.bak-<UTC stamp>` beside each installed file |
 | Local client | sing-box, `/etc/sing-box/config.json` 0600, active but disabled at boot |
 | Client identity | `~/.config/beam/client-identity.json`, `client-link.txt` 0600 |
 | Tunnel egress | IPv4 `158.94.216.102`, IPv6 `2a01:f900:11:168::1` |
-| Firewall | No host `nftables`/`ufw`; provider firewall is the only firewall (allowlist not verified here) |
+| Host firewall | `nftables` enabled; default-deny input; 22/443, established, ICMP/ICMPv6, loopback; LLMNR dropped |
+| SSH | key-only `demir`; root and `debian` disabled; X11 off; `MaxAuthTries 3`; `LoginGraceTime 30` |
+| Resolver | systemd-resolved DNS-over-TLS + DNSSEC; LLMNR/mDNS off |
+| UDP tuning | `/etc/sysctl.d/99-beam.conf` sets `rmem_max=wmem_max=4 MiB` |
 
 Old stock Xray is absent; only TCP/443 and SSH 22 are exposed. The unit sets
-`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `LimitNOFILE=65536`, and only `CAP_NET_BIND_SERVICE`.
+`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
+`PrivateDevices`, `ProtectKernel*`, `ProtectControlGroups`, `ProtectClock`,
+`RestrictNamespaces`, `SystemCallFilter=@system-service`,
+`MemoryDenyWriteExecute`, `LimitCORE=0`, `LimitNOFILE=65536`, and only
+`CAP_NET_BIND_SERVICE`. The Tokio blocking pool is capped at 160 threads.
 
 ## 2. Daily checks
 ```bash
@@ -110,12 +117,11 @@ scp -i "$SSH_KEY" "$BUNDLE" "$SERVER:/tmp/beam-deploy.tar.gz"
 Deploy and load the new binary:
 ```bash
 bssh 'rm -rf /tmp/beam-deploy && mkdir -p /tmp/beam-deploy && tar -xzf /tmp/beam-deploy.tar.gz -C /tmp/beam-deploy && sudo -n bash /tmp/beam-deploy/bootstrap.sh'
-bssh 'sudo -n systemctl restart beam'
 ```
 `bootstrap.sh` stops/disables the old Xray units, creates `beam`, backs up and
-installs binary/config/unit, validates the config, starts the service, and checks
-443. `enable --now` does not restart an active process; the explicit restart
-above is required.
+installs binary/config/unit, installs the UDP sysctl drop-in, validates the
+config, restarts the service (so an active process picks up the new binary and
+unit), and checks 443.
 Health checks:
 ```bash
 bssh 'systemctl is-active beam; systemctl is-enabled beam; systemctl show beam -p NRestarts --value'
@@ -126,15 +132,16 @@ sha256sum target/release/beam; bssh 'sha256sum /usr/local/bin/beam'
 The two hashes must match. Then run the client checks in section 3.
 Rollback uses the timestamped backups:
 ```bash
-bssh 'ls -1t /usr/local/bin/beam.bak-* /etc/beam/config.toml.bak-* /etc/systemd/system/beam.service.bak-*'
+bssh 'ls -1t /usr/local/bin/beam.bak-* /etc/beam/config.toml.bak-* /etc/systemd/system/beam.service.bak-* /etc/sysctl.d/99-beam.conf.bak-*'
 STAMP="<stamp>"
 bssh 'sudo -n systemctl stop beam'
 bssh "sudo -n install -m 0755 -o root -g root /usr/local/bin/beam.bak-$STAMP /usr/local/bin/beam"
 bssh "sudo -n install -m 0640 -o root -g beam /etc/beam/config.toml.bak-$STAMP /etc/beam/config.toml"
 bssh "sudo -n install -m 0644 -o root -g root /etc/systemd/system/beam.service.bak-$STAMP /etc/systemd/system/beam.service"
-bssh 'sudo -n systemctl daemon-reload && sudo -n systemctl start beam'
+bssh "sudo -n install -m 0644 -o root -g root /etc/sysctl.d/99-beam.conf.bak-$STAMP /etc/sysctl.d/99-beam.conf"
+bssh 'sudo -n sysctl --system >/dev/null; sudo -n systemctl daemon-reload && sudo -n systemctl start beam'
 ```
-Rollback is not atomic; stop first, install all three, then start. There is no
+Rollback is not atomic; stop first, install all four, then start. There is no
 automatic stock Xray fallback, so keep a known-good bundle or snapshot before cutover.
 
 ## 5. Identity rotation
@@ -165,8 +172,9 @@ bssh 'sudo -n systemctl disable beam'
 bssh 'sudo -n systemctl enable beam'
 ```
 Keep provider console access before changing SSH or firewall state; the web/serial
-console is the out-of-band path. The provider firewall is the only firewall;
-`nftables`/`ufw` are absent, so do not assume host rules.
+console is the out-of-band path. The host `nftables` rules are in
+`/etc/nftables.conf`; the provider firewall is a second layer. If a host rule
+mistake locks you out, use the provider console and run `nft flush ruleset`.
 Restore from a provider snapshot through the provider console (snapshot ->
 restore). After boot:
 ```bash
@@ -208,13 +216,13 @@ tune after a 24-hour soak.
 | 443 listener | present | missing briefly during restart | missing otherwise; page |
 | Egress | the two VPS addresses | ISP address | tunnel down; start sing-box |
 
-The live `max_connections` is 256. Each Vision Direct relay can hold a blocking
-task and a 512 KiB splice pipe. On 1 vCPU, Tokio's blocking pool can grow to 512
-threads, but more threads are not more capacity; 256 worst-case connections can
-pressure 1 GiB before the fd limit. Lower to 128 when RSS exceeds 256 MiB,
-threads exceed 64, swap is used, or p95 latency rises; lower to 64 if pressure
-persists. `max_udp_destinations` also consumes one socket/fd per destination.
-Change a limit, validate, and restart:
+The live `max_connections` is 64 and the pre-auth handshake timeout is 10 s.
+Each Vision Direct relay can hold up to two blocking splice tasks and 512 KiB
+pipes; the Tokio blocking pool is capped at 160 threads. The XUDP reply queue is
+512 frames and session sockets request a 1 MiB receive buffer. If RSS exceeds
+256 MiB, threads exceed 64, swap is used, or p95 latency rises, lower
+`max_connections` to 32. `max_udp_destinations` also consumes one socket/fd per
+destination; the live value is 1024. Change a limit, validate, and restart:
 ```bash
 ssh -t -i "$SSH_KEY" "$SERVER" 'sudoedit /etc/beam/config.toml'
 bssh 'sudo -n runuser -u beam -- /usr/local/bin/beam --check -c /etc/beam/config.toml'
@@ -223,25 +231,37 @@ bssh 'sudo -n systemctl restart beam'
 Edit only `[limits]`; keep the file root:beam 0640. The example's 1024 default is not the live value.
 
 ## 8. Known risks and gaps
-- No host firewall: only the provider firewall protects 22/443; a provider mistake exposes the host.
-- Root SSH key login and passwordless sudo for `demir` are the access model; the SSH key and provider account are the perimeter.
+- Host `nftables` is default-deny with 22/443, established, ICMP/ICMPv6 and
+  loopback allowed. The provider firewall was not independently verified.
+- SSH is key-only `demir` with passwordless sudo; root and `debian` are
+  disabled. The SSH key and provider account are the perimeter.
+- The installed kernel security update is not active until a reboot; `needrestart`
+  reports user-space services. Reboot in a maintenance window and verify 443.
 - `sing-box` is active but disabled at boot; after a reboot there is no tunnel until
   a manual/tray start. Enabling at boot changes host routing and needs a test.
 - Cover parity is incomplete: beam emits `key_share, supported_versions` versus the
   cover's `supported_versions, key_share`, and the encrypted flight is 3 records /
   416 B versus 5 / 3085 B (temporary Ed25519 certificate). See `docs/10-cover-parity.md`.
-- Only a 5-minute production soak has run; a separate read-only audit is in
-  progress. A 24-hour soak and privileged syscall/wakeup gates remain open.
+- Large HTTP/3 bodies through the production TUN occasionally stall 10–20 s.
+  The local lab reproduces the large-body failure with a gVisor TUN on both beam
+  and stock Xray; a `system` TUN passes 1.3 MiB. Switch the client TUN stack to
+  `system` (or `mixed`) before treating this as a server regression.
+- A 5-minute post-hardening soak and the read-only audit are complete; a 24-hour
+  soak and privileged syscall/wakeup gates remain open.
+- No per-IP connection cap; the 64-connection global cap, 10 s pre-auth timeout,
+  30 s cover timeout and provider firewall are the current mitigation.
 - HTTPS upload acceleration needs Vision Direct before the body (e.g.
   `Expect: 100-continue`). Fully framed uploads stay async at ~1.34-1.37 s/GiB
   versus ~0.11 s/GiB with early Direct; this is a performance gap, not correctness.
-- `bootstrap.sh` does not restart an active service; the explicit restart in section 4 is mandatory.
+- `bootstrap.sh` now restarts `beam`; verify 443 and a fresh SSH connection after
+  every deploy.
 - Single user, one inbound, no hot reload or stats; config changes need a restart, and there is no stock Xray fallback.
 
 ## 9. AI agent autonomy
 Without approval: read-only checks (`systemctl status`, `journalctl`, `ss`, `ps`,
-`df`, `free`, `curl`, `dig`, `openssl s_client`), local builds/tests/benchmarks,
-packaging, docs, and commits on feature branches. Server read-only checks are allowed.
+`df`, `free`, `curl`, `dig`, certificate checks via `curl -v`), local
+builds/tests/benchmarks, packaging, docs, and commits on feature branches.
+Server read-only checks are allowed.
 
 Local sudo is required for client rotation (`sudo python3 deploy/update-client.py`),
 starting/stopping `sing-box`, and editing `/etc/sing-box/config.json`. The sandbox

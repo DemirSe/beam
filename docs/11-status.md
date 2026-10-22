@@ -113,15 +113,36 @@ UDP modes:
 - `sing-box` is active but `disabled` at boot; start is manual/tray-driven.
 - `sudo python3 deploy/update-client.py` or the link import is the only local
   privileged action; the agent's sandbox sets `no_new_privs`.
-- No `nftables`/`ufw` is installed; only the provider/cloud firewall protects
-  22/443. The service exposes only TCP/443.
-- A 5-minute production soak and a read-only security audit are in progress;
-  the production runbook is being written.
+- Production hardening applied on 2026-10-22:
+  - 13 pending security updates installed; `needrestart` added. A kernel update
+    is installed but not active; no reboot was forced.
+  - Live limits lowered to `max_connections=64` and
+    `handshake_timeout_ms=10000`; unauthenticated cover relays are capped at
+    30 s.
+  - Tokio blocking pool capped at 160 threads; XUDP reply queue raised to 512;
+    session sockets request a 1 MiB receive buffer; host
+    `net.core.rmem_max=4 MiB`.
+  - systemd sandbox extended with a syscall filter, kernel/control-group/clock
+    protection, no devices, no namespaces, no new privileges, and core dumps
+    disabled.
+  - Host nftables is enabled with default-deny input; 22/443, established,
+    ICMP/ICMPv6 and loopback are allowed; LLMNR is dropped.
+  - SSH is `AllowUsers demir`, `PermitRootLogin no`, key-only, X11 off,
+    `MaxAuthTries 3`, `LoginGraceTime 30`. Root and `debian` keys were removed;
+    `debian` is locked with `nologin` and its sudoers entry removed.
+  - systemd-resolved uses DNS-over-TLS and DNSSEC (`allow-downgrade`); LLMNR and
+    mDNS are off.
+- A 5-minute post-hardening production soak is running; the previous audit and
+  soak reports are in `/tmp/opencode/`.
 
 ## In progress
 
 - Final 24-hour soak and privileged syscall/wakeup acceptance.
-- Deployment package (not deployed).
+- A reboot window for the installed kernel update.
+- Residual large-HTTP/3 stalls through the production TUN; the local lab shows
+  the same failure with a gVisor TUN on both beam and stock Xray, so the client
+  TUN stack is a contributing factor. Small H3 requests and large H3 bodies
+  with the `system` stack pass.
 
 ## Known gaps / not started
 
@@ -129,7 +150,14 @@ UDP modes:
 - The early upload splice depends on the client sending Direct before the
   body; fully framed uploads stay on the async path.
 - A 24-hour soak and privileged syscall/wakeup gates remain.
-- VPS cutover is intentionally not performed.
+- No per-IP connection cap; the global 64-connection cap, 10 s pre-auth
+  timeout, 30 s cover timeout and provider firewall are the current mitigation.
+- The provider L4 firewall/rate limit was not independently verified; the host
+  nftables rules are.
+- The local `sing-box` service is not enabled at boot.
+- Large H3 bodies can occasionally stall 10–20 s through the production TUN;
+  switching the client TUN stack from `gvisor` to `system` is the recommended
+  client-side workaround. The server-side 1.3 MiB H3 test passes locally.
 
 ## Evidence
 
@@ -159,6 +187,8 @@ bash bench/no-tun.sh
 ```
 
 The workspace currently has 234 `beam-core` unit tests, two integration tests,
-and 22 `beam-sys` tests. The full-TUN harness passes all eight probes for XUDP,
-packetaddr, and legacy VLESS UDP; the no-TUN server-capacity smoke is ~1.5x
-stock.
+and 23 `beam-sys` tests (259 total). The full-TUN harness passes all eight
+probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
+passes through the local `system`-stack TUN; the same large body fails with a
+gVisor TUN on both beam and stock Xray. The no-TUN server-capacity smoke is
+~1.5x stock.
