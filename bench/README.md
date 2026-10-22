@@ -157,3 +157,25 @@ The full-TUN correctness matrix remains `tests/tun/run.sh`; this harness does
 not replace it. The benchmark reuses the same client config renderer and
 target services, with two additive options (`config.py --log-level` and
 `services.py --large-file/--quiet`).
+
+## Server-capacity smoke without TUN
+
+```bash
+bash bench/no-tun.sh
+```
+
+This uses a stock Xray SOCKS client (VLESS + REALITY + Vision) against either
+stock Xray or beam, with the 256 MiB target on separate physical CPUs. It
+removes the sing-box TUN client cap and exposes the server data path.
+
+Last local result (2026-10-22, loopback, test fixture from
+`config.example.toml`):
+
+| Arm | Median | Min | Max |
+|---|---:|---:|---:|
+| beam | 889.3 MB/s | 884.7 | 911.4 |
+| stock Xray | 569.5 MB/s | 563.4 | 599.1 |
+
+Beam/stock ratio: **1.562x** on the warm samples. This is a server-capacity
+smoke test, not a WAN or full-TUN headline; the full-TUN client remains the
+bottleneck in the main harness.

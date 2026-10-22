@@ -117,6 +117,11 @@ def main() -> int:
     parser.add_argument("--singbox", action="store_true", help="also render singbox.json")
     parser.add_argument("--xray", action="store_true", help="also render xray-server.json")
     parser.add_argument(
+        "--xray-client",
+        action="store_true",
+        help="also render xray-client.json (SOCKS inbound, no TUN)",
+    )
+    parser.add_argument(
         "--packet-encoding",
         choices=("xudp", "packetaddr", "legacy"),
         default="xudp",
@@ -227,6 +232,55 @@ def main() -> int:
             json.dumps(xray, indent=2) + "\n", encoding="utf-8"
         )
         (out / "xray-server.json").chmod(0o600)
+
+    if args.xray_client:
+        host, port = args.listen.rsplit(":", 1)
+        client = {
+            "log": {"loglevel": "warning" if args.log_level == "warn" else args.log_level},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": 11080,
+                    "protocol": "socks",
+                    "settings": {"udp": True},
+                }
+            ],
+            "outbounds": [
+                {
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [
+                            {
+                                "address": host,
+                                "port": int(port),
+                                "users": [
+                                    {
+                                        "id": user_id,
+                                        "encryption": "none",
+                                        "flow": flow,
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                    "streamSettings": {
+                        "network": "tcp",
+                        "security": "reality",
+                        "realitySettings": {
+                            "serverName": server_names[0],
+                            "fingerprint": "chrome",
+                            "publicKey": public_key,
+                            "shortId": short_ids[0],
+                            "spiderX": "/",
+                        },
+                    },
+                }
+            ],
+        }
+        (out / "xray-client.json").write_text(
+            json.dumps(client, indent=2) + "\n", encoding="utf-8"
+        )
+        (out / "xray-client.json").chmod(0o600)
 
     return 0
 

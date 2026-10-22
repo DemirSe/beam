@@ -74,6 +74,10 @@ host (headline not valid; see `bench/results/`):
   1.03x (slightly worse).
 - Server RSS after warm-up: **0.24x** (76% lower).
 - UDP echo throughput: **1.22x** (22% higher).
+- No-TUN server-capacity smoke (stock Xray SOCKS client, 256 MiB plain HTTP):
+  beam **889 MB/s** vs stock **570 MB/s** (**1.56x**). This removes the
+  sing-box TUN client cap; it is a server-capacity indicator, not a WAN
+  headline.
 - HTTPS Vision Direct server CPU per GiB: ~1.5x stock; under investigation.
 - DNS p50/p95 favor beam; p99 is slightly worse. H3 p99 is ~4% worse; both are
   small absolute values on a noisy host.
