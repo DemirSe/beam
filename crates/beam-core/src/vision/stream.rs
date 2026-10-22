@@ -14,6 +14,7 @@ use std::task::{Context, Poll};
 use rand::Rng;
 use rand::rngs::SmallRng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::watch;
 
 use crate::tls::stream::{RawTls, RawTlsHandoff, TlsStreamError};
 
@@ -58,6 +59,7 @@ pub struct VisionStream<S, R = SmallRng> {
     writer: VisionWriterState,
     write_direct: bool,
     pending_direct_switch: bool,
+    direct_tx: watch::Sender<bool>,
     rng: R,
     write_queue: Vec<u8>,
     write_queue_offset: usize,
@@ -75,6 +77,7 @@ where
     /// Vision block together with the request header. Those trailing bytes are
     /// passed here; any remaining block bytes are read from `inner`.
     pub fn new(inner: S, user_id: [u8; 16], initial_body: Vec<u8>, rng: R) -> Self {
+        let (direct_tx, _) = watch::channel(false);
         Self {
             inner,
             user_id,
@@ -88,6 +91,7 @@ where
             writer: VisionWriterState::new(),
             write_direct: false,
             pending_direct_switch: false,
+            direct_tx,
             rng,
             write_queue: Vec::new(),
             write_queue_offset: 0,
@@ -118,6 +122,19 @@ where
     /// Returns `true` after the write direction switched to the raw socket.
     pub fn write_is_raw(&self) -> bool {
         self.write_direct
+    }
+
+    /// Watches whether both directions have switched to Direct.
+    ///
+    /// The value is `false` until both the read and write sides are raw. It is
+    /// latched: once `true`, the stream is ready for [`Self::into_raw`].
+    pub fn direct_watch(&self) -> watch::Receiver<bool> {
+        self.direct_tx.subscribe()
+    }
+
+    fn publish_direct(&self) {
+        self.direct_tx
+            .send_replace(self.read_is_raw() && self.write_is_raw());
     }
 
     /// Consumes the stream once both directions have switched to Direct.
@@ -256,6 +273,8 @@ where
             self.inner.switch_write_to_raw();
             self.write_direct = true;
             self.pending_direct_switch = false;
+            self.publish_direct();
+            tracing::debug!("Vision writer switched to raw");
         }
 
         self.pending_accept = None;
@@ -271,6 +290,8 @@ where
                 self.inner.switch_write_to_raw();
                 self.write_direct = true;
                 self.pending_direct_switch = false;
+                self.publish_direct();
+                tracing::debug!("Vision writer switched to raw");
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
@@ -346,6 +367,8 @@ where
                         this.inner.switch_read_to_raw();
                         this.direct_plaintext = this.inner.take_plaintext();
                         this.direct_plaintext_offset = 0;
+                        this.publish_direct();
+                        tracing::debug!("Vision reader switched to Direct");
                     }
                     if !content.is_empty() {
                         this.writer.inspect(&content);
@@ -436,7 +459,12 @@ where
         let take = buf.len().min(MAX_WRITE_BATCH);
         let complete = is_complete_app_data_records(&buf[..take]);
         match this.plan_and_queue(&buf[..take], complete) {
-            Ok(switch_direct) => this.pending_direct_switch = switch_direct,
+            Ok(switch_direct) => {
+                if switch_direct {
+                    tracing::debug!("Vision writer planned Direct");
+                }
+                this.pending_direct_switch = switch_direct;
+            }
             Err(error) => return Poll::Ready(Err(error)),
         }
         this.pending_accept = Some(take);
