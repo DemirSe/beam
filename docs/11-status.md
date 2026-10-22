@@ -29,6 +29,7 @@ Updated: 2026-10-22.
 | Vision block framing codec | Done |
 | Vision padding/direct state machine | Done |
 | XUDP frame codec | Done |
+| XUDP session table and UDP relay | Done |
 | Linux fd/socket/splice primitives | Done |
 | Zero-copy splice relay loop | Done |
 | REALITY TLS server adapter (rustls) | Done |
@@ -43,14 +44,14 @@ Updated: 2026-10-22.
 
 ## In progress
 
-- XUDP session layer and UDP relay.
 - Vision Direct implementation (raw TLS handoff).
+- Mux command integration with the XUDP session layer.
+- Full TUN harness.
 
 ## Known gaps / not started
 
 - Vision Direct transition to raw sockets, including TLS read-ahead.
 - TLS extension-order and encrypted-flight-size parity.
-- Mux command integration with the XUDP session layer.
 - Full TUN interoperability tests (DNS, QUIC, IPv6).
 - Performance matrix and regression harness.
 - Deployment package and VPS cutover.
@@ -74,6 +75,6 @@ cargo test --workspace
 bash scripts/cover-parity.sh
 ```
 
-The workspace currently has 168 `beam-core` unit tests, two integration tests,
+The workspace currently has 202 `beam-core` unit tests, two integration tests,
 and 22 `beam-sys` tests. Both the no-flow and Vision stock Xray clients complete
 a REALITY handshake and an HTTP request through the `beam` binary.
