@@ -7,6 +7,7 @@
 
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -103,6 +104,14 @@ pub trait RawTlsHandoff: AsyncRead + AsyncWrite + Unpin {
 
     /// Take any already-decrypted plaintext not yet delivered to the caller.
     fn take_plaintext(&mut self) -> Vec<u8>;
+
+    /// Duplicates the underlying socket for a one-way splice.
+    fn try_clone_socket(&self) -> io::Result<TcpStream> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "raw socket cloning is unavailable for this stream",
+        ))
+    }
 
     /// Consume the stream and return the raw socket with ordered prefixes.
     fn into_raw(self) -> Result<RawTls, TlsStreamError>
@@ -563,6 +572,13 @@ impl RawTlsHandoff for TlsStream {
 
     fn take_plaintext(&mut self) -> Vec<u8> {
         TlsStream::take_plaintext(self)
+    }
+
+    fn try_clone_socket(&self) -> io::Result<TcpStream> {
+        let fd = beam_sys::try_clone_fd(self.socket.as_raw_fd())?;
+        let stream = std::net::TcpStream::from(fd);
+        stream.set_nonblocking(true)?;
+        TcpStream::from_std(stream)
     }
 
     fn into_raw(self) -> Result<RawTls, TlsStreamError> {

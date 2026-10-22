@@ -5,6 +5,10 @@
 //! (TCP or Unix). The function does not take ownership of them and leaves them
 //! open on return.
 //!
+//! [`copy_one_way`] is the asymmetric variant used when one side is still
+//! framed. It uses a single pipe and can share a [`RelayActivity`] clock with
+//! the async direction so both halves use one connection-wide idle deadline.
+//!
 //! The loop watches source readability, pipe writability when a pipe is full,
 //! and sink writability when a pipe holds bytes. It does not poll pipe
 //! readability: the relay tracks the bytes it has buffered, and polling a pipe
@@ -27,5 +31,6 @@
 mod splice_copy;
 
 pub use splice_copy::{
-    DEFAULT_PIPE_SIZE, MAX_PIPE_SIZE, MIN_PIPE_SIZE, RelayConfig, RelayStats, copy_bidirectional,
+    DEFAULT_PIPE_SIZE, MAX_PIPE_SIZE, MIN_PIPE_SIZE, RelayActivity, RelayConfig, RelayStats,
+    copy_bidirectional, copy_one_way,
 };

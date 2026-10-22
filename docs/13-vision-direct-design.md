@@ -1,7 +1,8 @@
 # Vision `Direct`: record-bounded TLS stream and raw handoff
 
-**Design only.** This is the implementation plan for the post-Vision-Direct
-path; no code exists yet.
+This document records the implemented post-Vision-Direct path. The original
+plan required both directions to be raw before handoff; the benchmark results
+in section 7 led to an asymmetric write-only handoff.
 Sources: `docs/08-vision-xudp-spec.md` §2.3–2.6, `docs/07-reality-spec.md`, `crates/beam-core/src/tls/server.rs`, `crates/beam-core/src/vision/{frame,state}.rs`.
 
 ## 1. Why `tokio-rustls` must go
@@ -179,3 +180,27 @@ Interop:
   outlive the blocking call.
 - **TLS 1.2 / detector**: config rejects TLS 1.2 (`tls/server.rs:217-219`), matching §2.3
   line 57; the downlink writer still inspects target bytes and sees the inner ServerHello.
+
+## 7. Asymmetric handoff (implemented)
+
+The local HTTPS benchmark exposed a case the both-directions handoff missed:
+the server's Vision writer switches to Direct as soon as the target sends its
+first application-data record, but the client may have no further upload to
+send. The reader therefore stays framed until the connection closes, and the
+old all-or-nothing rule kept the entire download on the tokio copy path
+(`framed_down` equalled the full 256 MiB response in instrumentation).
+
+The relay now watches the Vision writer independently. When the write side is
+raw, `relay_vision` duplicates the client write and target read descriptors and
+starts a blocking **one-way** `splice(2)` from target to client. The
+client-to-target direction remains on the async Vision copy path. The duplicate
+descriptors share the socket but are owned exactly once; the original
+`VisionStream` keeps the framed read half. A shared `RelayActivity` clock keeps
+one connection-wide idle deadline across both halves.
+
+At the measured 211 MiB/s HTTPS rate the relay was waking for every 16-32 KiB
+TLS record. Slow bulk directions now accumulate data for 500 µs before one
+splice; the 2 MiB rate window disables batching again above 800 MiB/s. Fast
+transfers stay on the low-latency path. This reduced the local 256 MiB HTTPS
+server cost from 0.320 to 0.107 s/GiB at throughput parity while preserving the
+existing TUN probes.
