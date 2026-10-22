@@ -2,11 +2,15 @@
 
 Status: implemented and verified on 2026-10-22. This document describes
 `tests/tun/run.sh`, the local lab that drives the real sing-box v1.14.3
-full-TUN client through `beam`.
+full-TUN client through `beam`. The IPv6 UDP/DNS probes and the local HTTP/3
+origin are part of this harness; the `beam` UDP rows still report BLOCKED until
+the Mux command is integrated.
 
 The harness is intentionally separate from `docs/06-benchmark-harness.md`: it
 checks correctness and honest capability reporting, not throughput or latency.
-It never uses a VPS, an external network, or production credentials.
+The measured path never uses a VPS, an external network, or production
+credentials; only the one-time H3 dependency build runs outside the private
+network namespace.
 
 ## What it exercises
 
@@ -19,9 +23,9 @@ client namespace                         server namespace                  targe
                                                                            fd00:2::2/64
   sing-box TUN inbound                    beam VLESS+REALITY+Vision :443    HTTP :8080 (v4/v6)
   VLESS outbound, xudp, utls chrome                                         HTTPS :4443
-                                                                            UDP echo :9999
-                                                                            DNS :53
-                                                                            QUIC sink UDP :4443
+                                                                            UDP echo :9999 (v4/v6)
+                                                                            DNS :53 (v4/v6)
+                                                                            HTTP/3 origin UDP :4443
 ```
 
 The outer REALITY connection uses `10.10.1.1:443`. The target subnet
@@ -30,6 +34,13 @@ the target only through the TUN and the VLESS tunnel. The client namespace has
 no default route; only the two target routes are installed. The server
 namespace has no default route either. Accidental external traffic fails
 immediately instead of leaving the host.
+
+The target runs IPv4 and IPv6 UDP echo and DNS services on the same ports
+(`9999` and `53`). The `quic-udp` row uses a real HTTP/3 origin on
+`10.10.2.2:4443`, not a UDP echo: `tests/tun/h3-origin` terminates QUIC and
+HTTP/3, then serves the fixed body `beam-tun-h3-ok`. If that helper cannot be
+built, the harness falls back to a UDP sink on the same address and reports
+`quic-udp` as BLOCKED with the build error; it never reports a fake pass.
 
 The sing-box outbound is the production profile:
 
@@ -73,10 +84,16 @@ Optional arms and overrides:
 ```bash
 bash tests/tun/run.sh --control          # add the stock Xray control arm
 bash tests/tun/run.sh --release          # build target/release/beam
-bash tests/tun/run.sh --no-build         # reuse the existing binary
+bash tests/tun/run.sh --no-build         # reuse the existing binaries
 bash tests/tun/run.sh --out /tmp/my-run  # explicit run directory
 SKIP_BUILD=1 bash tests/tun/run.sh       # same as --no-build
 ```
+
+The first run also builds the H3 helper outside the private network namespace,
+where crates.io is reachable. `--no-build` and `SKIP_BUILD=1` reuse
+`tests/tun/h3-origin/target/debug/h3-origin`; set `H3_ORIGIN_BIN` to use a
+different prebuilt binary. The measured path itself never reaches an external
+network.
 
 Environment variables:
 
@@ -86,8 +103,37 @@ Environment variables:
 | `XRAY_BIN` | `/tmp/opencode/xray-server-compare/xray` | stock Xray control |
 | `TEST_CONFIG` | `/tmp/opencode/beam-test/beam.toml` | test REALITY fixture |
 | `TUN_OUT` | `/tmp/opencode/beam-tun/<UTC>-<pid>` | run directory |
-| `SKIP_BUILD` | `0` | reuse `target/<profile>/beam` |
+| `SKIP_BUILD` | `0` | reuse `target/<profile>/beam` and the H3 origin |
+| `H3_ORIGIN_BIN` | built helper | use a prebuilt `h3-origin` binary |
 | `TUN_FORCE_BLOCK` | `0` | force the TUN-blocked reporting path (test hook) |
+
+### Local HTTP/3 origin
+
+`tests/tun/h3-origin` is a separate Cargo workspace, deliberately not a member
+of the root workspace. It uses `quinn` 0.11, `h3`, `h3-quinn`, `rustls`,
+`rcgen`, and `tokio`; none of those become production `beam` dependencies. The
+server generates a fresh self-signed certificate in memory, advertises the
+`h3` ALPN, and answers every request with HTTP 200 and the fixed body
+`beam-tun-h3-ok`.
+
+Build it with:
+
+```bash
+source scripts/dev-env.sh
+cargo build --locked --manifest-path tests/tun/h3-origin/Cargo.toml
+```
+
+Run it by hand on loopback:
+
+```bash
+tests/tun/h3-origin/target/debug/h3-origin --listen 127.0.0.1:4443
+curl --http3-only --insecure --noproxy '*' https://127.0.0.1:4443/
+```
+
+`run.sh` builds the helper before entering the private network namespace and
+starts it in the target namespace on `10.10.2.2:4443`. If the build fails, the
+`quic-udp` row is BLOCKED with the last cargo error. If the binary builds but
+does not become ready, that is a harness failure, not a fake pass.
 
 The script re-execs itself under
 `unshare --user --map-root-user --mount --net`. It mounts a private tmpfs on
@@ -108,27 +154,31 @@ A known server limitation is never reported as `PASS` and does not make the
 run fail. A `BLOCKED` row is deliberately explicit; the table includes the
 observed client error and the matching server log message.
 
-## Verified result table (2026-10-22, beam worktree `feat/tun-harness`)
+## Verified result table (2026-10-22, beam worktree `feat/tun-v2`)
 
 | Test | beam | Detail |
 |---|---|---|
 | `tcp-http-v4` | **PASS** | HTTP 200, body `beam-tun-ok` through TUN → VLESS → target `10.10.2.2:8080` |
 | `tcp-http-v6` | **PASS** | HTTP 200, body `beam-tun-ok` through TUN → VLESS → target `[fd00:2::2]:8080` |
-| `udp-echo` | **BLOCKED** | XUDP not integrated; target `10.10.2.2:9999` is never reached |
-| `dns-udp` | **BLOCKED** | Same XUDP blocker; `dig @10.10.2.2 target.test` times out |
-| `quic-udp` | **BLOCKED** | Same XUDP blocker; HTTP/3 attempt to UDP `10.10.2.2:4443` times out |
-| `https-direct` | **BLOCKED** | Vision Direct not integrated; inner TLS reaches ServerHello, then the server closes |
+| `udp-echo` | **BLOCKED** | XUDP/Mux not integrated; target `10.10.2.2:9999` is never reached |
+| `udp-echo-v6` | **BLOCKED** | Same XUDP/Mux blocker; target `[fd00:2::2]:9999` is never reached |
+| `dns-udp` | **BLOCKED** | Same blocker; `dig @10.10.2.2 target.test A` times out |
+| `dns-udp-v6` | **BLOCKED** | Same blocker; `dig @fd00:2::2 target.test AAAA` times out |
+| `quic-udp` | **BLOCKED** | HTTP/3 origin is ready, but `curl --http3-only` never reaches it because UDP is Mux-blocked |
+| `https-direct` | **PASS** | `http=200` through the Vision Direct raw TLS handoff |
 
 The stock Xray control on the same topology and the same sing-box client
-proves the harness itself is capable of the blocked paths:
+proves the harness itself is capable of every blocked path:
 
 | Test | stock Xray | Detail |
 |---|---|---|
 | `tcp-http-v4` | **PASS** | HTTP 200 |
 | `tcp-http-v6` | **PASS** | HTTP 200 |
-| `udp-echo` | **PASS** | Exact payload echoed through XUDP |
+| `udp-echo` | **PASS** | Exact payload echoed through XUDP to `10.10.2.2:9999` |
+| `udp-echo-v6` | **PASS** | Exact payload echoed through XUDP to `[fd00:2::2]:9999` |
 | `dns-udp` | **PASS** | `NOERROR`, A record `10.10.2.2` |
-| `quic-udp` | **BLOCKED** | UDP reaches the target QUIC sink, but there is no local HTTP/3 origin |
+| `dns-udp-v6` | **PASS** | `NOERROR`, AAAA record `fd00:2::2` |
+| `quic-udp` | **PASS** | HTTP/3 200, body `beam-tun-h3-ok` from the local origin |
 | `https-direct` | **PASS** | HTTP 200 through Vision Direct |
 
 Run the control with:
@@ -148,34 +198,32 @@ is logged and the connection is closed:
 WARN beam_core::tls::server: authenticated VLESS command is not implemented yet; closing command=Mux
 ```
 
-sing-box with `packet_encoding: xudp` sends UDP as a Mux command, so the UDP
-echo, DNS, and QUIC probes all hit this line. The target services are healthy;
-the stock Xray control echoes UDP and answers DNS on the same topology. This is
-a server capability blocker, not a harness failure.
+sing-box with `packet_encoding: xudp` sends UDP as a Mux command, so the IPv4
+and IPv6 UDP echo, DNS, and QUIC probes all hit this line. The target services
+are healthy: the stock Xray control echoes both UDP families, answers A and
+AAAA queries, and completes HTTP/3 against the same local origin. This is a
+server capability blocker, not a harness failure.
 
-### Vision Direct / HTTPS
+### Vision Direct / HTTPS (resolved)
 
-`crates/beam-core/src/vision/stream.rs` rejects the Direct transition with:
-
-```text
-DEBUG beam: connection failed peer=... error=I/O error: Vision Direct mode is not supported in this milestone
-```
-
-The client completes the inner TLS handshake (an earlier probe variant reported
-`TLSv1.3`), then the first inner application-data record asks for Vision Direct.
-`beam` rejects that record instead of forwarding it, so the target never sees
-the HTTP request and `curl` reports an unexpected EOF. The stock Xray control
-returns HTTP 200 from the same origin. This is a server capability blocker.
+The Direct raw TLS handoff is implemented and the `https-direct` row now
+passes with `http=200`. The probe remains in the suite as a regression check;
+it exercises the inner TLS connection through the same full-TUN client.
 
 ### QUIC / HTTP/3
 
-QUIC uses UDP/443 (here UDP/4443). It is blocked by the XUDP limitation before
-any target is reached. In addition, this lab has no local HTTP/3 origin, so
-even a server with working UDP cannot complete an HTTP/3 request. The harness
-sends a real `curl --http3-only` attempt to UDP/4443 and records the failure.
-The target has a UDP sink on 4443 only to distinguish "packet reached the
-target" from "the tunnel dropped it"; the sink does not speak HTTP/3. This is
-reported as `BLOCKED`, never as `PASS`.
+QUIC uses UDP/443 (here UDP/4443). The target runs a real HTTP/3 origin that
+terminates QUIC and serves `beam-tun-h3-ok`; the harness sends
+`curl --http3-only --insecure` through the TUN and validates both the status
+and the body. The stock Xray control completes this request (HTTP/3 200). On
+`beam`, the Mux command is still rejected before any UDP packet leaves the
+server, so `curl` times out and the row is BLOCKED with the `command=Mux` log
+line. When Mux integration lands, no origin work remains for this probe.
+
+When the H3 helper is unavailable, the target falls back to a UDP sink on 4443
+to distinguish "packet reached the target" from "the tunnel dropped it". The
+sink never speaks HTTP/3, so that fallback is reported as BLOCKED with the
+build error, never as PASS.
 
 ### Full TUN unavailable
 
@@ -205,9 +253,12 @@ config/xray-server.json   control only
 config/target.{crt,key}   generated self-signed HTTPS test certificate
 logs/beam.log             beam debug log
 logs/singbox.log          sing-box debug log
-logs/target.log           target services and QUIC sink
+logs/target.log           IPv4/IPv6 target services and optional QUIC sink
+logs/h3-origin.log        local HTTP/3 origin and per-request log
+logs/h3-origin-build.log  cargo output when run.sh built the helper
 logs/xray.log             control only
 probes/beam/*.log|json    per-probe client output and structured result
+probes/*/quic-udp.body    HTTP/3 response body (must contain beam-tun-h3-ok)
 probes/xray/*.log|json    control probes
 network.txt               addresses, routes, links from all namespaces
 results-beam.tsv          name, result, detail
@@ -227,9 +278,12 @@ repository files and must not be replaced with production values.
   covered by `scripts/cover-parity.sh`, not here.
 - The client is sing-box v1.14.3. Hiddify and stock Xray clients are a separate
   compatibility matrix (`docs/01-compatibility.md`).
-- QUIC has no local HTTP/3 origin, so the best possible result here is proving
-  that a real HTTP/3 attempt reaches the intended UDP destination. It is
-  `BLOCKED` until both XUDP and a local H3 origin exist.
+- The H3 helper is test-only and lives in its own workspace under
+  `tests/tun/h3-origin`; `cargo build --workspace` at the repository root does
+  not build it and production `beam` does not depend on it.
+- QUIC now has a real local HTTP/3 origin, and the stock Xray control completes
+  the request. The `beam` row is `BLOCKED` only until the Mux command is
+  integrated; no further origin work is required.
 - ICMP is not carried by VLESS and is not tested; stock Xray has the same
   limitation (`docs/00-scope.md`).
 - The client namespace logs `network: missing default interface` at startup

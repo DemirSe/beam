@@ -5,10 +5,11 @@ One process hosts every target in the target network namespace:
 
 * plain HTTP on IPv4 and IPv6,
 * a self-signed HTTPS origin (used to exercise Vision Direct),
-* a UDP echo service,
-* a tiny DNS responder,
-* a UDP sink on 4443 so a QUIC probe can be distinguished from a routing
-  failure (it intentionally does not speak HTTP/3).
+* UDP echo services on IPv4 and IPv6,
+* tiny DNS responders on IPv4 and IPv6,
+* an optional UDP sink on 4443 so a QUIC probe can be distinguished from a
+  routing failure (it intentionally does not speak HTTP/3). The harness omits
+  the sink when the local HTTP/3 origin owns that address instead.
 
 This is test-only code and is not part of the beam server.
 """
@@ -168,8 +169,14 @@ def main() -> int:
     parser.add_argument("--http6", default="", help="optional IPv6 HTTP listen address")
     parser.add_argument("--tls", default="10.10.2.2:4443")
     parser.add_argument("--udp", default="10.10.2.2:9999")
+    parser.add_argument("--udp6", default="", help="optional IPv6 UDP echo listen address")
     parser.add_argument("--dns", default="10.10.2.2:53")
-    parser.add_argument("--quic-sink", default="10.10.2.2:4443")
+    parser.add_argument("--dns6", default="", help="optional IPv6 DNS listen address")
+    parser.add_argument(
+        "--quic-sink",
+        default="",
+        help="optional UDP sink address; empty when the HTTP/3 origin owns the port",
+    )
     parser.add_argument("--cert", required=True, type=Path)
     parser.add_argument("--key", required=True, type=Path)
     args = parser.parse_args()
@@ -185,7 +192,6 @@ def main() -> int:
     tls_host, tls_port = split(args.tls)
     udp_host, udp_port = split(args.udp)
     dns_host, dns_port = split(args.dns)
-    quic_host, quic_port = split(args.quic_sink)
 
     plain = _Server((http_host, http_port), Handler)
     servers.append(plain)
@@ -213,10 +219,30 @@ def main() -> int:
     dns_sock = _bind_udp(dns_host, dns_port)
     threads.append(threading.Thread(target=_dns_loop, args=(dns_sock,), daemon=True))
 
-    quic_sock = _bind_udp(quic_host, quic_port)
-    threads.append(
-        threading.Thread(target=_udp_loop, args=(quic_sock, "quic-sink", False), daemon=True)
-    )
+    if args.udp6:
+        udp6_host, udp6_port = split(args.udp6)
+        udp6_sock = _bind_udp(udp6_host, udp6_port)
+        threads.append(
+            threading.Thread(
+                target=_udp_loop, args=(udp6_sock, "udp-echo-v6", True), daemon=True
+            )
+        )
+
+    if args.dns6:
+        dns6_host, dns6_port = split(args.dns6)
+        dns6_sock = _bind_udp(dns6_host, dns6_port)
+        threads.append(
+            threading.Thread(target=_dns_loop, args=(dns6_sock,), daemon=True)
+        )
+
+    if args.quic_sink:
+        quic_host, quic_port = split(args.quic_sink)
+        quic_sock = _bind_udp(quic_host, quic_port)
+        threads.append(
+            threading.Thread(
+                target=_udp_loop, args=(quic_sock, "quic-sink", False), daemon=True
+            )
+        )
 
     for thread in threads:
         thread.start()
