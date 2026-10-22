@@ -28,6 +28,8 @@
 #   TUN_OUT         run directory (default /tmp/opencode/beam-tun/<timestamp>)
 #   SKIP_BUILD=1    reuse target/<profile>/beam and the H3 origin binary
 #   H3_ORIGIN_BIN   use a prebuilt h3-origin binary instead of building it
+#   UDP_MODE        sing-box packet_encoding: xudp, packetaddr, or legacy
+#                   (default xudp; legacy renders packet_encoding "")
 #
 # This is a local lab harness. It never reaches an external network in the
 # measured path; only the one-time dependency/build step runs outside it.
@@ -100,6 +102,7 @@ SING_BOX="${SING_BOX:-/tmp/opencode/bench/bin/sing-box}"
 XRAY_BIN="${XRAY_BIN:-/tmp/opencode/xray-server-compare/xray}"
 TEST_CONFIG="${TEST_CONFIG:-/tmp/opencode/beam-test/beam.toml}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+UDP_MODE="${UDP_MODE:-xudp}"
 PROFILE="debug"
 CONTROL=0
 OUT="${TUN_OUT:-}"
@@ -125,6 +128,11 @@ while [ $# -gt 0 ]; do
       [ $# -gt 0 ] || { echo "tun-harness: --out needs a directory" >&2; exit 2; }
       OUT="$1"
       ;;
+    --udp-mode)
+      shift
+      [ $# -gt 0 ] || { echo "tun-harness: --udp-mode needs a value" >&2; exit 2; }
+      UDP_MODE="$1"
+      ;;
     --help|-h)
       sed -n '2,40p' "$SELF" | sed 's/^# \{0,1\}//'
       exit 0
@@ -136,6 +144,11 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+case "$UDP_MODE" in
+  xudp|packetaddr|legacy) ;;
+  *) echo "tun-harness: unknown UDP mode: $UDP_MODE" >&2; exit 2 ;;
+esac
 
 if [ ! -f "$TEST_CONFIG" ]; then
   echo "tun-harness: test config not found: $TEST_CONFIG" >&2
@@ -355,6 +368,7 @@ print_summary() {
     echo "sing-box=$SING_BOX"
     echo "profile=$PROFILE"
     echo "control=$CONTROL"
+    echo "udp_mode=$UDP_MODE"
   } > "$RUN_DIR/environment.txt"
   "$SING_BOX" version > "$RUN_DIR/singbox-version.txt" 2>&1 || true
   if [ -x "$XRAY_BIN" ]; then
@@ -380,6 +394,7 @@ finish() {
 
 log "worktree $ROOT"
 log "run directory $RUN_DIR"
+log "sing-box UDP mode $UDP_MODE"
 log "sing-box $("$SING_BOX" version 2>/dev/null | head -n 1 || echo unknown)"
 
 if [ "$SKIP_BUILD" != "1" ]; then
@@ -517,6 +532,7 @@ fi
   --listen "$BEAM_ADDR" \
   --cover "$COVER" \
   --singbox \
+  --packet-encoding "$UDP_MODE" \
   "${XRAY_FLAG[@]}" \
   || { fail_harness "could not render the beam/sing-box/Xray configs"; exit 1; }
 

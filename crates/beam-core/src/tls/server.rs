@@ -6,8 +6,9 @@
 //! Unauthenticated connections are forwarded byte-for-byte to the configured
 //! cover. The adapter implements the TLS handshake, a minimal TCP VLESS path,
 //! and XTLS Vision framing, including the raw inner-TLS handoff on Vision
-//! Direct. XUDP mux streams are relayed through [`crate::xudp`]; legacy VLESS
-//! UDP and reverse streams remain out of scope.
+//! Direct. XUDP mux streams are relayed through [`crate::xudp`], legacy VLESS
+//! UDP and packetaddr through [`crate::udp`], and reverse streams remain out
+//! of scope.
 
 use std::fmt;
 use std::io;
@@ -38,6 +39,7 @@ use crate::reality::{Auth, RealityAuthConfig, authenticate};
 use crate::relay::{RelayConfig, copy_bidirectional};
 use crate::tls::stream::{TlsStream, TlsStreamError};
 use crate::tls::{ClientHello, MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN};
+use crate::udp::{LegacyUdpConfig, UdpError, handle_udp_stream};
 use crate::vision::VisionStream;
 use crate::vless::{Command, MAX_REQUEST_HEADER_LEN, RequestHeader, ResponseHeader, VlessError};
 use crate::xudp::{MuxError, XudpConfig, handle_mux_stream};
@@ -123,6 +125,14 @@ pub enum TlsServerError {
     #[error("VLESS request error: {0}")]
     Vless(#[from] VlessError),
 
+    /// The legacy UDP or packetaddr stream failed.
+    #[error("VLESS UDP error: {0}")]
+    Udp(#[from] UdpError),
+
+    /// A Vision request asked for legacy UDP.
+    #[error("VLESS UDP with the Vision flow is not supported; clients must use XUDP")]
+    VisionUdpUnsupported,
+
     /// The XUDP mux stream failed.
     #[error("XUDP mux error: {0}")]
     Xudp(#[from] MuxError),
@@ -152,6 +162,8 @@ pub struct TlsServerConfig {
     pub user_id: [u8; 16],
     /// XUDP mux/UDP relay limits.
     pub xudp: XudpConfig,
+    /// Legacy VLESS UDP and packetaddr limits.
+    pub udp: LegacyUdpConfig,
     provider: Arc<CryptoProvider>,
     certificate: TemporaryCertificate,
 }
@@ -202,6 +214,7 @@ impl TlsServerConfig {
             max_client_hello_bytes,
             user_id,
             xudp: XudpConfig::default(),
+            udp: LegacyUdpConfig::default(),
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             certificate: TemporaryCertificate::generate()?,
         })
@@ -211,6 +224,13 @@ impl TlsServerConfig {
     #[must_use]
     pub fn with_xudp(mut self, xudp: XudpConfig) -> Self {
         self.xudp = xudp;
+        self
+    }
+
+    /// Overrides the legacy UDP limits used for `Command::Udp` connections.
+    #[must_use]
+    pub fn with_udp(mut self, udp: LegacyUdpConfig) -> Self {
+        self.udp = udp;
         self
     }
 
@@ -294,6 +314,7 @@ impl fmt::Debug for TlsServerConfig {
             .field("handshake_timeout", &self.handshake_timeout)
             .field("max_client_hello_bytes", &self.max_client_hello_bytes)
             .field("xudp", &self.xudp)
+            .field("udp", &self.udp)
             .finish()
     }
 }
@@ -519,6 +540,31 @@ async fn handle_authenticated(
 
             Ok(ConnectionOutcome::Authenticated {
                 command: Command::Tcp,
+            })
+        }
+        Command::Udp => {
+            // Stock rejects Vision UDP before writing a response. Clients that
+            // select the Vision flow convert UDP to XUDP instead.
+            if request.vision {
+                return Err(TlsServerError::VisionUdpUnsupported);
+            }
+            let destination = request
+                .destination
+                .ok_or(TlsServerError::MissingDestination)?;
+
+            timeout(
+                config.handshake_timeout,
+                tls.write_all(&ResponseHeader::new().to_bytes()),
+            )
+            .await
+            .map_err(|_| TlsServerError::Timeout {
+                stage: "VLESS response write",
+            })??;
+
+            let stream = PrependStream::new(tls, request.body);
+            handle_udp_stream(stream, destination, &config.udp).await?;
+            Ok(ConnectionOutcome::Authenticated {
+                command: Command::Udp,
             })
         }
         Command::Mux => {
@@ -1029,6 +1075,16 @@ mod tests {
         };
         let config = test_config().with_xudp(xudp.clone());
         assert_eq!(config.xudp, xudp);
+    }
+
+    #[test]
+    fn udp_config_can_be_overridden() {
+        let udp = LegacyUdpConfig {
+            max_packetaddr_destinations: 7,
+            ..LegacyUdpConfig::default()
+        };
+        let config = test_config().with_udp(udp.clone());
+        assert_eq!(config.udp, udp);
     }
 
     #[test]

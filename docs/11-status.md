@@ -31,6 +31,7 @@ Updated: 2026-10-22.
 | XUDP frame codec | Done |
 | XUDP session table and UDP relay | Done |
 | XUDP over VLESS Mux | Done |
+| Legacy VLESS UDP and packetaddr | Done |
 | Linux fd/socket/splice primitives | Done |
 | Zero-copy splice relay loop | Done |
 | REALITY TLS server adapter (rustls) | Done |
@@ -43,27 +44,28 @@ Updated: 2026-10-22.
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP/HTTPS interop | **HTTP 200** |
 | Cover-parity harness | Done; gaps documented |
-| Full-TUN harness v2 | **8/8 PASS** with sing-box TUN |
-| Stock Xray baseline + test fixture | Done |
+| Full-TUN harness v2 | **8/8 PASS** |
 | Benchmark harness design | Done |
 
 ## Full-TUN matrix
 
-| Probe | Result |
-|---|---|
-| TCP HTTP IPv4 | PASS |
-| TCP HTTP IPv6 | PASS |
-| UDP echo IPv4 | PASS |
-| UDP echo IPv6 | PASS |
-| DNS IPv4 | PASS |
-| DNS IPv6 | PASS |
-| QUIC / HTTP3 | PASS |
-| HTTPS through Vision Direct | PASS |
+The same eight probes pass through the real sing-box TUN client with all three
+UDP modes:
+
+| Probe | XUDP | packetaddr | legacy UDP |
+|---|---|---|---|
+| TCP HTTP IPv4 | PASS | PASS | PASS |
+| TCP HTTP IPv6 | PASS | PASS | PASS |
+| UDP echo IPv4 | PASS | PASS | PASS |
+| UDP echo IPv6 | PASS | PASS | PASS |
+| DNS IPv4 | PASS | PASS | PASS |
+| DNS IPv6 | PASS | PASS | PASS |
+| QUIC / HTTP3 | PASS | PASS | PASS |
+| HTTPS through Vision Direct | PASS | PASS | PASS |
 
 ## In progress
 
 - Local performance benchmark against stock Xray.
-- Legacy VLESS UDP and packetaddr.
 
 ## Known gaps / not started
 
@@ -89,8 +91,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 bash scripts/cover-parity.sh
 bash tests/tun/run.sh
+bash tests/tun/run.sh --udp-mode packetaddr
+bash tests/tun/run.sh --udp-mode legacy
 ```
 
-The workspace currently has 211 `beam-core` unit tests, two integration tests,
-and 22 `beam-sys` tests. The full-TUN harness passes all eight probes through
-the real sing-box client, and the stock Xray control passes the same matrix.
+The workspace currently has 232 `beam-core` unit tests, two integration tests,
+and 22 `beam-sys` tests. The full-TUN harness passes all eight probes for XUDP,
+packetaddr, and legacy VLESS UDP; the stock Xray control passes the same matrix.

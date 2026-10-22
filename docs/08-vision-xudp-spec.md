@@ -172,12 +172,13 @@ XUDP is the ordinary mux frame format carried as VLESS body under command Mux (`
 - [D] Sing-box rejects domain destinations in packetaddr mode. `SB/protocol/vless/outbound.go:176-178,213-215`, `SV/packetaddr/packetaddr.go:15`.
 - [I] A packetaddr server must treat one VLESS UDP connection as a multi-destination session: strip/prepend the address per datagram and apply policy per inner destination, not once for the magic FQDN.
 - [I] packetaddr datagram max is 8190 minus the inner address length, because it uses legacy 2-byte length framing.
+- [I] Implemented in `crates/beam-core/src/udp/legacy.rs`. The fixed-destination relay binds one unconnected socket in the header destination family; packetaddr binds one IPv4 and one IPv6 socket and sends each inner destination through the matching family. The packetaddr destination table is bounded per connection. Stream lengths, UDP payloads, reply framing, and the table are bounded; all stream/socket/shutdown operations carry timeouts. Vision+UDP is rejected before the response header, matching stock.
 
 ## 5. Unverified / test recommendations
 
 - [U] Post-Direct coalescing: Xray handles raw leftovers in the same chunk (`X/proxy/proxy.go:603-609`); sing-box assumes Direct is the last block and inserts 5 ms when sending (`SV/vless/vision.go:220-235`). Test server->sing-box with forced single-segment writes; keep the gap.
 - [U] Direct close: verify whether an outer TLS close_notify after Direct is ignored by both clients; prefer raw abort.
 - [U] Cross-user GlobalID hijack is not prevented in stock Xray; test per-user scoping against a real full-cone reconnect.
-- [U] packetaddr was verified against sing-box/sing-vmess source, not captured traffic; add an interop test with `packet_encoding: "packetaddr"`.
+- [D] packetaddr was source-verified against sing-box/sing-vmess and is now verified end-to-end: `tests/tun/run.sh --udp-mode packetaddr` and `--udp-mode legacy` each pass all eight full-TUN probes with sing-box v1.14.3, and the beam log records `Authenticated { command: Udp }` for each UDP flow. The unit tests in `crates/beam-core/src/udp/legacy.rs` cover fixed IPv4/IPv6 echo, split and coalesced framing, EOF, oversize datagrams, packetaddr IPv4/IPv6, reply source stamping, malformed inner addresses, and the bounded destination table.
 - [U] Missing UUID prefix: both stock readers pass bytes through raw when the prefix is absent (`X/proxy/proxy.go:551-557`, `SV/vless/vision.go:333-345`); confirm this fallback never occurs in normal traffic.
 - [I] Fuzz targets: Vision block lengths/state machine, XUDP metadata/payload lengths, legacy length-prefixed datagrams, packetaddr inner addresses.

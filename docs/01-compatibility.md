@@ -75,3 +75,13 @@ outbound: freedom
 Every compatibility claim must name the test or the source reference that
 supports it. Behavior that is not covered by a test is not considered
 compatible.
+
+- XUDP: `crates/beam-core/src/xudp` unit tests and the full-TUN
+  `packet_encoding: xudp` arm.
+- Legacy VLESS UDP: `crates/beam-core/src/udp/legacy.rs` unit tests and
+  `tests/tun/run.sh --udp-mode legacy`.
+- packetaddr: the same unit tests plus
+  `tests/tun/run.sh --udp-mode packetaddr`; the magic FQDN and per-datagram
+  address layout match sing-vmess v0.2.8 (`packetaddr/packetaddr.go`,
+  `packetaddr/conn.go`) and sing-box v1.14.3 (`protocol/vless/outbound.go`,
+  `protocol/vless/inbound.go`).
