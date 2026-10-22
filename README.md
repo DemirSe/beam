@@ -4,8 +4,11 @@ A minimal, high-performance VLESS + REALITY + Vision server written in Rust.
 
 ## Status
 
-Preparation. This repository contains the project skeleton and design documents.
-There is no working server yet.
+Implemented, tested, and deployed for the single-user VLESS + REALITY + Vision
+profile. See [`docs/11-status.md`](docs/11-status.md) for the current state and
+[`docs/15-production-runbook.md`](docs/15-production-runbook.md) for live
+operations. The local stock-Xray comparison is in
+[`docs/16-local-comparison-2026-10-22.md`](docs/16-local-comparison-2026-10-22.md).
 
 ## Goal
 
@@ -65,6 +68,7 @@ value before deployment.
 - [`docs/13-vision-direct-design.md`](docs/13-vision-direct-design.md)
 - [`docs/14-tun-harness.md`](docs/14-tun-harness.md)
 - [`docs/15-production-runbook.md`](docs/15-production-runbook.md)
+- [`docs/16-local-comparison-2026-10-22.md`](docs/16-local-comparison-2026-10-22.md)
 
 ## Repository layout
 

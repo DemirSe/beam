@@ -168,17 +168,20 @@ This uses a stock Xray SOCKS client (VLESS + REALITY + Vision) against either
 stock Xray or beam, with the 256 MiB target on separate physical CPUs. It
 removes the sing-box TUN client cap and exposes the server data path.
 
-Last local result (2026-10-22, loopback, test fixture from
-`config.example.toml`):
+Latest local result (2026-10-22, loopback, test fixture from
+`config.example.toml`, **balanced 8-repetition order passes**):
 
 | Arm | Median | Min | Max |
 |---|---:|---:|---:|
-| beam | 889.3 MB/s | 884.7 | 911.4 |
-| stock Xray | 569.5 MB/s | 563.4 | 599.1 |
+| beam | **897.1 MB/s** | 868.0 | 921.3 |
+| stock Xray | **613.4 MB/s** | 197.4* | 649.3 |
 
-Beam/stock ratio: **1.562x** on the warm samples. This is a server-capacity
-smoke test, not a WAN or full-TUN headline; the full-TUN client remains the
-bottleneck in the main harness.
+Beam/stock ratio: **1.462x** on the warm samples. *One stock outlier; the
+median is unaffected. An earlier single-order run measured 889.3 vs 569.5
+MB/s (1.562x). The balanced result is the current figure. This is a
+server-capacity smoke test, not a WAN or full-TUN headline; the full-TUN
+client remains the bottleneck in the main harness. See
+`docs/16-local-comparison-2026-10-22.md` for the full comparison.
 
 ## Connection churn smoke
 

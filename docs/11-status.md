@@ -67,13 +67,26 @@ UDP modes:
 
 ## Performance snapshot
 
+- **Latest local comparison (2026-10-22, detailed):** in the balanced no-TUN
+  server-capacity run (8 warm repetitions per order), beam **897.1 MB/s** vs
+  stock **613.4 MB/s** = **1.462x**; every warm beam sample beat every warm
+  stock sample. Churn: 1000/1000 HTTP 200 at concurrency 32; RSS +0.5 MiB,
+  threads 2, fds 11. See `docs/16-local-comparison-2026-10-22.md`.
 - Full-TUN bulk throughput is **client-capped** by the sing-box TUN client on
   this host; stock and beam are at roughly 0.98-1.00x, so the fixed-multiplier
-  throughput gates are not evaluable in that harness.
+  throughput gates are not evaluable in that harness. In the latest 0/50 ms
+  runs, server CPU/GiB was 0.75-0.90x stock on TCP, RSS was 0.24x, and the
+  4-flow upload at 50 ms was 0.987x (1.3% lower); H3 p99 was 1.05x/1.01x on a
+  noisy host. Neither full-TUN run is headline-eligible.
+- **Compatibility:** beam passes all 8 full-TUN probes in `xudp`,
+  `packetaddr`, and `legacy`; stock Xray matches on `xudp`/`legacy` and is
+  3/8 on `packetaddr` because Xray has no packetaddr implementation. Cover
+  parity capture passes; the known extension-order and flight-size gaps are
+  unchanged.
 - **No-TUN server-capacity smoke** (stock Xray SOCKS client, 256 MiB plain
   HTTP, separate CPUs): beam **872 MB/s** vs stock **589 MB/s** in the final
-  run (**1.48x**; earlier runs 1.56x). This removes the TUN client cap and
-  exposes the server path.
+  older run (**1.48x**; earlier 1.56x; latest balanced 1.462x). This removes
+  the TUN client cap and exposes the server path.
 - Server CPU per GiB, TCP download: **0.79x** stock (21% lower).
 - Server CPU per GiB, TCP upload: ~1.00x / 1.03x (slightly worse).
 - HTTPS Vision Direct: early one-way splice reduced server CPU from ~0.32 to
@@ -182,6 +195,8 @@ UDP modes:
 - `docs/14-tun-harness.md`: full-TUN topology, probes, and control results.
 - `docs/15-production-runbook.md`: live operations, rotation, rollback, and
   monitoring.
+- `docs/16-local-comparison-2026-10-22.md`: detailed local stock-Xray vs beam
+  capacity, full-TUN, compatibility, and cover comparison.
 - `bench/README.md`: benchmark and no-TUN smoke usage.
 
 ## Current verification
