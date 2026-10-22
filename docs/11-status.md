@@ -38,6 +38,7 @@ Updated: 2026-10-22.
 | VLESS user validation | Done |
 | Vision-framed relay | Done |
 | Vision Direct raw TLS handoff | Done |
+| Splice on Vision Direct and cover fallback | Done |
 | Prefix replay stream | Done |
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP/HTTPS interop | **HTTP 200** |
@@ -61,13 +62,12 @@ Updated: 2026-10-22.
 
 ## In progress
 
-- Splice integration for the Vision Direct raw leg and cover fallback.
+- Local performance benchmark against stock Xray.
+- Legacy VLESS UDP and packetaddr.
 
 ## Known gaps / not started
 
 - TLS extension-order and encrypted-flight-size parity.
-- Legacy VLESS UDP and packetaddr for clients that do not use XUDP.
-- Performance matrix and regression harness against stock Xray.
 - Deployment package and VPS cutover.
 
 ## Evidence
