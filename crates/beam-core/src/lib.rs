@@ -4,6 +4,7 @@
 
 pub mod address;
 pub mod config;
+pub mod prepend_stream;
 pub mod reality;
 pub mod relay;
 pub mod tls;
