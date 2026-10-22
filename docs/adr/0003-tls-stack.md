@@ -21,7 +21,13 @@ Measured facts:
   cover's 1215 bytes. This is a cheap distinguisher and is not acceptable for
   this cover.
 - `rustls + aws-lc-rs` with `prefer-post-quantum` negotiates the cover's group,
-  cipher, ALPN, extension order, ServerHello size, and server-flight sizes.
+  cipher, ALPN, and ServerHello size. The local server-flight harness found two
+  remaining differences: extension order (beam emits `key_share,
+  supported_versions`; the cover emits `supported_versions, key_share`) and the
+  encrypted flight size (beam's temporary Ed25519 certificate versus the
+  cover's two-certificate EC chain). Both are documented in
+  `docs/10-cover-parity.md` and accepted for v1. A targeted rustls patch/fork
+  is the mitigation if they matter to the threat model.
 - BoringSSL matches the same public parameters but is slower, has a C++/libclang
   toolchain, and adds a `libstdc++` runtime dependency.
 - Neither library exposes arbitrary record padding. Stock's exact ServerHello
@@ -47,11 +53,11 @@ Unauthenticated connections are still forwarded to the cover byte-for-byte.
 ## Consequences
 
 - Client compatibility and full TUN work with the unchanged client profile.
-- The ServerHello group, cipher, ALPN, extension order, and size match the
-  cover for this PQ-capable cover.
-- The temporary Ed25519 certificate is smaller than the cover's EC chain, so
-  encrypted flight sizes may differ. The cover-parity harness must measure this;
-  certificate-size padding is the first remedy if the gap matters.
+- The ServerHello group, cipher, ALPN, and size match the cover for this
+  PQ-capable cover.
+- The extension order and encrypted-flight size still differ. They are recorded
+  as known v1 gaps; certificate-size padding and a rustls extension-order patch
+  are the first remedies if the threat model requires closing them.
 - The aws-lc provider must be initialized at process start to avoid the
   first-handshake initialization cost.
 - Re-run the cover probe from the deployment region before freezing the
