@@ -94,6 +94,22 @@ UDP modes:
 - Syscall/wakeup/splice gates and a 24-hour soak need a privileged, quiet
   acceptance run.
 
+## Deployment
+
+- 2026-10-22: fresh Debian 13.6 on the VPS, 1 vCPU/1 GB, 1 GB swap.
+- `beam.service` is **active and enabled**, listening on `0.0.0.0:443`;
+  idle process memory ~840 KiB.
+- A new REALITY identity was generated because the old private key was lost
+  with the server wipe. The old client credentials no longer work; the client
+  must be rotated once.
+- Verified from the laptop with stock Xray 26.3.27: HTTPS `example.com` 200,
+  HTTP 200, and a SOCKS5 UDP echo round trip.
+- Local client rotation: `sudo python3 deploy/update-client.py` or import
+  `~/.config/beam/client-link.txt`. The agent cannot run local `sudo` because
+  the shell sandbox sets `no_new_privs`; this is the only manual step.
+- No `nftables`/`ufw` is installed; only the provider/cloud firewall protects
+  22/443. The service exposes only TCP/443.
+
 ## In progress
 
 - Final 24-hour soak and privileged syscall/wakeup acceptance.
