@@ -1,0 +1,811 @@
+{
+  "schema": "beam-bench-summary/1",
+  "run_dir": "/home/demir/.local/share/opencode/worktree/3dd5f2/bench-harness/bench/results/20261022T014041Z",
+  "meta": {
+    "schema": "beam-bench-meta/1",
+    "run_id": "20261022T014041Z-1969179",
+    "started_at": "2026-10-22T01:40:41Z",
+    "finished_at": "2026-10-22T01:45:40Z",
+    "worktree": "/home/demir/.local/share/opencode/worktree/3dd5f2/bench-harness",
+    "git": {
+      "commit": "c23bfc7ab6801cff5421932f4ea1d07e9faf2620",
+      "dirty": false
+    },
+    "kernel": "Linux 7.2.10-200.fc44.x86_64 x86_64 GNU/Linux",
+    "host": {
+      "model": "11th Gen Intel(R) Core(TM) i5-1135G7 @ 2.40GHz",
+      "logical_cpus": 8,
+      "thread_siblings": {
+        "0": "0,4",
+        "1": "1,5",
+        "2": "2,6",
+        "3": "3,7",
+        "4": "0,4",
+        "5": "1,5",
+        "6": "2,6",
+        "7": "3,7"
+      },
+      "loadavg": [
+        "2.05",
+        "2.21",
+        "1.90"
+      ]
+    },
+    "cpu_roles": {
+      "server": 2,
+      "client": 1,
+      "client_cores": [
+        1
+      ],
+      "target": 3,
+      "driver": 1,
+      "free": [
+        0,
+        4,
+        5,
+        6,
+        7
+      ],
+      "masks": {
+        "server": "2",
+        "client": "1",
+        "target": "3"
+      }
+    },
+    "arms": [
+      "stock",
+      "beam"
+    ],
+    "reps": 3,
+    "duration_s": 10,
+    "rtt_ms": 0,
+    "host_load1_before": 3.1,
+    "host_load1_after": 2.05,
+    "binaries": {
+      "beam": {
+        "path": "/home/demir/.local/share/opencode/worktree/3dd5f2/bench-harness/target/release/beam",
+        "sha256": "787f97e06468b927844d37551391d3d68ed098e6b2e1322d3ae97e40c037e5c1"
+      },
+      "stock": {
+        "path": "/tmp/opencode/xray-server-compare/xray",
+        "sha256": "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed"
+      },
+      "singbox": {
+        "path": "/tmp/opencode/bench/bin/sing-box",
+        "sha256": "768d31fa7f68debc067bb4626539498a1e8751d36a7b99e1a54bee6a23815f93"
+      },
+      "iperf3": {
+        "path": "/tmp/opencode/tools/root/usr/bin/iperf3",
+        "sha256": "1e9652955954e7620ece14725d0bcabcc3afd263aee99c415202c5dbf7149cd5"
+      },
+      "h3_origin": {
+        "path": "/home/demir/.local/share/opencode/worktree/3dd5f2/bench-harness/bench/../tests/tun/h3-origin/target/debug/h3-origin",
+        "sha256": "de30144ad177b81d4648e036c84e027146eee3918cdc63075f04805fbe72a06e"
+      }
+    },
+    "versions": {
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+      "go": null,
+      "python": "3.14.8",
+      "singbox": "sing-box version 1.14.3\n\nEnvironment: go1.26.8 linux/amd64\nTags: with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0,with_purego\nRevision: 7054cac5124465ffdb145870d7c01885566711b1\nCGO: disabled",
+      "stock": "Xray 26.3.27 (Xray, Penetrates Everything.) d2758a0 (go1.26.1 linux/amd64)\nA unified platform for anti-censorship.",
+      "iperf3": "iperf 3.22 (cJSON 1.7.15)\nLinux thinkpad 7.2.10-200.fc44.x86_64 #1 SMP PREEMPT_DYNAMIC Sun Oct 11 18:11:51 UTC 2026 x86_64\nOptional features available: CPU affinity setting, IPv6 flow label, SCTP, TCP congestion algorithm setting, sendfile / zerocopy, socket pacing, authentication, bind to device, support IPv4 don't fragment, POSIX threads, GSO/GRO support",
+      "curl": "curl 8.18.0 (x86_64-redhat-linux-gnu) libcurl/8.18.0 OpenSSL/3.5.9 zlib/1.3.1.zlib-ng brotli/1.2.0 libidn2/2.3.8 libpsl/0.21.5 libssh/0.12.2/openssl/zlib nghttp2/1.68.0 ngtcp2/1.22.1 nghttp3/1.18.0 mit-krb5/1.22.2 OpenLDAP/2.6.15\nRelease-Date: 2026-01-07\nProtocols: dict file ftp ftps gopher gophers http https imap imaps ipfs ipns ldap ldaps mqtt pop3 pop3s rtsp scp sftp smb smbs smtp smtps telnet tftp ws wss\nFeatures: alt-svc AsynchDNS brotli GSS-API HSTS HTTP2 HTTP3 HTTPS-proxy IDN IPv6 Kerberos Largefile libz NTLM PSL SPNEGO SSL threadsafe TLS-SRP UnixSockets"
+    },
+    "large_file": {
+      "path": "/home/demir/.local/share/opencode/worktree/3dd5f2/bench-harness/bench/results/20261022T014041Z/config/large.bin",
+      "bytes": 67108864,
+      "sha256": "cd62408d27f7c2d3181e14ecd882abe0a153207843992890b1790b80e17a9d57"
+    },
+    "h3": {
+      "available": true,
+      "blocked_reason": null
+    },
+    "warnings": [
+      "host load 3.10 exceeds 0.3",
+      "host load after run 2.05 exceeds 0.3"
+    ]
+  },
+  "arms": [
+    "stock",
+    "beam"
+  ],
+  "valid": false,
+  "headline_eligible": false,
+  "invalid_reasons": [
+    "tcp-dl-1/stock: client core saturated (99.9-100.0%)",
+    "tcp-dl-1/beam: client core saturated (99.9-100.0%)",
+    "tcp-dl-4/stock: client core saturated (99.9-100.0%)",
+    "tcp-dl-4/beam: client core saturated (100.0-100.0%)",
+    "tcp-ul-1/stock: client core saturated (99.9-100.0%)",
+    "tcp-ul-1/beam: client core saturated (100.0-100.0%)",
+    "tcp-ul-4/stock: client core saturated (99.9-100.0%)",
+    "tcp-ul-4/beam: client core saturated (100.0-100.0%)",
+    "https-bulk/stock: client core saturated (98.9-99.0%)",
+    "https-bulk/beam: client core saturated (99.0-100.0%)"
+  ],
+  "host_noise": [
+    "host load after=2.05 (warning threshold 0.3)",
+    "host load before=3.1 (warning threshold 0.3)",
+    "dns-a/stock: non-role CPU busy (max 50.0%)",
+    "h3-latency/beam: non-role CPU busy (max 10.0%)",
+    "h3-latency/stock: non-role CPU busy (max 8.5%)",
+    "https-bulk/beam: non-role CPU busy (max 9.0%)",
+    "https-bulk/stock: non-role CPU busy (max 11.9%)",
+    "tcp-dl-1/beam: non-role CPU busy (max 8.6%)",
+    "tcp-dl-1/stock: non-role CPU busy (max 8.7%)",
+    "tcp-dl-4/beam: non-role CPU busy (max 7.9%)",
+    "tcp-dl-4/stock: non-role CPU busy (max 8.8%)",
+    "tcp-ul-1/beam: non-role CPU busy (max 8.9%)",
+    "tcp-ul-1/stock: non-role CPU busy (max 10.0%)",
+    "tcp-ul-4/beam: non-role CPU busy (max 9.5%)",
+    "tcp-ul-4/stock: non-role CPU busy (max 9.7%)",
+    "udp-echo/beam: non-role CPU busy (max 16.7%)",
+    "udp-echo/stock: non-role CPU busy (max 16.7%)"
+  ],
+  "blocked": [],
+  "failed": [],
+  "qdisc_drops": {},
+  "gates": {
+    "single_flow_throughput": {
+      "requirement": "beam >= 1.15x stock for 1-flow download and upload",
+      "pass": null,
+      "status": "INVALID",
+      "ratios": [
+        0.9934891707264533,
+        1.008319975571882
+      ]
+    },
+    "multi_flow_throughput": {
+      "requirement": "beam >= 1.10x stock for 4-flow download and upload",
+      "pass": null,
+      "status": "INVALID",
+      "ratios": [
+        1.0110296463626853,
+        0.9944561416459831
+      ]
+    },
+    "p99_latency": {
+      "requirement": "beam p99 <= stock p99 (DNS, HTTP/3)",
+      "pass": false,
+      "status": "FAIL",
+      "ratios": {
+        "dns-a": 1.3137517849382256,
+        "h3-latency": 1.0145098501828476
+      }
+    },
+    "rss_after_warmup": {
+      "requirement": "beam <= 50% of stock RSS after warm-up",
+      "pass": true,
+      "status": "PASS",
+      "ratio": 0.23862158647594278
+    },
+    "cpu_per_gib": {
+      "requirement": "beam server CPU per GiB < stock in every TCP scenario",
+      "pass": true,
+      "status": "PASS",
+      "ratios": {
+        "tcp-dl-1": 0.7979899497487437,
+        "tcp-dl-4": 0.7856096369851864,
+        "tcp-ul-1": 0.8832188420019627,
+        "tcp-ul-4": 0.8800166643521734
+      }
+    },
+    "aggregate_throughput": {
+      "requirement": "geometric mean of TCP throughput ratios > 1.0",
+      "pass": null,
+      "status": "INVALID",
+      "geomean": 1.0017924592945349
+    },
+    "no_regression": {
+      "requirement": "no throughput < 0.98x and no latency > 1.02x",
+      "pass": null,
+      "status": "INVALID"
+    }
+  },
+  "numeric_gates_pass": null,
+  "numeric_gates_status": "INVALID",
+  "hard_requirements": {
+    "aggregate_throughput": null,
+    "no_regression": null,
+    "valid": false,
+    "headline_eligible": false
+  },
+  "hard_requirements_pass": null,
+  "hard_requirements_status": "INVALID",
+  "comparisons": {
+    "tcp-dl-1": {
+      "stock": {
+        "n": 3,
+        "median": 1596994917.1902282,
+        "min": 1555527341.0820916,
+        "max": 1760623919.851396
+      },
+      "beam": {
+        "n": 3,
+        "median": 1586597155.9336808,
+        "min": 1568447903.7511413,
+        "max": 1742816384.395195
+      },
+      "ratio": 0.9934891707264533,
+      "unit": "Mbit/s"
+    },
+    "tcp-dl-4": {
+      "stock": {
+        "n": 3,
+        "median": 1504226509.2716763,
+        "min": 1496166240.7431886,
+        "max": 1514322330.6547072
+      },
+      "beam": {
+        "n": 3,
+        "median": 1520817595.7183194,
+        "min": 1512963086.322564,
+        "max": 1525311494.0780518
+      },
+      "ratio": 1.0110296463626853,
+      "unit": "Mbit/s"
+    },
+    "tcp-ul-1": {
+      "stock": {
+        "n": 3,
+        "median": 3081669685.8739643,
+        "min": 3054714020.557054,
+        "max": 3086667663.2131267
+      },
+      "beam": {
+        "n": 3,
+        "median": 3107309102.3810444,
+        "min": 3099718082.914555,
+        "max": 3143782283.421186
+      },
+      "ratio": 1.008319975571882,
+      "unit": "Mbit/s"
+    },
+    "tcp-ul-4": {
+      "stock": {
+        "n": 3,
+        "median": 2945104347.6018457,
+        "min": 2915976327.12624,
+        "max": 2949525897.7588944
+      },
+      "beam": {
+        "n": 3,
+        "median": 2928777106.2609415,
+        "min": 2907125426.83029,
+        "max": 2936820239.744238
+      },
+      "ratio": 0.9944561416459831,
+      "unit": "Mbit/s"
+    },
+    "https-bulk": {
+      "stock": {
+        "n": 3,
+        "median": 199.422,
+        "min": 196.254,
+        "max": 208.636
+      },
+      "beam": {
+        "n": 3,
+        "median": 201.084,
+        "min": 198.498,
+        "max": 205.796
+      },
+      "ratio": 1.0083340855071157,
+      "unit": "MiB/s"
+    },
+    "latency": {
+      "dns-a": {
+        "stock": {
+          "n": 600,
+          "p50": 0.055487,
+          "p95": 0.097276,
+          "p99": 0.16107,
+          "min": 0.049641,
+          "max": 2.20765,
+          "unit": "ms"
+        },
+        "beam": {
+          "n": 600,
+          "p50": 0.04679,
+          "p95": 0.061600999999999996,
+          "p99": 0.211606,
+          "min": 0.044419,
+          "max": 3.6941669999999998,
+          "unit": "ms"
+        },
+        "samples": {
+          "stock": 600,
+          "beam": 600
+        },
+        "p50_ratio": 0.8432605835601131,
+        "p95_ratio": 0.6332600024672067,
+        "p99_ratio": 1.3137517849382256
+      },
+      "h3-latency": {
+        "stock": {
+          "n": 60,
+          "p50": 7.283,
+          "p95": 8.092,
+          "p99": 8.477,
+          "min": 6.535,
+          "max": 8.859,
+          "unit": "ms"
+        },
+        "beam": {
+          "n": 60,
+          "p50": 7.543,
+          "p95": 8.445,
+          "p99": 8.6,
+          "min": 6.252,
+          "max": 8.754,
+          "unit": "ms"
+        },
+        "samples": {
+          "stock": 60,
+          "beam": 60
+        },
+        "p50_ratio": 1.035699574351229,
+        "p95_ratio": 1.0436233316856154,
+        "p99_ratio": 1.0145098501828476
+      },
+      "udp-echo": {
+        "stock": {
+          "n": 600,
+          "p50": 0.047478,
+          "p95": 0.071688,
+          "p99": 0.117034,
+          "min": 0.042856,
+          "max": 0.330478,
+          "unit": "ms"
+        },
+        "beam": {
+          "n": 600,
+          "p50": 0.041567,
+          "p95": 0.054246,
+          "p99": 0.08931399999999999,
+          "min": 0.038198,
+          "max": 0.23283500000000001,
+          "unit": "ms"
+        },
+        "samples": {
+          "stock": 600,
+          "beam": 600
+        },
+        "p50_ratio": 0.8755002316862547,
+        "p95_ratio": 0.7566956812855709,
+        "p99_ratio": 0.7631457525163627
+      }
+    },
+    "udp": {
+      "pps": {
+        "stock": {
+          "n": 3,
+          "median": 47.413,
+          "min": 46.201800000000006,
+          "max": 49.2086
+        },
+        "beam": {
+          "n": 3,
+          "median": 50.7844,
+          "min": 50.0138,
+          "max": 50.9955
+        },
+        "ratio": 1.0711070803366165
+      },
+      "mbps": {
+        "stock": {
+          "n": 3,
+          "median": 455.165,
+          "min": 443.538,
+          "max": 472.403
+        },
+        "beam": {
+          "n": 3,
+          "median": 487.531,
+          "min": 480.132,
+          "max": 489.557
+        },
+        "ratio": 1.0711082794151572
+      },
+      "loss_pct": {
+        "stock": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "beam": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "ratio": null
+      }
+    }
+  },
+  "resources": {
+    "rss": {
+      "stock": {
+        "after_warmup_median_kib": 36542.0,
+        "after_warmup_max_kib": 36912,
+        "peak_max_kib": 36952,
+        "fds_max": 60,
+        "threads_max": 7,
+        "client_rss_max_kib": 62920
+      },
+      "beam": {
+        "after_warmup_median_kib": 8308.0,
+        "after_warmup_max_kib": 8808,
+        "peak_max_kib": 10212,
+        "fds_max": 66,
+        "threads_max": 3,
+        "client_rss_max_kib": 63656
+      }
+    },
+    "cores": {
+      "stock": {
+        "server": {
+          "n": 12,
+          "median": 24.835,
+          "min": 15.03,
+          "max": 35.49
+        },
+        "client": {
+          "n": 12,
+          "median": 100.0,
+          "min": 99.9,
+          "max": 100.0
+        },
+        "target": {
+          "n": 12,
+          "median": 11.84,
+          "min": 7.52,
+          "max": 16.13
+        },
+        "driver": {
+          "n": 12,
+          "median": 100.0,
+          "min": 99.9,
+          "max": 100.0
+        }
+      },
+      "beam": {
+        "server": {
+          "n": 12,
+          "median": 22.25,
+          "min": 13.36,
+          "max": 30.99
+        },
+        "client": {
+          "n": 12,
+          "median": 100.0,
+          "min": 99.9,
+          "max": 100.0
+        },
+        "target": {
+          "n": 12,
+          "median": 9.32,
+          "min": 7.13,
+          "max": 11.76
+        },
+        "driver": {
+          "n": 12,
+          "median": 100.0,
+          "min": 99.9,
+          "max": 100.0
+        }
+      }
+    },
+    "cpu_per_gib_ratios": {
+      "tcp-dl-1": 0.7979899497487437,
+      "tcp-dl-4": 0.7856096369851864,
+      "tcp-ul-1": 0.8832188420019627,
+      "tcp-ul-4": 0.8800166643521734
+    },
+    "client_cpu_per_gib_median": {
+      "stock": 3.3886,
+      "beam": 3.40515
+    }
+  },
+  "scenario_meta": {
+    "tcp-dl-1": {
+      "label": "TCP download, 1 flow",
+      "unit": "Mbit/s"
+    },
+    "tcp-dl-4": {
+      "label": "TCP download, 4 flows",
+      "unit": "Mbit/s"
+    },
+    "tcp-ul-1": {
+      "label": "TCP upload, 1 flow",
+      "unit": "Mbit/s"
+    },
+    "tcp-ul-4": {
+      "label": "TCP upload, 4 flows",
+      "unit": "Mbit/s"
+    },
+    "https-bulk": {
+      "label": "HTTPS Vision Direct, 64 MiB",
+      "unit": "MiB/s"
+    },
+    "udp-echo": {
+      "label": "UDP echo",
+      "unit": "kpps"
+    },
+    "dns-a": {
+      "label": "DNS A over UDP",
+      "unit": "ms"
+    },
+    "h3-latency": {
+      "label": "QUIC/HTTP3 requests",
+      "unit": "ms"
+    }
+  },
+  "table_rows": {
+    "throughput": [
+      {
+        "label": "TCP download, 1 flow",
+        "stock": "1,597.0 Mbit/s (1,555.53\u20131,760.62)",
+        "beam": "1,586.6 Mbit/s (1,568.45\u20131,742.82)",
+        "ratio": "0.993x",
+        "requirement": ">= 1.15x",
+        "pass": null,
+        "invalid": true
+      },
+      {
+        "label": "TCP download, 4 flows",
+        "stock": "1,504.2 Mbit/s (1,496.17\u20131,514.32)",
+        "beam": "1,520.8 Mbit/s (1,512.96\u20131,525.31)",
+        "ratio": "1.011x",
+        "requirement": ">= 1.10x",
+        "pass": null,
+        "invalid": true
+      },
+      {
+        "label": "TCP upload, 1 flow",
+        "stock": "3,081.7 Mbit/s (3,054.71\u20133,086.67)",
+        "beam": "3,107.3 Mbit/s (3,099.72\u20133,143.78)",
+        "ratio": "1.008x",
+        "requirement": ">= 1.15x",
+        "pass": null,
+        "invalid": true
+      },
+      {
+        "label": "TCP upload, 4 flows",
+        "stock": "2,945.1 Mbit/s (2,915.98\u20132,949.53)",
+        "beam": "2,928.8 Mbit/s (2,907.13\u20132,936.82)",
+        "ratio": "0.994x",
+        "requirement": ">= 1.10x",
+        "pass": null,
+        "invalid": true
+      },
+      {
+        "label": "HTTPS Vision Direct, 64 MiB",
+        "stock": "199.4 MiB/s (196.25\u2013208.64)",
+        "beam": "201.1 MiB/s (198.50\u2013205.80)",
+        "ratio": "1.008x",
+        "requirement": ">= 0.98x (no regression)",
+        "pass": null,
+        "invalid": true
+      }
+    ],
+    "latency": [
+      {
+        "label": "DNS A over UDP p50",
+        "stock": "0.055 ms",
+        "beam": "0.047 ms",
+        "ratio": "0.843x",
+        "requirement": "informational",
+        "pass": null,
+        "informational": true
+      },
+      {
+        "label": "DNS A over UDP p95",
+        "stock": "0.097 ms",
+        "beam": "0.062 ms",
+        "ratio": "0.633x",
+        "requirement": "informational",
+        "pass": null,
+        "informational": true
+      },
+      {
+        "label": "DNS A over UDP p99",
+        "stock": "0.161 ms",
+        "beam": "0.212 ms",
+        "ratio": "1.314x",
+        "requirement": "<= 1.00x",
+        "pass": false,
+        "informational": false
+      },
+      {
+        "label": "QUIC/HTTP3 requests p50",
+        "stock": "7.283 ms",
+        "beam": "7.543 ms",
+        "ratio": "1.036x",
+        "requirement": "informational",
+        "pass": null,
+        "informational": true
+      },
+      {
+        "label": "QUIC/HTTP3 requests p95",
+        "stock": "8.092 ms",
+        "beam": "8.445 ms",
+        "ratio": "1.044x",
+        "requirement": "informational",
+        "pass": null,
+        "informational": true
+      },
+      {
+        "label": "QUIC/HTTP3 requests p99",
+        "stock": "8.477 ms",
+        "beam": "8.600 ms",
+        "ratio": "1.015x",
+        "requirement": "<= 1.00x",
+        "pass": false,
+        "informational": false
+      },
+      {
+        "label": "UDP echo p50",
+        "stock": "0.047 ms",
+        "beam": "0.042 ms",
+        "ratio": "0.876x",
+        "requirement": "informational",
+        "pass": null,
+        "informational": true
+      },
+      {
+        "label": "UDP echo p95",
+        "stock": "0.072 ms",
+        "beam": "0.054 ms",
+        "ratio": "0.757x",
+        "requirement": "informational",
+        "pass": null,
+        "informational": true
+      },
+      {
+        "label": "UDP echo p99",
+        "stock": "0.117 ms",
+        "beam": "0.089 ms",
+        "ratio": "0.763x",
+        "requirement": "informational",
+        "pass": null,
+        "informational": true
+      }
+    ],
+    "udp": [
+      {
+        "label": "UDP echo packet rate",
+        "stock": "47.41 kpps (46.20\u201349.21)",
+        "beam": "50.78 kpps (50.01\u201351.00)",
+        "ratio": "1.071x",
+        "requirement": ">= 0.98x (no regression)",
+        "pass": true,
+        "informational": false
+      },
+      {
+        "label": "UDP echo throughput",
+        "stock": "455.2 Mbit/s (443.54\u2013472.40)",
+        "beam": "487.5 Mbit/s (480.13\u2013489.56)",
+        "ratio": "1.071x",
+        "requirement": ">= 0.98x (no regression)",
+        "pass": true,
+        "informational": false
+      },
+      {
+        "label": "UDP echo loss",
+        "stock": "0.00% (0.00\u20130.00)",
+        "beam": "0.00% (0.00\u20130.00)",
+        "ratio": "n/a",
+        "requirement": "informational",
+        "pass": null,
+        "informational": true
+      }
+    ],
+    "resources": [
+      {
+        "label": "Server CPU per GiB, TCP download, 1 flow",
+        "stock": "0.597 s/GiB (0.60\u20130.60)",
+        "beam": "0.476 s/GiB (0.47\u20130.48)",
+        "ratio": "0.798x",
+        "requirement": "< 1.00x",
+        "pass": true
+      },
+      {
+        "label": "Server CPU per GiB, TCP download, 4 flows",
+        "stock": "0.614 s/GiB (0.61\u20130.62)",
+        "beam": "0.483 s/GiB (0.48\u20130.48)",
+        "ratio": "0.786x",
+        "requirement": "< 1.00x",
+        "pass": true
+      },
+      {
+        "label": "Server CPU per GiB, TCP upload, 1 flow",
+        "stock": "0.713 s/GiB (0.71\u20130.72)",
+        "beam": "0.630 s/GiB (0.62\u20130.63)",
+        "ratio": "0.883x",
+        "requirement": "< 1.00x",
+        "pass": true
+      },
+      {
+        "label": "Server CPU per GiB, TCP upload, 4 flows",
+        "stock": "0.720 s/GiB (0.72\u20130.72)",
+        "beam": "0.634 s/GiB (0.63\u20130.64)",
+        "ratio": "0.880x",
+        "requirement": "< 1.00x",
+        "pass": true
+      },
+      {
+        "label": "Server CPU per GiB, HTTPS Vision Direct",
+        "stock": "0.160 s/GiB (0.16\u20130.21)",
+        "beam": "0.373 s/GiB (0.37\u20130.37)",
+        "ratio": "2.333x",
+        "requirement": "informational",
+        "pass": null,
+        "informational": true
+      },
+      {
+        "label": "Client proxy CPU per GiB (TCP median)",
+        "stock": "3.389 s/GiB",
+        "beam": "3.405 s/GiB",
+        "ratio": "1.005x",
+        "requirement": "informational",
+        "pass": null,
+        "informational": true
+      },
+      {
+        "label": "Server RSS after warm-up (peak)",
+        "stock": "36.0 MiB",
+        "beam": "8.6 MiB",
+        "ratio": "0.239x",
+        "requirement": "<= 0.50x",
+        "pass": true
+      },
+      {
+        "label": "Server file descriptors (max)",
+        "stock": "60",
+        "beam": "66",
+        "ratio": "n/a",
+        "requirement": "no leak",
+        "pass": null,
+        "informational": true
+      },
+      {
+        "label": "Server threads (max)",
+        "stock": "7",
+        "beam": "3",
+        "ratio": "n/a",
+        "requirement": "no leak",
+        "pass": null,
+        "informational": true
+      },
+      {
+        "label": "Client + driver core busy (TCP scenarios)",
+        "stock": "100.00% (99.90\u2013100.00)",
+        "beam": "100.00% (99.90\u2013100.00)",
+        "ratio": "n/a",
+        "requirement": "< 85%",
+        "pass": false
+      },
+      {
+        "label": "Target core busy (TCP scenarios)",
+        "stock": "11.84% (7.52\u201316.13)",
+        "beam": "9.32% (7.13\u201311.76)",
+        "ratio": "n/a",
+        "requirement": "< 85%",
+        "pass": true
+      },
+      {
+        "label": "Server core busy (TCP scenarios)",
+        "stock": "24.84% (15.03\u201335.49)",
+        "beam": "22.25% (13.36\u201330.99)",
+        "ratio": "n/a",
+        "requirement": "1-vCPU model",
+        "pass": null,
+        "informational": true
+      }
+    ]
+  }
+}
