@@ -39,13 +39,14 @@ Updated: 2026-10-22.
 | VLESS user validation | Done |
 | Vision-framed relay | Done |
 | Vision Direct raw TLS handoff | Done |
-| Splice on Vision Direct and cover fallback | Done |
+| Early one-way raw download splice | Done |
 | Prefix replay stream | Done |
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP/HTTPS interop | **HTTP 200** |
 | Cover-parity harness | Done; gaps documented |
 | Full-TUN harness v2 | **8/8 PASS** |
-| Benchmark harness design | Done |
+| Full-TUN benchmark harness | Done |
+| No-TUN server-capacity smoke | Done |
 
 ## Full-TUN matrix
 
@@ -65,33 +66,33 @@ UDP modes:
 
 ## Performance snapshot
 
-Local full-TUN benchmark, stock Xray v26.3.27 vs beam, client-capped and noisy
-host (headline not valid; see `bench/results/`):
-
-- TCP download throughput: ~0.98x stock; upload: ~1.00x. The sing-box client
-  core is near its limit, so these are not server-capacity numbers.
-- Server CPU per GiB, TCP download: **0.79x** (21% lower); upload: ~1.00x /
-  1.03x (slightly worse).
-- Server RSS after warm-up: **0.24x** (76% lower).
-- UDP echo throughput: **1.22x** (22% higher).
-- No-TUN server-capacity smoke (stock Xray SOCKS client, 256 MiB plain HTTP):
-  beam **889 MB/s** vs stock **570 MB/s** (**1.56x**). This removes the
-  sing-box TUN client cap; it is a server-capacity indicator, not a WAN
-  headline.
-- HTTPS Vision Direct server CPU per GiB: ~1.5x stock; under investigation.
-- DNS p50/p95 favor beam; p99 is slightly worse. H3 p99 is ~4% worse; both are
-  small absolute values on a noisy host.
+- Full-TUN bulk throughput is **client-capped** by the sing-box TUN client on
+  this host; stock and beam are at roughly 0.98-1.00x, so the fixed-multiplier
+  throughput gates are not evaluable in that harness.
+- **No-TUN server-capacity smoke** (stock Xray SOCKS client, 256 MiB plain
+  HTTP, separate CPUs): beam **872 MB/s** vs stock **589 MB/s** in the final
+  run (**1.48x**; earlier runs 1.56x). This removes the TUN client cap and
+  exposes the server path.
+- Server CPU per GiB, TCP download: **0.79x** stock (21% lower).
+- Server CPU per GiB, TCP upload: ~1.00x / 1.03x (slightly worse).
+- HTTPS Vision Direct: early one-way splice reduced server CPU from ~0.32 to
+  **0.107 s/GiB**, matching stock; quick throughput ratio **1.033x**.
+- UDP echo throughput: **1.22x** stock.
+- Server RSS after warm-up: **0.24x** stock (76% lower).
+- DNS p50/p95 favor beam; p99 and H3 p99 are slightly worse on a noisy host.
 - Syscall/wakeup/splice gates need a privileged, quiet acceptance run.
 
 ## In progress
 
-- Performance optimization: Direct CPU, upload CPU, and a valid server-bound
-  throughput measurement.
+- Final soak/churn and RTT-condition validation.
+- Deployment package (not deployed).
 
 ## Known gaps / not started
 
 - TLS extension-order and encrypted-flight-size parity.
-- Deployment package and VPS cutover.
+- HTTPS upload still uses tokio copy; only the download direction gets the
+  early one-way splice.
+- VPS cutover is intentionally not performed.
 
 ## Evidence
 
@@ -103,6 +104,7 @@ host (headline not valid; see `bench/results/`):
 - `docs/12-custom-tls-design.md`: reference-only exact-mirroring design.
 - `docs/13-vision-direct-design.md`: Direct raw-handoff design.
 - `docs/14-tun-harness.md`: full-TUN topology, probes, and control results.
+- `bench/README.md`: benchmark and no-TUN smoke usage.
 
 ## Current verification
 
@@ -114,8 +116,10 @@ bash scripts/cover-parity.sh
 bash tests/tun/run.sh
 bash tests/tun/run.sh --udp-mode packetaddr
 bash tests/tun/run.sh --udp-mode legacy
+bash bench/no-tun.sh
 ```
 
-The workspace currently has 232 `beam-core` unit tests, two integration tests,
+The workspace currently has 234 `beam-core` unit tests, two integration tests,
 and 22 `beam-sys` tests. The full-TUN harness passes all eight probes for XUDP,
-packetaddr, and legacy VLESS UDP; the stock Xray control passes the same matrix.
+packetaddr, and legacy VLESS UDP; the no-TUN server-capacity smoke is ~1.5x
+stock.
