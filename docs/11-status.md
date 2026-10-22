@@ -80,6 +80,10 @@ UDP modes:
 - UDP echo throughput: **1.22x** stock.
 - Server RSS after warm-up: **0.24x** stock (76% lower).
 - DNS p50/p95 favor beam; p99 and H3 p99 are slightly worse on a noisy host.
+- At **50 ms RTT** (valid quick run, no client saturation): TCP throughput
+  0.98–1.01x stock; server CPU/GiB 0.77–0.95x; RSS 0.24x; DNS p99 +0.3%,
+  HTTP/3 p99 0.0%. Beam is at throughput parity with lower CPU/RSS under
+  added RTT.
 - Syscall/wakeup/splice gates need a privileged, quiet acceptance run.
 
 ## In progress
