@@ -5,8 +5,8 @@
 //! to rustls through a [`ReplayStream`] that replays the original record.
 //! Unauthenticated connections are forwarded byte-for-byte to the configured
 //! cover. The adapter implements the TLS handshake, a minimal TCP VLESS path,
-//! and XTLS Vision framing. XUDP and Vision Direct mode are deliberately out of
-//! scope.
+//! and XTLS Vision framing, including the raw inner-TLS handoff on Vision
+//! Direct. XUDP is deliberately out of scope.
 
 use std::fmt;
 use std::io;
@@ -27,17 +27,21 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
 use crate::address::{Address, NetLocation};
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
+use crate::tls::stream::{TlsStream, TlsStreamError};
 use crate::tls::{ClientHello, MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN};
 use crate::vision::VisionStream;
 use crate::vless::{Command, MAX_REQUEST_HEADER_LEN, RequestHeader, ResponseHeader, VlessError};
 
 /// Idle timeout for each relay read, write, and shutdown.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Relay buffer large enough for one maximum-size inner TLS record, including
+/// its five-byte header.
+const RELAY_BUFFER_LEN: usize = 16_384 + 256 + 5;
 
 /// Result of one accepted connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +104,10 @@ pub enum TlsServerError {
     /// rustls rejected a configuration or handshake.
     #[error("rustls error: {0}")]
     Rustls(#[from] rustls::Error),
+
+    /// The record-bounded TLS stream failed.
+    #[error("TLS stream error: {0}")]
+    TlsStream(#[from] TlsStreamError),
 
     /// A network or TLS stream I/O operation failed.
     #[error("I/O error: {0}")]
@@ -440,13 +448,16 @@ async fn handle_authenticated(
     config: &TlsServerConfig,
 ) -> Result<ConnectionOutcome, TlsServerError> {
     let server_config = Arc::new(config.build_server_config(&auth.auth_key[..])?);
-    let acceptor = TlsAcceptor::from(server_config);
-    let replay = ReplayStream::new(stream, record);
-    let mut tls = timeout(config.handshake_timeout, acceptor.accept(replay))
-        .await
-        .map_err(|_| TlsServerError::Timeout {
-            stage: "rustls handshake",
-        })??;
+    let connection =
+        rustls::ServerConnection::new(server_config).map_err(TlsServerError::Rustls)?;
+    let mut tls = timeout(
+        config.handshake_timeout,
+        TlsStream::accept(stream, connection, record),
+    )
+    .await
+    .map_err(|_| TlsServerError::Timeout {
+        stage: "TLS handshake",
+    })??;
 
     let request = read_vless_request(&mut tls, config.handshake_timeout).await?;
     if request.user_id.ct_eq(&config.user_id).unwrap_u8() == 0 {
@@ -628,7 +639,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; RELAY_BUFFER_LEN];
     loop {
         let count = timeout(idle_timeout, reader.read(&mut buffer))
             .await
@@ -638,18 +649,37 @@ where
         if count == 0 {
             break;
         }
-        timeout(idle_timeout, writer.write_all(&buffer[..count]))
+        let write = timeout(idle_timeout, writer.write_all(&buffer[..count]))
             .await
             .map_err(|_| TlsServerError::Timeout {
                 stage: "relay write",
-            })??;
+            })?;
+        match write {
+            Ok(()) => {}
+            Err(error) if is_peer_closed(&error) => break,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
     }
-    timeout(idle_timeout, writer.shutdown())
+    let shutdown = timeout(idle_timeout, writer.shutdown())
         .await
         .map_err(|_| TlsServerError::Timeout {
             stage: "relay shutdown",
-        })??;
+        })?;
+    match shutdown {
+        Ok(()) => {}
+        Err(error) if is_peer_closed(&error) => {}
+        Err(error) => return Err(TlsServerError::Io(error)),
+    }
     Ok(())
+}
+
+fn is_peer_closed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
 }
 
 async fn read_exact(stream: &TcpStream, buffer: &mut [u8]) -> io::Result<()> {

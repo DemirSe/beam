@@ -6,6 +6,7 @@
 
 pub mod client_hello;
 pub mod server;
+pub mod stream;
 
 pub use client_hello::{
     Alpn, AlpnIter, ClientHello, ClientHelloError, Extension, ExtensionIter, KeyShareEntry,
@@ -16,3 +17,4 @@ pub use client_hello::{
 pub use server::{
     ConnectionOutcome, ReplayStream, TlsServerConfig, TlsServerError, handle_connection,
 };
+pub use stream::{RawTls, RawTlsHandoff, TlsStream, TlsStreamError};
