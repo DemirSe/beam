@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import sys
 import tomllib
@@ -165,10 +166,10 @@ def main() -> int:
                     "tag": "tun-in",
                     "interface_name": "tun0",
                     "address": ["198.18.0.1/15", "fd00:1::1/64"],
-                    "mtu": 1500,
+                    "mtu": int(os.environ.get("TUN_MTU", "1500")),
                     "auto_route": False,
                     "strict_route": False,
-                    "stack": "system",
+                    "stack": os.environ.get("TUN_STACK", "system"),
                 }
             ],
             "outbounds": [

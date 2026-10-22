@@ -2,7 +2,8 @@
 //!
 //! The server listens on one UDP address, generates a fresh self-signed
 //! certificate in memory, and answers every request with HTTP 200 and the
-//! fixed body `beam-tun-h3-ok\n`. It never talks to an external network.
+//! marker `beam-tun-h3-ok\n`, repeated up to `H3_BODY_BYTES` when set. It never
+//! talks to an external network.
 //!
 //! This binary is test-only and deliberately lives outside the beam workspace.
 
@@ -16,6 +17,25 @@ use quinn::rustls;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 const MARKER: &[u8] = b"beam-tun-h3-ok\n";
+
+/// Returns the response body size. The default is the historical marker-only
+/// body; a larger value exercises QUIC/XUDP flow control and backpressure.
+fn body_len() -> Result<usize> {
+    let Some(raw) = env::var_os("H3_BODY_BYTES") else {
+        return Ok(MARKER.len());
+    };
+    let raw = raw.to_str().context("H3_BODY_BYTES must be valid UTF-8")?;
+    let len: usize = raw
+        .parse()
+        .with_context(|| format!("invalid H3_BODY_BYTES: {raw}"))?;
+    if !(MARKER.len()..=16 * 1024 * 1024).contains(&len) {
+        bail!(
+            "H3_BODY_BYTES must be between {} and 16777216",
+            MARKER.len()
+        );
+    }
+    Ok(len)
+}
 
 fn listen_addr() -> Result<SocketAddr> {
     let mut args = env::args().skip(1);
@@ -130,7 +150,13 @@ async fn serve_request(
         .resolve_request()
         .await
         .context("could not read the request headers")?;
-    let body = Bytes::from_static(MARKER);
+    let len = body_len()?;
+    let mut body = Vec::with_capacity(len);
+    while body.len() < len {
+        body.extend_from_slice(MARKER);
+    }
+    body.truncate(len);
+    let body = Bytes::from(body);
     let response = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain")
@@ -142,10 +168,19 @@ async fn serve_request(
         .send_response(response)
         .await
         .context("could not send the response headers")?;
-    stream
-        .send_data(body)
-        .await
-        .context("could not send the response body")?;
+    // Send bounded chunks so the h3 layer can apply QUIC stream flow control.
+    // A single multi-megabyte `send_data` is not a valid large-body test: it
+    // makes the origin reset the stream before the tunnel is exercised.
+    const CHUNK: usize = 1024;
+    let mut offset = 0;
+    while offset < body.len() {
+        let end = (offset + CHUNK).min(body.len());
+        stream
+            .send_data(body.slice(offset..end))
+            .await
+            .context("could not send the response body")?;
+        offset = end;
+    }
     stream
         .finish()
         .await
@@ -154,7 +189,7 @@ async fn serve_request(
         "h3-origin: {} {} -> 200 {} bytes",
         request.method(),
         request.uri(),
-        MARKER.len()
+        len
     );
     Ok(())
 }

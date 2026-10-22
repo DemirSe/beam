@@ -38,9 +38,10 @@ immediately instead of leaving the host.
 The target runs IPv4 and IPv6 UDP echo and DNS services on the same ports
 (`9999` and `53`). The `quic-udp` row uses a real HTTP/3 origin on
 `10.10.2.2:4443`, not a UDP echo: `tests/tun/h3-origin` terminates QUIC and
-HTTP/3, then serves the fixed body `beam-tun-h3-ok`. If that helper cannot be
-built, the harness falls back to a UDP sink on the same address and reports
-`quic-udp` as BLOCKED with the build error; it never reports a fake pass.
+HTTP/3, then serves the marker `beam-tun-h3-ok`; set `H3_BODY_BYTES` to repeat
+the marker up to 16 MiB for flow-control/backpressure coverage. If that helper
+cannot be built, the harness falls back to a UDP sink on the same address and
+reports `quic-udp` as BLOCKED with the build error; it never reports a fake pass.
 
 The sing-box outbound is the production profile:
 
@@ -110,6 +111,9 @@ Environment variables:
 | `TUN_OUT` | `/tmp/opencode/beam-tun/<UTC>-<pid>` | run directory |
 | `SKIP_BUILD` | `0` | reuse `target/<profile>/beam` and the H3 origin |
 | `H3_ORIGIN_BIN` | built helper | use a prebuilt `h3-origin` binary |
+| `H3_BODY_BYTES` | marker length | large H3 response body (15..16777216 bytes) |
+| `TUN_STACK` | `system` | sing-box TUN stack (`system`, `gvisor`, `mixed`) |
+| `TUN_MTU` | `1500` | sing-box TUN MTU |
 | `UDP_MODE` | `xudp` | sing-box `packet_encoding`: `xudp`, `packetaddr`, or `legacy` |
 | `TUN_FORCE_BLOCK` | `0` | force the TUN-blocked reporting path (test hook) |
 
@@ -119,8 +123,10 @@ Environment variables:
 of the root workspace. It uses `quinn` 0.11, `h3`, `h3-quinn`, `rustls`,
 `rcgen`, and `tokio`; none of those become production `beam` dependencies. The
 server generates a fresh self-signed certificate in memory, advertises the
-`h3` ALPN, and answers every request with HTTP 200 and the fixed body
-`beam-tun-h3-ok`.
+`h3` ALPN, and answers every request with HTTP 200 and the marker
+`beam-tun-h3-ok`. `H3_BODY_BYTES` repeats the marker to a larger body; the
+origin sends it in 1 KiB chunks because a single multi-megabyte `send_data`
+makes the `h3`/curl pair reset the stream before the tunnel is exercised.
 
 Build it with:
 
@@ -134,6 +140,8 @@ Run it by hand on loopback:
 ```bash
 tests/tun/h3-origin/target/debug/h3-origin --listen 127.0.0.1:4443
 curl --http3-only --insecure --noproxy '*' https://127.0.0.1:4443/
+H3_BODY_BYTES=1333889 tests/tun/h3-origin/target/debug/h3-origin --listen 127.0.0.1:4443
+curl --http3-only --insecure --noproxy '*' -o /dev/null -w '%{http_code} %{size_download}\n' https://127.0.0.1:4443/
 ```
 
 `run.sh` builds the helper before entering the private network namespace and
@@ -202,6 +210,23 @@ Run the control with:
 ```bash
 bash tests/tun/run.sh --control
 ```
+
+Large-body and TUN-stack coverage (2026-10-22):
+
+| Variant | Result | Detail |
+|---|---|---|
+| `H3_BODY_BYTES=1333889`, `TUN_STACK=system`, MTU 1500 | **PASS** | 1.3 MiB HTTP/3 body through beam/XUDP |
+| `H3_BODY_BYTES=1333889`, `TUN_STACK=gvisor`, MTU 1400 | **FAIL (client)** | Same failure with stock Xray; origin answered, curl reset/stalled before completing the body |
+
+Reproduce the large body:
+```bash
+SKIP_BUILD=1 H3_BODY_BYTES=1333889 TUN_STACK=system TUN_MTU=1500 \
+  bash tests/tun/run.sh --no-build
+```
+The gVisor result is a client-TUN limitation, not a beam-only regression; it is
+recorded because the production client may use gVisor. Switch the production
+client TUN stack to `system`/`mixed` before attributing large-H3 stalls to the
+server.
 
 ## Blockers, past and present
 
