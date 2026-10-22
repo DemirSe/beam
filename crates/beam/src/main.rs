@@ -25,8 +25,19 @@ struct Cli {
     check: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Each Vision Direct relay can occupy up to two blocking splice tasks. A
+    // 160-thread pool covers the live 64-connection cap with headroom and
+    // avoids Tokio's 512-thread default on a 1 GiB host.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(160)
+        .enable_all()
+        .build()
+        .context("failed to build the Tokio runtime")?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Config::from_path(&cli.config)
         .with_context(|| format!("failed to load `{}`", cli.config.display()))?;
@@ -89,6 +100,10 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         max_sessions,
         session_idle_timeout: Duration::from_millis(config.limits.idle_timeout_ms),
         io_timeout: Duration::from_millis(config.limits.handshake_timeout_ms),
+        // A single HTTP/3 body can arrive as hundreds of UDP datagrams while
+        // the outer TCP stream drains. Keep a larger bounded reply queue so a
+        // short client-side pause does not turn into QUIC packet loss.
+        max_queued_replies: 512,
         ..XudpConfig::default()
     };
     xudp.validate().context("invalid XUDP limits")?;

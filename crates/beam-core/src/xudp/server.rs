@@ -14,6 +14,7 @@
 //! `Command::Mux`, after writing the VLESS response header.
 
 use std::io;
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -41,6 +42,10 @@ const READ_CHUNK_LEN: usize = 8192;
 
 /// Hard bound for the reassembly buffer: one full frame plus one read.
 const MAX_BUFFERED_LEN: usize = MAX_FRAME_LEN + READ_CHUNK_LEN;
+
+/// Best-effort receive buffer for a session UDP socket. The kernel clamps this
+/// to `net.core.rmem_max`; the production host raises that limit.
+const UDP_RECV_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Upper bound on mux read inactivity.
 ///
@@ -413,7 +418,18 @@ impl MuxState {
             )
             .await
             {
-                Ok(Ok(socket)) => Arc::new(socket),
+                Ok(Ok(socket)) => {
+                    if let Err(error) =
+                        beam_sys::set_udp_recv_buffer(socket.as_raw_fd(), UDP_RECV_BUFFER_BYTES)
+                    {
+                        tracing::debug!(
+                            session_id = id,
+                            %error,
+                            "could not enlarge the XUDP socket receive buffer"
+                        );
+                    }
+                    Arc::new(socket)
+                }
                 Ok(Err(error)) => {
                     tracing::debug!(
                         session_id = id,

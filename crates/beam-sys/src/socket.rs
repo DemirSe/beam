@@ -28,6 +28,27 @@ pub fn set_reuse_addr(fd: RawFd) -> io::Result<()> {
     setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)
 }
 
+/// Sets the receive buffer for a UDP socket.
+///
+/// The kernel may clamp the request to `net.core.rmem_max` and doubles the
+/// stored value. The caller should treat a success as a best-effort tuning
+/// hint, not as a guaranteed buffer size.
+pub fn set_udp_recv_buffer(fd: RawFd, bytes: usize) -> io::Result<()> {
+    let size = libc::c_int::try_from(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "UDP receive buffer size does not fit in c_int",
+        )
+    })?;
+    if size <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "UDP receive buffer size must be positive",
+        ));
+    }
+    setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size)
+}
+
 fn duration_secs(value: Duration, name: &str) -> io::Result<libc::c_int> {
     let seconds = value.as_secs();
     if seconds == 0 {
@@ -75,9 +96,9 @@ fn setsockopt_int(
 
 #[cfg(test)]
 mod tests {
-    use super::{set_reuse_addr, set_tcp_keepalive, set_tcp_nodelay};
+    use super::{set_reuse_addr, set_tcp_keepalive, set_tcp_nodelay, set_udp_recv_buffer};
     use std::io;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::os::fd::AsRawFd;
     use std::time::Duration;
 
@@ -119,6 +140,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 
         set_reuse_addr(listener.as_raw_fd()).unwrap();
+    }
+
+    #[test]
+    fn udp_recv_buffer_succeeds_and_rejects_zero() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        set_udp_recv_buffer(socket.as_raw_fd(), 64 * 1024).unwrap();
+
+        let error = set_udp_recv_buffer(socket.as_raw_fd(), 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
