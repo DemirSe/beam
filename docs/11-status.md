@@ -42,20 +42,32 @@ Updated: 2026-10-22.
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP/HTTPS interop | **HTTP 200** |
 | Cover-parity harness | Done; gaps documented |
-| Full-TUN harness v2 | TCP v4/v6, IPv4/IPv6 UDP/DNS, QUIC/H3 and HTTPS probes added |
+| Full-TUN harness v2 | **8/8 PASS** with sing-box TUN |
 | Stock Xray baseline + test fixture | Done |
 | Benchmark harness design | Done |
 
+## Full-TUN matrix
+
+| Probe | Result |
+|---|---|
+| TCP HTTP IPv4 | PASS |
+| TCP HTTP IPv6 | PASS |
+| UDP echo IPv4 | PASS |
+| UDP echo IPv6 | PASS |
+| DNS IPv4 | PASS |
+| DNS IPv6 | PASS |
+| QUIC / HTTP3 | PASS |
+| HTTPS through Vision Direct | PASS |
+
 ## In progress
 
-- Rerun TUN v2 with the merged Mux path (IPv6 UDP/DNS and local HTTP/3 origin).
-- Splice integration for the Vision Direct raw leg.
+- Splice integration for the Vision Direct raw leg and cover fallback.
 
 ## Known gaps / not started
 
 - TLS extension-order and encrypted-flight-size parity.
-- Legacy VLESS UDP and packetaddr.
-- Performance matrix and regression harness.
+- Legacy VLESS UDP and packetaddr for clients that do not use XUDP.
+- Performance matrix and regression harness against stock Xray.
 - Deployment package and VPS cutover.
 
 ## Evidence
@@ -80,6 +92,5 @@ bash tests/tun/run.sh
 ```
 
 The workspace currently has 211 `beam-core` unit tests, two integration tests,
-and 22 `beam-sys` tests. The pre-Mux TUN run passed TCP v4/v6, UDP echo, DNS,
-and HTTPS Direct. TUN v2 adds IPv6 UDP/DNS and a local HTTP/3 origin; its stock
-Xray control passes all eight probes.
+and 22 `beam-sys` tests. The full-TUN harness passes all eight probes through
+the real sing-box client, and the stock Xray control passes the same matrix.
