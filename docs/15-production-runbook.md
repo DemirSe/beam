@@ -63,14 +63,25 @@ tunnel is down; run `sudo systemctl start sing-box` (disabled at boot) and retry
 ## 3. Client rotation
 Rotate after an identity change, on a new laptop, or when egress is not the VPS.
 `update-client.py` backs up `/etc/sing-box/config.json`, writes the REALITY
-fields from `~/.config/beam/client-identity.json`, restarts sing-box, and
-restores the backup on failure:
+fields from `~/.config/beam/client-identity.json`, sets every TUN inbound to
+`stack: system` with MTU 1400 (gVisor stalls large HTTP/3 bodies), restarts
+sing-box, restores the backup on failure, and enables the service at boot:
 ```bash
 cd /home/demir/pi/beam
 sudo python3 deploy/update-client.py
 ```
-Alternatively, import `~/.config/beam/client-link.txt` into Hiddify; it contains
-credentials, so never paste it into chat, tickets, or git. Verify:
+Alternatively, import `~/.config/beam/client-link.txt` into Hiddify; set Hiddify's
+TUN stack to `system` manually. The link contains credentials, so never paste it
+into chat, tickets, or git. For the local `Xray Tray (sing-box)`, install the
+passwordless unit rule and autostart:
+```bash
+sudo install -m 0644 deploy/50-sing-box-tray.rules \
+  /etc/polkit-1/rules.d/50-sing-box-tray.rules
+install -D -m 0644 deploy/sing-box-tray-autostart.desktop \
+  ~/.config/autostart/sing-box-tray.desktop
+```
+The rule only allows `demir` to manage `sing-box.service`; the tray can then
+start/stop/restart without a password prompt. Verify:
 ```bash
 systemctl status --no-pager sing-box
 curl -4 -sS https://ipv4.icanhazip.com; curl -6 -sS https://ipv6.icanhazip.com
@@ -238,17 +249,18 @@ Edit only `[limits]`; keep the file root:beam 0640. The example's 1024 default i
 - Kernel `6.12.113+deb13-cloud-amd64` is active after the 2026-10-22 reboot;
   `needrestart` reports no pending kernel. Verify 443 and a fresh SSH connection
   after any future kernel update.
-- `sing-box` is active but disabled at boot; after a reboot there is no tunnel until
-  a manual/tray start. Enabling at boot changes host routing and needs a test.
+- `update-client.py` enables `sing-box` at boot and the tray autostart is
+  installed; until the local sudo step is run, the service remains disabled and
+  a reboot needs a manual/tray start.
 - Cover parity is incomplete: beam emits `key_share, supported_versions` versus the
   cover's `supported_versions, key_share`, and the encrypted flight is 3 records /
   416 B versus 5 / 3085 B (temporary Ed25519 certificate). See `docs/10-cover-parity.md`.
 - Large HTTP/3 bodies through the production TUN occasionally stall 20–45 s.
   The post-hardening soak was 12/14 large-H3 success (two 45 s timeouts) while
   non-H3 was 87/87. The local lab reproduces the large-body failure with a gVisor
-  TUN on both beam and stock Xray; a `system` TUN passes 1.3 MiB. Switch the
-  client TUN stack to `system` (or `mixed`) before treating this as a server
-  regression.
+  TUN on both beam and stock Xray; a `system` TUN passes 1.3 MiB. The updated
+  `update-client.py` sets `system`; Hiddify users must select it manually before
+  treating this as a server regression.
 - A 5-minute post-hardening soak and the read-only audit are complete. A light
   24-hour background soak started on 2026-10-22 12:52 UTC
   (`/tmp/opencode/soak-24h-live2/`); the privileged quiet syscall/wakeup gates

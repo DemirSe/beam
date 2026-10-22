@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Xray Tray (sing-box)
+GenericName=Tunnel Control
+Comment=Start or stop the sing-box TUN tunnel
+Exec=/home/demir/.local/bin/sing-box-tray
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

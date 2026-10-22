@@ -110,7 +110,9 @@ UDP modes:
 - Unauthenticated probe test: a TLS client with SNI `whatsapp.net` sent to the
   VPS is forwarded to the real cover; the observed certificate is Meta's valid
   `*.whatsapp.net` certificate.
-- `sing-box` is active but `disabled` at boot; start is manual/tray-driven.
+- `sing-box` is active; the updated `update-client.py` enables it at boot, and
+  the tray autostart is installed. Until the local sudo step runs, the service
+  remains `disabled` and a reboot needs a manual/tray start.
 - `sudo python3 deploy/update-client.py` or the link import is the only local
   privileged action; the agent's sandbox sets `no_new_privs`.
 - Production hardening applied on 2026-10-22:
@@ -163,9 +165,10 @@ UDP modes:
   nftables rules are.
 - The local `sing-box` service is not enabled at boot.
 - Large H3 bodies can occasionally stall 20–45 s through the production TUN;
-  the post-hardening soak saw 2 timeouts in 14 attempts. Switching the client
-  TUN stack from `gvisor` to `system` is the recommended client-side workaround.
-  The server-side 1.3 MiB H3 test passes locally with the `system` stack.
+  the post-hardening soak saw 2 timeouts in 14 attempts. The updated
+  `deploy/update-client.py` sets the TUN stack to `system` (and enables the
+  service); Hiddify users must set it manually. The server-side 1.3 MiB H3 test
+  passes locally with the `system` stack.
 
 ## Evidence
 

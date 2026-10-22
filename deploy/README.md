@@ -15,13 +15,29 @@ kept outside the repository in `~/.config/beam/` with mode `0600`.
    deployment. The agent uses `sudo -n` over SSH.
 
 3. Update the local full-TUN client. The client config is root-only, so the
-   agent cannot do this from its sandbox. Choose one:
+   agent cannot do this from its sandbox:
 
    ```bash
    sudo python3 deploy/update-client.py
    ```
 
-   or import the link in `~/.config/beam/client-link.txt` into Hiddify.
+   The script now writes the REALITY identity, sets every TUN inbound to
+   `stack: system` with MTU 1400 (the gVisor stack stalls large HTTP/3 bodies),
+   restarts `sing-box`, and enables it at boot. If you import the link into
+   Hiddify instead, set its TUN stack to `system` manually.
+
+   Install the tray's passwordless unit rule and autostart:
+
+   ```bash
+   sudo install -m 0644 deploy/50-sing-box-tray.rules \
+     /etc/polkit-1/rules.d/50-sing-box-tray.rules
+   install -D -m 0644 deploy/sing-box-tray-autostart.desktop \
+     ~/.config/autostart/sing-box-tray.desktop
+   ```
+
+   The rule only allows `demir` to manage `sing-box.service`; the tray can then
+   start/stop/restart without a password prompt. The autostart launches the
+   existing `Xray Tray (sing-box)` at login.
 
 4. If the VPS IP changed, update `~/.config/beam/client-identity.json`
    (`server`), regenerate `client-outbound.json`/`client-link.txt`, and re-run

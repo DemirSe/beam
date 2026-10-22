@@ -28,6 +28,18 @@ def main() -> int:
 
     identity = json.loads(IDENTITY.read_text())
     config = json.loads(CONFIG.read_text())
+    tun_inbounds = [
+        inbound for inbound in config.get("inbounds", []) if inbound.get("type") == "tun"
+    ]
+    if not tun_inbounds:
+        print("update-client: expected at least one TUN inbound", file=sys.stderr)
+        return 2
+    # The kernel TUN stack is stable for large HTTP/3 bodies through this
+    # server. The gVisor stack intermittently resets/stalls large H3 streams.
+    for tun in tun_inbounds:
+        tun["stack"] = "system"
+        tun["mtu"] = 1400
+
     outbounds = config.get("outbounds", [])
     vless = [o for o in outbounds if o.get("type") == "vless"]
     if len(vless) != 1:
@@ -65,6 +77,16 @@ def main() -> int:
         print("update-client: restart failed; previous config restored", file=sys.stderr)
         print(result.stderr.strip(), file=sys.stderr)
         return 1
+
+    enabled = subprocess.run(
+        ["systemctl", "enable", "sing-box"], capture_output=True, text=True
+    )
+    if enabled.returncode != 0:
+        print(
+            "update-client: warning: could not enable sing-box at boot",
+            file=sys.stderr,
+        )
+        print(enabled.stderr.strip(), file=sys.stderr)
 
     print(f"update-client: updated {CONFIG}; backup={backup}")
     return 0
