@@ -15,17 +15,22 @@
 # IPv6. Known unimplemented server paths are reported as BLOCKED with the
 # exact beam log line; they do not make the run fail.
 #
+# The QUIC probe uses a real local HTTP/3 origin from tests/tun/h3-origin,
+# built outside the beam workspace before the network namespace is entered.
+#
 # Usage:
 #   bash tests/tun/run.sh [--release] [--control] [--no-build] [--out DIR]
 #
 # Environment:
-#   SING_BOX      sing-box binary (default /tmp/opencode/bench/bin/sing-box)
-#   XRAY_BIN      stock Xray binary (default /tmp/opencode/xray-server-compare/xray)
-#   TEST_CONFIG   beam REALITY fixture (default /tmp/opencode/beam-test/beam.toml)
-#   TUN_OUT       run directory (default /tmp/opencode/beam-tun/<timestamp>)
-#   SKIP_BUILD=1  reuse target/<profile>/beam
+#   SING_BOX        sing-box binary (default /tmp/opencode/bench/bin/sing-box)
+#   XRAY_BIN        stock Xray binary (default /tmp/opencode/xray-server-compare/xray)
+#   TEST_CONFIG     beam REALITY fixture (default /tmp/opencode/beam-test/beam.toml)
+#   TUN_OUT         run directory (default /tmp/opencode/beam-tun/<timestamp>)
+#   SKIP_BUILD=1    reuse target/<profile>/beam and the H3 origin binary
+#   H3_ORIGIN_BIN   use a prebuilt h3-origin binary instead of building it
 #
-# This is a local lab harness. It never reaches an external network.
+# This is a local lab harness. It never reaches an external network in the
+# measured path; only the one-time dependency/build step runs outside it.
 
 set -euo pipefail
 
@@ -43,8 +48,45 @@ if [ "$INNER" != "1" ]; then
     echo "tun-harness: unprivileged user+network namespaces are unavailable" >&2
     exit 1
   fi
+
+  # The H3 helper is a separate workspace. Build it before entering the
+  # private network namespace, where crates.io is unreachable. A build failure
+  # is reported later as a quic-udp BLOCKED row, not as a fake pass.
+  H3_BUILD=1
+  for argument in "$@"; do
+    case "$argument" in
+      --no-build|--help|-h) H3_BUILD=0 ;;
+    esac
+  done
+  [ "${SKIP_BUILD:-0}" = "1" ] && H3_BUILD=0
+  H3_BIN_OVERRIDE="${H3_ORIGIN_BIN:-}"
+  H3_ORIGIN_BIN=""
+  H3_BUILD_LOG=""
+  H3_BUILD_ERROR=""
+  if [ -n "$H3_BIN_OVERRIDE" ]; then
+    H3_ORIGIN_BIN="$H3_BIN_OVERRIDE"
+  elif [ "$H3_BUILD" = "1" ]; then
+    mkdir -p /tmp/opencode
+    H3_BUILD_LOG="$(mktemp /tmp/opencode/h3-origin-build.XXXXXX.log)"
+    # shellcheck source=../../scripts/dev-env.sh
+    source "$ROOT/scripts/dev-env.sh"
+    if cargo build --locked --manifest-path "$HERE/h3-origin/Cargo.toml" \
+        > "$H3_BUILD_LOG" 2>&1; then
+      H3_ORIGIN_BIN="$HERE/h3-origin/target/debug/h3-origin"
+    else
+      H3_BUILD_ERROR="cargo build for tests/tun/h3-origin failed: $(tail -n 1 "$H3_BUILD_LOG" | tr '\t\n' '  ')"
+    fi
+  else
+    H3_ORIGIN_BIN="$HERE/h3-origin/target/debug/h3-origin"
+    if [ ! -x "$H3_ORIGIN_BIN" ]; then
+      H3_BUILD_ERROR="H3 origin was not built (--no-build/SKIP_BUILD=1) and $H3_ORIGIN_BIN is missing"
+    fi
+  fi
+
   exec unshare --user --map-root-user --mount --net --fork \
     env TUN_HARNESS_INNER=1 TUN_HARNESS_ROOT="$ROOT" TUN_HARNESS_SELF="$SELF" \
+    TUN_H3_BIN="$H3_ORIGIN_BIN" TUN_H3_BUILD_ERROR="$H3_BUILD_ERROR" \
+    TUN_H3_BUILD_LOG="$H3_BUILD_LOG" \
     bash "$SELF" "$@"
 fi
 
@@ -69,6 +111,9 @@ SERVER_TARGET_ADDR="10.10.2.1/24"
 TARGET_V6="fd00:2::2/64"
 SERVER_TARGET_V6="fd00:2::1/64"
 COVER="10.10.2.2:4443"
+H3_ORIGIN_BIN="${H3_ORIGIN_BIN:-${TUN_H3_BIN:-$HERE/h3-origin/target/debug/h3-origin}}"
+H3_ORIGIN_ERROR="${TUN_H3_BUILD_ERROR:-}"
+H3_BUILD_LOG="${TUN_H3_BUILD_LOG:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -136,15 +181,21 @@ PROBE_DIR="$RUN_DIR/probes"
 BEAM_LOG="$LOG_DIR/beam.log"
 SINGBOX_LOG="$LOG_DIR/singbox.log"
 TARGET_LOG="$LOG_DIR/target.log"
+H3_LOG="$LOG_DIR/h3-origin.log"
 XRAY_LOG="$LOG_DIR/xray.log"
 BEAM_TSV="$RUN_DIR/results-beam.tsv"
 XRAY_TSV="$RUN_DIR/results-xray.tsv"
 : > "$BEAM_TSV"
 : > "$XRAY_TSV"
+if [ -n "$H3_BUILD_LOG" ] && [ -f "$H3_BUILD_LOG" ]; then
+  cp "$H3_BUILD_LOG" "$LOG_DIR/h3-origin-build.log" 2>/dev/null || true
+fi
 
 BEAM_PID=""
 SINGBOX_PID=""
 SERVICES_PID=""
+H3_ORIGIN_PID=""
+H3_READY=0
 XRAY_PID=""
 NAMESPACES=(tun-client tun-server tun-target)
 UNEXPECTED_FAIL=0
@@ -180,6 +231,7 @@ cleanup() {
   stop_pid "$SINGBOX_PID"
   stop_pid "$BEAM_PID"
   stop_pid "$XRAY_PID"
+  stop_pid "$H3_ORIGIN_PID"
   stop_pid "$SERVICES_PID"
   for namespace in "${NAMESPACES[@]}"; do
     ip netns del "$namespace" >/dev/null 2>&1
@@ -277,7 +329,7 @@ count_status() {
 blocked_file() {
   local reason=$1
   : > "$BEAM_TSV"
-  for name in tcp-http-v4 tcp-http-v6 udp-echo dns-udp quic-udp https-direct; do
+  for name in tcp-http-v4 tcp-http-v6 udp-echo udp-echo-v6 dns-udp dns-udp-v6 quic-udp https-direct; do
     record "$BEAM_TSV" "$name" BLOCKED "$reason"
   done
 }
@@ -472,20 +524,44 @@ fi
 # Processes
 # ---------------------------------------------------------------------------
 
+if [ -z "$H3_ORIGIN_ERROR" ] && [ ! -x "$H3_ORIGIN_BIN" ]; then
+  H3_ORIGIN_ERROR="local HTTP/3 origin binary is missing: $H3_ORIGIN_BIN"
+fi
+if [ -z "$H3_ORIGIN_ERROR" ]; then
+  log "starting local HTTP/3 origin on 10.10.2.2:4443"
+  ip netns exec tun-target "$H3_ORIGIN_BIN" --listen 10.10.2.2:4443 \
+    > "$H3_LOG" 2>&1 &
+  H3_ORIGIN_PID=$!
+  if wait_for_log "$H3_LOG" "h3-origin: READY" "$H3_ORIGIN_PID" 15; then
+    H3_READY=1
+  else
+    fail_harness "local HTTP/3 origin did not become ready"
+    tail -n 40 "$H3_LOG" >&2 || true
+    exit 1
+  fi
+else
+  log "local HTTP/3 origin unavailable: $H3_ORIGIN_ERROR"
+fi
+
 log "starting target services"
-HTTP6_ARGS=()
+TARGET_ARGS=(
+  --http 10.10.2.2:8080
+  --tls 10.10.2.2:4443
+  --udp 10.10.2.2:9999
+  --dns 10.10.2.2:53
+  --cert "$CONFIG_DIR/target.crt"
+  --key "$CONFIG_DIR/target.key"
+)
 if [ "$IPV6_AVAILABLE" = "1" ]; then
-  HTTP6_ARGS=(--http6 '[fd00:2::2]:8080')
+  TARGET_ARGS+=(--http6 '[fd00:2::2]:8080' --udp6 '[fd00:2::2]:9999' --dns6 '[fd00:2::2]:53')
+fi
+if [ "$H3_READY" != "1" ]; then
+  # Without an H3 origin the sink still proves whether a QUIC packet reached
+  # the target, but it never speaks HTTP/3 and therefore never produces a pass.
+  TARGET_ARGS+=(--quic-sink '10.10.2.2:4443')
 fi
 ip netns exec tun-target "$PYTHON" "$HERE/services.py" \
-  --http 10.10.2.2:8080 \
-  "${HTTP6_ARGS[@]}" \
-  --tls 10.10.2.2:4443 \
-  --udp 10.10.2.2:9999 \
-  --dns 10.10.2.2:53 \
-  --quic-sink 10.10.2.2:4443 \
-  --cert "$CONFIG_DIR/target.crt" \
-  --key "$CONFIG_DIR/target.key" \
+  "${TARGET_ARGS[@]}" \
   > "$TARGET_LOG" 2>&1 &
 SERVICES_PID=$!
 if ! wait_for_log "$TARGET_LOG" "target: READY" "$SERVICES_PID" 15; then
@@ -530,13 +606,20 @@ if ! ip netns exec tun-client ip route get 10.10.2.2 2>/dev/null | grep -q 'dev 
   fail_harness "10.10.2.2 does not resolve to tun0"
   exit 1
 fi
-if [ "$IPV6_AVAILABLE" = "1" ] \
-  && ! ip netns exec tun-client ip -6 addr show dev tun0 2>/dev/null | grep -q 'inet6 fd00:1::1'; then
-  IPV6_AVAILABLE=0
-fi
-if [ "$IPV6_AVAILABLE" = "1" ] \
-  && ! ip netns exec tun-client ip -6 route get fd00:2::2 2>/dev/null | grep -q 'dev tun0'; then
-  IPV6_AVAILABLE=0
+if [ "$IPV6_AVAILABLE" = "1" ]; then
+  # sing-box adds fd00:1::1 and the route just before this check. Duplicate
+  # address detection can briefly make the source address unusable and
+  # `ip -6 route get` fail, so retry instead of silently disabling IPv6.
+  tun6_ready=0
+  for _ in $(seq 1 30); do
+    if ip netns exec tun-client ip -6 addr show dev tun0 2>/dev/null | grep -q 'inet6 fd00:1::1' \
+      && ip netns exec tun-client ip -6 route get fd00:2::2 2>/dev/null | grep -q 'dev tun0'; then
+      tun6_ready=1
+      break
+    fi
+    sleep 0.1
+  done
+  [ "$tun6_ready" = "1" ] || IPV6_AVAILABLE=0
 fi
 
 {
@@ -606,26 +689,27 @@ probe_udp() {
 }
 
 probe_dns() {
-  local arm=$1
+  local arm=$1 name=$2 server=$3 qtype=$4 expected=$5
   local server_log="$LOG_DIR/$arm.log"
   local start=0
   [ -f "$server_log" ] && start=$(wc -c < "$server_log")
-  local log="$PROBE_DIR/$arm/dns-udp.log"
+  local log="$PROBE_DIR/$arm/$name.log"
   local rc=0
-  ip netns exec tun-client dig +notcp +time=3 +tries=1 @10.10.2.2 target.test A \
+  ip netns exec tun-client dig +notcp +time=3 +tries=1 "@$server" target.test "$qtype" \
     > "$log" 2>&1 || rc=$?
   local status
   status="$(grep -m1 'status:' "$log" | tr -s ' ' | sed 's/^ //' || true)"
   [ -n "$status" ] || status="$(tail -n 2 "$log" | tr '\n' ' ' || true)"
-  if [ "$rc" -eq 0 ] && grep -q 'status: NOERROR' "$log" && grep -q '10\.10\.2\.2' "$log"; then
-    record "$RUN_DIR/results-$arm.tsv" "dns-udp" PASS "$status"
+  if [ "$rc" -eq 0 ] && grep -q 'status: NOERROR' "$log" \
+      && grep -qF -- "$expected" "$log"; then
+    record "$RUN_DIR/results-$arm.tsv" "$name" PASS "$status; answer=$expected"
     return
   fi
   if [ "$arm" = "beam" ] && has_marker "$server_log" "$start" "authenticated VLESS command is not implemented yet"; then
-    record "$RUN_DIR/results-$arm.tsv" "dns-udp" BLOCKED \
+    record "$RUN_DIR/results-$arm.tsv" "$name" BLOCKED \
       "XUDP unimplemented; dig: $status; beam: $(marker_line "$server_log" "$start" "authenticated VLESS command is not implemented yet")"
   else
-    record "$RUN_DIR/results-$arm.tsv" "dns-udp" FAIL "$status"
+    record "$RUN_DIR/results-$arm.tsv" "$name" FAIL "$status"
     UNEXPECTED_FAIL=1
   fi
 }
@@ -637,33 +721,44 @@ probe_quic() {
       "the local curl has no HTTP/3 support; cannot send a QUIC Initial"
     return
   fi
+  if [ "$H3_READY" != "1" ]; then
+    record "$RUN_DIR/results-$arm.tsv" "quic-udp" BLOCKED \
+      "local HTTP/3 origin unavailable: $H3_ORIGIN_ERROR"
+    return
+  fi
   local server_log="$LOG_DIR/$arm.log"
   local start=0
   [ -f "$server_log" ] && start=$(wc -c < "$server_log")
-  local target_start=0
-  [ -f "$TARGET_LOG" ] && target_start=$(wc -c < "$TARGET_LOG")
+  local origin_start=0
+  [ -f "$H3_LOG" ] && origin_start=$(wc -c < "$H3_LOG")
   local log="$PROBE_DIR/$arm/quic-udp.log"
+  local body="$PROBE_DIR/$arm/quic-udp.body"
+  : > "$body"
   local rc=0
-  ip netns exec tun-client timeout 12 curl --http3-only --noproxy '*' -k -sS \
-    --max-time 8 -o /dev/null -w '%{http_code}' https://10.10.2.2:4443/ \
+  ip netns exec tun-client timeout 12 curl --http3-only --insecure --noproxy '*' -sS \
+    --max-time 8 -o "$body" -w '%{http_code}' https://10.10.2.2:4443/ \
     > "$log" 2>&1 || rc=$?
   local code
   code="$(tr -d '\r\n' < "$log")"
   local curl_error
   curl_error="$(tr '\n' ' ' < "$log" | cut -c1-240)"
-  if [ "$rc" -eq 0 ] && [ "$code" = "200" ]; then
-    record "$RUN_DIR/results-$arm.tsv" "quic-udp" PASS "HTTP/3 200"
+  local body_text
+  body_text="$(tr '\n' ' ' < "$body" | cut -c1-120)"
+  if [ "$rc" -eq 0 ] && [ "$code" = "200" ] \
+      && grep -qF 'beam-tun-h3-ok' "$body"; then
+    record "$RUN_DIR/results-$arm.tsv" "quic-udp" PASS "HTTP/3 200 body=$body_text"
     return
   fi
   if [ "$arm" = "beam" ] && has_marker "$server_log" "$start" "authenticated VLESS command is not implemented yet"; then
     record "$RUN_DIR/results-$arm.tsv" "quic-udp" BLOCKED \
       "XUDP unimplemented; curl: $curl_error; beam: $(marker_line "$server_log" "$start" "authenticated VLESS command is not implemented yet")"
-  elif has_marker "$TARGET_LOG" "$target_start" "quic-sink received"; then
-    record "$RUN_DIR/results-$arm.tsv" "quic-udp" BLOCKED \
-      "UDP reaches the target but there is no local HTTP/3 origin; curl: $curl_error"
+  elif has_marker "$H3_LOG" "$origin_start" "-> 200"; then
+    record "$RUN_DIR/results-$arm.tsv" "quic-udp" FAIL \
+      "HTTP/3 origin answered but curl failed; curl: $curl_error"
+    UNEXPECTED_FAIL=1
   else
     record "$RUN_DIR/results-$arm.tsv" "quic-udp" FAIL \
-      "QUIC probe failed without reaching the target; curl: $curl_error"
+      "QUIC probe failed without reaching the HTTP/3 origin; curl: $curl_error"
     UNEXPECTED_FAIL=1
   fi
 }
@@ -707,7 +802,19 @@ run_suite() {
       "IPv6 is unavailable in the client or target namespace"
   fi
   probe_udp "$arm" "udp-echo" 10.10.2.2 9999
-  probe_dns "$arm"
+  if [ "$IPV6_AVAILABLE" = "1" ]; then
+    probe_udp "$arm" "udp-echo-v6" "fd00:2::2" 9999
+  else
+    record "$RUN_DIR/results-$arm.tsv" "udp-echo-v6" BLOCKED \
+      "IPv6 is unavailable in the client or target namespace"
+  fi
+  probe_dns "$arm" "dns-udp" "10.10.2.2" A 10.10.2.2
+  if [ "$IPV6_AVAILABLE" = "1" ]; then
+    probe_dns "$arm" "dns-udp-v6" "fd00:2::2" AAAA "fd00:2::2"
+  else
+    record "$RUN_DIR/results-$arm.tsv" "dns-udp-v6" BLOCKED \
+      "IPv6 is unavailable in the client or target namespace"
+  fi
   probe_quic "$arm"
   probe_https_curl "$arm"
 }

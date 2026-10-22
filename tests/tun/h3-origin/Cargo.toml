@@ -1,0 +1,19 @@
+[package]
+name = "h3-origin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep this helper out of the beam workspace: it is test-only and pulls in
+# QUIC/HTTP3 dependencies that the production server does not need.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+quinn = "0.11.12"
+rcgen = "0.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

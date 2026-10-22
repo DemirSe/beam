@@ -30,6 +30,7 @@ Updated: 2026-10-22.
 | Vision padding/direct state machine | Done |
 | XUDP frame codec | Done |
 | XUDP session table and UDP relay | Done |
+| XUDP over VLESS Mux | Done |
 | Linux fd/socket/splice primitives | Done |
 | Zero-copy splice relay loop | Done |
 | REALITY TLS server adapter (rustls) | Done |
@@ -39,24 +40,21 @@ Updated: 2026-10-22.
 | Vision Direct raw TLS handoff | Done |
 | Prefix replay stream | Done |
 | Stock Xray no-flow TCP interop | **HTTP 200** |
-| Stock Xray Vision TCP interop | **HTTP 200** |
+| Stock Xray Vision TCP/HTTPS interop | **HTTP 200** |
 | Cover-parity harness | Done; gaps documented |
-| XUDP over VLESS Mux | Done |
-| Full-TUN harness | TCP v4/v6, UDP, DNS, HTTPS Direct PASS; QUIC blocked on local H3 origin |
+| Full-TUN harness v2 | TCP v4/v6, IPv4/IPv6 UDP/DNS, QUIC/H3 and HTTPS probes added |
 | Stock Xray baseline + test fixture | Done |
 | Benchmark harness design | Done |
 
 ## In progress
 
-- TUN harness v2: IPv6 UDP/DNS and a local HTTP/3 origin.
+- Rerun TUN v2 with the merged Mux path (IPv6 UDP/DNS and local HTTP/3 origin).
+- Splice integration for the Vision Direct raw leg.
 
 ## Known gaps / not started
 
 - TLS extension-order and encrypted-flight-size parity.
-- QUIC/HTTP3 local origin (the UDP/XUDP path itself is validated by DNS/UDP echo).
 - Legacy VLESS UDP and packetaddr.
-- Splice integration for the Vision Direct raw leg.
-- Performance matrix against stock Xray.
 - Performance matrix and regression harness.
 - Deployment package and VPS cutover.
 
@@ -69,6 +67,7 @@ Updated: 2026-10-22.
 - `docs/06-benchmark-harness.md`: local benchmark topology and gates.
 - `docs/12-custom-tls-design.md`: reference-only exact-mirroring design.
 - `docs/13-vision-direct-design.md`: Direct raw-handoff design.
+- `docs/14-tun-harness.md`: full-TUN topology, probes, and control results.
 
 ## Current verification
 
@@ -77,9 +76,10 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 bash scripts/cover-parity.sh
+bash tests/tun/run.sh
 ```
 
 The workspace currently has 211 `beam-core` unit tests, two integration tests,
-and 22 `beam-sys` tests. The full-TUN harness passes TCP v4/v6, UDP echo, DNS,
-and HTTPS Direct through the real sing-box client; QUIC is blocked only by the
-lack of a local HTTP/3 origin in the harness.
+and 22 `beam-sys` tests. The pre-Mux TUN run passed TCP v4/v6, UDP echo, DNS,
+and HTTPS Direct. TUN v2 adds IPv6 UDP/DNS and a local HTTP/3 origin; its stock
+Xray control passes all eight probes.
