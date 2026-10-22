@@ -2,7 +2,7 @@
 
 This document records the implemented post-Vision-Direct path. The original
 plan required both directions to be raw before handoff; the benchmark results
-in section 7 led to an asymmetric write-only handoff.
+in section 7 led to independent one-way handoffs for each direction.
 Sources: `docs/08-vision-xudp-spec.md` §2.3–2.6, `docs/07-reality-spec.md`, `crates/beam-core/src/tls/server.rs`, `crates/beam-core/src/vision/{frame,state}.rs`.
 
 ## 1. Why `tokio-rustls` must go
@@ -175,13 +175,14 @@ Interop:
   but a timeout tears the connection down, so no duplicate bytes today.
 - **KeyUpdate**: a post-handshake KeyUpdate can queue output on a read-only connection;
   flush `outgoing` opportunistically in `poll_read`.
-- **Half-raw is mandatory**: forcing the downlink raw at uplink Direct breaks stock clients.
+- **Half-raw is mandatory**: either direction may be raw while the other is
+  framed. Never force one socket's raw handoff from the other direction's state.
 - **Splice handoff**: fds must be nonblocking (tokio sockets are) and the `TcpStream`s must
   outlive the blocking call.
 - **TLS 1.2 / detector**: config rejects TLS 1.2 (`tls/server.rs:217-219`), matching §2.3
   line 57; the downlink writer still inspects target bytes and sees the inner ServerHello.
 
-## 7. Asymmetric handoff (implemented)
+## 7. Symmetric handoff (implemented)
 
 The local HTTPS benchmark exposed a case the both-directions handoff missed:
 the server's Vision writer switches to Direct as soon as the target sends its
@@ -190,17 +191,32 @@ send. The reader therefore stays framed until the connection closes, and the
 old all-or-nothing rule kept the entire download on the tokio copy path
 (`framed_down` equalled the full 256 MiB response in instrumentation).
 
-The relay now watches the Vision writer independently. When the write side is
-raw, `relay_vision` duplicates the client write and target read descriptors and
-starts a blocking **one-way** `splice(2)` from target to client. The
-client-to-target direction remains on the async Vision copy path. The duplicate
-descriptors share the socket but are owned exactly once; the original
-`VisionStream` keeps the framed read half. A shared `RelayActivity` clock keeps
-one connection-wide idle deadline across both halves.
+The relay now watches each direction independently:
+
+- **Download**: when `write_direct_watch` fires, duplicate the client write and
+  target read descriptors and start a blocking one-way `splice(2)` from target
+  to client.
+- **Upload**: `read_handoff_watch` fires only after the reader is Direct and
+  every already-buffered prefix has been drained: Direct block content, raw
+  block remainder, and TLS read-ahead. The async loop has therefore already
+  written the ordered plaintext prefix to the target. Duplicate the client read
+  and target write descriptors and start a one-way splice from client to
+  target.
+
+If both directions become raw, beam keeps two independent one-way relays with
+one shared `RelayActivity` deadline. There is no competing full bidirectional
+relay and no handoff transition. Each duplicated descriptor is owned exactly
+once; the originals remain with the async half until that half stops.
 
 At the measured 211 MiB/s HTTPS rate the relay was waking for every 16-32 KiB
 TLS record. Slow bulk directions now accumulate data for 500 µs before one
 splice; the 2 MiB rate window disables batching again above 800 MiB/s. Fast
 transfers stay on the low-latency path. This reduced the local 256 MiB HTTPS
-server cost from 0.320 to 0.107 s/GiB at throughput parity while preserving the
-existing TUN probes.
+download server cost from 0.320 to 0.107 s/GiB at throughput parity.
+
+For upload, a 256 MiB HTTP `PUT` with `Expect: 100-continue` (so the stock
+client enters upload Direct early) dropped server cost from 0.285-0.289 to
+0.109-0.119 s/GiB at ~223 MiB/s. Without the early `100 Continue`, the stock
+client sends the whole body framed and only sends a final 24-byte Direct block;
+the upload handoff cannot help that client pattern (before 1.34, after 1.37
+s/GiB, within noise).

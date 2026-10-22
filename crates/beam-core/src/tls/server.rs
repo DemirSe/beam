@@ -721,13 +721,19 @@ where
     Ok(())
 }
 
-/// Relays a Vision stream, switching the bulk write direction to a one-way
-/// splice as soon as its raw socket is ready.
+/// Relays a Vision stream, handing each raw direction to its own one-way
+/// splice as soon as that direction is ready.
 ///
-/// The upload continues through Vision/tokio copy. This is deliberate: a client
-/// can receive the server's Direct block and then have no further upload to
-/// send, so requiring both directions to be raw would keep an entire download
-/// on the copy path.
+/// The upload and download halves are independent. A client can receive the
+/// server's Direct block without having more upload data (download-only), or
+/// send Direct upload data while the server writer is still framed. Waiting for
+/// both directions before using `splice(2)` leaves one bulk direction on the
+/// copy path in either case.
+///
+/// When both directions are raw, beam keeps two independent one-way relays
+/// with one shared [`RelayActivity`] deadline. It does not switch to a single
+/// bidirectional relay, so neither direction has to wait for the other to
+/// finish.
 async fn relay_vision(
     vision: VisionStream<TlsStream>,
     target: TcpStream,
@@ -735,97 +741,216 @@ async fn relay_vision(
 ) -> Result<(), TlsServerError> {
     let activity = Arc::new(RelayActivity::new());
     let mut write_direct = vision.write_direct_watch();
-    let (client_write, target_read_splice) =
-        match (vision.try_clone_raw_socket(), try_clone_tcp(&target)) {
-            (Ok(client_write), Ok(target_read_splice)) => (client_write, target_read_splice),
-            (client_result, target_result) => {
-                let client_error = client_result.err();
-                let target_error = target_result.err();
-                tracing::debug!(
-                    ?client_error,
-                    ?target_error,
-                    "could not clone raw Vision sockets; using the copy relay"
-                );
-                return relay_bidirectional(vision, target, idle_timeout).await;
-            }
-        };
+    let mut read_handoff = vision.read_handoff_watch();
+
+    let clones = (|| -> Result<_, TlsServerError> {
+        Ok((
+            vision.try_clone_raw_socket()?,
+            vision.try_clone_raw_socket()?,
+            try_clone_tcp(&target)?,
+            try_clone_tcp(&target)?,
+        ))
+    })();
+    let (client_read, client_write, target_read_splice, target_write_splice) = match clones {
+        Ok(clones) => clones,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "could not clone raw Vision sockets; using the copy relay"
+            );
+            return relay_bidirectional(vision, target, idle_timeout).await;
+        }
+    };
 
     let (mut vision_read, mut vision_write) = tokio::io::split(vision);
     let (mut target_read, mut target_write) = tokio::io::split(target);
 
     let up_activity = Arc::clone(&activity);
-    let up = tokio::spawn(async move {
-        copy_direction(
+    let up = async move {
+        let (copied_up, raw_read) = copy_direction_until_read_handoff(
             &mut vision_read,
             &mut target_write,
             idle_timeout,
+            &mut read_handoff,
             Some(&up_activity),
         )
-        .await
-    });
-
-    let down = copy_direction_until_write_raw(
-        &mut target_read,
-        &mut vision_write,
-        idle_timeout,
-        &mut write_direct,
-        Some(&activity),
-    )
-    .await;
-
-    let (copied_down, raw_write) = match down {
-        Ok(result) => result,
-        Err(error) => {
-            up.abort();
-            return Err(error);
+        .await?;
+        if !raw_read {
+            tracing::debug!(copied_up, "Vision relay finished without a raw read");
+            return Ok(());
         }
-    };
-    drop(vision_write);
-    drop(target_read);
 
-    if !raw_write {
-        let copied_up = up.await.map_err(join_error)??;
         tracing::debug!(
             copied_up,
-            copied_down,
-            "Vision relay finished without a raw write"
+            "Vision read switched to raw; starting one-way upload splice"
         );
-        return Ok(());
+        let config = splice_config(idle_timeout);
+        let relay_activity = Arc::clone(&up_activity);
+        let result = tokio::task::spawn_blocking(move || {
+            copy_one_way(
+                client_read.as_raw_fd(),
+                target_write_splice.as_raw_fd(),
+                &config,
+                Some(&relay_activity),
+            )
+        })
+        .await
+        .map_err(join_error)?;
+        match result {
+            Ok(stats) => tracing::debug!(
+                copied_up,
+                bytes = stats.bytes_a_to_b,
+                splice_calls = stats.splice_calls,
+                polls = stats.polls,
+                "one-way Vision upload splice finished"
+            ),
+            Err(error) if is_peer_closed(&error) => {
+                tracing::debug!(%error, copied_up, "one-way Vision upload splice peer closed");
+            }
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+        Ok(())
+    };
+
+    let down_activity = Arc::clone(&activity);
+    let down = async move {
+        let (copied_down, raw_write) = copy_direction_until_write_raw(
+            &mut target_read,
+            &mut vision_write,
+            idle_timeout,
+            &mut write_direct,
+            Some(&down_activity),
+        )
+        .await?;
+        if !raw_write {
+            tracing::debug!(copied_down, "Vision relay finished without a raw write");
+            return Ok(());
+        }
+
+        tracing::debug!(
+            copied_down,
+            "Vision write switched to raw; starting one-way download splice"
+        );
+        let config = splice_config(idle_timeout);
+        let relay_activity = Arc::clone(&down_activity);
+        let result = tokio::task::spawn_blocking(move || {
+            copy_one_way(
+                target_read_splice.as_raw_fd(),
+                client_write.as_raw_fd(),
+                &config,
+                Some(&relay_activity),
+            )
+        })
+        .await
+        .map_err(join_error)?;
+        match result {
+            Ok(stats) => tracing::debug!(
+                copied_down,
+                bytes = stats.bytes_a_to_b,
+                splice_calls = stats.splice_calls,
+                polls = stats.polls,
+                "one-way Vision download splice finished"
+            ),
+            Err(error) if is_peer_closed(&error) => {
+                tracing::debug!(%error, copied_down, "one-way Vision download splice peer closed");
+            }
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+        Ok(())
+    };
+
+    tokio::try_join!(up, down)?;
+    Ok(())
+}
+
+/// Copies the client-to-target direction until the reader's raw handoff is
+/// safe. Returns the copied byte count and whether the read direction switched.
+///
+/// The watch is published only after the Vision reader has drained every
+/// ordered prefix byte: block content, raw block remainder, and TLS read-ahead.
+/// Those bytes are written to the target before this function returns, so the
+/// blocking upload splice can start at the raw socket without a separate
+/// prefix buffer.
+async fn copy_direction_until_read_handoff<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle_timeout: Duration,
+    read_handoff: &mut watch::Receiver<bool>,
+    activity_clock: Option<&RelayActivity>,
+) -> Result<(u64, bool), TlsServerError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0u8; RELAY_BUFFER_LEN];
+    let mut relayed = 0_u64;
+    loop {
+        if *read_handoff.borrow() {
+            return Ok((relayed, true));
+        }
+
+        let read = tokio::select! {
+            changed = read_handoff.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                if *read_handoff.borrow() {
+                    return Ok((relayed, true));
+                }
+                continue;
+            }
+            read = timeout(idle_timeout, reader.read(&mut buffer)) => read,
+        };
+        let count = match read {
+            Ok(result) => result?,
+            Err(_) => {
+                if activity_clock
+                    .and_then(RelayActivity::elapsed)
+                    .is_some_and(|elapsed| elapsed < idle_timeout)
+                {
+                    continue;
+                }
+                return Err(TlsServerError::Timeout {
+                    stage: "relay read",
+                });
+            }
+        };
+        if count == 0 {
+            break;
+        }
+
+        let write = timeout(idle_timeout, writer.write_all(&buffer[..count]))
+            .await
+            .map_err(|_| TlsServerError::Timeout {
+                stage: "relay write",
+            })?;
+        match write {
+            Ok(()) => {
+                relayed = relayed.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                if let Some(clock) = activity_clock {
+                    clock.touch();
+                }
+            }
+            Err(error) if is_peer_closed(&error) => break,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+
+        if *read_handoff.borrow() {
+            return Ok((relayed, true));
+        }
     }
 
-    tracing::debug!(
-        copied_down,
-        "Vision write switched to raw; starting one-way splice"
-    );
-    let config = splice_config(idle_timeout);
-    let relay_activity = Arc::clone(&activity);
-    let relay = tokio::task::spawn_blocking(move || {
-        copy_one_way(
-            target_read_splice.as_raw_fd(),
-            client_write.as_raw_fd(),
-            &config,
-            Some(&relay_activity),
-        )
-    });
-
-    let (up_result, relay_result) = tokio::join!(up, relay);
-    let copied_up = up_result.map_err(join_error)??;
-    let relay_result = relay_result.map_err(join_error)?;
-    match relay_result {
-        Ok(stats) => tracing::debug!(
-            copied_up,
-            copied_down,
-            bytes = stats.bytes_a_to_b,
-            splice_calls = stats.splice_calls,
-            polls = stats.polls,
-            "one-way Vision splice finished"
-        ),
-        Err(error) if is_peer_closed(&error) => {
-            tracing::debug!(%error, copied_up, "one-way Vision splice peer closed");
-        }
+    let shutdown = timeout(idle_timeout, writer.shutdown())
+        .await
+        .map_err(|_| TlsServerError::Timeout {
+            stage: "relay shutdown",
+        })?;
+    match shutdown {
+        Ok(()) => {}
+        Err(error) if is_peer_closed(&error) => {}
         Err(error) => return Err(TlsServerError::Io(error)),
     }
-    Ok(())
+    Ok((relayed, false))
 }
 
 /// Copies the target-to-client direction until the Vision writer is raw.

@@ -61,6 +61,7 @@ pub struct VisionStream<S, R = SmallRng> {
     pending_direct_switch: bool,
     direct_tx: watch::Sender<bool>,
     write_direct_tx: watch::Sender<bool>,
+    read_handoff_tx: watch::Sender<bool>,
     rng: R,
     write_queue: Vec<u8>,
     write_queue_offset: usize,
@@ -80,6 +81,7 @@ where
     pub fn new(inner: S, user_id: [u8; 16], initial_body: Vec<u8>, rng: R) -> Self {
         let (direct_tx, _) = watch::channel(false);
         let (write_direct_tx, _) = watch::channel(false);
+        let (read_handoff_tx, _) = watch::channel(false);
         Self {
             inner,
             user_id,
@@ -95,6 +97,7 @@ where
             pending_direct_switch: false,
             direct_tx,
             write_direct_tx,
+            read_handoff_tx,
             rng,
             write_queue: Vec::new(),
             write_queue_offset: 0,
@@ -138,6 +141,17 @@ where
     /// Watches whether the write direction has switched to the raw socket.
     pub fn write_direct_watch(&self) -> watch::Receiver<bool> {
         self.write_direct_tx.subscribe()
+    }
+
+    /// Watches the upload handoff boundary.
+    ///
+    /// The value becomes `true` only after the read side is Direct and all
+    /// already-buffered Vision block bytes, raw block remainder, and decrypted
+    /// TLS read-ahead have been drained. At that point the next read goes to
+    /// the raw socket, so the client read side can be handed to a one-way
+    /// splice without losing ordered plaintext.
+    pub fn read_handoff_watch(&self) -> watch::Receiver<bool> {
+        self.read_handoff_tx.subscribe()
     }
 
     /// Returns a duplicate of the underlying raw socket for a one-way splice.
@@ -361,6 +375,12 @@ where
                         this.direct_plaintext_offset = 0;
                     }
                     return Poll::Ready(Ok(()));
+                }
+                if this.read_is_raw() {
+                    // All ordered plaintext before the raw socket is drained.
+                    // Publish before polling the socket so the async relay can
+                    // stop without consuming the first raw bytes.
+                    this.read_handoff_tx.send_replace(true);
                 }
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
@@ -827,6 +847,7 @@ mod tests {
         peer.shutdown().await.expect("shutdown Direct writer");
 
         let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(8));
+        let handoff = vision.read_handoff_watch();
         let mut output = Vec::new();
         vision
             .read_to_end(&mut output)
@@ -836,6 +857,7 @@ mod tests {
         assert_eq!(raw.len() - block_len, 3);
         assert!(vision.read_is_raw());
         assert!(!vision.write_is_raw());
+        assert!(*handoff.borrow());
     }
 
     #[tokio::test]
