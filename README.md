@@ -63,6 +63,7 @@ value before deployment.
 - [`docs/11-status.md`](docs/11-status.md)
 - [`docs/12-custom-tls-design.md`](docs/12-custom-tls-design.md)
 - [`docs/13-vision-direct-design.md`](docs/13-vision-direct-design.md)
+- [`docs/14-tun-harness.md`](docs/14-tun-harness.md)
 
 ## Repository layout
 

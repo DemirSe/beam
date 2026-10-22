@@ -39,6 +39,7 @@ Updated: 2026-10-22.
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP interop | **HTTP 200** |
 | Cover-parity harness | Done; gaps documented |
+| Full-TUN harness | Done; TCP v4/v6 PASS, UDP/DNS/QUIC and HTTPS Direct BLOCKED |
 | Stock Xray baseline + test fixture | Done |
 | Benchmark harness design | Done |
 
@@ -46,13 +47,12 @@ Updated: 2026-10-22.
 
 - Vision Direct implementation (raw TLS handoff).
 - Mux command integration with the XUDP session layer.
-- Full TUN harness.
 
 ## Known gaps / not started
 
 - Vision Direct transition to raw sockets, including TLS read-ahead.
 - TLS extension-order and encrypted-flight-size parity.
-- Full TUN interoperability tests (DNS, QUIC, IPv6).
+- Full TUN UDP/DNS/QUIC (blocked on Mux integration).
 - Performance matrix and regression harness.
 - Deployment package and VPS cutover.
 
