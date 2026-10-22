@@ -31,6 +31,8 @@ Updated: 2026-10-22.
 | XUDP frame codec | Done |
 | XUDP session table and UDP relay | Done |
 | XUDP over VLESS Mux | Done |
+| Legacy VLESS UDP (`Command::Udp`) | Done |
+| packetaddr multi-destination UDP | Done |
 | Linux fd/socket/splice primitives | Done |
 | Zero-copy splice relay loop | Done |
 | REALITY TLS server adapter (rustls) | Done |
@@ -43,6 +45,8 @@ Updated: 2026-10-22.
 | Stock Xray Vision TCP/HTTPS interop | **HTTP 200** |
 | Cover-parity harness | Done; gaps documented |
 | Full-TUN harness v2 | **8/8 PASS** with sing-box TUN |
+| Full-TUN packetaddr arm | **8/8 PASS** (`--udp-mode packetaddr`) |
+| Full-TUN legacy UDP arm | **8/8 PASS** (`--udp-mode legacy`) |
 | Stock Xray baseline + test fixture | Done |
 | Benchmark harness design | Done |
 
@@ -66,7 +70,6 @@ Updated: 2026-10-22.
 ## Known gaps / not started
 
 - TLS extension-order and encrypted-flight-size parity.
-- Legacy VLESS UDP and packetaddr for clients that do not use XUDP.
 - Performance matrix and regression harness against stock Xray.
 - Deployment package and VPS cutover.
 
@@ -91,6 +94,9 @@ bash scripts/cover-parity.sh
 bash tests/tun/run.sh
 ```
 
-The workspace currently has 211 `beam-core` unit tests, two integration tests,
+The workspace currently has 232 `beam-core` unit tests, two integration tests,
 and 22 `beam-sys` tests. The full-TUN harness passes all eight probes through
-the real sing-box client, and the stock Xray control passes the same matrix.
+the real sing-box client with `packet_encoding` set to `xudp`, `packetaddr`,
+and `""` (legacy), and the stock Xray control passes the same matrix. Evidence
+for the new arms is in `docs/14-tun-harness.md` and
+`docs/08-vision-xudp-spec.md` section 4.

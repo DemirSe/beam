@@ -8,6 +8,7 @@ pub mod prepend_stream;
 pub mod reality;
 pub mod relay;
 pub mod tls;
+pub mod udp;
 pub mod vision;
 pub mod vless;
 pub mod xudp;

@@ -114,6 +114,12 @@ def main() -> int:
     parser.add_argument("--cover", required=True, help="REALITY cover address")
     parser.add_argument("--singbox", action="store_true", help="also render singbox.json")
     parser.add_argument("--xray", action="store_true", help="also render xray-server.json")
+    parser.add_argument(
+        "--packet-encoding",
+        choices=("xudp", "packetaddr", "legacy"),
+        default="xudp",
+        help="sing-box UDP mode: xudp, packetaddr, or legacy (empty string)",
+    )
     args = parser.parse_args()
 
     source = args.test_config.read_text(encoding="utf-8")
@@ -160,7 +166,9 @@ def main() -> int:
                     "server_port": int(args.listen.rsplit(":", 1)[1]),
                     "uuid": user_id,
                     "flow": flow,
-                    "packet_encoding": "xudp",
+                    "packet_encoding": (
+                        "" if args.packet_encoding == "legacy" else args.packet_encoding
+                    ),
                     "tls": {
                         "enabled": True,
                         "server_name": server_names[0],

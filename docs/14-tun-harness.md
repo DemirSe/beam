@@ -3,8 +3,8 @@
 Status: implemented and verified on 2026-10-22. This document describes
 `tests/tun/run.sh`, the local lab that drives the real sing-box v1.14.3
 full-TUN client through `beam`. The IPv6 UDP/DNS probes and the local HTTP/3
-origin are part of this harness; the `beam` UDP rows still report BLOCKED until
-the Mux command is integrated.
+origin are part of this harness. The default UDP arm is `xudp`; `--udp-mode`
+also selects the legacy VLESS UDP and packetaddr arms.
 
 The harness is intentionally separate from `docs/06-benchmark-harness.md`: it
 checks correctness and honest capability reporting, not throughput or latency.
@@ -22,7 +22,7 @@ client namespace                         server namespace                  targe
                                           vs 10.10.2.1/24, fd00:2::1/64 -- ts 10.10.2.2/24
                                                                            fd00:2::2/64
   sing-box TUN inbound                    beam VLESS+REALITY+Vision :443    HTTP :8080 (v4/v6)
-  VLESS outbound, xudp, utls chrome                                         HTTPS :4443
+  VLESS outbound, udp mode, utls chrome                                     HTTPS :4443
                                                                             UDP echo :9999 (v4/v6)
                                                                             DNS :53 (v4/v6)
                                                                             HTTP/3 origin UDP :4443
@@ -64,6 +64,9 @@ The sing-box outbound is the production profile:
 }
 ```
 
+`--udp-mode` rewrites `packet_encoding` to `packetaddr` or to the empty string
+(`legacy`) for the compatibility arms; the default stays `xudp`.
+
 `config.py` reads the UUID, private key, short id, and SNI from the test
 fixture, derives the X25519 public key with a small RFC 7748 implementation,
 and writes `beam.toml`, `singbox.json`, and optionally `xray-server.json` into
@@ -86,6 +89,8 @@ bash tests/tun/run.sh --control          # add the stock Xray control arm
 bash tests/tun/run.sh --release          # build target/release/beam
 bash tests/tun/run.sh --no-build         # reuse the existing binaries
 bash tests/tun/run.sh --out /tmp/my-run  # explicit run directory
+bash tests/tun/run.sh --udp-mode packetaddr  # packetaddr UDP
+bash tests/tun/run.sh --udp-mode legacy      # packet_encoding ""
 SKIP_BUILD=1 bash tests/tun/run.sh       # same as --no-build
 ```
 
@@ -105,6 +110,7 @@ Environment variables:
 | `TUN_OUT` | `/tmp/opencode/beam-tun/<UTC>-<pid>` | run directory |
 | `SKIP_BUILD` | `0` | reuse `target/<profile>/beam` and the H3 origin |
 | `H3_ORIGIN_BIN` | built helper | use a prebuilt `h3-origin` binary |
+| `UDP_MODE` | `xudp` | sing-box `packet_encoding`: `xudp`, `packetaddr`, or `legacy` |
 | `TUN_FORCE_BLOCK` | `0` | force the TUN-blocked reporting path (test hook) |
 
 ### Local HTTP/3 origin
@@ -154,21 +160,31 @@ A known server limitation is never reported as `PASS` and does not make the
 run fail. A `BLOCKED` row is deliberately explicit; the table includes the
 observed client error and the matching server log message.
 
-## Verified result table (2026-10-22, beam worktree `feat/tun-v2`)
+## Verified result table (2026-10-22)
+
+Default `--udp-mode xudp` arm:
 
 | Test | beam | Detail |
 |---|---|---|
 | `tcp-http-v4` | **PASS** | HTTP 200, body `beam-tun-ok` through TUN → VLESS → target `10.10.2.2:8080` |
 | `tcp-http-v6` | **PASS** | HTTP 200, body `beam-tun-ok` through TUN → VLESS → target `[fd00:2::2]:8080` |
-| `udp-echo` | **BLOCKED** | XUDP/Mux not integrated; target `10.10.2.2:9999` is never reached |
-| `udp-echo-v6` | **BLOCKED** | Same XUDP/Mux blocker; target `[fd00:2::2]:9999` is never reached |
-| `dns-udp` | **BLOCKED** | Same blocker; `dig @10.10.2.2 target.test A` times out |
-| `dns-udp-v6` | **BLOCKED** | Same blocker; `dig @fd00:2::2 target.test AAAA` times out |
-| `quic-udp` | **BLOCKED** | HTTP/3 origin is ready, but `curl --http3-only` never reaches it because UDP is Mux-blocked |
+| `udp-echo` | **PASS** | Exact payload echoed through XUDP to `10.10.2.2:9999` |
+| `udp-echo-v6` | **PASS** | Exact payload echoed through XUDP to `[fd00:2::2]:9999` |
+| `dns-udp` | **PASS** | `NOERROR`, A record `10.10.2.2` |
+| `dns-udp-v6` | **PASS** | `NOERROR`, AAAA record `fd00:2::2` |
+| `quic-udp` | **PASS** | HTTP/3 200, body `beam-tun-h3-ok` from the local origin |
 | `https-direct` | **PASS** | `http=200` through the Vision Direct raw TLS handoff |
 
+UDP encoding arms run on 2026-10-22 with the same sing-box v1.14.3 client:
+
+| Arm | `packet_encoding` | Result | Evidence |
+|---|---|---|---|
+| `xudp` | `"xudp"` | **8/8 PASS** | default full-TUN arm |
+| `packetaddr` | `"packetaddr"` | **8/8 PASS** | `/tmp/opencode/tun-packetaddr`; beam logs `Authenticated { command: Udp }` for the five UDP flows |
+| `legacy` | `""` | **8/8 PASS** | `/tmp/opencode/tun-legacy`; beam logs `Authenticated { command: Udp }` for the five UDP flows |
+
 The stock Xray control on the same topology and the same sing-box client
-proves the harness itself is capable of every blocked path:
+proves the harness itself is capable of every path:
 
 | Test | stock Xray | Detail |
 |---|---|---|
@@ -187,22 +203,18 @@ Run the control with:
 bash tests/tun/run.sh --control
 ```
 
-## Exact blockers
+## Blockers, past and present
 
-### XUDP / UDP / DNS / QUIC
+### XUDP / UDP / DNS / QUIC (resolved)
 
-`beam-core/src/tls/server.rs` handles only `Command::Tcp`. Every other command
-is logged and the connection is closed:
+`Command::Mux` (XUDP), `Command::Udp` (legacy and packetaddr), and both
+address families are implemented. The UDP echo, DNS, and QUIC rows pass in all
+three UDP encoding arms. A connection that selects an unimplemented command
+(such as `Command::Rvs`) is still logged and closed:
 
 ```text
-WARN beam_core::tls::server: authenticated VLESS command is not implemented yet; closing command=Mux
+WARN beam_core::tls::server: authenticated VLESS command is not implemented yet; closing command=Rvs
 ```
-
-sing-box with `packet_encoding: xudp` sends UDP as a Mux command, so the IPv4
-and IPv6 UDP echo, DNS, and QUIC probes all hit this line. The target services
-are healthy: the stock Xray control echoes both UDP families, answers A and
-AAAA queries, and completes HTTP/3 against the same local origin. This is a
-server capability blocker, not a harness failure.
 
 ### Vision Direct / HTTPS (resolved)
 
@@ -215,10 +227,8 @@ it exercises the inner TLS connection through the same full-TUN client.
 QUIC uses UDP/443 (here UDP/4443). The target runs a real HTTP/3 origin that
 terminates QUIC and serves `beam-tun-h3-ok`; the harness sends
 `curl --http3-only --insecure` through the TUN and validates both the status
-and the body. The stock Xray control completes this request (HTTP/3 200). On
-`beam`, the Mux command is still rejected before any UDP packet leaves the
-server, so `curl` times out and the row is BLOCKED with the `command=Mux` log
-line. When Mux integration lands, no origin work remains for this probe.
+and the body. Both `beam` and the stock Xray control complete this request
+(HTTP/3 200) in every UDP encoding arm.
 
 When the H3 helper is unavailable, the target falls back to a UDP sink on 4443
 to distinguish "packet reached the target" from "the tunnel dropped it". The
@@ -281,9 +291,8 @@ repository files and must not be replaced with production values.
 - The H3 helper is test-only and lives in its own workspace under
   `tests/tun/h3-origin`; `cargo build --workspace` at the repository root does
   not build it and production `beam` does not depend on it.
-- QUIC now has a real local HTTP/3 origin, and the stock Xray control completes
-  the request. The `beam` row is `BLOCKED` only until the Mux command is
-  integrated; no further origin work is required.
+- QUIC has a real local HTTP/3 origin, and both `beam` and the stock Xray
+  control complete the request. No further origin work is required.
 - ICMP is not carried by VLESS and is not tested; stock Xray has the same
   limitation (`docs/00-scope.md`).
 - The client namespace logs `network: missing default interface` at startup
