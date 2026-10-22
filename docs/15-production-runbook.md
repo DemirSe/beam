@@ -17,7 +17,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | Item | State |
 |---|---|
 | Host | Debian 13.6, x86_64, 1 vCPU, 1 GiB RAM, 1 GiB swap |
-| Service | `beam.service`, active and enabled, `User=beam`, `0.0.0.0:443`; cover `whatsapp.net:443`; limits 64 connections / 10 s handshake |
+| Service | `beam.service`, active and enabled, `User=beam`, `0.0.0.0:443`; cover `whatsapp.net:443`; limits 64 connections / 10 s handshake; systemd exposure 1.7 OK |
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
 | Unit / backups | `/etc/systemd/system/beam.service` 0644; `*.bak-<UTC stamp>` beside each installed file |

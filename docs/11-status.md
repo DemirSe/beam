@@ -124,7 +124,8 @@ UDP modes:
     `net.core.rmem_max=4 MiB`.
   - systemd sandbox extended with a syscall filter, kernel/control-group/clock
     protection, no devices, no namespaces, no new privileges, and core dumps
-    disabled.
+    disabled. `systemd-analyze security beam` reports **1.7 OK** (was 5.6
+    MEDIUM).
   - Host nftables is enabled with default-deny input; 22/443, established,
     ICMP/ICMPv6 and loopback are allowed; LLMNR is dropped.
   - SSH is `AllowUsers demir`, `PermitRootLogin no`, key-only, X11 off,
