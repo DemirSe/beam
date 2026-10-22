@@ -158,8 +158,9 @@ UDP modes:
 
 - A light 24-hour background soak started on 2026-10-22 12:52 UTC from the
   laptop: 1 MiB HTTPS, DNS, small H3 and IPv6 every 5 minutes, with server
-  RSS/fd/thread samples. Logs: `/tmp/opencode/soak-24h-live2/`. Stop with
-  `kill 2076352`. This is not the privileged quiet syscall/wakeup acceptance.
+  RSS/fd/thread samples. It was paused for the detailed benchmark and resumed
+  at 15:42 UTC. Logs: `/tmp/opencode/soak-24h-live3/`; stop with
+  `kill 2089354`. This is not the privileged quiet syscall/wakeup acceptance.
 - Residual large-HTTP/3 stalls through the production TUN; the local lab shows
   the same failure with a gVisor TUN on both beam and stock Xray, so the client
   TUN stack is a contributing factor. Small H3 requests and large H3 bodies
