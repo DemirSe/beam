@@ -36,21 +36,21 @@ Updated: 2026-10-22.
 | Cover fallback (byte-exact ClientHello) | Done |
 | VLESS user validation | Done |
 | Vision-framed relay | Done |
+| Vision Direct raw TLS handoff | Done |
+| Prefix replay stream | Done |
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP interop | **HTTP 200** |
 | Cover-parity harness | Done; gaps documented |
-| Full-TUN harness | Done; TCP v4/v6 PASS, UDP/DNS/QUIC and HTTPS Direct BLOCKED |
+| Full-TUN harness | Done; TCP v4/v6 and HTTPS Direct PASS; UDP/DNS/QUIC blocked on Mux |
 | Stock Xray baseline + test fixture | Done |
 | Benchmark harness design | Done |
 
 ## In progress
 
-- Vision Direct implementation (raw TLS handoff).
 - Mux command integration with the XUDP session layer.
 
 ## Known gaps / not started
 
-- Vision Direct transition to raw sockets, including TLS read-ahead.
 - TLS extension-order and encrypted-flight-size parity.
 - Full TUN UDP/DNS/QUIC (blocked on Mux integration).
 - Performance matrix and regression harness.
@@ -75,6 +75,6 @@ cargo test --workspace
 bash scripts/cover-parity.sh
 ```
 
-The workspace currently has 202 `beam-core` unit tests, two integration tests,
-and 22 `beam-sys` tests. Both the no-flow and Vision stock Xray clients complete
-a REALITY handshake and an HTTP request through the `beam` binary.
+The workspace currently has 210 `beam-core` unit tests, two integration tests,
+and 22 `beam-sys` tests. The full-TUN harness passes TCP v4/v6 and HTTPS Direct
+through the real sing-box client; UDP/DNS still need the Mux path.
