@@ -1,8 +1,8 @@
 # Production runbook
 Live single-user `beam` deployment, 2026-10-22. This file has no UUIDs, short
-IDs, private keys, client links, or server address. Secrets stay in
-`~/.config/beam/` locally and `/etc/beam/config.toml` on the host. Replace
-`<server>` and define:
+IDs, private keys, or client links. Public server addresses are included.
+Secrets stay in `~/.config/beam/` locally and `/etc/beam/config.toml` on the
+host. Replace `<server>` and define:
 ```bash
 export HOST="<server>"
 export SERVER=demir@$HOST
@@ -24,7 +24,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | Local client | sing-box, `/etc/sing-box/config.json` 0600, active but disabled at boot |
 | Client identity | `~/.config/beam/client-identity.json`, `client-link.txt` 0600 |
 | Tunnel egress | IPv4 `158.94.216.102`, IPv6 `2a01:f900:11:168::1` |
-| Firewall | No `nftables`/`ufw`; provider firewall allows only 22/443 |
+| Firewall | No host `nftables`/`ufw`; provider firewall is the only firewall (allowlist not verified here) |
 
 Old stock Xray is absent; only TCP/443 and SSH 22 are exposed. The unit sets
 `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `LimitNOFILE=65536`, and only `CAP_NET_BIND_SERVICE`.
@@ -74,13 +74,17 @@ curl --http3-only -sS -o /dev/null -w '%{http_code}\n' https://cloudflare-quic.c
 The HTTP checks must print `200`; DNS must return addresses. HTTP/3 needs a
 curl built with HTTP/3 (`curl --version | grep -i HTTP3`). This covers HTTPS,
 HTTP, DNS, HTTP/3, IPv6, and Vision Direct; UDP echo is lab-only.
-Check that unauthenticated TLS still reaches the real cover:
+Check that unauthenticated TLS still reaches the real cover. The laptop may not
+have the `openssl` CLI, so use curl's verbose certificate output:
 ```bash
-openssl s_client -connect "$HOST:443" -servername whatsapp.net -showcerts </dev/null 2>/dev/null \
-  | openssl x509 -noout -subject -issuer -ext subjectAltName
+curl --interface wlp0s20f3 --resolve "whatsapp.net:443:$HOST" \
+  -sS -v -o /dev/null https://whatsapp.net/ 2>&1 \
+  | grep -E 'subject:|issuer:|SSL connection'
 ```
-Expect a public certificate for `*.whatsapp.net`, not a beam certificate; this
-proves cover forwarding.
+Expect a public certificate for `*.whatsapp.net` issued by a public CA, not a
+beam certificate; this proves cover forwarding. Drop `--interface` on a host
+without the TUN, or use the active Wi-Fi interface if the TUN intercepts the
+server IP.
 Run the local full-TUN matrix after client or server changes:
 ```bash
 source scripts/dev-env.sh
@@ -144,7 +148,7 @@ compatibility binary; otherwise use a trusted X25519 generator with raw-base64ur
 umask 077
 /tmp/opencode/xray-server-compare/xray x25519 > ~/.config/beam/new-identity.txt
 chmod 600 ~/.config/beam/new-identity.txt
-openssl rand -hex 8 > ~/.config/beam/new-short-id.txt
+python3 -c 'import secrets; print(secrets.token_hex(8))' > ~/.config/beam/new-short-id.txt
 python3 -c 'import uuid; print(uuid.uuid4())' > ~/.config/beam/new-user-id.txt
 ```
 Copy the values into `~/.config/beam/beam.toml` and
