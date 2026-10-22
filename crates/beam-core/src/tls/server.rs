@@ -47,6 +47,13 @@ use crate::xudp::{MuxError, XudpConfig, handle_mux_stream};
 /// Idle timeout for each relay read, write, and shutdown.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Idle timeout for unauthenticated cover relays.
+///
+/// Cover connections are not authenticated and must not pin a blocking splice
+/// thread for the full VPN idle timeout. A slow cover handshake or an idle
+/// probe is closed after this bound.
+const COVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Relay buffer large enough for one maximum-size inner TLS record, including
 /// its five-byte header.
 const RELAY_BUFFER_LEN: usize = 16_384 + 256 + 5;
@@ -629,7 +636,7 @@ async fn forward_to_cover(
         .map_err(|_| TlsServerError::Timeout {
             stage: "cover ClientHello write",
         })??;
-    relay_splice(client, cover).await?;
+    relay_splice(client, cover, COVER_IDLE_TIMEOUT).await?;
     Ok(ConnectionOutcome::CoverForwarded)
 }
 
@@ -1046,8 +1053,12 @@ fn try_clone_tcp(stream: &TcpStream) -> Result<TcpStream, TlsServerError> {
 }
 
 /// Hands two raw sockets to the blocking splice relay.
-async fn relay_splice(left: TcpStream, right: TcpStream) -> Result<(), TlsServerError> {
-    let config = splice_config(RELAY_IDLE_TIMEOUT);
+async fn relay_splice(
+    left: TcpStream,
+    right: TcpStream,
+    idle_timeout: Duration,
+) -> Result<(), TlsServerError> {
+    let config = splice_config(idle_timeout);
     let result = tokio::task::spawn_blocking(move || {
         copy_bidirectional(left.as_raw_fd(), right.as_raw_fd(), &config)
     })
