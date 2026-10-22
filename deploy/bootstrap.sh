@@ -1,0 +1,74 @@
+#!/bin/bash
+# Bootstrap beam on a fresh Debian 13 host. Run as root from the bundle directory.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$HERE/beam"
+CONFIG="$HERE/beam.toml"
+UNIT="$HERE/beam.service"
+INSTALL_BIN=/usr/local/bin/beam
+INSTALL_CONFIG=/etc/beam/config.toml
+INSTALL_UNIT=/etc/systemd/system/beam.service
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+
+[ "$(id -u)" -eq 0 ] || { echo "bootstrap: must run as root" >&2; exit 1; }
+for file in "$BIN" "$CONFIG" "$UNIT"; do
+  [ -f "$file" ] || { echo "bootstrap: missing $file" >&2; exit 1; }
+done
+[ "$(uname -m)" = "x86_64" ] || { echo "bootstrap: expected x86_64" >&2; exit 1; }
+
+if [ -r /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "${ID:-} ${VERSION_ID:-}" in
+    "debian 13") ;;
+    *) echo "bootstrap: warning: tested on Debian 13, found ${PRETTY_NAME:-unknown}" >&2 ;;
+  esac
+fi
+
+# Stop any old stock/comparison listeners so 443 is free.
+for unit in xray.service xray-compare.service; do
+  if systemctl list-unit-files "$unit" >/dev/null 2>&1; then
+    systemctl stop "$unit" 2>/dev/null || true
+    systemctl disable "$unit" 2>/dev/null || true
+  fi
+done
+
+if ! getent group beam >/dev/null; then
+  groupadd --system beam
+fi
+if ! id beam >/dev/null 2>&1; then
+  useradd --system --gid beam --home-dir /nonexistent --shell /usr/sbin/nologin beam
+fi
+
+install -d -m 0750 -o root -g beam /etc/beam
+for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT"; do
+  if [ -e "$old" ]; then
+    cp -a "$old" "$old.bak-$STAMP"
+  fi
+done
+
+install -m 0755 -o root -g root "$BIN" "$INSTALL_BIN"
+install -m 0600 -o root -g beam "$CONFIG" "$INSTALL_CONFIG"
+install -m 0644 -o root -g root "$UNIT" "$INSTALL_UNIT"
+
+runuser -u beam -- "$INSTALL_BIN" --check -c "$INSTALL_CONFIG"
+
+systemctl daemon-reload
+systemctl enable --now beam
+sleep 2
+systemctl is-active --quiet beam || {
+  systemctl status --no-pager -l beam || true
+  journalctl -u beam -n 50 --no-pager || true
+  exit 1
+}
+
+ss -ltn | grep -q ':443 ' || {
+  echo "bootstrap: beam is active but not listening on 443" >&2
+  systemctl status --no-pager -l beam || true
+  journalctl -u beam -n 50 --no-pager || true
+  exit 1
+}
+
+echo "bootstrap: beam is active on 443"
+systemctl status --no-pager -l beam | sed -n '1,12p'
