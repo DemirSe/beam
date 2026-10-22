@@ -6,7 +6,8 @@
 //! Unauthenticated connections are forwarded byte-for-byte to the configured
 //! cover. The adapter implements the TLS handshake, a minimal TCP VLESS path,
 //! and XTLS Vision framing, including the raw inner-TLS handoff on Vision
-//! Direct. XUDP is deliberately out of scope.
+//! Direct. XUDP mux streams are relayed through [`crate::xudp`]; legacy VLESS
+//! UDP and reverse streams remain out of scope.
 
 use std::fmt;
 use std::io;
@@ -30,11 +31,13 @@ use tokio::time::timeout;
 use zeroize::Zeroizing;
 
 use crate::address::{Address, NetLocation};
+use crate::prepend_stream::PrependStream;
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
 use crate::tls::stream::{TlsStream, TlsStreamError};
 use crate::tls::{ClientHello, MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN};
 use crate::vision::VisionStream;
 use crate::vless::{Command, MAX_REQUEST_HEADER_LEN, RequestHeader, ResponseHeader, VlessError};
+use crate::xudp::{MuxError, XudpConfig, handle_mux_stream};
 
 /// Idle timeout for each relay read, write, and shutdown.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -116,6 +119,10 @@ pub enum TlsServerError {
     /// The VLESS request was malformed or truncated.
     #[error("VLESS request error: {0}")]
     Vless(#[from] VlessError),
+
+    /// The XUDP mux stream failed.
+    #[error("XUDP mux error: {0}")]
+    Xudp(#[from] MuxError),
 }
 
 /// Process-lifetime REALITY TLS server configuration.
@@ -140,6 +147,8 @@ pub struct TlsServerConfig {
     pub max_client_hello_bytes: usize,
     /// The only authorized VLESS user id.
     pub user_id: [u8; 16],
+    /// XUDP mux/UDP relay limits.
+    pub xudp: XudpConfig,
     provider: Arc<CryptoProvider>,
     certificate: TemporaryCertificate,
 }
@@ -189,9 +198,17 @@ impl TlsServerConfig {
             handshake_timeout,
             max_client_hello_bytes,
             user_id,
+            xudp: XudpConfig::default(),
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             certificate: TemporaryCertificate::generate()?,
         })
+    }
+
+    /// Overrides the XUDP mux limits used for `Command::Mux` connections.
+    #[must_use]
+    pub fn with_xudp(mut self, xudp: XudpConfig) -> Self {
+        self.xudp = xudp;
+        self
     }
 
     fn reality_config(&self) -> RealityAuthConfig<'_> {
@@ -273,6 +290,7 @@ impl fmt::Debug for TlsServerConfig {
             .field("cover", &self.cover)
             .field("handshake_timeout", &self.handshake_timeout)
             .field("max_client_hello_bytes", &self.max_client_hello_bytes)
+            .field("xudp", &self.xudp)
             .finish()
     }
 }
@@ -498,6 +516,30 @@ async fn handle_authenticated(
 
             Ok(ConnectionOutcome::Authenticated {
                 command: Command::Tcp,
+            })
+        }
+        Command::Mux => {
+            timeout(
+                config.handshake_timeout,
+                tls.write_all(&ResponseHeader::new().to_bytes()),
+            )
+            .await
+            .map_err(|_| TlsServerError::Timeout {
+                stage: "VLESS response write",
+            })??;
+
+            let xudp = Arc::new(config.xudp.clone());
+            if request.vision {
+                let rng = SmallRng::seed_from_u64(vision_seed());
+                let vision = VisionStream::new(tls, request.user_id, request.body, rng);
+                handle_mux_stream(vision, xudp).await?;
+            } else {
+                let stream = PrependStream::new(tls, request.body);
+                handle_mux_stream(stream, xudp).await?;
+            }
+
+            Ok(ConnectionOutcome::Authenticated {
+                command: Command::Mux,
             })
         }
         command => {
@@ -771,6 +813,16 @@ mod tests {
             .choose_scheme(&[])
             .expect("the stock Chrome fingerprint offers no Ed25519 scheme");
         assert_eq!(signer.scheme(), SignatureScheme::ED25519);
+    }
+
+    #[test]
+    fn xudp_config_can_be_overridden() {
+        let xudp = XudpConfig {
+            max_sessions: 7,
+            ..XudpConfig::default()
+        };
+        let config = test_config().with_xudp(xudp.clone());
+        assert_eq!(config.xudp, xudp);
     }
 
     #[test]

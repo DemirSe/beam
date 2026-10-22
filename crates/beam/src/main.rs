@@ -7,6 +7,7 @@ use anyhow::Context;
 use beam_core::address::{Address, NetLocation};
 use beam_core::config::{Config, LogLevel};
 use beam_core::tls::{MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN, TlsServerConfig, handle_connection};
+use beam_core::xudp::XudpConfig;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -81,7 +82,18 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
     };
     let user_id = *config.user.id.as_bytes();
 
-    TlsServerConfig::new(
+    let max_sessions = usize::try_from(config.limits.max_udp_destinations)
+        .unwrap_or(usize::MAX)
+        .clamp(1, usize::from(u16::MAX) + 1);
+    let xudp = XudpConfig {
+        max_sessions,
+        session_idle_timeout: Duration::from_millis(config.limits.idle_timeout_ms),
+        io_timeout: Duration::from_millis(config.limits.handshake_timeout_ms),
+        ..XudpConfig::default()
+    };
+    xudp.validate().context("invalid XUDP limits")?;
+
+    let tls = TlsServerConfig::new(
         *config.reality.private_key,
         config.reality.short_ids.clone(),
         config.reality.server_names.clone(),
@@ -93,7 +105,9 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
         user_id,
     )
-    .context("failed to build the TLS server configuration")
+    .context("failed to build the TLS server configuration")?;
+
+    Ok(tls.with_xudp(xudp))
 }
 
 fn init_logging(level: LogLevel) {
