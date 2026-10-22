@@ -17,7 +17,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | Item | State |
 |---|---|
 | Host | Debian 13.6, x86_64, 1 vCPU, 1 GiB RAM, 1 GiB swap; kernel 6.12.113 active |
-| Service | `beam.service`, active and enabled, `User=beam`, `0.0.0.0:443`; cover `whatsapp.net:443`; limits 64 connections / 10 s handshake; systemd exposure 1.7 OK |
+| Service | `beam.service`, active and enabled, `User=beam`, `0.0.0.0:443`; cover `whatsapp.net:443`; limits 1024 connections / 10 s handshake; systemd exposure 1.7 OK |
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
 | Unit / backups | `/etc/systemd/system/beam.service` 0644; `*.bak-<UTC stamp>` beside each installed file |
@@ -28,6 +28,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | SSH | key-only `demir`; root and `debian` disabled; X11 off; `MaxAuthTries 3`; `LoginGraceTime 30` |
 | Resolver | systemd-resolved DNS-over-TLS + DNSSEC; LLMNR/mDNS off |
 | UDP tuning | `/etc/sysctl.d/99-beam.conf` sets `rmem_max=wmem_max=4 MiB` |
+| Network tuning | `/etc/sysctl.d/99-beam-net.conf` sets `tcp_congestion_control=bbr` and `default_qdisc=fq`; `beam-qdisc.service` reapplies `fq` to `eth0` at boot |
 
 Old stock Xray is absent; only TCP/443 and SSH 22 are exposed. The unit sets
 `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
@@ -219,7 +220,7 @@ tune after a 24-hour soak.
 |---|---|---|---|
 | RSS | < 20 MiB idle | > 128 MiB or monotonic growth | > 256 MiB; restart, lower limits |
 | fds | ~10 idle | > 256 | > 512; check leaks, lower limits |
-| Threads | 2 idle | > 16 | > 64; lower `max_connections` |
+| Threads | 27-43 idle | > 128 | > 160; lower `max_connections` |
 | Swap | 0 used | any sustained use | > 128 MiB; restart, lower limits |
 | Disk | < 70% | > 80% | > 90%; vacuum journal, clean bundles |
 | Load | < 1 | > 2 | > 4; investigate before changing limits |
@@ -227,19 +228,28 @@ tune after a 24-hour soak.
 | 443 listener | present | missing briefly during restart | missing otherwise; page |
 | Egress | the two VPS addresses | ISP address | tunnel down; start sing-box |
 
-The live `max_connections` is 64 and the pre-auth handshake timeout is 10 s.
+The live `max_connections` is 1024 and the pre-auth handshake timeout is 10 s.
 Each Vision Direct relay can hold up to two blocking splice tasks and 512 KiB
 pipes; the Tokio blocking pool is capped at 160 threads. The XUDP reply queue is
 512 frames and session sockets request a 1 MiB receive buffer. If RSS exceeds
-256 MiB, threads exceed 64, swap is used, or p95 latency rises, lower
-`max_connections` to 32. `max_udp_destinations` also consumes one socket/fd per
+256 MiB, threads exceed 160, swap is used, or p95 latency rises, lower
+`max_connections` to 256. `max_udp_destinations` also consumes one socket/fd per
 destination; the live value is 1024. Change a limit, validate, and restart:
 ```bash
 ssh -t -i "$SSH_KEY" "$SERVER" 'sudoedit /etc/beam/config.toml'
 bssh 'sudo -n runuser -u beam -- /usr/local/bin/beam --check -c /etc/beam/config.toml'
 bssh 'sudo -n systemctl restart beam'
 ```
-Edit only `[limits]`; keep the file root:beam 0640. The example's 1024 default is not the live value.
+Edit only `[limits]`; keep the file root:beam 0640. The example's 1024 default matches the live value.
+
+### Network tuning during the 2026-10-23 hotspot test
+
+`tcp_congestion_control=bbr` and `fq` were measured on the live hotspot path
+with a 5 MB download repeated five times per mode. Cubic median was
+**2.76 MB/s** (2.37–4.63); BBR median was **5.75 MB/s** (5.39–6.65) with a
+smaller spread. CPU remained idle outside the transfer and the qdisc reported
+zero drops. Run `sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc`
+and `/sbin/tc qdisc show dev eth0` after a reboot; expect `bbr` and `fq`.
 
 ## 8. Known risks and gaps
 - Host `nftables` is default-deny with 22/443, established, ICMP/ICMPv6 and
@@ -265,7 +275,7 @@ Edit only `[limits]`; keep the file root:beam 0640. The example's 1024 default i
   24-hour background soak was resumed on 2026-10-22 15:42 UTC
   (`/tmp/opencode/soak-24h-live3/`); the privileged quiet syscall/wakeup gates
   remain open.
-- No per-IP connection cap; the 64-connection global cap, 10 s pre-auth timeout,
+- No per-IP connection cap; the 1024-connection global cap, 10 s pre-auth timeout,
   30 s cover timeout and provider firewall are the current mitigation.
 - HTTPS upload acceleration needs Vision Direct before the body (e.g.
   `Expect: 100-continue`). Fully framed uploads stay async at ~1.34-1.37 s/GiB

@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-10-22.
+Updated: 2026-10-23.
 
 ## Decisions
 
@@ -132,7 +132,7 @@ UDP modes:
   - 13 pending security updates installed; `needrestart` added. Kernel
     `6.12.113+deb13-cloud-amd64` is active after a controlled reboot on
     2026-10-22.
-  - Live limits lowered to `max_connections=64` and
+  - Live limits lowered to `max_connections=1024` and
     `handshake_timeout_ms=10000`; unauthenticated cover relays are capped at
     30 s.
   - Tokio blocking pool capped at 160 threads; XUDP reply queue raised to 512;
@@ -144,6 +144,11 @@ UDP modes:
     MEDIUM).
   - Host nftables is enabled with default-deny input; 22/443, established,
     ICMP/ICMPv6 and loopback are allowed; LLMNR is dropped.
+  - BBR + `fq` enabled on 2026-10-23 for the live hotspot path. Five 5 MB
+    downloads per mode: cubic median **2.76 MB/s** (2.37–4.63), BBR median
+    **5.75 MB/s** (5.39–6.65); the qdisc reported zero drops. Persisted with
+    `/etc/sysctl.d/99-beam-net.conf`, `/etc/modules-load.d/beam-net.conf`, and
+    `beam-qdisc.service`.
   - SSH is `AllowUsers demir`, `PermitRootLogin no`, key-only, X11 off,
     `MaxAuthTries 3`, `LoginGraceTime 30`. Root and `debian` keys were removed;
     `debian` is locked with `nologin` and its sudoers entry removed.
@@ -173,7 +178,7 @@ UDP modes:
 - The early upload splice depends on the client sending Direct before the
   body; fully framed uploads stay on the async path.
 - A 24-hour soak and privileged syscall/wakeup gates remain.
-- No per-IP connection cap; the global 64-connection cap, 10 s pre-auth
+- No per-IP connection cap; the global 1024-connection cap, 10 s pre-auth
   timeout, 30 s cover timeout and provider firewall are the current mitigation.
 - The provider L4 firewall/rate limit was not independently verified; the host
   nftables rules are.
