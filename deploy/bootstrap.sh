@@ -49,7 +49,7 @@ for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT"; do
 done
 
 install -m 0755 -o root -g root "$BIN" "$INSTALL_BIN"
-install -m 0600 -o root -g beam "$CONFIG" "$INSTALL_CONFIG"
+install -m 0640 -o root -g beam "$CONFIG" "$INSTALL_CONFIG"
 install -m 0644 -o root -g root "$UNIT" "$INSTALL_UNIT"
 
 runuser -u beam -- "$INSTALL_BIN" --check -c "$INSTALL_CONFIG"
