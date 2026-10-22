@@ -84,7 +84,10 @@ UDP modes:
   0.98–1.01x stock; server CPU/GiB 0.77–0.95x; RSS 0.24x; DNS p99 +0.3%,
   HTTP/3 p99 0.0%. Beam is at throughput parity with lower CPU/RSS under
   added RTT.
-- Syscall/wakeup/splice gates need a privileged, quiet acceptance run.
+- Connection churn smoke: 1,000 requests at concurrency 32, all HTTP 200;
+  RSS 7.7→8.3 MiB, threads 2, fds 10, no leaks.
+- Syscall/wakeup/splice gates and a 24-hour soak need a privileged, quiet
+  acceptance run.
 
 ## In progress
 

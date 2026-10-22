@@ -179,3 +179,18 @@ Last local result (2026-10-22, loopback, test fixture from
 Beam/stock ratio: **1.562x** on the warm samples. This is a server-capacity
 smoke test, not a WAN or full-TUN headline; the full-TUN client remains the
 bottleneck in the main harness.
+
+## Connection churn smoke
+
+```bash
+bash bench/churn.sh
+```
+
+The last local run sent **1,000** requests at concurrency **32** through the
+stock Xray SOCKS client. All 1,000 returned HTTP 200 in ~5 seconds. Beam's
+server RSS moved from 7,676 KiB to 8,328 KiB after warm-up; threads stayed at 2
+and file descriptors at 10. A failure count or an fd growth above baseline + 16
+fails the script.
+
+This is a short smoke, not a 24-hour soak. The 24-hour soak and privileged
+syscall/wakeup gates still need a dedicated acceptance run.
