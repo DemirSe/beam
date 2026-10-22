@@ -149,6 +149,11 @@ UDP modes:
     **5.75 MB/s** (5.39–6.65); the qdisc reported zero drops. Persisted with
     `/etc/sysctl.d/99-beam-net.conf`, `/etc/modules-load.d/beam-net.conf`, and
     `beam-qdisc.service`.
+  - `tcp_mtu_probing` remains **0** intentionally. The live outer MSS is
+    1348–1448, but false black-hole detection would cap the MSS to
+    `tcp_base_mss=1024` after three RTOs and can halve it further; no MTU
+    black hole has been observed (`TcpExtTCPMTUPFail/Success=0`,
+    `IpExtInNoRoutes=0`). Revisit only with a measured PMTU failure.
   - SSH is `AllowUsers demir`, `PermitRootLogin no`, key-only, X11 off,
     `MaxAuthTries 3`, `LoginGraceTime 30`. Root and `debian` keys were removed;
     `debian` is locked with `nologin` and its sudoers entry removed.

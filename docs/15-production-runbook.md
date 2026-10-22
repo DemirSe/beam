@@ -251,6 +251,18 @@ smaller spread. CPU remained idle outside the transfer and the qdisc reported
 zero drops. Run `sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc`
 and `/sbin/tc qdisc show dev eth0` after a reboot; expect `bbr` and `fq`.
 
+### MTU probing stays disabled
+
+`net.ipv4.tcp_mtu_probing` remains **0**. On a lossy mobile path it is not a
+free win: after `tcp_retries1` (3 here) RTO retries the kernel enables probing
+and caps the MSS at `tcp_base_mss` (**1024** on this host), while repeated RTOs
+can halve `search_low` down to `tcp_mtu_probe_floor` (48). SACK/DSACK can also
+suppress the recovery probe. The live outer MSS is 1348–1448, so a false
+positive costs roughly 24–29% payload per segment before recovery. No ICMP
+black hole has been observed here (`TcpExtTCPMTUPFail/Success=0`,
+`IpExtInNoRoutes=0`); keep it disabled unless a real PMTU black hole is
+measured and a targeted MSS clamp is not sufficient.
+
 ## 8. Known risks and gaps
 - Host `nftables` is default-deny with 22/443, established, ICMP/ICMPv6 and
   loopback allowed. The provider firewall was not independently verified.
