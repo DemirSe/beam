@@ -1,5 +1,6 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use beam_sys::{PollEvents, PollFd, SpliceFlags, pipe, poll, splice};
@@ -21,6 +22,26 @@ pub const MAX_PIPE_SIZE: usize = 1024 * 1024;
 /// Both directions get a fill and a drain budget before the relay polls again,
 /// so a bulk transfer cannot starve a small request in the opposite direction.
 const WORK_PER_ROUND: usize = 1024 * 1024;
+
+/// Bytes after which a slow bulk direction starts batching reads.
+const BATCH_THRESHOLD: u64 = 256 * 1024;
+
+/// Directions below this measured rate start batching.
+const BATCH_RATE_LIMIT: f64 = 500.0 * 1024.0 * 1024.0;
+
+/// A batching direction above this rate stops batching again.
+const BATCH_DISABLE_RATE: f64 = 800.0 * 1024.0 * 1024.0;
+
+/// Grace period used to accumulate source data before one splice.
+const BATCH_SLEEP: Duration = Duration::from_micros(500);
+
+/// Disable batching after this much idle time so later small responses keep
+/// their normal latency.
+const BATCH_RESET: Duration = Duration::from_millis(100);
+
+/// Rate-check window used to decide whether a bulk direction is still slow.
+const BATCH_RATE_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+const BATCH_RATE_WINDOW_TIME: Duration = Duration::from_millis(50);
 
 /// Relay tuning and limits.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +185,14 @@ struct Direction {
     shutdown_sent: bool,
     /// Bytes delivered to `sink`.
     bytes: u64,
+    /// The main poll reported source readiness since the last fill.
+    read_ready: bool,
+    /// Start of the current rate-check window.
+    rate_at: Option<Instant>,
+    /// Bytes delivered at the start of the current rate-check window.
+    rate_bytes: u64,
+    /// Slow bulk direction: wait briefly so one splice moves a larger chunk.
+    batch_enabled: bool,
 }
 
 impl Direction {
@@ -178,6 +207,10 @@ impl Direction {
             read_done: false,
             shutdown_sent: false,
             bytes: 0,
+            read_ready: true,
+            rate_at: None,
+            rate_bytes: 0,
+            batch_enabled: false,
         }
     }
 
@@ -206,18 +239,229 @@ pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Resul
     let (b_pipe_read, b_pipe_write) = pipe()?;
 
     for fd in [a_pipe_write.as_raw_fd(), b_pipe_write.as_raw_fd()] {
-        if let Err(error) = beam_sys::set_pipe_size(fd, config.pipe_size) {
-            tracing::debug!(
+        match beam_sys::set_pipe_size(fd, config.pipe_size) {
+            Ok(actual) => tracing::debug!(requested = config.pipe_size, actual, "relay pipe sized"),
+            Err(error) => tracing::debug!(
                 ?error,
                 pipe_size = config.pipe_size,
                 "could not resize relay pipe; using the kernel default"
-            );
+            ),
         }
     }
 
     let mut forward = Direction::new(a, b, a_pipe_read, a_pipe_write);
     let mut backward = Direction::new(b, a, b_pipe_read, b_pipe_write);
     let mut stats = RelayStats::default();
+    let result = run_loop(&mut forward, &mut backward, &mut stats, config);
+
+    stats.bytes_a_to_b = forward.bytes;
+    stats.bytes_b_to_a = backward.bytes;
+    let total = stats.total_bytes();
+    let bytes_per_splice = total.checked_div(stats.splice_calls).unwrap_or(0);
+    tracing::debug!(
+        pipe_size = config.pipe_size,
+        bytes_a_to_b = stats.bytes_a_to_b,
+        bytes_b_to_a = stats.bytes_b_to_a,
+        splice_calls = stats.splice_calls,
+        polls = stats.polls,
+        bytes_per_splice,
+        error = ?result.as_ref().err(),
+        "relay finished"
+    );
+
+    result?;
+    Ok(stats)
+}
+
+/// Shared activity clock for the two halves of an asymmetric Vision relay.
+///
+/// The async upload and the blocking download relay both touch this clock. An
+/// idle timeout is measured from the most recent activity in either direction,
+/// which preserves the bidirectional relay's idle semantics after the
+/// directions are split.
+#[derive(Debug)]
+pub struct RelayActivity {
+    last: Mutex<Instant>,
+}
+
+impl RelayActivity {
+    /// Creates a clock starting at the current instant.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            last: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Records activity now.
+    pub fn touch(&self) {
+        if let Ok(mut last) = self.last.lock() {
+            *last = Instant::now();
+        }
+    }
+
+    /// Returns how long ago the most recent activity happened.
+    #[must_use]
+    pub fn elapsed(&self) -> Option<Duration> {
+        self.last.lock().ok().map(|last| last.elapsed())
+    }
+}
+
+impl Default for RelayActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Copies one direction between two connected, nonblocking stream sockets.
+///
+/// This is the asymmetric counterpart to [`copy_bidirectional`]. It is used
+/// when only the Vision write direction has switched to raw, so the bulk
+/// download can use `splice(2)` while the framed upload continues on its async
+/// path. It shuts down the sink's write half when the source reaches EOF.
+///
+/// `activity_clock` is shared with the opposite async direction so the idle
+/// timeout measures activity in either direction. Slow bulk transfers batch
+/// source reads; fast and small transfers keep the low-latency path.
+pub fn copy_one_way(
+    source: RawFd,
+    sink: RawFd,
+    config: &RelayConfig,
+    activity_clock: Option<&RelayActivity>,
+) -> io::Result<RelayStats> {
+    config.validate()?;
+
+    let (pipe_read, pipe_write) = pipe()?;
+    match beam_sys::set_pipe_size(pipe_write.as_raw_fd(), config.pipe_size) {
+        Ok(actual) => tracing::debug!(requested = config.pipe_size, actual, "one-way pipe sized"),
+        Err(error) => tracing::debug!(
+            ?error,
+            pipe_size = config.pipe_size,
+            "could not resize one-way relay pipe; using the kernel default"
+        ),
+    }
+
+    let mut direction = Direction::new(source, sink, pipe_read, pipe_write);
+    let mut stats = RelayStats::default();
+    let result = run_one_way(&mut direction, &mut stats, config, activity_clock);
+
+    stats.bytes_a_to_b = direction.bytes;
+    let bytes_per_splice = stats
+        .bytes_a_to_b
+        .checked_div(stats.splice_calls)
+        .unwrap_or(0);
+    tracing::debug!(
+        pipe_size = config.pipe_size,
+        bytes = stats.bytes_a_to_b,
+        splice_calls = stats.splice_calls,
+        polls = stats.polls,
+        bytes_per_splice,
+        batch_enabled = direction.batch_enabled,
+        error = ?result.as_ref().err(),
+        "one-way relay finished"
+    );
+
+    result?;
+    Ok(stats)
+}
+
+fn run_one_way(
+    direction: &mut Direction,
+    stats: &mut RelayStats,
+    config: &RelayConfig,
+    activity_clock: Option<&RelayActivity>,
+) -> io::Result<()> {
+    let mut committed = 0_u64;
+    let mut last_activity = Instant::now();
+    let mut shutdown_started: Option<Instant> = None;
+
+    loop {
+        let now = Instant::now();
+        let local_elapsed = now.saturating_duration_since(last_activity);
+        let idle_elapsed = activity_clock
+            .and_then(RelayActivity::elapsed)
+            .map_or(local_elapsed, |shared| shared.min(local_elapsed));
+        let limit = inactivity_limit(config, shutdown_started.is_some());
+        if idle_elapsed >= limit {
+            if shutdown_started.is_some() {
+                break;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "one-way relay idle timeout",
+            ));
+        }
+
+        if direction.batch_enabled && direction.in_pipe == 0 && !direction.read_done {
+            if now.saturating_duration_since(last_activity) > BATCH_RESET {
+                direction.batch_enabled = false;
+                direction.rate_at = None;
+                direction.rate_bytes = direction.bytes;
+            } else {
+                std::thread::sleep(BATCH_SLEEP);
+            }
+        }
+
+        let mut activity = false;
+        if direction.read_ready {
+            activity |= fill(
+                direction,
+                WORK_PER_ROUND,
+                config.max_bytes,
+                &mut committed,
+                stats,
+            )?;
+            direction.read_ready = false;
+        }
+        if config.max_bytes.is_some_and(|limit| committed >= limit) {
+            direction.read_done = true;
+        }
+
+        activity |= drain(direction, WORK_PER_ROUND, stats)?;
+        maybe_update_batch(direction);
+        maybe_shutdown(direction, stats)?;
+
+        let now = Instant::now();
+        if activity {
+            last_activity = now;
+            if let Some(clock) = activity_clock {
+                clock.touch();
+            }
+        }
+        if shutdown_started.is_none() && direction.read_done {
+            shutdown_started = Some(now);
+            last_activity = now;
+        }
+        if direction.is_done() {
+            break;
+        }
+
+        let mut fds = [
+            poll_source(direction),
+            poll_pipe_write(direction),
+            poll_sink(direction),
+        ];
+        stats.polls = stats.polls.saturating_add(1);
+        let poll_timeout =
+            inactivity_limit(config, shutdown_started.is_some()).saturating_sub(idle_elapsed);
+        match poll(&mut fds, Some(poll_timeout)) {
+            Ok(_) => {
+                direction.read_ready = !fds[0].revents().is_empty() || !fds[1].revents().is_empty();
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn run_loop(
+    forward: &mut Direction,
+    backward: &mut Direction,
+    stats: &mut RelayStats,
+    config: &RelayConfig,
+) -> io::Result<()> {
     let mut committed = 0_u64;
     let mut last_activity = Instant::now();
     let mut shutdown_started: Option<Instant> = None;
@@ -239,37 +483,50 @@ pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Resul
         let mut activity = false;
 
         // Fill both pipes before draining them so neither direction waits for
-        // the other to finish a full round.
+        // the other to finish a full round. A source that the last poll did
+        // not report readable is skipped until it becomes readable again.
+        let forward_ready = forward.read_ready;
+        let backward_ready = backward.read_ready;
+        forward.read_ready = false;
+        backward.read_ready = false;
         if forward_first {
-            activity |= fill(
-                &mut forward,
-                WORK_PER_ROUND,
-                config.max_bytes,
-                &mut committed,
-                &mut stats,
-            )?;
-            activity |= fill(
-                &mut backward,
-                WORK_PER_ROUND,
-                config.max_bytes,
-                &mut committed,
-                &mut stats,
-            )?;
+            if forward_ready {
+                activity |= fill(
+                    forward,
+                    WORK_PER_ROUND,
+                    config.max_bytes,
+                    &mut committed,
+                    stats,
+                )?;
+            }
+            if backward_ready {
+                activity |= fill(
+                    backward,
+                    WORK_PER_ROUND,
+                    config.max_bytes,
+                    &mut committed,
+                    stats,
+                )?;
+            }
         } else {
-            activity |= fill(
-                &mut backward,
-                WORK_PER_ROUND,
-                config.max_bytes,
-                &mut committed,
-                &mut stats,
-            )?;
-            activity |= fill(
-                &mut forward,
-                WORK_PER_ROUND,
-                config.max_bytes,
-                &mut committed,
-                &mut stats,
-            )?;
+            if backward_ready {
+                activity |= fill(
+                    backward,
+                    WORK_PER_ROUND,
+                    config.max_bytes,
+                    &mut committed,
+                    stats,
+                )?;
+            }
+            if forward_ready {
+                activity |= fill(
+                    forward,
+                    WORK_PER_ROUND,
+                    config.max_bytes,
+                    &mut committed,
+                    stats,
+                )?;
+            }
         }
 
         if config.max_bytes.is_some_and(|limit| committed >= limit) {
@@ -277,11 +534,11 @@ pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Resul
             backward.read_done = true;
         }
 
-        activity |= drain(&mut forward, WORK_PER_ROUND, &mut stats)?;
-        activity |= drain(&mut backward, WORK_PER_ROUND, &mut stats)?;
+        activity |= drain(forward, WORK_PER_ROUND, stats)?;
+        activity |= drain(backward, WORK_PER_ROUND, stats)?;
 
-        maybe_shutdown(&mut forward, &mut stats)?;
-        maybe_shutdown(&mut backward, &mut stats)?;
+        maybe_shutdown(forward, stats)?;
+        maybe_shutdown(backward, stats)?;
 
         let now = Instant::now();
         if activity {
@@ -299,12 +556,12 @@ pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Resul
         forward_first = !forward_first;
 
         let mut fds = [
-            poll_source(&forward),
-            poll_pipe_write(&forward),
-            poll_sink(&forward),
-            poll_source(&backward),
-            poll_pipe_write(&backward),
-            poll_sink(&backward),
+            poll_source(forward),
+            poll_pipe_write(forward),
+            poll_sink(forward),
+            poll_source(backward),
+            poll_pipe_write(backward),
+            poll_sink(backward),
         ];
 
         stats.polls = stats.polls.saturating_add(1);
@@ -316,7 +573,10 @@ pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Resul
                 last_activity,
             )),
         ) {
-            Ok(_) => {}
+            Ok(_) => {
+                forward.read_ready = !fds[0].revents().is_empty() || !fds[1].revents().is_empty();
+                backward.read_ready = !fds[3].revents().is_empty() || !fds[4].revents().is_empty();
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
@@ -332,9 +592,37 @@ pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Resul
         }
     }
 
-    stats.bytes_a_to_b = forward.bytes;
-    stats.bytes_b_to_a = backward.bytes;
-    Ok(stats)
+    Ok(())
+}
+
+fn maybe_update_batch(direction: &mut Direction) {
+    if direction.bytes < BATCH_THRESHOLD {
+        return;
+    }
+    let now = Instant::now();
+    let Some(start) = direction.rate_at else {
+        direction.rate_at = Some(now);
+        direction.rate_bytes = direction.bytes;
+        return;
+    };
+    let elapsed = now.saturating_duration_since(start);
+    let bytes = direction.bytes.saturating_sub(direction.rate_bytes);
+    if bytes < BATCH_RATE_WINDOW_BYTES && elapsed < BATCH_RATE_WINDOW_TIME {
+        return;
+    }
+    let seconds = elapsed.as_secs_f64();
+    if seconds > 0.0 {
+        let rate = bytes as f64 / seconds;
+        if direction.batch_enabled {
+            if rate > BATCH_DISABLE_RATE {
+                direction.batch_enabled = false;
+            }
+        } else if rate < BATCH_RATE_LIMIT {
+            direction.batch_enabled = true;
+        }
+    }
+    direction.rate_at = Some(now);
+    direction.rate_bytes = direction.bytes;
 }
 
 fn fill(
@@ -348,54 +636,47 @@ fn fill(
         return Ok(false);
     }
 
-    let mut progress = false;
-    let mut remaining = budget;
-    while remaining > 0 {
-        let allowance = match max_bytes {
-            Some(limit) => limit.saturating_sub(*committed),
-            None => u64::MAX,
-        };
-        if allowance == 0 {
-            direction.read_done = true;
-            return Ok(progress);
-        }
-
-        let len = remaining.min(usize::try_from(allowance).unwrap_or(usize::MAX));
-        if len == 0 {
-            break;
-        }
-
-        stats.splice_calls = stats.splice_calls.saturating_add(1);
-        match splice(
-            direction.source,
-            direction.pipe_write.as_raw_fd(),
-            len,
-            SpliceFlags::MOVE | SpliceFlags::NONBLOCK,
-        ) {
-            Ok(0) => {
-                direction.read_done = true;
-                stats.eofs = stats.eofs.saturating_add(1);
-                return Ok(true);
-            }
-            Ok(moved) => {
-                direction.in_pipe = direction.in_pipe.saturating_add(moved);
-                *committed = committed.saturating_add(u64::try_from(moved).unwrap_or(u64::MAX));
-                remaining = remaining.saturating_sub(moved);
-                progress = true;
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                // `EAGAIN` can mean the source is empty or the pipe is full.
-                // If the source still has data, the pipe must be full.
-                direction.pipe_full =
-                    direction.in_pipe > 0 && source_has_data(direction.source, stats)?;
-                return Ok(progress);
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(progress),
-            Err(error) => return Err(error),
-        }
+    let allowance = match max_bytes {
+        Some(limit) => limit.saturating_sub(*committed),
+        None => u64::MAX,
+    };
+    if allowance == 0 {
+        direction.read_done = true;
+        return Ok(false);
     }
 
-    Ok(progress)
+    let len = budget.min(usize::try_from(allowance).unwrap_or(usize::MAX));
+    if len == 0 {
+        return Ok(false);
+    }
+
+    stats.splice_calls = stats.splice_calls.saturating_add(1);
+    match splice(
+        direction.source,
+        direction.pipe_write.as_raw_fd(),
+        len,
+        SpliceFlags::MOVE | SpliceFlags::NONBLOCK,
+    ) {
+        Ok(0) => {
+            direction.read_done = true;
+            stats.eofs = stats.eofs.saturating_add(1);
+            Ok(true)
+        }
+        Ok(moved) => {
+            direction.in_pipe = direction.in_pipe.saturating_add(moved);
+            *committed = committed.saturating_add(u64::try_from(moved).unwrap_or(u64::MAX));
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            // `EAGAIN` can mean the source is empty or the pipe is full.
+            // If the source still has data, the pipe must be full.
+            direction.pipe_full =
+                direction.in_pipe > 0 && source_has_data(direction.source, stats)?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn source_has_data(fd: RawFd, stats: &mut RelayStats) -> io::Result<bool> {
@@ -499,12 +780,13 @@ fn inactivity_timeout(
 mod tests {
     use super::{
         DEFAULT_PIPE_SIZE, MAX_PIPE_SIZE, MIN_PIPE_SIZE, RelayConfig, RelayStats,
-        copy_bidirectional,
+        copy_bidirectional, copy_one_way,
     };
     use std::io::{self, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -600,6 +882,92 @@ mod tests {
         assert_eq!(stats.half_closes, 2);
         assert!(stats.splice_calls > 0);
         assert!(stats.polls > 0);
+    }
+
+    #[test]
+    fn one_way_copies_and_half_closes() {
+        let (client, relay_a, relay_b, mut target) = relay_pair();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| {
+                beam_sys::set_nonblocking(relay_a.as_raw_fd())?;
+                beam_sys::set_nonblocking(relay_b.as_raw_fd())?;
+                copy_one_way(relay_a.as_raw_fd(), relay_b.as_raw_fd(), &config(), None)
+            })();
+            let _ = sender.send(result);
+        });
+
+        let payload = vec![0x5a; 2 * 1024 * 1024 + 17];
+        let expected = payload.clone();
+        let mut client_writer = client.try_clone().unwrap();
+        let client_thread = thread::spawn(move || {
+            client_writer.write_all(&payload).unwrap();
+            client_writer.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let mut received = Vec::new();
+        target.read_to_end(&mut received).unwrap();
+        client_thread.join().unwrap();
+
+        let stats = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("one-way relay did not finish")
+            .unwrap();
+        assert_eq!(received, expected);
+        assert_eq!(stats.bytes_a_to_b, expected.len() as u64);
+        assert_eq!(stats.bytes_b_to_a, 0);
+        assert_eq!(stats.eofs, 1);
+        assert_eq!(stats.half_closes, 1);
+        assert!(stats.splice_calls > 0);
+        assert!(stats.polls > 0);
+    }
+
+    #[test]
+    fn shared_activity_keeps_one_way_alive() {
+        let (client, relay_a, relay_b, mut target) = relay_pair();
+        let activity = Arc::new(super::RelayActivity::new());
+        let relay_activity = Arc::clone(&activity);
+        let config = RelayConfig {
+            idle_timeout: Duration::from_millis(300),
+            shutdown_timeout: Duration::from_secs(1),
+            ..config()
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| {
+                beam_sys::set_nonblocking(relay_a.as_raw_fd())?;
+                beam_sys::set_nonblocking(relay_b.as_raw_fd())?;
+                copy_one_way(
+                    relay_a.as_raw_fd(),
+                    relay_b.as_raw_fd(),
+                    &config,
+                    Some(&relay_activity),
+                )
+            })();
+            let _ = sender.send(result);
+        });
+
+        let heartbeat = thread::spawn(move || {
+            for _ in 0..10 {
+                thread::sleep(Duration::from_millis(50));
+                activity.touch();
+            }
+        });
+
+        heartbeat.join().unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut received = Vec::new();
+        target.read_to_end(&mut received).unwrap();
+        assert!(received.is_empty());
+
+        let stats = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one-way relay did not finish")
+            .unwrap();
+        assert_eq!(stats.bytes_a_to_b, 0);
+        assert_eq!(stats.eofs, 1);
+        assert_eq!(stats.half_closes, 1);
     }
 
     #[test]

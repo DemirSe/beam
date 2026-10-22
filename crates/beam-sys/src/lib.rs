@@ -6,7 +6,7 @@
 //! explains the invariants the caller must uphold.
 
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 pub mod fd;
 pub mod poll;
@@ -45,6 +45,18 @@ pub fn set_pipe_size(fd: RawFd, size: usize) -> io::Result<usize> {
     } else {
         Ok(result as usize)
     }
+}
+
+/// Duplicates a descriptor with close-on-exec set.
+pub fn try_clone_fd(fd: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: `F_DUPFD_CLOEXEC` only reads the integer descriptor and returns a
+    // new descriptor owned by the caller. It does not dereference a pointer.
+    let result = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `result` is a newly duplicated descriptor owned by this call.
+    Ok(unsafe { OwnedFd::from_raw_fd(result) })
 }
 
 /// Shuts down the write half of a connected socket.
