@@ -105,6 +105,44 @@ The probe offers TLS 1.3 (all runs negotiated 1.3), ALPN `h2,http/1.1`, disables
 this does not affect negotiated parameters), and taps the TCP stream to capture all handshake records.
 Source: `cover-probe/src/{common,rtls,btls}.rs`.
 
+## Local cover-parity harness
+
+`scripts/cover-parity.sh` reproduces the authenticated server flight locally. It builds
+`beam` in the current worktree, starts it on `127.0.0.1:18443` with the throwaway REALITY
+key from `/tmp/opencode/beam-test/beam.toml`, and puts a recording TCP proxy on
+`127.0.0.1:18444`. The stock Xray 26.3.27 no-flow client (`client-no-flow.json`) connects
+through the proxy; a loopback HTTP request completes the VLESS/TCP path. The proxy
+captures every server TLS record in the flight, and `scripts/cover-parity.py` prints the
+ServerHello parameters and compares the capture with
+`/tmp/opencode/beam-spike-tls/cover-artifacts/rustls-aws-pq-serverflight.bin`.
+
+Prerequisites are `cargo`, `python3`, `curl`, the stock Xray binary at
+`/tmp/opencode/xray-server-compare/xray`, the no-flow client config at
+`/tmp/opencode/tls-server-harness/client-no-flow.json`, the test config, and the cover
+artifact. Override paths with `XRAY_BIN`, `CLIENT_TEMPLATE`, `TEST_CONFIG`, and
+`COVER_ARTIFACT`; ports can be changed with `BEAM_PORT`, `PROXY_PORT`, `SOCKS_PORT`, and
+`HTTP_PORT`. The harness is loopback-only: the cover destination in the generated beam
+config is a closed local port, so a failed authentication cannot reach the internet.
+
+```bash
+source scripts/dev-env.sh
+bash scripts/cover-parity.sh
+```
+
+The run directory (`/tmp/opencode/beam-cover-parity.XXXXXX`) contains `report.txt`,
+`report.json`, `capture/server-flight.bin`, and component logs. The script exits non-zero
+only on build/start, handshake, or parse failure. Flight-size differences caused by
+beam's temporary Ed25519 certificate are reported as quantified deltas and do not fail
+the run.
+
+Last local result (2026-10-22): group `X25519MLKEM768`, cipher
+`TLS_AES_128_GCM_SHA256`, and the 1215-byte ServerHello match the cover. The extension
+order differs: beam/rustls emits `key_share, supported_versions` (`0x0033, 0x002b`),
+while the cover emits `supported_versions, key_share` (`0x002b, 0x0033`). This is a
+plaintext distinguisher unrelated to the temporary certificate. The encrypted flight is
+3 records / 416 B versus 5 records / 3085 B for the cover (-2669 B), as expected from one
+temporary Ed25519 certificate instead of the cover's two-certificate EC chain.
+
 ## Raw artifacts
 - Logs: `cover-ring-whatsapp.log`, `cover-awspq-whatsapp.log`, `cover-boring-whatsapp.log`,
   `cover-boring-x25519-whatsapp.log`, and `cover-*-3runs.log`.
