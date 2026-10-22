@@ -104,11 +104,19 @@ UDP modes:
   must be rotated once.
 - Verified from the laptop with stock Xray 26.3.27: HTTPS `example.com` 200,
   HTTP 200, and a SOCKS5 UDP echo round trip.
-- Local client rotation: `sudo python3 deploy/update-client.py` or import
-  `~/.config/beam/client-link.txt`. The agent cannot run local `sudo` because
-  the shell sandbox sets `no_new_privs`; this is the only manual step.
+- Local client rotation completed. Full-TUN egress is the VPS: IPv4
+  `158.94.216.102`, IPv6 `2a01:f900:11:168::1`. HTTPS/HTTP, DNS, HTTP/3 and
+  IPv6 all pass through the live TUN.
+- Unauthenticated probe test: a TLS client with SNI `whatsapp.net` sent to the
+  VPS is forwarded to the real cover; the observed certificate is Meta's valid
+  `*.whatsapp.net` certificate.
+- `sing-box` is active but `disabled` at boot; start is manual/tray-driven.
+- `sudo python3 deploy/update-client.py` or the link import is the only local
+  privileged action; the agent's sandbox sets `no_new_privs`.
 - No `nftables`/`ufw` is installed; only the provider/cloud firewall protects
   22/443. The service exposes only TCP/443.
+- A 5-minute production soak and a read-only security audit are in progress;
+  the production runbook is being written.
 
 ## In progress
 
