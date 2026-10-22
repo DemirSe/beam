@@ -41,18 +41,22 @@ Updated: 2026-10-22.
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP interop | **HTTP 200** |
 | Cover-parity harness | Done; gaps documented |
-| Full-TUN harness | Done; TCP v4/v6 and HTTPS Direct PASS; UDP/DNS/QUIC blocked on Mux |
+| XUDP over VLESS Mux | Done |
+| Full-TUN harness | TCP v4/v6, UDP, DNS, HTTPS Direct PASS; QUIC blocked on local H3 origin |
 | Stock Xray baseline + test fixture | Done |
 | Benchmark harness design | Done |
 
 ## In progress
 
-- Mux command integration with the XUDP session layer.
+- TUN harness v2: IPv6 UDP/DNS and a local HTTP/3 origin.
 
 ## Known gaps / not started
 
 - TLS extension-order and encrypted-flight-size parity.
-- Full TUN UDP/DNS/QUIC (blocked on Mux integration).
+- QUIC/HTTP3 local origin (the UDP/XUDP path itself is validated by DNS/UDP echo).
+- Legacy VLESS UDP and packetaddr.
+- Splice integration for the Vision Direct raw leg.
+- Performance matrix against stock Xray.
 - Performance matrix and regression harness.
 - Deployment package and VPS cutover.
 
@@ -75,6 +79,7 @@ cargo test --workspace
 bash scripts/cover-parity.sh
 ```
 
-The workspace currently has 210 `beam-core` unit tests, two integration tests,
-and 22 `beam-sys` tests. The full-TUN harness passes TCP v4/v6 and HTTPS Direct
-through the real sing-box client; UDP/DNS still need the Mux path.
+The workspace currently has 211 `beam-core` unit tests, two integration tests,
+and 22 `beam-sys` tests. The full-TUN harness passes TCP v4/v6, UDP echo, DNS,
+and HTTPS Direct through the real sing-box client; QUIC is blocked only by the
+lack of a local HTTP/3 origin in the harness.
