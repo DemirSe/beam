@@ -3,8 +3,9 @@
 //! [`VisionStream`] wraps an outer TLS stream and turns the VLESS body into
 //! Vision blocks. The first block in each direction carries the raw VLESS user
 //! id; later blocks do not. The reader strips padding and stops framing on
-//! `End`. Direct mode is rejected: bypassing the outer TLS layer requires relay
-//! plumbing that this milestone does not implement.
+//! `End`. On `Direct`, the inner record-bounded TLS stream switches to the raw
+//! socket; the caller can continue through this wrapper or call
+//! [`VisionStream::into_raw`] once both directions have switched.
 
 use std::io;
 use std::pin::Pin;
@@ -14,19 +15,26 @@ use rand::Rng;
 use rand::rngs::SmallRng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::tls::stream::{RawTls, RawTlsHandoff, TlsStreamError};
+
 use super::frame::{
     Command, MAX_BLOCK_LEN, MAX_CONTENT_LEN, VisionError, encode_block, parse_block,
 };
-use super::state::{VisionReaderState, VisionStateError, VisionWriterState};
+use super::state::{VisionReaderMode, VisionReaderState, VisionStateError, VisionWriterState};
 
 /// Chunk size used when reading framing bytes from the inner stream.
 const READ_CHUNK: usize = 4096;
 
+/// Largest TLS record body accepted by the inner stream.
+const MAX_INNER_TLS_BODY: usize = 16_384 + 256;
+
 /// Maximum plaintext accepted by one `poll_write` call.
 ///
 /// Larger caller buffers are accepted on later polls. Within one call the
-/// plaintext is split into [`MAX_CONTENT_LEN`] blocks.
-const MAX_WRITE_BATCH: usize = MAX_BLOCK_LEN;
+/// plaintext is split into [`MAX_CONTENT_LEN`] blocks. The batch is large
+/// enough to contain one complete maximum-size inner TLS record so the Direct
+/// trigger sees the same record boundary as the stock writer.
+const MAX_WRITE_BATCH: usize = 5 + MAX_INNER_TLS_BODY;
 
 /// Maximum empty Vision blocks processed in one `poll_read` call before
 /// yielding to the executor.
@@ -45,7 +53,11 @@ pub struct VisionStream<S, R = SmallRng> {
     read_buf: Vec<u8>,
     read_out: Vec<u8>,
     read_out_offset: usize,
+    direct_plaintext: Vec<u8>,
+    direct_plaintext_offset: usize,
     writer: VisionWriterState,
+    write_direct: bool,
+    pending_direct_switch: bool,
     rng: R,
     write_queue: Vec<u8>,
     write_queue_offset: usize,
@@ -54,7 +66,7 @@ pub struct VisionStream<S, R = SmallRng> {
 
 impl<S, R> VisionStream<S, R>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: RawTlsHandoff,
     R: Rng + Unpin,
 {
     /// Wraps `inner`, using `initial_body` as the first buffered Vision bytes.
@@ -71,7 +83,11 @@ where
             read_buf: initial_body,
             read_out: Vec::new(),
             read_out_offset: 0,
+            direct_plaintext: Vec::new(),
+            direct_plaintext_offset: 0,
             writer: VisionWriterState::new(),
+            write_direct: false,
+            pending_direct_switch: false,
             rng,
             write_queue: Vec::new(),
             write_queue_offset: 0,
@@ -92,6 +108,57 @@ where
     /// Returns whether the writer has stopped padding this direction.
     pub fn padding_enabled(&self) -> bool {
         self.writer.padding_enabled()
+    }
+
+    /// Returns `true` after the read direction switched to the raw socket.
+    pub fn read_is_raw(&self) -> bool {
+        matches!(self.reader.mode(), VisionReaderMode::Direct)
+    }
+
+    /// Returns `true` after the write direction switched to the raw socket.
+    pub fn write_is_raw(&self) -> bool {
+        self.write_direct
+    }
+
+    /// Consumes the stream once both directions have switched to Direct.
+    pub fn into_raw(self) -> Result<RawTls, TlsStreamError> {
+        if !self.read_is_raw() || !self.write_is_raw() {
+            return Err(TlsStreamError::RawNotEnabled);
+        }
+
+        let Self {
+            inner,
+            read_buf,
+            read_out,
+            read_out_offset,
+            direct_plaintext,
+            direct_plaintext_offset,
+            write_queue,
+            write_queue_offset,
+            ..
+        } = self;
+
+        let mut inbound = Vec::new();
+        if read_out_offset < read_out.len() {
+            inbound.extend_from_slice(&read_out[read_out_offset..]);
+        }
+        inbound.extend_from_slice(&read_buf);
+        if direct_plaintext_offset < direct_plaintext.len() {
+            inbound.extend_from_slice(&direct_plaintext[direct_plaintext_offset..]);
+        }
+
+        let mut raw = inner.into_raw()?;
+        inbound.extend_from_slice(&raw.inbound);
+        raw.inbound = inbound;
+
+        if write_queue_offset < write_queue.len() {
+            let mut outbound = Vec::new();
+            outbound.extend_from_slice(&write_queue[write_queue_offset..]);
+            outbound.extend_from_slice(&raw.outbound);
+            raw.outbound = outbound;
+        }
+
+        Ok(raw)
     }
 
     fn poll_flush_queue(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -132,12 +199,15 @@ where
         .map_err(vision_error)
     }
 
-    fn plan_and_queue(&mut self, accepted: &[u8]) -> io::Result<()> {
+    fn plan_and_queue(
+        &mut self,
+        accepted: &[u8],
+        complete_app_data_records: bool,
+    ) -> io::Result<bool> {
         let chunks: Vec<&[u8]> = accepted.chunks(MAX_CONTENT_LEN).collect();
-        let plan = self.writer.plan_write(&chunks, false, &mut self.rng);
-        if plan.switch_to_direct {
-            return Err(direct_error());
-        }
+        let plan = self
+            .writer
+            .plan_write(&chunks, complete_app_data_records, &mut self.rng);
 
         for (index, block_plan) in plan.blocks.iter().enumerate() {
             let Some(content) = chunks.get(index) else {
@@ -154,13 +224,64 @@ where
                 self.write_queue.extend_from_slice(chunk);
             }
         }
-        Ok(())
+        Ok(plan.switch_to_direct)
+    }
+
+    fn finish_pending_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let Some(accepted) = self.pending_accept else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Vision writer lost its pending write",
+            )));
+        };
+
+        match self.poll_flush_queue(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => {
+                self.pending_accept = None;
+                return Poll::Ready(Err(error));
+            }
+            Poll::Pending => return Poll::Pending,
+        }
+
+        if self.pending_direct_switch {
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => {
+                    self.pending_accept = None;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+            self.inner.switch_write_to_raw();
+            self.write_direct = true;
+            self.pending_direct_switch = false;
+        }
+
+        self.pending_accept = None;
+        Poll::Ready(Ok(accepted))
+    }
+
+    fn finish_direct_switch(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.pending_direct_switch {
+            return Poll::Ready(Ok(()));
+        }
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                self.inner.switch_write_to_raw();
+                self.write_direct = true;
+                self.pending_direct_switch = false;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 impl<S, R> AsyncRead for VisionStream<S, R>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: RawTlsHandoff,
     R: Rng + Unpin,
 {
     fn poll_read(
@@ -190,6 +311,17 @@ where
                     this.read_buf.drain(..count);
                     return Poll::Ready(Ok(()));
                 }
+                if this.direct_plaintext_offset < this.direct_plaintext.len() {
+                    let remaining = &this.direct_plaintext[this.direct_plaintext_offset..];
+                    let count = remaining.len().min(buf.remaining());
+                    buf.put_slice(&remaining[..count]);
+                    this.direct_plaintext_offset += count;
+                    if this.direct_plaintext_offset == this.direct_plaintext.len() {
+                        this.direct_plaintext.clear();
+                        this.direct_plaintext_offset = 0;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
 
@@ -211,7 +343,9 @@ where
                         return Poll::Ready(Err(state_error(error)));
                     }
                     if command == Command::Direct {
-                        return Poll::Ready(Err(direct_error()));
+                        this.inner.switch_read_to_raw();
+                        this.direct_plaintext = this.inner.take_plaintext();
+                        this.direct_plaintext_offset = 0;
                     }
                     if !content.is_empty() {
                         this.writer.inspect(&content);
@@ -263,7 +397,7 @@ where
 
 impl<S, R> AsyncWrite for VisionStream<S, R>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: RawTlsHandoff,
     R: Rng + Unpin,
 {
     fn poll_write(
@@ -273,18 +407,8 @@ where
     ) -> Poll<io::Result<usize>> {
         let this = self.as_mut().get_mut();
 
-        if let Some(accepted) = this.pending_accept {
-            match this.poll_flush_queue(cx) {
-                Poll::Ready(Ok(())) => {
-                    this.pending_accept = None;
-                    return Poll::Ready(Ok(accepted));
-                }
-                Poll::Ready(Err(error)) => {
-                    this.pending_accept = None;
-                    return Poll::Ready(Err(error));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
+        if this.pending_accept.is_some() {
+            return this.finish_pending_write(cx);
         }
 
         if !this.write_queue.is_empty() {
@@ -296,6 +420,13 @@ where
         }
 
         if !this.writer.padding_enabled() {
+            if this.pending_direct_switch {
+                match this.finish_direct_switch(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
         if buf.is_empty() {
@@ -303,27 +434,23 @@ where
         }
 
         let take = buf.len().min(MAX_WRITE_BATCH);
-        if let Err(error) = this.plan_and_queue(&buf[..take]) {
-            return Poll::Ready(Err(error));
+        let complete = is_complete_app_data_records(&buf[..take]);
+        match this.plan_and_queue(&buf[..take], complete) {
+            Ok(switch_direct) => this.pending_direct_switch = switch_direct,
+            Err(error) => return Poll::Ready(Err(error)),
         }
         this.pending_accept = Some(take);
-
-        match this.poll_flush_queue(cx) {
-            Poll::Ready(Ok(())) => {
-                this.pending_accept = None;
-                Poll::Ready(Ok(take))
-            }
-            Poll::Ready(Err(error)) => {
-                this.pending_accept = None;
-                Poll::Ready(Err(error))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        this.finish_pending_write(cx)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.as_mut().get_mut();
         match this.poll_flush_queue(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        match this.finish_direct_switch(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
@@ -338,13 +465,49 @@ where
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
         }
+        match this.finish_direct_switch(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         match Pin::new(&mut this.inner).poll_flush(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
         }
+        this.pending_accept = None;
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
+}
+
+fn is_complete_app_data_records(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let Some(remaining) = data.get(offset..) else {
+            return false;
+        };
+        let Some(header) = remaining.get(..5) else {
+            return false;
+        };
+        if header[0] != 0x17 || header[1] != 0x03 || header[2] != 0x03 {
+            return false;
+        }
+        let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        if length > MAX_INNER_TLS_BODY {
+            return false;
+        }
+        let Some(end) = offset.checked_add(5 + length) else {
+            return false;
+        };
+        if end > data.len() {
+            return false;
+        }
+        offset = end;
+    }
+    true
 }
 
 fn vision_error(error: VisionError) -> io::Error {
@@ -353,13 +516,6 @@ fn vision_error(error: VisionError) -> io::Error {
 
 fn state_error(error: VisionStateError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
-fn direct_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Vision Direct mode is not supported in this milestone",
-    )
 }
 
 #[cfg(test)]
@@ -374,6 +530,48 @@ mod tests {
         0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
         0xff,
     ];
+
+    impl RawTlsHandoff for tokio::io::DuplexStream {
+        fn switch_read_to_raw(&mut self) {}
+
+        fn switch_write_to_raw(&mut self) {}
+
+        fn take_plaintext(&mut self) -> Vec<u8> {
+            Vec::new()
+        }
+
+        fn into_raw(self) -> Result<RawTls, TlsStreamError> {
+            Err(TlsStreamError::RawNotEnabled)
+        }
+    }
+
+    fn server_hello() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x42; 32]);
+        body.push(32);
+        body.extend(std::iter::repeat_n(0x33, 32));
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.push(0);
+        body.extend_from_slice(&[0x00, 0x06]);
+        body.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+
+        let mut record = Vec::new();
+        record.extend_from_slice(&[0x16, 0x03, 0x03]);
+        record.extend_from_slice(&((4 + body.len()) as u16).to_be_bytes());
+        record.push(0x02);
+        record.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        record.extend_from_slice(&body);
+        record
+    }
+
+    fn app_data_record(payload: &[u8]) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&[0x17, 0x03, 0x03]);
+        record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        record.extend_from_slice(payload);
+        record
+    }
 
     fn rng(seed: u64) -> SmallRng {
         SmallRng::seed_from_u64(seed)
@@ -563,18 +761,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_mode_is_unsupported() {
-        let raw = block_bytes(Some(USER_ID), Command::Direct, b"x", 0);
+    async fn direct_mode_switches_to_passthrough() {
+        let mut raw = block_bytes(Some(USER_ID), Command::Direct, b"direct", 2);
+        let block_len = raw.len();
+        raw.extend_from_slice(b"raw");
+
         let (mut peer, client) = duplex(64 * 1024);
         peer.write_all(&raw).await.expect("write Direct block");
         peer.shutdown().await.expect("shutdown Direct writer");
 
         let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(8));
         let mut output = Vec::new();
-        let error = vision
+        vision
             .read_to_end(&mut output)
             .await
-            .expect_err("Direct must be rejected");
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            .expect("read Direct stream");
+        assert_eq!(output, b"directraw");
+        assert_eq!(raw.len() - block_len, 3);
+        assert!(vision.read_is_raw());
+        assert!(!vision.write_is_raw());
+    }
+
+    #[tokio::test]
+    async fn writer_emits_direct_after_server_hello_with_uuid() {
+        let (client, mut peer) = duplex(64 * 1024);
+        let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(10));
+        vision.writer.inspect(&server_hello());
+
+        let app = app_data_record(b"payload");
+        vision
+            .write_all(&app)
+            .await
+            .expect("write application data");
+        vision.write_all(b"raw").await.expect("write raw bytes");
+        vision.shutdown().await.expect("shutdown Vision writer");
+
+        let mut raw = Vec::new();
+        peer.read_to_end(&mut raw)
+            .await
+            .expect("read raw Vision output");
+        let (block, used) = parse_block(&raw, true)
+            .expect("Direct block must parse")
+            .expect("Direct block must be complete");
+        assert_eq!(block.uuid, Some(USER_ID));
+        assert_eq!(block.command, Command::Direct);
+        assert_eq!(block.content, app);
+        assert_eq!(&raw[used..], b"raw");
+        assert!(vision.write_is_raw());
+        assert!(!vision.read_is_raw());
     }
 }
