@@ -40,6 +40,7 @@ Updated: 2026-10-22.
 | Vision-framed relay | Done |
 | Vision Direct raw TLS handoff | Done |
 | Early one-way raw download splice | Done |
+| Early one-way raw upload splice | Done |
 | Prefix replay stream | Done |
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP/HTTPS interop | **HTTP 200** |
@@ -77,6 +78,10 @@ UDP modes:
 - Server CPU per GiB, TCP upload: ~1.00x / 1.03x (slightly worse).
 - HTTPS Vision Direct: early one-way splice reduced server CPU from ~0.32 to
   **0.107 s/GiB**, matching stock; quick throughput ratio **1.033x**.
+- HTTPS upload with `Expect: 100-continue`: server CPU fell from ~0.288 to
+  **0.113 s/GiB** (~2.5x lower) at throughput parity. Clients that keep the
+  entire body framed do not trigger the early handoff; that is a client
+  behavior limitation, not a server regression.
 - UDP echo throughput: **1.22x** stock.
 - Server RSS after warm-up: **0.24x** stock (76% lower).
 - DNS p50/p95 favor beam; p99 and H3 p99 are slightly worse on a noisy host.
@@ -91,14 +96,15 @@ UDP modes:
 
 ## In progress
 
-- Final soak/churn and RTT-condition validation.
+- Final 24-hour soak and privileged syscall/wakeup acceptance.
 - Deployment package (not deployed).
 
 ## Known gaps / not started
 
 - TLS extension-order and encrypted-flight-size parity.
-- HTTPS upload still uses tokio copy; only the download direction gets the
-  early one-way splice.
+- The early upload splice depends on the client sending Direct before the
+  body; fully framed uploads stay on the async path.
+- A 24-hour soak and privileged syscall/wakeup gates remain.
 - VPS cutover is intentionally not performed.
 
 ## Evidence
