@@ -10,8 +10,8 @@
 //! unreachable destination, a failed send, or a socket read error) is reported
 //! as `End + Error` for that session and does not take down unrelated sessions.
 //!
-//! This module is not wired into `crate::tls::server` yet; the handler is
-//! exposed for the later merge.
+//! The TLS adapter calls [`handle_mux_stream`] for an authenticated VLESS
+//! `Command::Mux`, after writing the VLESS response header.
 
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};

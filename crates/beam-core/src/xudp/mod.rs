@@ -30,9 +30,9 @@
 //! - Domain destinations are resolved on every frame. Stock Xray caches the
 //!   address for an outbound domain; the wire behavior is the same, but the
 //!   cache is a future optimization.
-//! - The handler is not wired into `crate::tls::server` yet. It accepts any
-//!   `AsyncRead + AsyncWrite + Unpin + Send + 'static`, which lets the later
-//!   merge pass a Vision-decoded VLESS body without changing this layer.
+//! - The handler is used by `crate::tls::server` for VLESS `Command::Mux`. It
+//!   accepts any `AsyncRead + AsyncWrite + Unpin + Send + 'static`, which lets
+//!   the TLS adapter pass a Vision-decoded or prefix-replayed VLESS body.
 
 pub mod frame;
 mod server;
