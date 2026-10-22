@@ -141,6 +141,8 @@ UDP modes:
 - `docs/12-custom-tls-design.md`: reference-only exact-mirroring design.
 - `docs/13-vision-direct-design.md`: Direct raw-handoff design.
 - `docs/14-tun-harness.md`: full-TUN topology, probes, and control results.
+- `docs/15-production-runbook.md`: live operations, rotation, rollback, and
+  monitoring.
 - `bench/README.md`: benchmark and no-TUN smoke usage.
 
 ## Current verification
