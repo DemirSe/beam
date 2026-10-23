@@ -174,6 +174,8 @@ The fixed local binary (`feat/deep-hardening`) was tested beyond the unit suite:
 | Cover flood | 100 simultaneous unauthenticated TLS probes: exactly **32** reached the cover; authenticated HTTP stayed **200** with 2.1–2.8 ms response time |
 | Cover down | Authenticated VLESS/TCP still returned 200 with `dest` closed; unauthenticated probe saw EOF |
 | No-TUN capacity, 64 MiB | beam **831.6 MB/s** median vs stock Xray **299.3 MB/s** (2.78x; cold stock outlier, not a headline) |
+| TCP integrity, 64 MiB download | SHA-256 match; 200; 0.088 s; RSS 7,928 KiB, 10 fds |
+| TCP integrity, 64 MiB upload | SHA-256 match; 200; 0.108 s; RSS 8,084 KiB, 10 fds |
 | Full TUN XUDP, MTU 1500 | **8/8 PASS** with the fixed binary |
 | Full TUN XUDP, MTU 1400 | 7/8 PASS; only H3, reproduced with stock Xray |
 | 1-hour mixed TCP/UDP soak | In progress; see `/tmp/opencode/deep-campaign/soak-live/` |
