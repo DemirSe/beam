@@ -22,7 +22,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
 | Unit / backups | `/etc/systemd/system/beam.service` 0644; `*.bak-<UTC stamp>` beside each installed file |
-| Pending hardening | Repo now has a global XUDP cap of 256, a cover cap of 32, systemd memory limits, and fuzz targets; **not yet deployed** |
+| Hardening | Deployed 2026-10-23 12:46 UTC: binary `5379e682…`; global XUDP 256, cover 32, `MemoryHigh=512M`/`MemoryMax=768M`/`MemorySwapMax=512M`; live config preserved |
 | Local client | sing-box, `/etc/sing-box/config.json` 0600, active but disabled at boot |
 | Client identity | `~/.config/beam/client-identity.json`, `client-link.txt` 0600 |
 | Tunnel egress | IPv4 `158.94.216.102`, IPv6 `2a01:f900:11:168::1` |
@@ -233,13 +233,13 @@ tune after a 24-hour soak.
 The live `max_connections` is 1024 and the pre-auth handshake timeout is 10 s.
 Each Vision Direct relay can hold up to two blocking splice tasks and 512 KiB
 pipes; the Tokio blocking pool is capped at 160 threads. The XUDP reply queue is
-512 frames and session sockets request a 1 MiB receive buffer. The repo adds a
-**process-wide 256-session XUDP cap** (active plus retained sockets), a **32
-cover-relay cap**, and `MemoryHigh=512M`/`MemoryMax=768M`; these are not live
-until the next deploy. If RSS exceeds 256 MiB, threads exceed 160, swap is used,
+512 frames and session sockets request a 1 MiB receive buffer. The live service
+now runs the **process-wide 256-session XUDP cap** (active plus retained
+sockets), the **32 cover-relay cap**, and `MemoryHigh=512M`/`MemoryMax=768M`/
+`MemorySwapMax=512M`. If RSS exceeds 256 MiB, threads exceed 160, swap is used,
 or p95 latency rises, lower `max_connections` to 256. `max_udp_destinations`
 also consumes one socket/fd per destination; the live value is 1024, while the
-process-wide cap is 256. After deploying the new unit, check
+process-wide cap is 256. Check
 
 ```bash
 bssh 'systemctl show beam -p MemoryHigh -p MemoryMax -p MemorySwapMax'

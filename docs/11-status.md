@@ -167,11 +167,17 @@ UDP modes:
   There was no restart, RSS stayed at ~10.2 MiB, and FDs went 124 → 154 → 134
   (peak → +60 s). The previous audit and soak reports are in `/tmp/opencode/`.
 
-## Pending deployment
+## Deployed hardening
 
-- The global XUDP cap, cover concurrency cap, systemd memory limits, and fuzz
-  targets are implemented and locally verified but **not deployed**. See
-  `docs/17-resource-hardening.md`.
+- On 2026-10-23 12:46 UTC the merged hardening binary was deployed to the live
+  VPS: SHA-256 `5379e6823944fb6e3c2a3e14fbbe12a5b394e4c50a5597f25ac9ceb5c276d951`.
+- The global XUDP cap (256), cover concurrency cap (32), and systemd
+  `MemoryHigh=512M` / `MemoryMax=768M` / `MemorySwapMax=512M` are live.
+- The live config was **not overwritten**; the existing 1024-connection,
+  `info`-level config was preserved. The unit and binary backups are timestamped
+  `20261023T124410Z`.
+- Post-deploy IPv4/IPv6 egress, HTTPS, HTTP, DNS, and the cover certificate were
+  verified. See `docs/17-resource-hardening.md`.
 
 ## In progress
 

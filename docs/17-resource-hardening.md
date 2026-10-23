@@ -119,9 +119,9 @@ Add a separate `fuzz/` workspace with targets for:
 sockets. The fuzz workspace is excluded from the production workspace, and the
 `fuzz` feature is not enabled in release builds.
 
-CI now also runs `cargo test --workspace --release`. A separate scheduled
-workflow builds and runs each target for a short budget. Fuzzing does not touch
-the production binary or server.
+CI can run `cargo test --workspace --release` when manually dispatched. A
+separate manual fuzz workflow builds and runs each target for a short budget.
+Fuzzing has no schedule and does not touch the production binary or server.
 
 ## Verification
 
@@ -206,16 +206,31 @@ a 24-hour soak impossible. Use the self-hosted lab for those. The self-hosted
 runner must have `/dev/net/tun`, unprivileged user namespaces, sing-box, stock
 Xray, iperf3, the test REALITY config, and the H3 origin toolchain available.
 
-GitHub only exposes the `workflow_dispatch` button from the default branch. The
-manual `ci` workflow is already present on `main`; the `fuzz` and `lab`
-workflows live with the hardening branch and become manually available after
-that branch is merged or made the default. Until then, run fuzzing and the
-full-TUN/benchmark lab locally.
+All three workflows are now on the default branch (`main`) and are
+manual-only. There is no schedule, push, or pull-request trigger. Run them from
+the Actions tab, or ask the agent to run the local commands.
 
-## Deployment note
+## Deployment record
 
-The live VPS still runs the previous unit and binary. Deployment must apply the
-new unit (memory limits) and binary together, then verify:
+Deployed to the live VPS on **2026-10-23 12:46 UTC** with the merged `main`
+binary:
+
+- Binary SHA-256:
+  `5379e6823944fb6e3c2a3e14fbbe12a5b394e4c50a5597f25ac9ceb5c276d951`
+- `/etc/beam/config.toml` was **not overwritten**; the live 1024-connection /
+  `info` config was preserved. Its SHA-256 remained
+  `21eb3d0c48e4b7b6b8c4c8f387475c2ec401972a4760964c28eb042448522107`.
+- The new unit is active with `MemoryHigh=512M`, `MemoryMax=768M`, and
+  `MemorySwapMax=512M`.
+- Backups:
+  - `/usr/local/bin/beam.bak-20261023T124410Z`
+  - `/etc/systemd/system/beam.service.bak-20261023T124410Z`
+- Service is active with `NRestarts=0`; the listener is `0.0.0.0:443`, and the
+  post-deploy cover test returned the real Meta `*.whatsapp.net` certificate.
+- IPv4/IPv6 egress and HTTPS/HTTP/DNS through the local TUN were verified after
+  the restart.
+
+Post-deploy checks still recommended under representative load:
 
 - `systemctl show beam -p MemoryHigh -p MemoryMax -p MemorySwapMax`
 - `cat /sys/fs/cgroup/system.slice/beam.service/memory.current`
@@ -223,5 +238,3 @@ new unit (memory limits) and binary together, then verify:
 - `ss -uanp | grep beam` under a full-TUN workload
 - `nstat -az` for `UdpRcvbufErrors`/`UdpSndbufErrors`
 - authenticated p95 while a cover-probe burst is running
-
-No deployment is performed by this change.
