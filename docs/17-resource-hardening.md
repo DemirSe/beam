@@ -207,9 +207,9 @@ runner must have `/dev/net/tun`, unprivileged user namespaces, sing-box, stock
 Xray, iperf3, the test REALITY config, and the H3 origin toolchain available.
 
 GitHub only exposes the `workflow_dispatch` button from the default branch. The
-`ci` workflow can be added to `main` as a workflow-only change; the `fuzz` and
-`lab` workflows live with the hardening branch and become manually available
-after that branch is merged or made the default. Until then, run fuzzing and the
+manual `ci` workflow is already present on `main`; the `fuzz` and `lab`
+workflows live with the hardening branch and become manually available after
+that branch is merged or made the default. Until then, run fuzzing and the
 full-TUN/benchmark lab locally.
 
 ## Deployment note
