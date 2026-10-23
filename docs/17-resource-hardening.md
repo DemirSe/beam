@@ -181,7 +181,7 @@ The fixed local binary (`feat/deep-hardening`) was tested beyond the unit suite:
 | TCP integrity, 64 MiB upload | SHA-256 match; 200; 0.108 s; RSS 8,084 KiB, 10 fds |
 | Full TUN XUDP, MTU 1500 | **8/8 PASS** with the fixed binary |
 | Full TUN XUDP, MTU 1400 | 7/8 PASS; only H3, reproduced with stock Xray |
-| Mixed TCP/UDP soak | 276 iterations (23 min) before a rebuild: 0 errors; RSS 8,224 → 8,460 KiB; threads 9; fds 12. A fresh 1 h run is still in progress. |
+| 1-hour mixed TCP/UDP soak | 720 iterations: **0 errors**; RSS 8,308 → 8,788 KiB; threads 9 → 9; fds 12 → 12. A 24-hour soak and privileged acceptance remain open. |
 | Final full-TUN matrix, MTU 1500 | **8/8** for `xudp`, `legacy`, and `packetaddr`; 1.3 MiB H3 body also **8/8** |
 
 The cover cap and cross-stream retained eviction are independent: the cap
