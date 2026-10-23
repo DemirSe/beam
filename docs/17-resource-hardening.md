@@ -150,6 +150,35 @@ Results after the change:
   the known client/MTU H3 stall, not with the new session limiter. It is
   recorded as a client-TUN issue to investigate separately.
 
+## Old vs new local smoke (2026-10-23)
+
+The pre-hardening live binary was compared with the new local binary on the
+same lab topology. Hashes:
+
+| Arm | SHA-256 |
+|---|---|
+| old (live `e99638cd...`) | `e99638cde81d13cb2cf153b6a80c1d39328d88ba27f919667327602f32ac5b47` |
+| new (`dfa3b59`) | `5379e6823944fb6e3c2a3e14fbbe12a5b394e4c50a5597f25ac9ceb5c276d951` |
+
+Full-TUN XUDP, system stack:
+
+| MTU | old | new |
+|---:|---|---|
+| 1500 | 8/8 PASS | 8/8 PASS |
+| 1400 | 7/8 PASS; `quic-udp` failed | 7/8 PASS; `quic-udp` failed |
+
+The identical 1400 result shows the H3 failure is not introduced by the new
+session caps; it is the existing client/TUN/MTU issue.
+
+A short clean benchmark (`--quick --reps 2`) was **client-core saturated** and
+ran under host load 0.64–1.31, so it is directional only, not a headline
+measurement. Old/new medians were in the same band: TCP download 1 flow
+1679/1748 Mbit/s, upload 3038/3067 Mbit/s, HTTPS 197/191 MiB/s, UDP echo
+49.4/44.6 kpps, RSS 9.8/10.0 MiB, server threads 3/3, server fds 34/34. The
+differences are within the noise of this short, invalid run; no systematic
+regression is visible. A valid comparison requires a quiet host and more
+repetitions.
+
 ## Deployment note
 
 The live VPS still runs the previous unit and binary. Deployment must apply the
