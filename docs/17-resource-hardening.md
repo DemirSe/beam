@@ -145,8 +145,8 @@ provides one. Local checks used the portable GCC toolchain under
 
 Results after the change:
 
-- `cargo test --workspace`: 238 beam-core unit tests, 2 integration tests, and
-  23 beam-sys tests pass after the cross-stream retained-socket test.
+- `cargo test --workspace`: 239 beam-core unit tests, 2 integration tests, and
+  23 beam-sys tests pass after the cross-stream retained-socket tests.
 - `cargo test --workspace --release`: pass.
 - `cargo check --manifest-path fuzz/Cargo.toml`: pass with the portable C++
   compiler; `scripts/dev-env.sh` now exports `CXX` when that wrapper exists.
@@ -160,6 +160,27 @@ Results after the change:
   1280/1300/1450. At MTU 1480, 1492, and 1500 the same H3 probe passes 8/8,
   including a 1.3 MiB body. This is a client TUN/UDP fragmentation limitation,
   not a beam XUDP limiter regression; see `docs/14-tun-harness.md`.
+
+## Local stress follow-up (2026-10-23)
+
+The fixed local binary (`feat/deep-hardening`) was tested beyond the unit suite:
+
+| Check | Result |
+|---|---|
+| 10,000-connection churn, concurrency 64 | **10,000/10,000 HTTP 200** in 67 s; RSS 7,804 → 8,640 KiB; threads 2 → 2; fds 10 → 10 |
+| 10,000-connection churn, concurrency 256 | **10,000/10,000 HTTP 200** in 55 s; RSS 7,760 → 9,032 KiB; threads 2 → 2; fds 10 → 10 |
+| Malformed TLS/handshake stress | 2,000 random or truncated connections: process alive; RSS 6,516 → 7,292 KiB; fds 10 → 10; threads 9 → 9 |
+| Slow ClientHello header | 32 connections sent only the 5-byte record header: all timed out and closed by ~13 s; fds 42 → 10; process alive |
+| Cover flood | 100 simultaneous unauthenticated TLS probes: exactly **32** reached the cover; authenticated HTTP stayed **200** with 2.1–2.8 ms response time |
+| Cover down | Authenticated VLESS/TCP still returned 200 with `dest` closed; unauthenticated probe saw EOF |
+| No-TUN capacity, 64 MiB | beam **831.6 MB/s** median vs stock Xray **299.3 MB/s** (2.78x; cold stock outlier, not a headline) |
+| Full TUN XUDP, MTU 1500 | **8/8 PASS** with the fixed binary |
+| Full TUN XUDP, MTU 1400 | 7/8 PASS; only H3, reproduced with stock Xray |
+| 1-hour mixed TCP/UDP soak | In progress; see `/tmp/opencode/deep-campaign/soak-live/` |
+
+The cover cap and cross-stream retained eviction are independent: the cap
+protects the blocking pool, while retained eviction protects new UDP flows from
+optional session state.
 
 ## Old vs new local smoke (2026-10-23)
 
