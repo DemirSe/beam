@@ -224,9 +224,9 @@ SKIP_BUILD=1 H3_BODY_BYTES=1333889 TUN_STACK=system TUN_MTU=1500 \
   bash tests/tun/run.sh --no-build
 ```
 The gVisor result is a client-TUN limitation, not a beam-only regression; it is
-recorded because the production client may use gVisor. Switch the production
-client TUN stack to `system`/`mixed` before attributing large-H3 stalls to the
-server.
+recorded because other clients such as Hiddify may still use gVisor. Switch
+the client TUN stack to `system`/`mixed` before attributing large-H3 stalls to
+the server.
 
 ### TUN MTU sensitivity (2026-10-23)
 
@@ -239,18 +239,46 @@ The small HTTP/3 probe is sensitive to TUN MTU even though TCP and the
 | 1300 | 7/8 | not run | no H3 connection |
 | 1400 | 7/8 | **7/8** | connection starts, GET stalls |
 | 1450 | 7/8 | not run | origin answers, client fails |
-| 1480 | **8/8** | not run | PASS |
-| 1492 | **8/8** | not run | PASS |
+| 1480 | **8/8** | not run | PASS (IPv4) |
+| 1492 | **8/8** | not run | PASS (IPv4) |
 | 1500 | **8/8** | **8/8** | PASS |
 
 `H3_BODY_BYTES=1333889` also passes at 1480 and 1500 and fails at 1400. The
 failure is unchanged by UDP encoding (`xudp`, `packetaddr`, `legacy`) and by
 the TUN stack (`system`, `gvisor`, `mixed`), and stock Xray reproduces it on
-the same client. The target's QUIC origin logs a connection but no HTTP request, which
-is consistent with fragmented UDP datagrams being unusable at a TUN MTU below
-the QUIC path size. The production requirement remains MTU 1400; if HTTP/3 is
-needed, use MTU >=1480 for IPv4 (>=1492 is the safe IPv6 bound) or accept the
-documented H3 gap. TCP, UDP echo, DNS, and Vision/HTTPS are unaffected.
+the same client. The target's QUIC origin logs a connection but no HTTP request,
+which is consistent with the client TUN being unable to accept the 1480-byte
+inner datagram; the tunnel does not carry ICMP PTB back to the QUIC sender.
+The production client now uses **TUN MTU 1500**; 1400 remains a fallback that
+loses H3. IPv4 H3 needs at least 1480; IPv6 H3 needs 1500 with the local quinn
+origin (1452-byte UDP payload plus 48 bytes of IPv6/UDP headers). The 1480 and
+1492 rows above are IPv4-only. TCP, UDP echo, DNS, and Vision/HTTPS are
+unaffected at 1400.
+
+### Mobile hotspot validation (2026-10-24)
+
+The production client was tested from a laptop behind a **TT Mobil hotspot**
+(AS20978) with TUN MTU 1500 and an outer TCP MSS of only **1388**:
+
+| Probe | Result |
+|---|---|
+| TCP 64 MiB | **HTTP 200**, 14.27 MB/s, SHA-256 unchanged |
+| Upload 16 MiB (HTTP/2) | **HTTP 200**, 1.64 MB/s |
+| HTTP/3 Cloudflare, 1.33 MB body | **5/5 PASS**, ~0.7-0.8 s |
+| HTTP/3 YouTube | **10/10 PASS**, ~0.8-1.2 s |
+| HTTP/3 Google | **10/10 HTTP 200**; 1-3/10 took ~10.5 s to complete |
+| HTTP/3 Cloudflare over IPv6, 1.33 MB | **HTTP 200** |
+| HTTP/2 Google and YouTube | **10/10 PASS**, ~0.6-0.9 s |
+| TUN RX/TX drops | 0 |
+| Server UDP errors / restarts | 0 / 0 |
+
+The smaller outer MSS did not matter: the TCP tunnel segmented the 1500-byte
+inner path without TUN drops. The old 1400 value timed out Google and YouTube
+H3 on the fixed network. At 1500 all tested H3 sites returned 200. The Google
+outliers delivered most of the body quickly but delayed the final bytes by
+~10.5 s; HTTP/2 stayed stable, and TUN/server drop counters stayed at zero.
+This is H3-over-TCP/QUIC PTO, not an MTU drop. If deterministic latency is more
+important than H3, block QUIC on the client and use HTTP/2 over TCP.
 
 ## Blockers, past and present
 

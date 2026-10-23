@@ -19,9 +19,9 @@ on:
         type: choice
         options: [xudp, packetaddr, legacy]
       mtu:
-        description: "TUN MTU"
+        description: "TUN MTU (production 1500; 1400 is the H3-loss fallback)"
         required: true
-        default: "1400"
+        default: "1500"
       rtt_ms:
         description: "Benchmark netem RTT in milliseconds"
         required: true

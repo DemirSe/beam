@@ -22,9 +22,12 @@ kept outside the repository in `~/.config/beam/` with mode `0600`.
    ```
 
    The script now writes the REALITY identity, sets every TUN inbound to
-   `stack: system` with MTU 1400 (the gVisor stack stalls large HTTP/3 bodies),
-   restarts `sing-box`, and enables it at boot. If you import the link into
-   Hiddify instead, set its TUN stack to `system` manually.
+   `stack: system` with MTU 1500, restarts `sing-box`, and enables it at boot.
+   The kernel stack is stable for large HTTP/3 bodies; the gVisor stack stalls
+   them. MTU 1500 matches the server egress path, while 1400 loses Google and
+   YouTube H3. The outer TCP connection segments for smaller mobile/hotspot
+   paths. If you import the link into Hiddify instead, set its TUN stack to
+   `system` and its MTU to `1500` manually.
 
    Install the tray's passwordless unit rule and autostart:
 

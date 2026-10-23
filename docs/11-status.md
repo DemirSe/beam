@@ -191,11 +191,11 @@ UDP modes:
   RSS/fd/thread samples. It was paused for the detailed benchmark and resumed
   at 15:42 UTC. Logs: `/tmp/opencode/soak-24h-live3/`; stop with
   `kill 2089354`. This is not the privileged quiet syscall/wakeup acceptance.
-- Residual large-HTTP/3 stalls through the production TUN; the local lab shows
-  the same failure with a gVisor TUN on both beam and stock Xray, so the client
-  TUN stack is a contributing factor. Small H3 requests and large H3 bodies
-  with the `system` stack pass. Switch the client stack to `system`/`mixed`
-  before treating this as a server regression.
+- H3 over the TCP tunnel can still show ~10.5 s Google completion outliers at
+  TUN MTU 1500 even though HTTP/2 is stable and TUN/server drop counters stay
+  at zero; this is QUIC PTO/TCP HOL, not an MTU drop. gVisor still stalls large
+  H3 bodies; the production client uses `system`. See
+  `docs/14-tun-harness.md`.
 
 ## Known gaps / not started
 
@@ -214,14 +214,19 @@ UDP modes:
 - The provider L4 firewall/rate limit was not independently verified; the host
   nftables rules are.
 - The local `sing-box` service is not enabled at boot.
-- Large H3 bodies can occasionally stall 20–45 s through the production TUN;
-  the post-hardening soak saw 2 timeouts in 14 attempts. The updated
-  `deploy/update-client.py` sets the TUN stack to `system` (and enables the
-  service); Hiddify users must set it manually. The server-side 1.3 MiB H3 test
-  passes locally with the `system` stack.
-- **H3 requires TUN MTU >=1480 (>=1492 for IPv6) in the local lab.** The
-  failure at 1400 reproduces with stock Xray and all UDP encodings; TCP, UDP
-  echo, DNS, and HTTPS pass at 1400. See `docs/14-tun-harness.md`.
+- Large H3 bodies can occasionally stall through the production TUN. The
+  original 20–45 s stalls were consistent with the 1400 MTU failure; at 1500
+  the 2026-10-24 mobile run passed 1.33 MiB H3 and 64 MiB TCP, but Google H3
+  still showed
+  1–3/10 ~10.5 s completion outliers while HTTP/2 stayed stable. TUN and
+  server drop counters stayed at zero, so this is H3-over-TCP/QUIC PTO rather
+  than an MTU drop. The updated `deploy/update-client.py` sets `system` and
+  MTU 1500; Hiddify users must set both manually.
+- **Production TUN MTU is 1500.** H3 needs at least 1480 for IPv4 and 1500 for
+  IPv6; at 1400 Google and YouTube H3 time out. The 2026-10-24 TT Mobil
+  hotspot run with outer MSS 1388 passed 64 MiB TCP at 14.27 MB/s, 1.33 MiB
+  H3, IPv6 H3, and 16 MiB upload with zero TUN drops. See
+  `docs/14-tun-harness.md`.
 - `XudpSessionLimiter` now evicts a retained GlobalID socket from any mux
   stream when the 256-slot global limit is full, instead of rejecting a new
   live session while optional retention state exists. The cross-stream

@@ -157,9 +157,10 @@ Results after the change:
 - Local full-TUN `xudp` at **MTU 1500**: 8/8 PASS.
 - Local full-TUN `xudp` at **MTU 1400**: 7/8 PASS; only `quic-udp` failed.
   The same 7/8 result reproduces with stock Xray as the server, and at MTU
-  1280/1300/1450. At MTU 1480, 1492, and 1500 the same H3 probe passes 8/8,
-  including a 1.3 MiB body. This is a client TUN/UDP fragmentation limitation,
-  not a beam XUDP limiter regression; see `docs/14-tun-harness.md`.
+  1280/1300/1450. At MTU 1480, 1492, and 1500 the same IPv4 H3 probe passes
+  8/8, including a 1.3 MiB body; IPv6 H3 needs 1500. This is a client
+  TUN/MTU limitation, not a beam XUDP limiter regression; see
+  `docs/14-tun-harness.md`.
 
 ## Local stress follow-up (2026-10-23)
 
@@ -358,8 +359,10 @@ deployed with `BEAM_KEEP_CONFIG=1`:
   `MemoryHigh=512M` / `MemoryMax=768M` / `MemorySwapMax=512M`.
 - Post-deploy cover test returned the real Meta `*.whatsapp.net` certificate.
 - Local TUN IPv4/IPv6 egress, HTTPS, HTTP, and DNS passed after the restart.
-- HTTP/3 at TUN MTU 1400 remains the known stock-Xray/client limitation; see
-  `docs/14-tun-harness.md`.
+- The production client now uses TUN MTU 1500; 1400 remains the fallback that
+  loses Google/YouTube H3. The 2026-10-24 TT Mobil hotspot run with outer MSS
+  1388 passed 64 MiB TCP, 1.33 MiB H3, IPv6 H3, and upload with zero TUN
+  drops; see `docs/14-tun-harness.md`.
 
 Post-deploy checks still recommended under representative load:
 

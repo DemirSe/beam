@@ -36,9 +36,12 @@ def main() -> int:
         return 2
     # The kernel TUN stack is stable for large HTTP/3 bodies through this
     # server. The gVisor stack intermittently resets/stalls large H3 streams.
+    # MTU 1500 matches the server's 1500-byte egress path. The outer TCP
+    # connection still segments for smaller mobile/hotspot paths; 1400 loses
+    # Google/YouTube H3 because their QUIC packets exceed the inner MTU.
     for tun in tun_inbounds:
         tun["stack"] = "system"
-        tun["mtu"] = 1400
+        tun["mtu"] = 1500
 
     outbounds = config.get("outbounds", [])
     vless = [o for o in outbounds if o.get("type") == "vless"]

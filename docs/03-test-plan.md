@@ -80,9 +80,9 @@ client traffic through the server:
 - UDP DNS and QUIC/HTTP3.
 - IPv4 and IPv6 destinations.
 - Reconnect while a transfer is active.
-- TUN MTU 1400 (production value); verify no fragmentation or truncation.
-  Also run a 1500-byte control to separate client-stack behavior from the
-  production MTU.
+- TUN MTU 1500 (production value); verify no fragmentation or truncation.
+  Also run a 1400 control to reproduce the H3 MTU gap and separate
+  client-stack behavior from the production MTU.
 
 The client configuration is unchanged from the stock deployment. This test is
 a release blocker for replacing the production server.

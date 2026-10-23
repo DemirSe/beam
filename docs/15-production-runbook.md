@@ -67,8 +67,11 @@ tunnel is down; run `sudo systemctl start sing-box` (disabled at boot) and retry
 Rotate after an identity change, on a new laptop, or when egress is not the VPS.
 `update-client.py` backs up `/etc/sing-box/config.json`, writes the REALITY
 fields from `~/.config/beam/client-identity.json`, sets every TUN inbound to
-`stack: system` with MTU 1400 (gVisor stalls large HTTP/3 bodies), restarts
-sing-box, restores the backup on failure, and enables the service at boot:
+`stack: system` with MTU 1500, restarts sing-box, restores the backup on
+failure, and enables the service at boot. The kernel stack is stable for large
+HTTP/3 bodies; gVisor stalls them. MTU 1500 matches the server egress path,
+while 1400 loses Google and YouTube H3. The outer TCP connection segments for
+smaller mobile/hotspot paths:
 ```bash
 cd /home/demir/pi/beam
 sudo python3 deploy/update-client.py
@@ -317,19 +320,21 @@ measured and a targeted MSS clamp is not sufficient.
 - Cover parity is incomplete: beam emits `key_share, supported_versions` versus the
   cover's `supported_versions, key_share`, and the encrypted flight is 3 records /
   416 B versus 5 / 3085 B (temporary Ed25519 certificate). See `docs/10-cover-parity.md`.
-- Large HTTP/3 bodies through the production TUN occasionally stall 20–45 s.
-  The post-hardening soak was 12/14 large-H3 success (two 45 s timeouts) while
-  non-H3 was 87/87. The local lab reproduces the large-body failure with a gVisor
-  TUN on both beam and stock Xray; a `system` TUN passes 1.3 MiB. The updated
-  `update-client.py` sets `system`; Hiddify users must select it manually before
-  treating this as a server regression.
-- **HTTP/3 needs TUN MTU >=1480 on this client stack.** The local 2026-10-23
-  matrix passes the H3 probe at 1480/1492/1500 and fails at 1280/1300/1400/1450
-  with beam and with stock Xray, across all UDP encodings and both `system` and
-  `gvisor` TUN stacks. TCP, 1200-byte UDP, DNS, and HTTPS are unaffected at
-  1400. The production requirement remains MTU 1400; do not attribute H3 stalls
-  to beam without first retrying at 1480 (IPv6-safe 1492) or accepting the H3
-  gap.
+- Large HTTP/3 bodies through the production TUN can still show completion
+  outliers. The original 20–45 s stalls were consistent with the 1400 MTU
+  failure. At 1500 the 2026-10-24 TT Mobil hotspot run passed 1.33 MiB H3 and
+  64 MiB TCP, but Google H3 showed 1–3/10 ~10.5 s completion outliers while
+  HTTP/2 stayed stable. TUN
+  and server drop counters stayed at zero, so this is H3-over-TCP/QUIC PTO,
+  not an MTU drop. Hiddify users must select `system` and MTU 1500 manually.
+- **HTTP/3 needs TUN MTU >=1480 for IPv4 and 1500 for IPv6 on this client
+  stack.** The local 2026-10-23 matrix passes the IPv4 H3 probe at
+  1480/1492/1500 and fails at 1280/1300/1400/1450 with beam and with stock
+  Xray, across all UDP encodings and both `system` and `gvisor` TUN stacks.
+  TCP, 1200-byte UDP, DNS, and HTTPS are unaffected at 1400. The production
+  client is now **MTU 1500**; 1400 remains the fallback that loses H3. The
+  2026-10-24 mobile hotspot run used outer MSS 1388 with no TUN drops. See
+  `docs/14-tun-harness.md`.
 - A 5-minute post-hardening soak and the read-only audit are complete. A light
   24-hour background soak was resumed on 2026-10-22 15:42 UTC
   (`/tmp/opencode/soak-24h-live3/`); the privileged quiet syscall/wakeup gates
