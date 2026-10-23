@@ -169,15 +169,20 @@ UDP modes:
 
 ## Deployed hardening
 
-- On 2026-10-23 12:46 UTC the merged hardening binary was deployed to the live
-  VPS: SHA-256 `5379e6823944fb6e3c2a3e14fbbe12a5b394e4c50a5597f25ac9ceb5c276d951`.
+- On 2026-10-23 12:46 UTC the first hardening binary was deployed: SHA-256
+  `5379e6823944fb6e3c2a3e14fbbe12a5b394e4c50a5597f25ac9ceb5c276d951`.
+- On 2026-10-23 18:10 UTC the deep-audit follow-up was deployed: SHA-256
+  `bd17ac26928d4e659a0f7596f959b5a66f0f8314288c7720220882e4ea88287b`.
+  It includes the accept-loop, relay-cancellation, replay-cache, TCP idle,
+  XUDP retained/queue, GlobalID migration, packetaddr isolation, VLESS route,
+  TOML redaction, and legacy-config fixes.
 - The global XUDP cap (256), cover concurrency cap (32), and systemd
   `MemoryHigh=512M` / `MemoryMax=768M` / `MemorySwapMax=512M` are live.
 - The live config was **not overwritten**; the existing 1024-connection,
-  `info`-level config was preserved. The unit and binary backups are timestamped
-  `20261023T124410Z`.
-- Post-deploy IPv4/IPv6 egress, HTTPS, HTTP, DNS, and the cover certificate were
-  verified. See `docs/17-resource-hardening.md`.
+  `info`-level config was preserved. The latest unit and binary backups are
+  timestamped `20261023T181052Z`.
+- Post-deploy IPv4/IPv6 egress, HTTPS, HTTP, DNS, the cover certificate, and
+  `NRestarts=0` were verified. See `docs/17-resource-hardening.md`.
 
 ## In progress
 

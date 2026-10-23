@@ -2,8 +2,8 @@
 
 Date: 2026-10-23. Scope: the first three findings from the production audit.
 This document records the design decisions and the implemented code. The
-original hardening was deployed on 2026-10-23; the local follow-up in this
-document (cross-stream retained-socket eviction) is still test-only.
+original hardening was deployed on 2026-10-23; the deep-audit follow-up was
+deployed later the same day at 18:10 UTC.
 
 ## 1. XUDP memory and session bounds
 
@@ -188,12 +188,17 @@ The cover cap and cross-stream retained eviction are independent: the cap
 protects the blocking pool, while retained eviction protects new UDP flows from
 optional session state.
 
-## Follow-up fixes (local branch, not yet deployed)
+## Deployed follow-up (2026-10-23 18:10 UTC)
 
 The deep local audit found several operational/security issues outside the
-first deployment. These are fixed and covered locally but are **not on the live
-VPS** until a later deploy. Local branch binary SHA-256:
+first deployment. They are fixed and deployed to the live VPS. Live binary
+SHA-256:
 `bd17ac26928d4e659a0f7596f959b5a66f0f8314288c7720220882e4ea88287b`.
+The live `/etc/beam/config.toml` was preserved with hash
+`21eb3d0c48e4b7b6b8c4c8f387475c2ec401972a4760964c28eb042448522107`;
+the deploy used `BEAM_KEEP_CONFIG=1`. Binary and unit backups:
+`/usr/local/bin/beam.bak-20261023T181052Z` and
+`/etc/systemd/system/beam.service.bak-20261023T181052Z`.
 
 - **Accept-loop survival.** An `accept(2)` error such as `EMFILE` no longer
   terminates the process. The loop logs, backs off from 10 ms to 1 s, and keeps
@@ -335,6 +340,26 @@ binary:
   post-deploy cover test returned the real Meta `*.whatsapp.net` certificate.
 - IPv4/IPv6 egress and HTTPS/HTTP/DNS through the local TUN were verified after
   the restart.
+
+### Follow-up deployment (2026-10-23 18:10 UTC)
+
+The deep-audit branch (`feat/deep-hardening`, merge commit `2210f03`) was
+deployed with `BEAM_KEEP_CONFIG=1`:
+
+- Binary SHA-256:
+  `bd17ac26928d4e659a0f7596f959b5a66f0f8314288c7720220882e4ea88287b`
+- Config SHA-256 remained
+  `21eb3d0c48e4b7b6b8c4c8f387475c2ec401972a4760964c28eb042448522107`;
+  the live 1024-connection / `info` config was preserved.
+- Backups:
+  - `/usr/local/bin/beam.bak-20261023T181052Z`
+  - `/etc/systemd/system/beam.service.bak-20261023T181052Z`
+- Service active, `NRestarts=0`, listener `0.0.0.0:443`; cgroup limits
+  `MemoryHigh=512M` / `MemoryMax=768M` / `MemorySwapMax=512M`.
+- Post-deploy cover test returned the real Meta `*.whatsapp.net` certificate.
+- Local TUN IPv4/IPv6 egress, HTTPS, HTTP, and DNS passed after the restart.
+- HTTP/3 at TUN MTU 1400 remains the known stock-Xray/client limitation; see
+  `docs/14-tun-harness.md`.
 
 Post-deploy checks still recommended under representative load:
 

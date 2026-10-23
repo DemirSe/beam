@@ -22,7 +22,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
 | Unit / backups | `/etc/systemd/system/beam.service` 0644; `*.bak-<UTC stamp>` beside each installed file |
-| Hardening | Deployed 2026-10-23 12:46 UTC: binary `5379e682…`; global XUDP 256, cover 32, `MemoryHigh=512M`/`MemoryMax=768M`/`MemorySwapMax=512M`; live config preserved |
+| Hardening | Deployed 2026-10-23 18:10 UTC: binary `bd17ac26…` (deep-audit fixes); global XUDP 256, cover 32, `MemoryHigh=512M`/`MemoryMax=768M`/`MemorySwapMax=512M`; live config preserved; backups `20261023T181052Z` |
 | Local client | sing-box, `/etc/sing-box/config.json` 0600, active but disabled at boot |
 | Client identity | `~/.config/beam/client-identity.json`, `client-link.txt` 0600 |
 | Tunnel egress | IPv4 `158.94.216.102`, IPv6 `2a01:f900:11:168::1` |
