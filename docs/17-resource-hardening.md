@@ -179,6 +179,33 @@ differences are within the noise of this short, invalid run; no systematic
 regression is visible. A valid comparison requires a quiet host and more
 repetitions.
 
+## GitHub Actions budget
+
+The repository is private, so standard GitHub-hosted Linux runners consume the
+GitHub Free allowance (currently 2,000 minutes/month, 500 MB artifact storage,
+10 GB cache storage; Linux is the 1x billing tier). The private standard runner
+is roughly 2 vCPU / 8 GB; the public runner is 4 vCPU / 16 GB. A hosted job also
+has a 6-hour maximum, so it cannot run a 24-hour soak.
+
+Workflow policy on this branch:
+
+| Workflow | Trigger | Budget intent |
+|---|---|---|
+| `ci.yml` | push to `main`, PRs, manual | fmt/clippy/debug tests on every run; release only on `main`; cache + cancel-in-progress |
+| `fuzz.yml` | weekly schedule + manual | seven 60 s targets, bounded to one job |
+| `lab.yml` | manual only | self-hosted `beam-lab` runner for full-TUN and benchmark runs |
+
+Do not run full-TUN benchmarks or long soaks on a shared GitHub-hosted runner:
+CPU/network noise makes the numbers meaningless, and the 6-hour job limit makes
+a 24-hour soak impossible. Use the self-hosted lab for those. The self-hosted
+runner must have `/dev/net/tun`, unprivileged user namespaces, sing-box, stock
+Xray, iperf3, the test REALITY config, and the H3 origin toolchain available.
+
+Scheduled workflows run from the default branch. Because the hardening commits
+are intentionally on `feat/resource-hardening` rather than `main`, the weekly
+fuzz schedule becomes active only after this branch is merged or otherwise made
+the default. Until then, use `workflow_dispatch` on the branch.
+
 ## Deployment note
 
 The live VPS still runs the previous unit and binary. Deployment must apply the

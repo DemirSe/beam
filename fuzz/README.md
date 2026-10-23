@@ -19,4 +19,7 @@ cargo +nightly fuzz run config -- -max_total_time=60 -timeout=10
 
 The targets have no network side effects. `legacy_udp` uses a test-only
 feature-gated helper to exercise the pure reassembly and packetaddr parsers.
-CI runs a short nightly budget; use a longer local budget for parser changes.
+The scheduled GitHub workflow runs a short **weekly** budget to stay inside a
+private repository's free Actions minutes. Use `workflow_dispatch` on this
+branch for an on-demand run, and a longer local/self-hosted budget for parser
+changes.
