@@ -35,10 +35,11 @@
 //!   optimization. All lookups are bounded by [`XudpConfig::io_timeout`].
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -192,10 +193,24 @@ pub enum XudpConfigError {
 /// A permit is held by each active session and by each retained GlobalID
 /// socket. Permits therefore cover both the live and the close-expiry states,
 /// which are the states that keep a kernel UDP socket alive.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct XudpSessionLimiter {
     max: usize,
     permits: Arc<Semaphore>,
+    /// Weak references to every mux-stream session table that may retain a
+    /// closed GlobalID socket. Retained sockets hold a global permit; the
+    /// registry lets a new active session evict that optional state before it
+    /// is rejected for a global-limit condition.
+    retained_tables: Arc<Mutex<Vec<Weak<Mutex<SessionTable>>>>>,
+}
+
+impl fmt::Debug for XudpSessionLimiter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XudpSessionLimiter")
+            .field("max", &self.max)
+            .field("available", &self.permits.available_permits())
+            .finish()
+    }
 }
 
 impl XudpSessionLimiter {
@@ -206,6 +221,7 @@ impl XudpSessionLimiter {
         Self {
             max,
             permits: Arc::new(Semaphore::new(max)),
+            retained_tables: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -215,9 +231,51 @@ impl XudpSessionLimiter {
         self.max
     }
 
+    /// Registers one mux stream's session table for global retained eviction.
+    pub(crate) fn register_table(&self, table: &Arc<Mutex<SessionTable>>) {
+        let mut tables = lock(&self.retained_tables);
+        tables.retain(|table| table.strong_count() > 0);
+        tables.push(Arc::downgrade(table));
+    }
+
     /// Tries to reserve one global session slot without waiting.
+    #[cfg(test)]
     pub(crate) fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.permits).try_acquire_owned().ok()
+    }
+
+    /// Reserves a slot, evicting optional retained sockets when the limit is
+    /// full.
+    ///
+    /// Active sessions are never evicted. Retained GlobalID sockets are
+    /// optional reattachment state, so a new live flow wins over them. If the
+    /// limit consists only of active sessions, this returns `None` and the
+    /// caller must reject the new flow.
+    pub(crate) fn try_acquire_or_evict(&self) -> Option<OwnedSemaphorePermit> {
+        loop {
+            if let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() {
+                return Some(permit);
+            }
+            if !self.evict_one_retained() {
+                return None;
+            }
+        }
+    }
+
+    /// Evicts the oldest retained socket from any registered mux stream.
+    fn evict_one_retained(&self) -> bool {
+        let tables: Vec<Arc<Mutex<SessionTable>>> = {
+            let mut tables = lock(&self.retained_tables);
+            tables.retain(|table| table.strong_count() > 0);
+            tables.iter().filter_map(Weak::upgrade).collect()
+        };
+
+        for table in tables {
+            if lock(&table).evict_oldest_expiring() {
+                return true;
+            }
+        }
+        false
     }
 }
 
