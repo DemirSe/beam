@@ -18,3 +18,5 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Test (release)
+        run: cargo test --workspace --release

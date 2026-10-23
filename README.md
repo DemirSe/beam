@@ -69,6 +69,7 @@ value before deployment.
 - [`docs/14-tun-harness.md`](docs/14-tun-harness.md)
 - [`docs/15-production-runbook.md`](docs/15-production-runbook.md)
 - [`docs/16-local-comparison-2026-10-22.md`](docs/16-local-comparison-2026-10-22.md)
+- [`docs/17-resource-hardening.md`](docs/17-resource-hardening.md)
 
 ## Repository layout
 

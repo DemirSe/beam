@@ -9,6 +9,9 @@
 //! A malformed frame closes the stream. A per-session failure (`New` with an
 //! unreachable destination, a failed send, or a socket read error) is reported
 //! as `End + Error` for that session and does not take down unrelated sessions.
+//! A process-wide limiter bounds active plus retained sockets across all mux
+//! streams; the per-stream [`XudpConfig::max_sessions`] limit alone is not an
+//! aggregate memory bound.
 //!
 //! The TLS adapter calls [`handle_mux_stream`] for an authenticated VLESS
 //! `Command::Mux`, after writing the VLESS response header.
@@ -25,7 +28,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 
 use super::session::{
     ActiveSession, ExpiringSession, Session, SessionTable, SocketFamily, XudpConfig,
-    XudpConfigError, encode_end_frame, resolve_destination, spawn_reply_task,
+    XudpConfigError, XudpSessionLimiter, encode_end_frame, resolve_destination, spawn_reply_task,
 };
 use crate::xudp::frame::{
     self, Frame, GLOBAL_ID_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN, METADATA_PREFIX_LEN,
@@ -131,6 +134,7 @@ struct MuxState {
     config: Arc<XudpConfig>,
     table: Arc<Mutex<SessionTable>>,
     outbound: mpsc::Sender<Vec<u8>>,
+    limiter: XudpSessionLimiter,
 }
 
 /// Handles one XUDP mux stream until EOF or a protocol error.
@@ -141,7 +145,14 @@ struct MuxState {
 /// empty stream has been idle for `session_idle_timeout`. Every session and
 /// reply task is stopped before it returns. A 24-hour read-inactivity backstop
 /// also bounds a stream that keeps sessions active but never sends a frame.
-pub async fn handle_mux_stream<S>(stream: S, config: Arc<XudpConfig>) -> Result<(), MuxError>
+///
+/// `limiter` is process-wide; the per-stream `max_sessions` count does not
+/// bound aggregate memory when several mux streams are open.
+pub async fn handle_mux_stream<S>(
+    stream: S,
+    config: Arc<XudpConfig>,
+    limiter: XudpSessionLimiter,
+) -> Result<(), MuxError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -162,6 +173,7 @@ where
         config: config.clone(),
         table: Arc::clone(&table),
         outbound,
+        limiter,
     };
 
     let result = read_loop(&mut reader, &state, &mut writer_failed_rx).await;
@@ -401,10 +413,10 @@ impl MuxState {
         let reusable = retained
             .as_ref()
             .is_some_and(|retained| retained.family == family);
-        let socket = if let Some(retained) = retained
+        let (socket, permit) = if let Some(retained) = retained
             && reusable
         {
-            retained.socket
+            (retained.socket, retained.permit)
         } else {
             // A family change cannot reuse the retained socket; it was removed
             // from the table and is dropped here. Treat this as a fresh New.
@@ -412,7 +424,15 @@ impl MuxState {
                 tracing::debug!(session_id = id, "XUDP session limit reached; rejecting New");
                 return self.send_end(id, true).await;
             }
-            match timeout(
+            let Some(permit) = self.limiter.try_acquire() else {
+                tracing::debug!(
+                    session_id = id,
+                    global_limit = self.limiter.max(),
+                    "global XUDP session limit reached; rejecting New"
+                );
+                return self.send_end(id, true).await;
+            };
+            let socket = match timeout(
                 self.config.io_timeout,
                 UdpSocket::bind(family.bind_address()),
             )
@@ -442,7 +462,8 @@ impl MuxState {
                     tracing::debug!(session_id = id, "XUDP session socket bind timed out");
                     return self.send_end(id, true).await;
                 }
-            }
+            };
+            (socket, Some(permit))
         };
 
         if parsed.option.has_data() && !parsed.payload.is_empty() {
@@ -468,7 +489,9 @@ impl MuxState {
             }
         }
 
-        let session = Arc::new(Session::new(id, global_id, socket, family, resolved));
+        let session = Arc::new(Session::new(
+            id, global_id, socket, family, resolved, permit,
+        ));
         let reply_task = spawn_reply_task(
             Arc::clone(&session),
             self.outbound.clone(),
@@ -629,6 +652,7 @@ impl MuxState {
         let error = reason.is_error() || session.failed();
         self.send_end(session.id, error).await?;
 
+        let permit = session.take_permit();
         if reason.retains_socket()
             && let Some(global_id) = session.global_id
         {
@@ -639,6 +663,7 @@ impl MuxState {
                 // A pathological Duration must not panic on overflow; an
                 // immediately expired entry only loses optional retention.
                 expires_at: now.checked_add(self.config.close_expiry).unwrap_or(now),
+                permit,
             };
             let replaced = lock_table(&self.table).insert_expiring(global_id, retained);
             drop(replaced);
@@ -720,7 +745,7 @@ mod tests {
         Frame, FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_PAYLOAD_LEN, SessionStatus,
         TargetNetwork, XudpError, encode_frame, parse_frame,
     };
-    use crate::xudp::session::{XudpConfig, XudpConfigError};
+    use crate::xudp::session::{XudpConfig, XudpConfigError, XudpSessionLimiter};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
@@ -741,8 +766,15 @@ mod tests {
     }
 
     fn start_mux(config: Arc<XudpConfig>) -> (DuplexStream, JoinHandle<Result<(), MuxError>>) {
+        start_mux_with_limiter(config, XudpSessionLimiter::default())
+    }
+
+    fn start_mux_with_limiter(
+        config: Arc<XudpConfig>,
+        limiter: XudpSessionLimiter,
+    ) -> (DuplexStream, JoinHandle<Result<(), MuxError>>) {
         let (client, server) = tokio::io::duplex(256 * 1024);
-        let task = tokio::spawn(handle_mux_stream(server, config));
+        let task = tokio::spawn(handle_mux_stream(server, config, limiter));
         (client, task)
     }
 
@@ -915,7 +947,7 @@ mod tests {
             max_sessions: 0,
             ..XudpConfig::default()
         });
-        let result = handle_mux_stream(server, config).await;
+        let result = handle_mux_stream(server, config, XudpSessionLimiter::default()).await;
         assert!(matches!(
             result,
             Err(MuxError::Config(XudpConfigError::MaxSessions))
@@ -964,6 +996,30 @@ mod tests {
         assert_eq!(end.session_id, 1);
         assert_eq!(end.status, SessionStatus::End);
         assert!(!end.option.has_error());
+
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn global_session_limit_rejects_new() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let (mut client, task) = start_mux_with_limiter(test_config(), XudpSessionLimiter::new(1));
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &destination, b"first", None)).await;
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("the first session must be admitted");
+        assert_eq!(reply.payload, b"first");
+
+        write_frame(&mut client, new_spec(2, &destination, b"second", None)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("the rejected New must receive End");
+        assert_eq!(end.session_id, 2);
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(end.option.has_error());
 
         finish(client, task).await;
     }

@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Test-only helpers for the separate cargo-fuzz workspace. This feature is
+# never enabled in production builds.
+fuzz = []
+
 [dependencies]
 aes-gcm = "0.10"
 base64 = "0.22"

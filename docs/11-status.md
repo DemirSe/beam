@@ -30,12 +30,14 @@ Updated: 2026-10-23.
 | Vision padding/direct state machine | Done |
 | XUDP frame codec | Done |
 | XUDP session table and UDP relay | Done |
+| Process-wide XUDP session limiter | Done (256 sessions) |
 | XUDP over VLESS Mux | Done |
 | Legacy VLESS UDP and packetaddr | Done |
 | Linux fd/socket/splice primitives | Done |
 | Zero-copy splice relay loop | Done |
 | REALITY TLS server adapter (rustls) | Done |
 | Cover fallback (byte-exact ClientHello) | Done |
+| Cover concurrency cap | Done (32 relays) |
 | VLESS user validation | Done |
 | Vision-framed relay | Done |
 | Vision Direct raw TLS handoff | Done |
@@ -45,6 +47,7 @@ Updated: 2026-10-23.
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP/HTTPS interop | **HTTP 200** |
 | Cover-parity harness | Done; gaps documented |
+| Fuzz workspace and scheduled CI | Done; local compile check |
 | Full-TUN harness v2 | **8/8 PASS** |
 | Full-TUN benchmark harness | Done |
 | No-TUN server-capacity smoke | Done |
@@ -111,7 +114,7 @@ UDP modes:
 
 - 2026-10-22: fresh Debian 13.6 on the VPS, 1 vCPU/1 GB, 1 GB swap.
 - `beam.service` is **active and enabled**, listening on `0.0.0.0:443`;
-  idle process memory ~840 KiB.
+  idle process memory ~17 MiB.
 - A new REALITY identity was generated because the old private key was lost
   with the server wipe. The old client credentials no longer work; the client
   must be rotated once.
@@ -164,6 +167,12 @@ UDP modes:
   There was no restart, RSS stayed at ~10.2 MiB, and FDs went 124 → 154 → 134
   (peak → +60 s). The previous audit and soak reports are in `/tmp/opencode/`.
 
+## Pending deployment
+
+- The global XUDP cap, cover concurrency cap, systemd memory limits, and fuzz
+  targets are implemented and locally verified but **not deployed**. See
+  `docs/17-resource-hardening.md`.
+
 ## In progress
 
 - A light 24-hour background soak started on 2026-10-22 12:52 UTC from the
@@ -189,7 +198,8 @@ UDP modes:
   blocking-thread pool is about 80 active Vision Direct pairs; the listener
   backlog is 128 and historical `ListenOverflows=102`. The 512/1024×1 MB load
   logs show 49.7 s median and 937 timeouts respectively. Current normal load is
-  tens of connections.
+  tens of connections. The new global XUDP cap (256) and cover cap (32) reduce
+  the burst memory/thread exposure but have not been deployed yet.
 - The provider L4 firewall/rate limit was not independently verified; the host
   nftables rules are.
 - The local `sing-box` service is not enabled at boot.
@@ -211,6 +221,8 @@ UDP modes:
 - `docs/14-tun-harness.md`: full-TUN topology, probes, and control results.
 - `docs/15-production-runbook.md`: live operations, rotation, rollback, and
   monitoring.
+- `docs/17-resource-hardening.md`: XUDP/cover/fuzz hardening audit and pending
+  deployment.
 - `docs/16-local-comparison-2026-10-22.md`: detailed local stock-Xray vs beam
   capacity, full-TUN, compatibility, and cover comparison.
 - `bench/README.md`: benchmark and no-TUN smoke usage.
@@ -221,6 +233,9 @@ UDP modes:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo test --workspace --release
+cargo check --manifest-path fuzz/Cargo.toml
+cargo +nightly fuzz build
 bash scripts/cover-parity.sh
 bash tests/tun/run.sh
 bash tests/tun/run.sh --udp-mode packetaddr
@@ -228,8 +243,8 @@ bash tests/tun/run.sh --udp-mode legacy
 bash bench/no-tun.sh
 ```
 
-The workspace currently has 234 `beam-core` unit tests, two integration tests,
-and 23 `beam-sys` tests (259 total). The full-TUN harness passes all eight
+The workspace currently has 237 `beam-core` unit tests, two integration tests,
+and 23 `beam-sys` tests (262 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
 gVisor TUN on both beam and stock Xray. The no-TUN server-capacity smoke is

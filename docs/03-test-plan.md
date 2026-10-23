@@ -28,6 +28,12 @@ Every parser that consumes untrusted bytes gets a fuzz target:
 The invariant is: no panic, no unbounded allocation, no out-of-bounds read, and
 either a valid value or a typed error.
 
+Implemented targets live in the separate `fuzz/` workspace:
+`client_hello`, `reality_auth`, `vless`, `vision`, `xudp`, `legacy_udp`, and
+`config`. The `legacy_udp` target uses a feature-gated pure parser helper and
+opens no sockets. The scheduled `fuzz` workflow runs a short budget nightly;
+local parser changes should use a longer budget.
+
 ### Integration tests
 
 Loopback-only fixtures:
@@ -74,7 +80,9 @@ client traffic through the server:
 - UDP DNS and QUIC/HTTP3.
 - IPv4 and IPv6 destinations.
 - Reconnect while a transfer is active.
-- TUN MTU 1500; verify no fragmentation or truncation.
+- TUN MTU 1400 (production value); verify no fragmentation or truncation.
+  Also run a 1500-byte control to separate client-stack behavior from the
+  production MTU.
 
 The client configuration is unchanged from the stock deployment. This test is
 a release blocker for replacing the production server.
