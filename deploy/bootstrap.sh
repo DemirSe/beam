@@ -13,10 +13,27 @@ INSTALL_UNIT=/etc/systemd/system/beam.service
 INSTALL_SYSCTL=/etc/sysctl.d/99-beam.conf
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
+# Keep a live config when only the binary/unit are being updated. The bundle
+# still contains a config for a fresh install, but a host with a different
+# local max_connections/log level must not be silently overwritten.
+KEEP_CONFIG="${BEAM_KEEP_CONFIG:-0}"
+case "$KEEP_CONFIG" in
+  0|1) ;;
+  *) echo "bootstrap: BEAM_KEEP_CONFIG must be 0 or 1" >&2; exit 1 ;;
+esac
+
 [ "$(id -u)" -eq 0 ] || { echo "bootstrap: must run as root" >&2; exit 1; }
-for file in "$BIN" "$CONFIG" "$UNIT" "$SYSCTL"; do
+for file in "$BIN" "$UNIT" "$SYSCTL"; do
   [ -f "$file" ] || { echo "bootstrap: missing $file" >&2; exit 1; }
 done
+if [ "$KEEP_CONFIG" = "0" ]; then
+  [ -f "$CONFIG" ] || { echo "bootstrap: missing $CONFIG" >&2; exit 1; }
+else
+  [ -f "$INSTALL_CONFIG" ] || {
+    echo "bootstrap: BEAM_KEEP_CONFIG=1 but $INSTALL_CONFIG does not exist" >&2
+    exit 1
+  }
+fi
 [ "$(uname -m)" = "x86_64" ] || { echo "bootstrap: expected x86_64" >&2; exit 1; }
 
 if [ -r /etc/os-release ]; then
@@ -51,7 +68,9 @@ for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL"; d
 done
 
 install -m 0755 -o root -g root "$BIN" "$INSTALL_BIN"
-install -m 0640 -o root -g beam "$CONFIG" "$INSTALL_CONFIG"
+if [ "$KEEP_CONFIG" = "0" ]; then
+  install -m 0640 -o root -g beam "$CONFIG" "$INSTALL_CONFIG"
+fi
 install -m 0644 -o root -g root "$UNIT" "$INSTALL_UNIT"
 install -m 0644 -o root -g root "$SYSCTL" "$INSTALL_SYSCTL"
 sysctl --system >/dev/null

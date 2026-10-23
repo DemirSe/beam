@@ -136,6 +136,16 @@ bssh 'rm -rf /tmp/beam-deploy && mkdir -p /tmp/beam-deploy && tar -xzf /tmp/beam
 installs binary/config/unit, installs the UDP sysctl drop-in, validates the
 config, restarts the service (so an active process picks up the new binary and
 unit), and checks 443.
+
+If the local `~/.config/beam/beam.toml` differs from the live config (for
+example local `max_connections=64`/`log=warn` versus live 1024/`info`), update
+only the binary and unit and preserve `/etc/beam/config.toml`:
+```bash
+bssh 'rm -rf /tmp/beam-deploy && mkdir -p /tmp/beam-deploy && tar -xzf /tmp/beam-deploy.tar.gz -C /tmp/beam-deploy && sudo -n env BEAM_KEEP_CONFIG=1 bash /tmp/beam-deploy/bootstrap.sh'
+```
+`BEAM_KEEP_CONFIG=1` skips the config install but still requires the live file,
+validates it with the new binary, installs the unit, restarts, and checks 443.
+The bundle's `beam.toml` is ignored in that mode.
 Health checks:
 ```bash
 bssh 'systemctl is-active beam; systemctl is-enabled beam; systemctl show beam -p NRestarts --value'
