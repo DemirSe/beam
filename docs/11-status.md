@@ -256,8 +256,8 @@ bash tests/tun/run.sh --udp-mode legacy
 bash bench/no-tun.sh
 ```
 
-The workspace currently has 239 `beam-core` unit tests, two integration tests,
-and 23 `beam-sys` tests (264 total). The full-TUN harness passes all eight
+The workspace currently has 249 `beam-core` unit tests, two integration tests,
+and 23 `beam-sys` tests (274 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
 gVisor TUN on both beam and stock Xray. The no-TUN server-capacity smoke is
