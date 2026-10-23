@@ -187,13 +187,18 @@ GitHub Free allowance (currently 2,000 minutes/month, 500 MB artifact storage,
 is roughly 2 vCPU / 8 GB; the public runner is 4 vCPU / 16 GB. A hosted job also
 has a 6-hour maximum, so it cannot run a 24-hour soak.
 
-Workflow policy on this branch:
+Workflow policy:
 
 | Workflow | Trigger | Budget intent |
 |---|---|---|
-| `ci.yml` | push to `main`, PRs, manual | fmt/clippy/debug tests on every run; release only on `main`; cache + cancel-in-progress |
-| `fuzz.yml` | weekly schedule + manual | seven 60 s targets, bounded to one job |
+| `ci.yml` | manual only | fmt/clippy/debug/release tests when a test pass is requested |
+| `fuzz.yml` | manual only | seven 60 s targets when fuzzing is requested |
 | `lab.yml` | manual only | self-hosted `beam-lab` runner for full-TUN and benchmark runs |
+
+There are **no scheduled workflows and no automatic test triggers**. A push,
+pull request, or merge does not spend Actions minutes by itself. Tests run only
+when the owner dispatches a workflow or asks the agent to run the local
+commands.
 
 Do not run full-TUN benchmarks or long soaks on a shared GitHub-hosted runner:
 CPU/network noise makes the numbers meaningless, and the 6-hour job limit makes
@@ -201,12 +206,11 @@ a 24-hour soak impossible. Use the self-hosted lab for those. The self-hosted
 runner must have `/dev/net/tun`, unprivileged user namespaces, sing-box, stock
 Xray, iperf3, the test REALITY config, and the H3 origin toolchain available.
 
-GitHub only exposes scheduled workflows and the `workflow_dispatch` button from
-the default branch. Because the hardening commits are intentionally on
-`feat/resource-hardening` rather than `main`, the weekly fuzz schedule and the
-manual `lab` workflow are **not active yet**; they become available only after
-this branch is merged or otherwise made the default. Until then, run fuzzing
-and the full-TUN/benchmark lab locally.
+GitHub only exposes the `workflow_dispatch` button from the default branch. The
+`ci` workflow can be added to `main` as a workflow-only change; the `fuzz` and
+`lab` workflows live with the hardening branch and become manually available
+after that branch is merged or made the default. Until then, run fuzzing and the
+full-TUN/benchmark lab locally.
 
 ## Deployment note
 

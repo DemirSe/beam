@@ -1,13 +1,8 @@
 name: ci
 
+# Tests are manual-only. Run this workflow from the Actions tab (or ask the
+# agent to run the local commands) when a test pass is wanted.
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "**/*.md"
-  pull_request:
-    paths-ignore:
-      - "**/*.md"
   workflow_dispatch:
 
 concurrency:
@@ -32,8 +27,5 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      # Keep the expensive release build for the default branch. Pull requests
-      # still get the full debug test suite and lint/format gates.
       - name: Test (release)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo test --workspace --release

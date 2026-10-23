@@ -1,12 +1,8 @@
 name: fuzz
 
+# Fuzzing is manual-only. There is no schedule and no automatic trigger.
 on:
   workflow_dispatch:
-  # Weekly rather than nightly: seven 60 s targets plus the nightly toolchain
-  # and fuzz build are enough to exceed a tight private-repository budget when
-  # combined with normal CI. A longer local/self-hosted run remains available.
-  schedule:
-    - cron: "0 3 * * 0"
 
 permissions:
   contents: read
