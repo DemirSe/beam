@@ -218,7 +218,7 @@ UDP modes:
   original 20–45 s stalls were consistent with the 1400 MTU failure; at 1500
   the 2026-10-24 mobile run passed 1.33 MiB H3 and 64 MiB TCP, but Google H3
   still showed
-  1–3/10 ~10.5 s completion outliers while HTTP/2 stayed stable. TUN and
+  1–4/10 ~10.5 s completion outliers while HTTP/2 stayed stable. TUN and
   server drop counters stayed at zero, so this is H3-over-TCP/QUIC PTO rather
   than an MTU drop. The updated `deploy/update-client.py` sets `system` and
   MTU 1500; Hiddify users must set both manually.

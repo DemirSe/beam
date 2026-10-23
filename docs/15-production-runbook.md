@@ -323,7 +323,7 @@ measured and a targeted MSS clamp is not sufficient.
 - Large HTTP/3 bodies through the production TUN can still show completion
   outliers. The original 20–45 s stalls were consistent with the 1400 MTU
   failure. At 1500 the 2026-10-24 TT Mobil hotspot run passed 1.33 MiB H3 and
-  64 MiB TCP, but Google H3 showed 1–3/10 ~10.5 s completion outliers while
+  64 MiB TCP, but Google H3 showed 1–4/10 ~10.5 s completion outliers while
   HTTP/2 stayed stable. TUN
   and server drop counters stayed at zero, so this is H3-over-TCP/QUIC PTO,
   not an MTU drop. Hiddify users must select `system` and MTU 1500 manually.

@@ -266,7 +266,7 @@ The production client was tested from a laptop behind a **TT Mobil hotspot**
 | Upload 16 MiB (HTTP/2) | **HTTP 200**, 1.64 MB/s |
 | HTTP/3 Cloudflare, 1.33 MB body | **5/5 PASS**, ~0.7-0.8 s |
 | HTTP/3 YouTube | **10/10 PASS**, ~0.8-1.2 s |
-| HTTP/3 Google | **10/10 HTTP 200**; 1-3/10 took ~10.5 s to complete |
+| HTTP/3 Google | **10/10 HTTP 200**; 1-4/10 took ~10.5 s to complete |
 | HTTP/3 Cloudflare over IPv6, 1.33 MB | **HTTP 200** |
 | HTTP/2 Google and YouTube | **10/10 PASS**, ~0.6-0.9 s |
 | TUN RX/TX drops | 0 |
