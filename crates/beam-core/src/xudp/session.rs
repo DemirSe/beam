@@ -76,6 +76,13 @@ pub const DEFAULT_CLOSE_EXPIRY: Duration = Duration::from_secs(60);
 /// Default number of reply frames that may wait for the stream writer.
 pub const DEFAULT_MAX_QUEUED_REPLIES: usize = 64;
 
+/// Process-wide budget for reply bytes waiting in mux queues.
+///
+/// The per-stream frame count alone lets 256 streams accumulate roughly a
+/// gigabyte of 8 KiB frames. This budget bounds the aggregate Rust-side queue
+/// while still leaving room for large HTTP/3 bursts on a single stream.
+pub const DEFAULT_REPLY_QUEUE_BUDGET: usize = 32 * 1024 * 1024;
+
 /// Default timeout for one socket send, receive, or stream write.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -202,6 +209,8 @@ pub struct XudpSessionLimiter {
     /// registry lets a new active session evict that optional state before it
     /// is rejected for a global-limit condition.
     retained_tables: Arc<Mutex<Vec<Weak<Mutex<SessionTable>>>>>,
+    /// Process-wide byte budget for reply frames waiting on stream writers.
+    reply_budget: Arc<Semaphore>,
 }
 
 impl fmt::Debug for XudpSessionLimiter {
@@ -222,6 +231,7 @@ impl XudpSessionLimiter {
             max,
             permits: Arc::new(Semaphore::new(max)),
             retained_tables: Arc::new(Mutex::new(Vec::new())),
+            reply_budget: Arc::new(Semaphore::new(DEFAULT_REPLY_QUEUE_BUDGET)),
         }
     }
 
@@ -260,6 +270,20 @@ impl XudpSessionLimiter {
                 return None;
             }
         }
+    }
+
+    /// Reserves aggregate queue bytes for one reply frame.
+    pub(crate) fn try_reserve_reply(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes).ok()?;
+        Arc::clone(&self.reply_budget)
+            .try_acquire_many_owned(bytes)
+            .ok()
+    }
+
+    /// Returns the configured aggregate reply-byte budget.
+    #[must_use]
+    pub const fn reply_budget_bytes(&self) -> usize {
+        DEFAULT_REPLY_QUEUE_BUDGET
     }
 
     /// Evicts the oldest retained socket from any registered mux stream.
@@ -395,6 +419,24 @@ pub(crate) async fn resolve_destination(
                 }
             }
             chosen.ok_or(ResolveError::FamilyMismatch)
+        }
+    }
+}
+
+/// One encoded frame waiting for the mux writer.
+///
+/// `budget` is held until the writer has written (or dropped) the frame, so
+/// aggregate queued bytes stay bounded even when many streams are slow.
+pub(crate) struct QueuedFrame {
+    pub(crate) bytes: Vec<u8>,
+    _budget: Option<OwnedSemaphorePermit>,
+}
+
+impl QueuedFrame {
+    pub(crate) fn new(bytes: Vec<u8>, budget: Option<OwnedSemaphorePermit>) -> Self {
+        Self {
+            bytes,
+            _budget: budget,
         }
     }
 }
@@ -542,6 +584,22 @@ impl SessionTable {
         self.active.remove(&id)
     }
 
+    /// Removes and returns the active session attached to `global_id`.
+    ///
+    /// Xray treats a GlobalID as one logical UDP flow and migrates it when a
+    /// new `New` arrives on another session id. Keeping both attachments would
+    /// duplicate replies and leak a socket.
+    pub(crate) fn take_by_global_id(
+        &mut self,
+        global_id: [u8; GLOBAL_ID_LEN],
+    ) -> Option<ActiveSession> {
+        let id = self
+            .active
+            .iter()
+            .find_map(|(id, entry)| (entry.session.global_id == Some(global_id)).then_some(*id))?;
+        self.active.remove(&id)
+    }
+
     /// Removes `id` only when it still holds `session`.
     ///
     /// A reply task uses this so a stale task cannot remove a newer session
@@ -629,11 +687,12 @@ impl SessionTable {
 /// Spawns the task that reads replies from one session socket.
 pub(crate) fn spawn_reply_task(
     session: Arc<Session>,
-    outbound: mpsc::Sender<Vec<u8>>,
+    outbound: mpsc::Sender<QueuedFrame>,
     table: Arc<Mutex<SessionTable>>,
     config: Arc<XudpConfig>,
+    limiter: XudpSessionLimiter,
 ) -> JoinHandle<()> {
-    tokio::spawn(reply_loop(session, outbound, table, config))
+    tokio::spawn(reply_loop(session, outbound, table, config, limiter))
 }
 
 /// Reads datagrams until the session stops or the socket fails.
@@ -644,9 +703,10 @@ pub(crate) fn spawn_reply_task(
 /// keeps the reply task unblockable.
 async fn reply_loop(
     session: Arc<Session>,
-    outbound: mpsc::Sender<Vec<u8>>,
+    outbound: mpsc::Sender<QueuedFrame>,
     table: Arc<Mutex<SessionTable>>,
     config: Arc<XudpConfig>,
+    limiter: XudpSessionLimiter,
 ) {
     let mut stop = session.stop_receiver();
     if *stop.borrow() || session.is_closed() {
@@ -697,7 +757,14 @@ async fn reply_loop(
                         if frame::encode_frame(&mut frame, spec).is_err() {
                             continue;
                         }
-                        match outbound.try_send(frame) {
+                        let Some(budget) = limiter.try_reserve_reply(frame.len()) else {
+                            tracing::trace!(
+                                session_id = session.id,
+                                "XUDP aggregate reply budget is full; dropping a datagram"
+                            );
+                            continue;
+                        };
+                        match outbound.try_send(QueuedFrame::new(frame, Some(budget))) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 tracing::trace!(
@@ -738,7 +805,11 @@ async fn reply_loop(
         if !end.is_empty() {
             // Best effort with a bound. The queue may be full, but this is the
             // only place that reports a failed relay.
-            let _ = timeout(config.io_timeout, outbound.send(end)).await;
+            let _ = timeout(
+                config.io_timeout,
+                outbound.send(QueuedFrame::new(end, None)),
+            )
+            .await;
         }
     }
 }
@@ -901,6 +972,24 @@ mod tests {
         assert_eq!(
             XudpSessionLimiter::default().max(),
             DEFAULT_MAX_GLOBAL_SESSIONS
+        );
+    }
+
+    #[test]
+    fn reply_queue_budget_is_process_wide() {
+        let limiter = XudpSessionLimiter::new(1);
+        let budget = limiter.reply_budget_bytes();
+        let permit = limiter
+            .try_reserve_reply(budget)
+            .expect("the whole budget must be reservable");
+        assert!(
+            limiter.try_reserve_reply(1).is_none(),
+            "the byte budget must reject one more byte"
+        );
+        drop(permit);
+        assert!(
+            limiter.try_reserve_reply(1).is_some(),
+            "released reply bytes must be reusable"
         );
     }
 

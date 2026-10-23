@@ -36,12 +36,12 @@ pub enum ConfigError {
     },
     /// The file was not valid TOML or did not match the schema.
     ///
-    /// Only the parser's summary message is kept. The rendered TOML error is
-    /// intentionally discarded because it can contain source lines with
-    /// secret values.
+    /// Only a location and a generic schema message are kept. The parser's
+    /// rendered message is intentionally discarded because type errors can
+    /// include the offending value, and source lines can contain secrets.
     #[error("invalid TOML configuration: {message}")]
     Toml {
-        /// Sanitized parser message.
+        /// Sanitized parser location/message.
         message: String,
     },
     /// The file was valid TOML but failed semantic validation.
@@ -100,7 +100,7 @@ impl Config {
     /// Parse and validate a configuration from a TOML string.
     pub fn from_toml_str(input: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(input).map_err(|error| ConfigError::Toml {
-            message: error.message().to_owned(),
+            message: sanitized_toml_error(&error, input),
         })?;
         Self::try_from(raw).map_err(ConfigError::Validation)
     }
@@ -125,6 +125,26 @@ impl FromStr for Config {
     }
 }
 
+/// Returns a location-only TOML error message.
+///
+/// `toml::de::Error::message()` is not safe to print for type mismatches: it
+/// renders the offending value (for example a secret pasted into a numeric
+/// field). The span gives operators enough information to find the typo
+/// without copying source text into logs.
+fn sanitized_toml_error(error: &toml::de::Error, input: &str) -> String {
+    let Some(span) = error.span() else {
+        return "TOML syntax or schema error".to_owned();
+    };
+    let offset = span.start.min(input.len());
+    let prefix = &input[..offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(offset, |(_, tail)| tail.len())
+        + 1;
+    format!("TOML syntax or schema error at line {line}, column {column}")
+}
+
 impl TryFrom<RawConfig> for Config {
     type Error = ValidationError;
 
@@ -138,6 +158,9 @@ impl TryFrom<RawConfig> for Config {
         } = raw;
 
         let listen: SocketAddr = server.listen.parse().map_err(|_| ValidationError::Listen)?;
+        if listen.port() == 0 {
+            return Err(ValidationError::Listen);
+        }
         let id = Uuid::parse_str(&user.id).map_err(|_| ValidationError::UserId)?;
         let flow = parse_flow(&user.flow)?;
         let private_key = decode_private_key(reality.private_key.as_str())?;
@@ -391,11 +414,78 @@ idle_timeout_ms = 300000
             "[server]\nlisten = \"127.0.0.1:443\"\nunexpected = true",
         );
         let error = Config::from_toml_str(&nested).unwrap_err();
-        assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(matches!(error, ConfigError::Toml { .. }), "{error}");
 
         let top_level = format!("{}\n[unexpected]\nvalue = true\n", config_toml(&key));
         let error = Config::from_toml_str(&top_level).unwrap_err();
-        assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(matches!(error, ConfigError::Toml { .. }), "{error}");
+    }
+
+    #[test]
+    fn rejects_wrong_types_without_leaking_values() {
+        const CANARY: &str = "SUPERSECRET-CANARY-0123456789";
+        let key = private_key();
+        let replacements = [
+            (
+                "max_connections = 1024",
+                format!("max_connections = \"{CANARY}\""),
+            ),
+            (
+                "max_udp_destinations = 2048",
+                format!("max_udp_destinations = \"{CANARY}\""),
+            ),
+            (
+                "handshake_timeout_ms = 60000",
+                format!("handshake_timeout_ms = \"{CANARY}\""),
+            ),
+            (
+                "idle_timeout_ms = 300000",
+                format!("idle_timeout_ms = \"{CANARY}\""),
+            ),
+            (
+                "listen = \"127.0.0.1:443\"",
+                format!("listen = [\"{CANARY}\"]"),
+            ),
+            (
+                "id = \"00000000-0000-0000-0000-000000000000\"",
+                format!("id = [\"{CANARY}\"]"),
+            ),
+            (
+                "short_ids = [\"0123456789abcdef\"]",
+                format!("short_ids = \"{CANARY}\""),
+            ),
+            (
+                "server_names = [\"whatsapp.net\"]",
+                format!("server_names = \"{CANARY}\""),
+            ),
+            (
+                "dest = \"whatsapp.net:443\"",
+                format!("dest = [\"{CANARY}\"]"),
+            ),
+            ("level = \"warn\"", format!("level = [\"{CANARY}\"]")),
+        ];
+        for (old, new) in replacements {
+            let input = config_toml(&key).replace(old, &new);
+            assert_ne!(
+                input,
+                config_toml(&key),
+                "replacement for {old:?} did not apply"
+            );
+            let error = Config::from_toml_str(&input).unwrap_err();
+            assert!(matches!(error, ConfigError::Toml { .. }), "{error}");
+            assert!(!error.to_string().contains(CANARY), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_port_zero_listener() {
+        let input = config_toml(&private_key())
+            .replace("listen = \"127.0.0.1:443\"", "listen = \"127.0.0.1:0\"");
+        let error = Config::from_toml_str(&input).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::Validation(ValidationError::Listen)
+        ));
     }
 
     #[test]

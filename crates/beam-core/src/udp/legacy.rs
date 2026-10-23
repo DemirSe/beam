@@ -371,7 +371,7 @@ where
     let idle = sleep(config.idle_timeout);
     tokio::pin!(idle);
 
-    let outcome = 'session: loop {
+    let outcome = loop {
         while let Some(frame) = decoder.next_frame()? {
             let (destination, payload) = parse_packetaddr(&decoder.buffer[frame.clone()])?;
             let destination = normalize_address(destination);
@@ -403,11 +403,15 @@ where
 
             match timeout(config.io_timeout, socket.send_to(payload, destination)).await {
                 Ok(Ok(_)) => {}
-                Ok(Err(error)) => break 'session Err(UdpError::Io(error)),
+                Ok(Err(error)) => {
+                    // Packetaddr is deliberately multi-destination. One bad
+                    // inner destination (broadcast, unreachable family, or a
+                    // transient route error) must not tear down every other
+                    // datagram on this VLESS UDP connection.
+                    tracing::debug!(%destination, %error, "packetaddr send failed; dropping datagram");
+                }
                 Err(_) => {
-                    break 'session Err(UdpError::Timeout {
-                        stage: "datagram send",
-                    });
+                    tracing::debug!(%destination, "packetaddr send timed out; dropping datagram");
                 }
             }
             decoder.consume(frame.end);
@@ -1286,6 +1290,29 @@ mod tests {
         write_frame(&mut client, b"").await;
         write_frame(&mut client, b"after-zero").await;
         assert_eq!(read_frame(&mut client).await, b"after-zero");
+        finish_clean(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn packetaddr_send_failure_drops_only_that_datagram() {
+        let echo = spawn_ipv4_echo().await;
+        let (mut client, task) = start(packetaddr_destination(), test_config(MAX_DATAGRAM_SIZE));
+
+        // An unconnected socket cannot send to the limited broadcast address
+        // without SO_BROADCAST. The packetaddr session must survive and still
+        // relay the next valid destination.
+        write_frame(
+            &mut client,
+            &packetaddr_datagram(SocketAddr::from((Ipv4Addr::BROADCAST, 9)), b"bad"),
+        )
+        .await;
+        write_frame(&mut client, &packetaddr_datagram(echo.address, b"good")).await;
+
+        let reply = read_frame(&mut client).await;
+        let (source, payload) = parse_packetaddr_reply(&reply);
+        assert_eq!(source, echo.address);
+        assert_eq!(payload, b"good");
+
         finish_clean(client, task).await;
     }
 
