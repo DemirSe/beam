@@ -228,6 +228,30 @@ recorded because the production client may use gVisor. Switch the production
 client TUN stack to `system`/`mixed` before attributing large-H3 stalls to the
 server.
 
+### TUN MTU sensitivity (2026-10-23)
+
+The small HTTP/3 probe is sensitive to TUN MTU even though TCP and the
+1200-byte UDP echo probes are not:
+
+| TUN MTU | beam xudp | stock Xray control | H3 result |
+|---:|---|---|---|
+| 1280 | 7/8 | not run | no H3 connection |
+| 1300 | 7/8 | not run | no H3 connection |
+| 1400 | 7/8 | **7/8** | connection starts, GET stalls |
+| 1450 | 7/8 | not run | origin answers, client fails |
+| 1480 | **8/8** | not run | PASS |
+| 1492 | **8/8** | not run | PASS |
+| 1500 | **8/8** | **8/8** | PASS |
+
+`H3_BODY_BYTES=1333889` also passes at 1480 and 1500 and fails at 1400. The
+failure is unchanged by UDP encoding (`xudp`, `packetaddr`, `legacy`) and by
+the TUN stack (`system`, `gvisor`), and stock Xray reproduces it on the same
+client. The target's QUIC origin logs a connection but no HTTP request, which
+is consistent with fragmented UDP datagrams being unusable at a TUN MTU below
+the QUIC path size. The production requirement remains MTU 1400; if HTTP/3 is
+needed, use MTU >=1480 for IPv4 (>=1492 is the safe IPv6 bound) or accept the
+documented H3 gap. TCP, UDP echo, DNS, and Vision/HTTPS are unaffected.
+
 ## Blockers, past and present
 
 ### XUDP / UDP / DNS / QUIC (resolved)

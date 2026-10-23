@@ -1,8 +1,9 @@
 # Resource hardening audit: XUDP, cover, and fuzzing
 
 Date: 2026-10-23. Scope: the first three findings from the production audit.
-This document records the design decisions and the implemented code. **Nothing
-in this change has been deployed to the VPS yet.**
+This document records the design decisions and the implemented code. The
+original hardening was deployed on 2026-10-23; the local follow-up in this
+document (cross-stream retained-socket eviction) is still test-only.
 
 ## 1. XUDP memory and session bounds
 
@@ -28,7 +29,12 @@ in this change has been deployed to the VPS yet.**
    when the kernel socket is finally dropped.
 3. Keep the per-stream `max_sessions` limit; the global limiter is an additional
    aggregate bound, not a replacement for the stream-local table bound.
-4. Add systemd memory protection:
+4. When the global limiter is full, evict optional retained GlobalID sockets
+   from **any** mux stream before rejecting a new live session. A retained
+   socket is only reattachment state; it must not make a new flow fail while
+   no active session needs to be dropped. This is implemented by registering
+   each stream's session table as a weak reference in the shared limiter.
+5. Add systemd memory protection:
    - `MemoryHigh=512M`
    - `MemoryMax=768M`
    - `MemorySwapMax=512M`
@@ -49,12 +55,12 @@ theoretically reach about 2 GiB of socket memory.
 - The limiter is checked only on `New`, not per packet or per reply.
 - Normal full-TUN traffic with fewer than 256 destinations sees no added
   datagram-path work.
-- At the limit, the next `New` receives `End + Error`; this is a deliberate
+- At the limit, retained sockets are evicted first; if every permit belongs to
+  an active session, the next `New` receives `End + Error`. This is a deliberate
   capacity trade-off, not a CPU regression.
 - Keeping the 1 MiB buffer preserves the existing H3 behavior.
-- `MemoryMax` adds no CPU work in normal operation. If set too low it would
-  cause reclaim or OOM; the chosen values are above the observed peak and will
-  be validated on the host before deployment.
+- `MemoryMax` adds no CPU work in normal operation. The deployed cgroup peak
+  stayed well below the limits.
 
 ## 2. Cover concurrency
 
@@ -139,16 +145,21 @@ provides one. Local checks used the portable GCC toolchain under
 
 Results after the change:
 
-- `cargo test --workspace`: 237 beam-core unit tests, 2 integration tests, and
-  23 beam-sys tests pass.
+- `cargo test --workspace`: 238 beam-core unit tests, 2 integration tests, and
+  23 beam-sys tests pass after the cross-stream retained-socket test.
 - `cargo test --workspace --release`: pass.
 - `cargo check --manifest-path fuzz/Cargo.toml`: pass with the portable C++
-  compiler.
+  compiler; `scripts/dev-env.sh` now exports `CXX` when that wrapper exists.
+- Seven libFuzzer targets ran for 60 s each: `client_hello` 18,884,104 runs,
+  `reality_auth` 8,682,442, `vless` 8,851,106, `vision` 12,828,316,
+  `xudp` 14,895,441, `legacy_udp` 9,211,483, and `config` 960,640; no crash or
+  sanitizer report.
 - Local full-TUN `xudp` at **MTU 1500**: 8/8 PASS.
 - Local full-TUN `xudp` at **MTU 1400**: 7/8 PASS; only `quic-udp` failed.
-  The HTTP/3 origin saw the QUIC connection, and the failure is consistent with
-  the known client/MTU H3 stall, not with the new session limiter. It is
-  recorded as a client-TUN issue to investigate separately.
+  The same 7/8 result reproduces with stock Xray as the server, and at MTU
+  1280/1300/1450. At MTU 1480, 1492, and 1500 the same H3 probe passes 8/8,
+  including a 1.3 MiB body. This is a client TUN/UDP fragmentation limitation,
+  not a beam XUDP limiter regression; see `docs/14-tun-harness.md`.
 
 ## Old vs new local smoke (2026-10-23)
 
