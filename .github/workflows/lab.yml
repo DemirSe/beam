@@ -1,0 +1,92 @@
+name: lab
+
+# Full-TUN and benchmark runs belong on a trusted, persistent machine, not on a
+# shared GitHub-hosted runner. This workflow is manual-only and requires a
+# self-hosted runner labelled `beam-lab`.
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Test suite"
+        required: true
+        default: tun
+        type: choice
+        options: [tun, bench, both]
+      udp_mode:
+        description: "sing-box packet encoding for the TUN suite"
+        required: true
+        default: xudp
+        type: choice
+        options: [xudp, packetaddr, legacy]
+      mtu:
+        description: "TUN MTU"
+        required: true
+        default: "1400"
+      rtt_ms:
+        description: "Benchmark netem RTT in milliseconds"
+        required: true
+        default: "0"
+      reps:
+        description: "Benchmark repetitions"
+        required: true
+        default: "2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lab-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lab:
+    runs-on: [self-hosted, linux, x64, beam-lab]
+    timeout-minutes: 360
+    env:
+      SING_BOX: /usr/local/bin/sing-box
+      XRAY_BIN: /tmp/opencode/xray-server-compare/xray
+      TEST_CONFIG: /tmp/opencode/beam-test/beam.toml
+      IPERF3: /tmp/opencode/tools/root/usr/bin/iperf3
+      IPERF3_LIB: /tmp/opencode/tools/root/usr/lib64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare lab
+        run: |
+          source scripts/dev-env.sh
+          mkdir -p "$RUNNER_TEMP/beam-lab"
+          test -x "$SING_BOX" || { echo "missing SING_BOX: $SING_BOX" >&2; exit 1; }
+          test -f "$TEST_CONFIG" || { echo "missing TEST_CONFIG: $TEST_CONFIG" >&2; exit 1; }
+          test -x "$IPERF3" || { echo "missing IPERF3: $IPERF3" >&2; exit 1; }
+      - name: Full-TUN suite
+        if: inputs.suite != 'bench'
+        run: |
+          source scripts/dev-env.sh
+          SKIP_BUILD=0 \
+            SING_BOX="$SING_BOX" \
+            TUN_MTU="${{ inputs.mtu }}" \
+            TUN_STACK=system \
+            TUN_OUT="$RUNNER_TEMP/beam-lab/tun" \
+            bash tests/tun/run.sh --udp-mode "${{ inputs.udp_mode }}"
+      - name: Benchmark suite
+        if: inputs.suite != 'tun'
+        run: |
+          source scripts/dev-env.sh
+          test -x "$XRAY_BIN" || { echo "missing XRAY_BIN: $XRAY_BIN" >&2; exit 1; }
+          SKIP_BUILD=0 \
+            SING_BOX="$SING_BOX" \
+            XRAY_BIN="$XRAY_BIN" \
+            TEST_CONFIG="$TEST_CONFIG" \
+            IPERF3="$IPERF3" \
+            IPERF3_LIB="$IPERF3_LIB" \
+            bash bench/run.sh --quick \
+              --reps "${{ inputs.reps }}" \
+              --rtt-ms "${{ inputs.rtt_ms }}" \
+              --arms beam,stock \
+              --out "$RUNNER_TEMP/beam-lab/bench"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lab-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/beam-lab
+          retention-days: 3
+          if-no-files-found: ignore

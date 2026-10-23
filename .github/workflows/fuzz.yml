@@ -1,0 +1,45 @@
+name: fuzz
+
+# Fuzzing is manual-only. There is no schedule and no automatic trigger.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Format fuzz workspace
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+      - name: Build fuzz targets
+        run: cargo fuzz build
+      - name: Run client_hello
+        run: cargo fuzz run client_hello -- -max_total_time=60 -timeout=10
+      - name: Run reality_auth
+        run: cargo fuzz run reality_auth -- -max_total_time=60 -timeout=10
+      - name: Run vless
+        run: cargo fuzz run vless -- -max_total_time=60 -timeout=10
+      - name: Run vision
+        run: cargo fuzz run vision -- -max_total_time=60 -timeout=10
+      - name: Run xudp
+        run: cargo fuzz run xudp -- -max_total_time=60 -timeout=10
+      - name: Run legacy_udp
+        run: cargo fuzz run legacy_udp -- -max_total_time=60 -timeout=10
+      - name: Run config
+        run: cargo fuzz run config -- -max_total_time=60 -timeout=10

@@ -29,7 +29,7 @@ use sha2::Sha512;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
@@ -42,7 +42,9 @@ use crate::tls::{ClientHello, MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN};
 use crate::udp::{LegacyUdpConfig, UdpError, handle_udp_stream};
 use crate::vision::VisionStream;
 use crate::vless::{Command, MAX_REQUEST_HEADER_LEN, RequestHeader, ResponseHeader, VlessError};
-use crate::xudp::{MuxError, XudpConfig, handle_mux_stream};
+use crate::xudp::{
+    DEFAULT_MAX_GLOBAL_SESSIONS, MuxError, XudpConfig, XudpSessionLimiter, handle_mux_stream,
+};
 
 /// Idle timeout for each relay read, write, and shutdown.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -54,6 +56,14 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// probe is closed after this bound.
 const COVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum number of unauthenticated cover relays in flight at once.
+///
+/// Cover relays and authenticated Vision Direct relays share the process
+/// blocking pool. A cover flood must not be able to occupy that pool and
+/// starve the VPN data path. The limit is global rather than per-IP because
+/// the deployment intentionally does not filter by client address.
+const COVER_MAX_CONCURRENCY: usize = 32;
+
 /// Relay buffer large enough for one maximum-size inner TLS record, including
 /// its five-byte header.
 const RELAY_BUFFER_LEN: usize = 16_384 + 256 + 5;
@@ -63,6 +73,9 @@ const RELAY_BUFFER_LEN: usize = 16_384 + 256 + 5;
 pub enum ConnectionOutcome {
     /// The connection was not authenticated and was forwarded to the cover.
     CoverForwarded,
+    /// The connection was not authenticated and was closed because the cover
+    /// concurrency limit was reached.
+    CoverLimited,
     /// The REALITY handshake succeeded and the VLESS command was observed.
     Authenticated {
         /// The VLESS command from the request.
@@ -169,10 +182,14 @@ pub struct TlsServerConfig {
     pub user_id: [u8; 16],
     /// XUDP mux/UDP relay limits.
     pub xudp: XudpConfig,
+    /// Process-wide XUDP session limiter shared by every mux stream.
+    xudp_limiter: XudpSessionLimiter,
     /// Legacy VLESS UDP and packetaddr limits.
     pub udp: LegacyUdpConfig,
     provider: Arc<CryptoProvider>,
     certificate: TemporaryCertificate,
+    /// Global cap on unauthenticated cover relays.
+    cover_permits: Arc<Semaphore>,
 }
 
 impl TlsServerConfig {
@@ -221,9 +238,11 @@ impl TlsServerConfig {
             max_client_hello_bytes,
             user_id,
             xudp: XudpConfig::default(),
+            xudp_limiter: XudpSessionLimiter::new(DEFAULT_MAX_GLOBAL_SESSIONS),
             udp: LegacyUdpConfig::default(),
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             certificate: TemporaryCertificate::generate()?,
+            cover_permits: Arc::new(Semaphore::new(COVER_MAX_CONCURRENCY)),
         })
     }
 
@@ -231,6 +250,13 @@ impl TlsServerConfig {
     #[must_use]
     pub fn with_xudp(mut self, xudp: XudpConfig) -> Self {
         self.xudp = xudp;
+        self
+    }
+
+    /// Overrides the process-wide XUDP session limiter.
+    #[must_use]
+    pub fn with_xudp_limiter(mut self, limiter: XudpSessionLimiter) -> Self {
+        self.xudp_limiter = limiter;
         self
     }
 
@@ -321,7 +347,9 @@ impl fmt::Debug for TlsServerConfig {
             .field("handshake_timeout", &self.handshake_timeout)
             .field("max_client_hello_bytes", &self.max_client_hello_bytes)
             .field("xudp", &self.xudp)
+            .field("xudp_limiter", &self.xudp_limiter)
             .field("udp", &self.udp)
+            .field("cover_max_concurrency", &COVER_MAX_CONCURRENCY)
             .finish()
     }
 }
@@ -588,10 +616,10 @@ async fn handle_authenticated(
             if request.vision {
                 let rng = SmallRng::seed_from_u64(vision_seed());
                 let vision = VisionStream::new(tls, request.user_id, request.body, rng);
-                handle_mux_stream(vision, xudp).await?;
+                handle_mux_stream(vision, xudp, config.xudp_limiter.clone()).await?;
             } else {
                 let stream = PrependStream::new(tls, request.body);
-                handle_mux_stream(stream, xudp).await?;
+                handle_mux_stream(stream, xudp, config.xudp_limiter.clone()).await?;
             }
 
             Ok(ConnectionOutcome::Authenticated {
@@ -630,6 +658,17 @@ async fn forward_to_cover(
     record: &[u8],
     config: &TlsServerConfig,
 ) -> Result<ConnectionOutcome, TlsServerError> {
+    // Fail fast rather than queueing an unbounded number of cover relays in
+    // the shared blocking pool. The permit is held through the relay so a
+    // cover connection cannot outlive the cap.
+    let _cover_permit = match Arc::clone(&config.cover_permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::debug!("cover concurrency limit reached; closing probe");
+            return Ok(ConnectionOutcome::CoverLimited);
+        }
+    };
+
     let mut cover = dial(&config.cover, config.handshake_timeout).await?;
     timeout(config.handshake_timeout, cover.write_all(record))
         .await
@@ -1196,6 +1235,32 @@ mod tests {
             [0x22; 16],
         )
         .expect("test configuration")
+    }
+
+    #[tokio::test]
+    async fn cover_limit_is_global_and_bounded() {
+        let config = test_config();
+        let mut permits = Vec::new();
+        for _ in 0..COVER_MAX_CONCURRENCY {
+            permits.push(
+                Arc::clone(&config.cover_permits)
+                    .try_acquire_owned()
+                    .expect("cover permit must be available below the limit"),
+            );
+        }
+        assert!(
+            Arc::clone(&config.cover_permits)
+                .try_acquire_owned()
+                .is_err(),
+            "the cover limit must reject one more relay"
+        );
+        permits.pop();
+        assert!(
+            Arc::clone(&config.cover_permits)
+                .try_acquire_owned()
+                .is_ok(),
+            "a released cover permit must be reusable"
+        );
     }
 
     #[test]

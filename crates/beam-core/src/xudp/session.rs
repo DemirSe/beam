@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 
@@ -53,6 +53,15 @@ use crate::xudp::frame::{
 
 /// Default maximum number of sessions (active and retained) per mux stream.
 pub const DEFAULT_MAX_SESSIONS: usize = 2048;
+
+/// Process-wide maximum number of XUDP sessions (active and retained).
+///
+/// Each session owns one UDP socket. The per-stream limit is not an aggregate
+/// bound because one process can have many mux streams. Keep this below the
+/// per-stream limit and size it with the kernel receive buffer in mind; on the
+/// 1 GiB production host the socket buffers, not the Rust heap, are the
+/// dominant cost.
+pub const DEFAULT_MAX_GLOBAL_SESSIONS: usize = 256;
 
 /// Default maximum UDP payload accepted from a frame or queued for a reply.
 pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = MAX_PAYLOAD_LEN;
@@ -176,6 +185,46 @@ pub enum XudpConfigError {
     /// `io_timeout` was zero.
     #[error("XUDP io_timeout must be non-zero")]
     IoTimeout,
+}
+
+/// Process-wide XUDP session limiter.
+///
+/// A permit is held by each active session and by each retained GlobalID
+/// socket. Permits therefore cover both the live and the close-expiry states,
+/// which are the states that keep a kernel UDP socket alive.
+#[derive(Clone, Debug)]
+pub struct XudpSessionLimiter {
+    max: usize,
+    permits: Arc<Semaphore>,
+}
+
+impl XudpSessionLimiter {
+    /// Creates a limiter with at least one permit.
+    #[must_use]
+    pub fn new(max: usize) -> Self {
+        let max = max.max(1);
+        Self {
+            max,
+            permits: Arc::new(Semaphore::new(max)),
+        }
+    }
+
+    /// Returns the configured global session limit.
+    #[must_use]
+    pub const fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Tries to reserve one global session slot without waiting.
+    pub(crate) fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.permits).try_acquire_owned().ok()
+    }
+}
+
+impl Default for XudpSessionLimiter {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_GLOBAL_SESSIONS)
+    }
 }
 
 /// Address family of a session socket.
@@ -307,6 +356,8 @@ pub(crate) struct Session {
     stop: watch::Sender<bool>,
     closed: AtomicBool,
     failed: AtomicBool,
+    /// Global session slot, released when the socket is finally dropped.
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
 impl Session {
@@ -317,6 +368,7 @@ impl Session {
         socket: Arc<UdpSocket>,
         family: SocketFamily,
         destination: SocketAddr,
+        permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         let (stop, _) = watch::channel(false);
         Self {
@@ -329,7 +381,13 @@ impl Session {
             stop,
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            permit: Mutex::new(permit),
         }
+    }
+
+    /// Takes the global session slot so it can move to a retained socket.
+    pub(crate) fn take_permit(&self) -> Option<OwnedSemaphorePermit> {
+        lock(&self.permit).take()
     }
 
     /// Marks request or reply activity.
@@ -399,6 +457,8 @@ pub(crate) struct ExpiringSession {
     pub(crate) family: SocketFamily,
     /// Absolute expiry instant.
     pub(crate) expires_at: Instant,
+    /// Global session slot held while the socket is retained.
+    pub(crate) permit: Option<OwnedSemaphorePermit>,
 }
 
 /// Per-mux-stream session table.
@@ -671,8 +731,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResolveError, Session, SessionTable, SocketFamily, XudpConfig, XudpConfigError,
-        encode_end_frame, resolve_destination, socket_addr_to_location,
+        DEFAULT_MAX_GLOBAL_SESSIONS, ResolveError, Session, SessionTable, SocketFamily, XudpConfig,
+        XudpConfigError, XudpSessionLimiter, encode_end_frame, resolve_destination,
+        socket_addr_to_location,
     };
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{FrameOption, SessionStatus, parse_frame};
@@ -763,6 +824,26 @@ mod tests {
         for (config, expected) in cases {
             assert_eq!(config.validate(), Err(expected));
         }
+    }
+
+    #[test]
+    fn global_session_limiter_is_bounded() {
+        let limiter = XudpSessionLimiter::new(1);
+        let permit = limiter.try_acquire().expect("first slot must be available");
+        assert!(
+            limiter.try_acquire().is_none(),
+            "the limit must reject a second slot"
+        );
+        drop(permit);
+        assert!(
+            limiter.try_acquire().is_some(),
+            "a released slot must be reusable"
+        );
+        assert_eq!(limiter.max(), 1);
+        assert_eq!(
+            XudpSessionLimiter::default().max(),
+            DEFAULT_MAX_GLOBAL_SESSIONS
+        );
     }
 
     #[test]
@@ -890,6 +971,7 @@ mod tests {
             Arc::clone(&socket),
             SocketFamily::V4,
             address,
+            None,
         ));
         let mut table = SessionTable::default();
         assert_eq!(table.total(), 0);
@@ -905,6 +987,7 @@ mod tests {
             socket,
             family: SocketFamily::V4,
             expires_at: tokio::time::Instant::now() + Duration::from_secs(1),
+            permit: None,
         };
         table.insert_expiring([7; 8], entry);
         assert_eq!(table.total(), 2);
@@ -922,6 +1005,7 @@ mod tests {
             Arc::clone(&socket),
             SocketFamily::V4,
             address,
+            None,
         ));
         let mut table = SessionTable::default();
         table.insert(super::ActiveSession {
@@ -938,6 +1022,7 @@ mod tests {
             socket,
             family: SocketFamily::V4,
             expires_at: now,
+            permit: None,
         };
         table.insert_expiring([9; 8], entry);
         assert_eq!(table.expire_retained(now), 1);

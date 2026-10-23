@@ -783,6 +783,23 @@ fn is_peer_closed(error: &io::Error) -> bool {
     )
 }
 
+/// Test-only entry point for the legacy UDP parser fuzz target.
+///
+/// This is compiled only with the `fuzz` feature and is not part of the
+/// production API. It exercises frame reassembly and packetaddr parsing
+/// without opening a socket.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub fn fuzz_legacy_parser(data: &[u8]) {
+    let mut decoder = FrameDecoder::new(MAX_FRAMED_DATAGRAM_SIZE);
+    if decoder.push(data).is_ok() {
+        while let Ok(Some(frame)) = decoder.next_frame() {
+            decoder.consume(frame.end);
+        }
+    }
+    let _ = parse_packetaddr(data);
+}
+
 /// Bounded packetaddr destination table.
 struct DestinationTable {
     entries: HashSet<SocketAddr>,

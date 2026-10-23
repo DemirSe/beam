@@ -10,7 +10,8 @@ export SSH_KEY=~/.ssh/id_ed25519_netlen_demir
 bssh() { ssh -i "$SSH_KEY" "$SERVER" "$@"; }
 ```
 Related: `deploy/README.md`, `docs/10-cover-parity.md`,
-`docs/13-vision-direct-design.md`, `docs/14-tun-harness.md`, `bench/README.md`.
+`docs/13-vision-direct-design.md`, `docs/14-tun-harness.md`,
+`docs/17-resource-hardening.md`, `bench/README.md`.
 
 ## 1. What is deployed
 
@@ -21,6 +22,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
 | Unit / backups | `/etc/systemd/system/beam.service` 0644; `*.bak-<UTC stamp>` beside each installed file |
+| Pending hardening | Repo now has a global XUDP cap of 256, a cover cap of 32, systemd memory limits, and fuzz targets; **not yet deployed** |
 | Local client | sing-box, `/etc/sing-box/config.json` 0600, active but disabled at boot |
 | Client identity | `~/.config/beam/client-identity.json`, `client-link.txt` 0600 |
 | Tunnel egress | IPv4 `158.94.216.102`, IPv6 `2a01:f900:11:168::1` |
@@ -51,8 +53,8 @@ Expect `active (running)` and `enabled`; `ss` should show `beam` on
 `authenticated VLESS command is not implemented yet; closing command=Rvs` for
 the unsupported reverse command; treat anything else as actionable.
 `ps` reports RSS/VSZ in KiB and `nlwp` as threads. Local churn baseline: RSS
-7.7 to 8.3 MiB, 2 threads, 10 fds; live idle RSS was about 840 KiB. The same
-pass covers disk, inodes, swap, load, and restart count.
+7.7 to 8.3 MiB, 2 threads, 10 fds; live idle RSS was about 17 MiB at the last
+audit. The same pass covers disk, inodes, swap, load, and restart count.
 From the laptop, with the TUN client running, verify egress:
 ```bash
 curl -4 -sS https://ipv4.icanhazip.com
@@ -231,10 +233,21 @@ tune after a 24-hour soak.
 The live `max_connections` is 1024 and the pre-auth handshake timeout is 10 s.
 Each Vision Direct relay can hold up to two blocking splice tasks and 512 KiB
 pipes; the Tokio blocking pool is capped at 160 threads. The XUDP reply queue is
-512 frames and session sockets request a 1 MiB receive buffer. If RSS exceeds
-256 MiB, threads exceed 160, swap is used, or p95 latency rises, lower
-`max_connections` to 256. `max_udp_destinations` also consumes one socket/fd per
-destination; the live value is 1024. Change a limit, validate, and restart:
+512 frames and session sockets request a 1 MiB receive buffer. The repo adds a
+**process-wide 256-session XUDP cap** (active plus retained sockets), a **32
+cover-relay cap**, and `MemoryHigh=512M`/`MemoryMax=768M`; these are not live
+until the next deploy. If RSS exceeds 256 MiB, threads exceed 160, swap is used,
+or p95 latency rises, lower `max_connections` to 256. `max_udp_destinations`
+also consumes one socket/fd per destination; the live value is 1024, while the
+process-wide cap is 256. After deploying the new unit, check
+
+```bash
+bssh 'systemctl show beam -p MemoryHigh -p MemoryMax -p MemorySwapMax'
+bssh 'cat /sys/fs/cgroup/system.slice/beam.service/memory.current; cat /sys/fs/cgroup/system.slice/beam.service/memory.peak'
+bssh 'nstat -az | grep -E "UdpRcvbufErrors|UdpSndbufErrors"'
+```
+
+Change a limit, validate, and restart:
 ```bash
 ssh -t -i "$SSH_KEY" "$SERVER" 'sudoedit /etc/beam/config.toml'
 bssh 'sudo -n runuser -u beam -- /usr/local/bin/beam --check -c /etc/beam/config.toml'
@@ -254,7 +267,10 @@ but with a 49.7 s median latency; a 1024×1 MB load produced 937 timeouts and
 927 partial bodies, with 162 threads. Do not raise the blocking pool blindly
 on the 1 GiB host; lower `max_connections` or move the relay to an
 epoll/io_uring design if bulk concurrency matters. The current normal load is
-tens of connections, where the pool is not saturated.
+tens of connections, where the pool is not saturated. Unauthenticated cover
+relays are separately capped at **32** in the repo so a probe burst cannot fill
+the shared blocking pool. XUDP sessions are capped at **256 process-wide** in
+addition to the per-stream limit.
 
 ### Network tuning during the 2026-10-23 hotspot test
 
