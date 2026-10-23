@@ -201,10 +201,12 @@ a 24-hour soak impossible. Use the self-hosted lab for those. The self-hosted
 runner must have `/dev/net/tun`, unprivileged user namespaces, sing-box, stock
 Xray, iperf3, the test REALITY config, and the H3 origin toolchain available.
 
-Scheduled workflows run from the default branch. Because the hardening commits
-are intentionally on `feat/resource-hardening` rather than `main`, the weekly
-fuzz schedule becomes active only after this branch is merged or otherwise made
-the default. Until then, use `workflow_dispatch` on the branch.
+GitHub only exposes scheduled workflows and the `workflow_dispatch` button from
+the default branch. Because the hardening commits are intentionally on
+`feat/resource-hardening` rather than `main`, the weekly fuzz schedule and the
+manual `lab` workflow are **not active yet**; they become available only after
+this branch is merged or otherwise made the default. Until then, run fuzzing
+and the full-TUN/benchmark lab locally.
 
 ## Deployment note
 

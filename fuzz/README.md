@@ -20,6 +20,7 @@ cargo +nightly fuzz run config -- -max_total_time=60 -timeout=10
 The targets have no network side effects. `legacy_udp` uses a test-only
 feature-gated helper to exercise the pure reassembly and packetaddr parsers.
 The scheduled GitHub workflow runs a short **weekly** budget to stay inside a
-private repository's free Actions minutes. Use `workflow_dispatch` on this
-branch for an on-demand run, and a longer local/self-hosted budget for parser
-changes.
+private repository's free Actions minutes. GitHub only exposes scheduled and
+manual workflows from the default branch, so while these changes are on the
+hardening branch, run the targets locally. The weekly schedule and the manual
+button become available after this branch is merged or made the default.
