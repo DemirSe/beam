@@ -31,8 +31,8 @@ either a valid value or a typed error.
 Implemented targets live in the separate `fuzz/` workspace:
 `client_hello`, `reality_auth`, `vless`, `vision`, `xudp`, `legacy_udp`, and
 `config`. The `legacy_udp` target uses a feature-gated pure parser helper and
-opens no sockets. The scheduled `fuzz` workflow runs a short budget nightly;
-local parser changes should use a longer budget.
+opens no sockets. The manual `fuzz` workflow runs a short budget when
+dispatched; local parser changes should use a longer budget.
 
 ### Integration tests
 
@@ -118,8 +118,9 @@ cargo test --workspace
 cargo test --workspace --release
 ```
 
-Fuzz and soak runs are scheduled separately; they are not required on every
-commit, but a release candidate cannot ship without them.
+Fuzz and soak runs are manual and separate from CI; they are not required on
+every commit, but a release candidate cannot ship without them. There is no
+schedule and no automatic test trigger.
 
 ## Test data rules
 

@@ -1,8 +1,9 @@
 # Resource hardening audit: XUDP, cover, and fuzzing
 
 Date: 2026-10-23. Scope: the first three findings from the production audit.
-This document records the design decisions and the implemented code. **Nothing
-in this change has been deployed to the VPS yet.**
+This document records the design decisions and the implemented code. The
+original hardening was deployed on 2026-10-23; the local follow-up in this
+document (cross-stream retained-socket eviction) is still test-only.
 
 ## 1. XUDP memory and session bounds
 
@@ -28,7 +29,12 @@ in this change has been deployed to the VPS yet.**
    when the kernel socket is finally dropped.
 3. Keep the per-stream `max_sessions` limit; the global limiter is an additional
    aggregate bound, not a replacement for the stream-local table bound.
-4. Add systemd memory protection:
+4. When the global limiter is full, evict optional retained GlobalID sockets
+   from **any** mux stream before rejecting a new live session. A retained
+   socket is only reattachment state; it must not make a new flow fail while
+   no active session needs to be dropped. This is implemented by registering
+   each stream's session table as a weak reference in the shared limiter.
+5. Add systemd memory protection:
    - `MemoryHigh=512M`
    - `MemoryMax=768M`
    - `MemorySwapMax=512M`
@@ -49,12 +55,12 @@ theoretically reach about 2 GiB of socket memory.
 - The limiter is checked only on `New`, not per packet or per reply.
 - Normal full-TUN traffic with fewer than 256 destinations sees no added
   datagram-path work.
-- At the limit, the next `New` receives `End + Error`; this is a deliberate
+- At the limit, retained sockets are evicted first; if every permit belongs to
+  an active session, the next `New` receives `End + Error`. This is a deliberate
   capacity trade-off, not a CPU regression.
 - Keeping the 1 MiB buffer preserves the existing H3 behavior.
-- `MemoryMax` adds no CPU work in normal operation. If set too low it would
-  cause reclaim or OOM; the chosen values are above the observed peak and will
-  be validated on the host before deployment.
+- `MemoryMax` adds no CPU work in normal operation. The deployed cgroup peak
+  stayed well below the limits.
 
 ## 2. Cover concurrency
 
@@ -139,16 +145,116 @@ provides one. Local checks used the portable GCC toolchain under
 
 Results after the change:
 
-- `cargo test --workspace`: 237 beam-core unit tests, 2 integration tests, and
-  23 beam-sys tests pass.
+- `cargo test --workspace`: 249 beam-core unit tests, 2 integration tests, and
+  23 beam-sys tests pass after the follow-up fixes (274 total).
 - `cargo test --workspace --release`: pass.
 - `cargo check --manifest-path fuzz/Cargo.toml`: pass with the portable C++
-  compiler.
+  compiler; `scripts/dev-env.sh` now exports `CXX` when that wrapper exists.
+- Seven libFuzzer targets ran for 60 s each: `client_hello` 18,884,104 runs,
+  `reality_auth` 8,682,442, `vless` 8,851,106, `vision` 12,828,316,
+  `xudp` 14,895,441, `legacy_udp` 9,211,483, and `config` 960,640; no crash or
+  sanitizer report.
 - Local full-TUN `xudp` at **MTU 1500**: 8/8 PASS.
 - Local full-TUN `xudp` at **MTU 1400**: 7/8 PASS; only `quic-udp` failed.
-  The HTTP/3 origin saw the QUIC connection, and the failure is consistent with
-  the known client/MTU H3 stall, not with the new session limiter. It is
-  recorded as a client-TUN issue to investigate separately.
+  The same 7/8 result reproduces with stock Xray as the server, and at MTU
+  1280/1300/1450. At MTU 1480, 1492, and 1500 the same H3 probe passes 8/8,
+  including a 1.3 MiB body. This is a client TUN/UDP fragmentation limitation,
+  not a beam XUDP limiter regression; see `docs/14-tun-harness.md`.
+
+## Local stress follow-up (2026-10-23)
+
+The fixed local binary (`feat/deep-hardening`) was tested beyond the unit suite:
+
+| Check | Result |
+|---|---|
+| 10,000-connection churn, concurrency 64 | **10,000/10,000 HTTP 200** in 67 s; RSS 7,804 → 8,640 KiB; threads 2 → 2; fds 10 → 10 |
+| 10,000-connection churn, concurrency 256 | **10,000/10,000 HTTP 200** in 55 s; RSS 7,760 → 9,032 KiB; threads 2 → 2; fds 10 → 10 |
+| 10,000-connection churn after fixes | **10,000/10,000 HTTP 200** in 56 s; RSS 7,908 → 9,220 KiB; threads 2 → 2; fds 10 → 10 |
+| Malformed TLS/handshake stress | 2,000 random or truncated connections: process alive; RSS 6,516 → 7,292 KiB; fds 10 → 10; threads 9 → 9 |
+| Slow ClientHello header | 32 connections sent only the 5-byte record header: all timed out and closed by ~13 s; fds 42 → 10; process alive |
+| Replay filter | Stock fixture: first send returned a 1,637-byte server flight; exact resend was forwarded to the closed cover and got EOF |
+| Accept error under fd pressure | `RLIMIT_NOFILE=64`, 120 idle sockets: EMFILE warnings and backoff; process/listener survived; a new connection succeeded after close |
+| Cover flood | 100 simultaneous unauthenticated TLS probes: exactly **32** reached the cover; authenticated HTTP stayed **200** with 2.1–2.8 ms response time |
+| Cover down | Authenticated VLESS/TCP still returned 200 with `dest` closed; unauthenticated probe saw EOF |
+| No-TUN capacity, 64 MiB | beam **831.6 MB/s** median vs stock Xray **299.3 MB/s** (2.78x; cold stock outlier, not a headline) |
+| TCP integrity, 64 MiB download | SHA-256 match; 200; 0.088 s; RSS 7,928 KiB, 10 fds |
+| TCP integrity, 64 MiB upload | SHA-256 match; 200; 0.108 s; RSS 8,084 KiB, 10 fds |
+| Full TUN XUDP, MTU 1500 | **8/8 PASS** with the fixed binary |
+| Full TUN XUDP, MTU 1400 | 7/8 PASS; only H3, reproduced with stock Xray |
+| 1-hour mixed TCP/UDP soak | 720 iterations: **0 errors**; RSS 8,308 → 8,788 KiB; threads 9 → 9; fds 12 → 12. A 24-hour soak and privileged acceptance remain open. |
+| Final full-TUN matrix, MTU 1500 | **8/8** for `xudp`, `legacy`, and `packetaddr`; 1.3 MiB H3 body also **8/8** |
+
+The cover cap and cross-stream retained eviction are independent: the cap
+protects the blocking pool, while retained eviction protects new UDP flows from
+optional session state.
+
+## Follow-up fixes (local branch, not yet deployed)
+
+The deep local audit found several operational/security issues outside the
+first deployment. These are fixed and covered locally but are **not on the live
+VPS** until a later deploy. Local branch binary SHA-256:
+`bd17ac26928d4e659a0f7596f959b5a66f0f8314288c7720220882e4ea88287b`.
+
+- **Accept-loop survival.** An `accept(2)` error such as `EMFILE` no longer
+  terminates the process. The loop logs, backs off from 10 ms to 1 s, and keeps
+  the listener alive. Reproduced with `RLIMIT_NOFILE=64`: 120 accepted-but-idle
+  sockets produced EMFILE warnings, the process and listener survived, and a
+  new connection succeeded after the sockets closed.
+- **Vision relay cancellation.** A failed direction now signals its sibling
+  through `RelayActivity`; blocking one-way splices poll the stop flag every
+  250 ms. This prevents a dropped `spawn_blocking` handle from leaving a
+  detached splice and its duplicated fds/pipe running indefinitely.
+- **Shared TCP idle clock.** Non-Vision bidirectional relays now use one
+  activity clock for both directions, so a long download is not killed because
+  the upload direction is idle. `limits.idle_timeout_ms` is also wired into
+  authenticated TCP relays instead of only XUDP.
+- **TOML redaction.** Deserialization errors now report only line/column and a
+  generic schema message. A secret placed in a wrong-typed field (for example
+  `max_connections = "SECRET"`) is no longer echoed into stderr/journald.
+- **Replay filter.** Authenticated ClientHellos are remembered by their
+  encrypted 32-byte session id in a bounded 4,096-entry, 60 s cache. An exact
+  replay is forwarded to the cover instead of starting another authenticated
+  handshake. This is a deliberate deviation from stock REALITY's no-cache
+  behavior.
+- **No TLS 1.3 tickets.** Rustls' two default tickets are disabled to match
+  stock REALITY's post-handshake shape.
+- **Absolute pre-auth deadlines.** One deadline now covers the ClientHello
+  record, and one covers the VLESS request, instead of resetting the timeout on
+  every partial read.
+- **XUDP GlobalID migration.** A new `New` with an existing GlobalID closes the
+  old active attachment and reuses its retained socket; two session ids no
+  longer keep duplicate sockets for one logical UDP flow.
+- **XUDP aggregate reply budget.** Reply frames reserve from a process-wide
+  32 MiB byte budget in addition to the 512-frame per-stream queue. A blocked
+  client can no longer accumulate roughly a gigabyte of queued 8 KiB frames
+  across 256 streams.
+- **Packetaddr failure isolation.** A failed `send_to` for one inner
+  destination drops only that datagram; other flows on the same packetaddr
+  session survive.
+- **Legacy UDP config.** `handshake_timeout_ms`, `idle_timeout_ms`, and
+  `max_udp_destinations` now feed `LegacyUdpConfig` as well as XUDP.
+- **VLESS route compatibility.** UUID bytes 6-7 are ignored for account lookup,
+  matching stock Xray's `vlessRoute` behavior; the raw UUID is still used for
+  the Vision prefix.
+- **Deployment safety.** `bootstrap.sh` accepts `BEAM_KEEP_CONFIG=1` to update
+  only the binary/unit and preserve `/etc/beam/config.toml` when the local and
+  live configs differ.
+
+Residual issues not fixed in this pass:
+
+- TLS `close_notify` is not surfaced as EOF; an unclean TCP FIN is treated as
+  clean in the record reader.
+- Unknown or mismatched VLESS flows are treated as no-flow; stock rejects them.
+- Post-Direct outer-TLS KeyUpdate on the still-framed direction is not covered
+  by an integration test.
+- Reply-task teardown/ordering races under a simultaneous session-id reuse are
+  not covered by an integration test.
+- Source filtering remains deliberately disabled for stock parity; see
+  `docs/08-vision-xudp-spec.md`.
+- Cover-cap exhaustion remains an intentional fail-fast security trade-off.
+- There is no SIGTERM drain/graceful shutdown yet.
+- `max_connections` and timeout upper bounds are still only manually
+  constrained; port 0 is now rejected.
 
 ## Old vs new local smoke (2026-10-23)
 

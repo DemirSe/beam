@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 
 use super::session::{
-    ActiveSession, ExpiringSession, Session, SessionTable, SocketFamily, XudpConfig,
+    ActiveSession, ExpiringSession, QueuedFrame, Session, SessionTable, SocketFamily, XudpConfig,
     XudpConfigError, XudpSessionLimiter, encode_end_frame, resolve_destination, spawn_reply_task,
 };
 use crate::xudp::frame::{
@@ -133,7 +133,7 @@ impl CloseReason {
 struct MuxState {
     config: Arc<XudpConfig>,
     table: Arc<Mutex<SessionTable>>,
-    outbound: mpsc::Sender<Vec<u8>>,
+    outbound: mpsc::Sender<QueuedFrame>,
     limiter: XudpSessionLimiter,
 }
 
@@ -169,6 +169,7 @@ where
     ));
 
     let table = Arc::new(Mutex::new(SessionTable::default()));
+    limiter.register_table(&table);
     let state = MuxState {
         config: config.clone(),
         table: Arc::clone(&table),
@@ -206,7 +207,7 @@ where
 /// Serializes frames from the reply tasks and the read loop.
 async fn write_loop<W>(
     mut writer: W,
-    mut inbound: mpsc::Receiver<Vec<u8>>,
+    mut inbound: mpsc::Receiver<QueuedFrame>,
     io_timeout: Duration,
     writer_failed: watch::Sender<bool>,
 ) -> io::Result<()>
@@ -214,7 +215,7 @@ where
     W: AsyncWrite + Unpin,
 {
     while let Some(frame) = inbound.recv().await {
-        if let Err(error) = write_frame(&mut writer, &frame, io_timeout).await {
+        if let Err(error) = write_frame(&mut writer, &frame.bytes, io_timeout).await {
             let _ = writer_failed.send(true);
             return Err(error);
         }
@@ -406,64 +407,71 @@ impl MuxState {
             DuplicateStatus::None => {}
         }
 
+        // Stock migrates a GlobalID to a new mux session id instead of leaving
+        // two active attachments for one logical UDP flow.
+        if let Some(global_id) = global_id {
+            let old = { lock_table(&self.table).take_by_global_id(global_id) };
+            if let Some(old) = old {
+                self.close_active(old, CloseReason::ClientEnd).await?;
+            }
+        }
+
         // A clean close with a nonzero GlobalID retains its socket. Reattach
         // when this New names the same identifier within the stream.
         let retained =
             global_id.and_then(|global_id| lock_table(&self.table).take_expiring(global_id));
-        let reusable = retained
-            .as_ref()
-            .is_some_and(|retained| retained.family == family);
-        let (socket, permit) = if let Some(retained) = retained
-            && reusable
-        {
-            (retained.socket, retained.permit)
-        } else {
-            // A family change cannot reuse the retained socket; it was removed
-            // from the table and is dropped here. Treat this as a fresh New.
-            if !self.reserve_session_slot() {
-                tracing::debug!(session_id = id, "XUDP session limit reached; rejecting New");
-                return self.send_end(id, true).await;
-            }
-            let Some(permit) = self.limiter.try_acquire() else {
-                tracing::debug!(
-                    session_id = id,
-                    global_limit = self.limiter.max(),
-                    "global XUDP session limit reached; rejecting New"
-                );
-                return self.send_end(id, true).await;
-            };
-            let socket = match timeout(
-                self.config.io_timeout,
-                UdpSocket::bind(family.bind_address()),
-            )
-            .await
-            {
-                Ok(Ok(socket)) => {
-                    if let Err(error) =
-                        beam_sys::set_udp_recv_buffer(socket.as_raw_fd(), UDP_RECV_BUFFER_BYTES)
-                    {
+        let (socket, permit) = match retained {
+            Some(retained) if retained.family == family => (retained.socket, retained.permit),
+            retained => {
+                // A family change cannot reuse the retained socket; it was
+                // removed from the table and is dropped here. Release its
+                // permit before asking the global limiter for a fresh slot.
+                drop(retained);
+                if !self.reserve_session_slot() {
+                    tracing::debug!(session_id = id, "XUDP session limit reached; rejecting New");
+                    return self.send_end(id, true).await;
+                }
+                let Some(permit) = self.limiter.try_acquire_or_evict() else {
+                    tracing::debug!(
+                        session_id = id,
+                        global_limit = self.limiter.max(),
+                        "global XUDP session limit reached; rejecting New"
+                    );
+                    return self.send_end(id, true).await;
+                };
+                let socket = match timeout(
+                    self.config.io_timeout,
+                    UdpSocket::bind(family.bind_address()),
+                )
+                .await
+                {
+                    Ok(Ok(socket)) => {
+                        if let Err(error) =
+                            beam_sys::set_udp_recv_buffer(socket.as_raw_fd(), UDP_RECV_BUFFER_BYTES)
+                        {
+                            tracing::debug!(
+                                session_id = id,
+                                %error,
+                                "could not enlarge the XUDP socket receive buffer"
+                            );
+                        }
+                        Arc::new(socket)
+                    }
+                    Ok(Err(error)) => {
                         tracing::debug!(
                             session_id = id,
                             %error,
-                            "could not enlarge the XUDP socket receive buffer"
+                            "XUDP session socket bind failed"
                         );
+                        return self.send_end(id, true).await;
                     }
-                    Arc::new(socket)
-                }
-                Ok(Err(error)) => {
-                    tracing::debug!(
-                        session_id = id,
-                        %error,
-                        "XUDP session socket bind failed"
-                    );
-                    return self.send_end(id, true).await;
-                }
-                Err(_) => {
-                    tracing::debug!(session_id = id, "XUDP session socket bind timed out");
-                    return self.send_end(id, true).await;
-                }
-            };
-            (socket, Some(permit))
+                    Err(_) => {
+                        tracing::debug!(session_id = id, "XUDP session socket bind timed out");
+                        return self.send_end(id, true).await;
+                    }
+                };
+                (socket, Some(permit))
+            }
         };
 
         if parsed.option.has_data() && !parsed.payload.is_empty() {
@@ -497,6 +505,7 @@ impl MuxState {
             self.outbound.clone(),
             Arc::clone(&self.table),
             Arc::clone(&self.config),
+            self.limiter.clone(),
         );
         let replaced = lock_table(&self.table).insert(ActiveSession {
             session,
@@ -523,6 +532,10 @@ impl MuxState {
         };
         session.touch();
 
+        if !parsed.option.has_data() || parsed.payload.is_empty() {
+            return Ok(());
+        }
+
         let destination = match parsed.destination.as_ref() {
             Some(location) => {
                 match resolve_destination(location, Some(session.family), self.config.io_timeout)
@@ -548,10 +561,6 @@ impl MuxState {
             // last destination this session used.
             None => session.destination(),
         };
-
-        if !parsed.option.has_data() || parsed.payload.is_empty() {
-            return Ok(());
-        }
 
         match timeout(
             self.config.io_timeout,
@@ -654,6 +663,7 @@ impl MuxState {
 
         let permit = session.take_permit();
         if reason.retains_socket()
+            && !session.failed()
             && let Some(global_id) = session.global_id
         {
             let now = Instant::now();
@@ -688,7 +698,12 @@ impl MuxState {
         if frame.is_empty() {
             return Err(MuxError::Encode);
         }
-        match timeout(self.config.io_timeout, self.outbound.send(frame)).await {
+        match timeout(
+            self.config.io_timeout,
+            self.outbound.send(QueuedFrame::new(frame, None)),
+        )
+        .await
+        {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(MuxError::WriterClosed),
             Err(_) => Err(MuxError::Timeout {
@@ -1022,6 +1037,156 @@ mod tests {
         assert!(end.option.has_error());
 
         finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn global_id_migrates_to_a_new_session_id() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let config = Arc::new(XudpConfig {
+            session_idle_timeout: Duration::from_secs(30),
+            close_expiry: Duration::from_secs(30),
+            io_timeout: Duration::from_secs(2),
+            ..XudpConfig::default()
+        });
+        let (mut client, task) = start_mux(config);
+        let mut buffer = Vec::new();
+        let global_id = Some([0x55; GLOBAL_ID_LEN]);
+
+        write_frame(&mut client, new_spec(1, &destination, b"first", global_id)).await;
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("first session must echo");
+        assert_eq!(reply.payload, b"first");
+
+        write_frame(&mut client, new_spec(2, &destination, b"second", global_id)).await;
+        let old_end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("migrated session must receive End");
+        assert_eq!(old_end.session_id, 1);
+        assert_eq!(old_end.status, SessionStatus::End);
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("new session must echo");
+        assert_eq!(reply.session_id, 2);
+        assert_eq!(reply.payload, b"second");
+
+        write_frame(&mut client, keep_spec(1, None, b"stale")).await;
+        let stale_end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("old session id must be gone");
+        assert_eq!(stale_end.session_id, 1);
+        assert_eq!(stale_end.status, SessionStatus::End);
+
+        write_frame(&mut client, keep_spec(2, None, b"still")).await;
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("migrated session must still echo");
+        assert_eq!(reply.session_id, 2);
+        assert_eq!(reply.payload, b"still");
+
+        write_frame(&mut client, FrameSpec::new(2, SessionStatus::End)).await;
+        let _ = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn global_limit_evicts_retained_socket_from_another_stream() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let config = Arc::new(XudpConfig {
+            max_sessions: 2,
+            session_idle_timeout: Duration::from_secs(30),
+            close_expiry: Duration::from_secs(30),
+            io_timeout: Duration::from_secs(2),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::new(1);
+        let (mut first, first_task) = start_mux_with_limiter(Arc::clone(&config), limiter.clone());
+        let (mut second, second_task) = start_mux_with_limiter(config, limiter);
+        let mut buffer = Vec::new();
+
+        write_frame(
+            &mut first,
+            new_spec(1, &destination, b"retained", Some([0x44; GLOBAL_ID_LEN])),
+        )
+        .await;
+        let reply = read_frame(&mut first, &mut buffer)
+            .await
+            .expect("first session must echo");
+        assert_eq!(reply.payload, b"retained");
+
+        write_frame(&mut first, FrameSpec::new(1, SessionStatus::End)).await;
+        let end = read_frame(&mut first, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+
+        // The first stream's clean GlobalID close retains its socket and holds
+        // the only global permit. A new session in another stream must evict
+        // that optional state instead of failing the live flow.
+        write_frame(&mut second, new_spec(2, &destination, b"fresh", None)).await;
+        let reply = read_frame(&mut second, &mut buffer)
+            .await
+            .expect("a retained socket must not reject a live session");
+        assert_eq!(reply.session_id, 2);
+        assert_eq!(reply.payload, b"fresh");
+
+        write_frame(&mut second, FrameSpec::new(2, SessionStatus::End)).await;
+        let _ = read_frame(&mut second, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+
+        finish(first, first_task).await;
+        finish(second, second_task).await;
+    }
+
+    #[tokio::test]
+    async fn global_limit_does_not_evict_an_active_session_in_another_stream() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let config = Arc::new(XudpConfig {
+            max_sessions: 2,
+            session_idle_timeout: Duration::from_secs(30),
+            close_expiry: Duration::from_secs(30),
+            io_timeout: Duration::from_secs(2),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::new(1);
+        let (mut first, first_task) = start_mux_with_limiter(Arc::clone(&config), limiter.clone());
+        let (mut second, second_task) = start_mux_with_limiter(config, limiter);
+        let mut buffer = Vec::new();
+
+        write_frame(&mut first, new_spec(1, &destination, b"active", None)).await;
+        let reply = read_frame(&mut first, &mut buffer)
+            .await
+            .expect("first session must echo");
+        assert_eq!(reply.payload, b"active");
+
+        write_frame(&mut second, new_spec(2, &destination, b"rejected", None)).await;
+        let end = read_frame(&mut second, &mut buffer)
+            .await
+            .expect("the rejected New must receive End");
+        assert_eq!(end.session_id, 2);
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(end.option.has_error());
+
+        // The active session in the first stream still owns the permit.
+        write_frame(&mut first, keep_spec(1, None, b"still")).await;
+        let reply = read_frame(&mut first, &mut buffer)
+            .await
+            .expect("active session must survive global pressure");
+        assert_eq!(reply.payload, b"still");
+
+        write_frame(&mut first, FrameSpec::new(1, SessionStatus::End)).await;
+        let _ = read_frame(&mut first, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+
+        finish(first, first_task).await;
+        finish(second, second_task).await;
     }
 
     #[tokio::test]

@@ -10,13 +10,14 @@
 //! UDP and packetaddr through [`crate::udp`], and reverse streams remain out
 //! of scope.
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use rand::SeedableRng;
@@ -63,6 +64,60 @@ const COVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// starve the VPN data path. The limit is global rather than per-IP because
 /// the deployment intentionally does not filter by client address.
 const COVER_MAX_CONCURRENCY: usize = 32;
+
+/// Bound on remembered authenticated ClientHello session ids.
+const REPLAY_CACHE_CAPACITY: usize = 4_096;
+
+/// Retention for one replay-cache entry.
+const REPLAY_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Bounded exact-replay filter for authenticated ClientHellos.
+///
+/// The key is the encrypted 32-byte REALITY session id. It is not a secret and
+/// is not logged; the cache never stores a ClientHello, key share, or auth key.
+struct ReplayCache {
+    entries: HashMap<[u8; 32], Instant>,
+    order: VecDeque<[u8; 32]>,
+    ttl: Duration,
+}
+
+impl ReplayCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::with_capacity(REPLAY_CACHE_CAPACITY),
+            order: VecDeque::with_capacity(REPLAY_CACHE_CAPACITY),
+            ttl,
+        }
+    }
+
+    /// Returns `true` if this id was seen within the TTL; otherwise records it.
+    fn seen_before(&mut self, id: [u8; 32]) -> bool {
+        let now = Instant::now();
+        while let Some(front) = self.order.front().copied() {
+            let expired = self
+                .entries
+                .get(&front)
+                .is_none_or(|seen| now.duration_since(*seen) >= self.ttl);
+            if !expired {
+                break;
+            }
+            self.order.pop_front();
+            self.entries.remove(&front);
+        }
+
+        if self.entries.contains_key(&id) {
+            return true;
+        }
+        if self.entries.len() >= REPLAY_CACHE_CAPACITY
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(id, now);
+        self.order.push_back(id);
+        false
+    }
+}
 
 /// Relay buffer large enough for one maximum-size inner TLS record, including
 /// its five-byte header.
@@ -176,6 +231,8 @@ pub struct TlsServerConfig {
     pub cover: NetLocation,
     /// Timeout for ClientHello reads, cover setup, and the TLS handshake.
     pub handshake_timeout: Duration,
+    /// Inactivity timeout for authenticated TCP relays.
+    pub relay_idle_timeout: Duration,
     /// Maximum total ClientHello record size, including its five-byte header.
     pub max_client_hello_bytes: usize,
     /// The only authorized VLESS user id.
@@ -190,6 +247,8 @@ pub struct TlsServerConfig {
     certificate: TemporaryCertificate,
     /// Global cap on unauthenticated cover relays.
     cover_permits: Arc<Semaphore>,
+    /// Bounded exact-replay filter for authenticated ClientHellos.
+    replay_cache: Mutex<ReplayCache>,
 }
 
 impl TlsServerConfig {
@@ -235,6 +294,7 @@ impl TlsServerConfig {
             max_time_diff,
             cover,
             handshake_timeout,
+            relay_idle_timeout: RELAY_IDLE_TIMEOUT,
             max_client_hello_bytes,
             user_id,
             xudp: XudpConfig::default(),
@@ -243,6 +303,7 @@ impl TlsServerConfig {
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             certificate: TemporaryCertificate::generate()?,
             cover_permits: Arc::new(Semaphore::new(COVER_MAX_CONCURRENCY)),
+            replay_cache: Mutex::new(ReplayCache::new(REPLAY_CACHE_TTL)),
         })
     }
 
@@ -267,6 +328,13 @@ impl TlsServerConfig {
         self
     }
 
+    /// Overrides the inactivity timeout for authenticated TCP relays.
+    #[must_use]
+    pub fn with_relay_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.relay_idle_timeout = timeout;
+        self
+    }
+
     fn reality_config(&self) -> RealityAuthConfig<'_> {
         RealityAuthConfig {
             private_key: &self.private_key,
@@ -275,6 +343,13 @@ impl TlsServerConfig {
             min_client_version: self.min_client_version,
             max_client_version: self.max_client_version,
             max_time_diff: self.max_time_diff,
+        }
+    }
+
+    fn replay_seen(&self, id: [u8; 32]) -> bool {
+        match self.replay_cache.lock() {
+            Ok(mut cache) => cache.seen_before(id),
+            Err(poisoned) => poisoned.into_inner().seen_before(id),
         }
     }
 
@@ -299,11 +374,15 @@ impl TlsServerConfig {
             CertifiedKey::new(chain, Arc::new(RealitySigningKey { inner: signing_key }));
         certified.keys_match().map_err(TlsServerError::Rustls)?;
 
-        let config = rustls::ServerConfig::builder_with_provider(self.provider.clone())
+        let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(TlsServerError::Rustls)?
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified)));
+        // Stock REALITY does not issue TLS 1.3 session tickets. Disabling them
+        // avoids extra post-handshake records and keeps the authenticated
+        // flight closer to the cover.
+        config.send_tls13_tickets = 0;
         Ok(config)
     }
 }
@@ -345,6 +424,7 @@ impl fmt::Debug for TlsServerConfig {
             .field("max_time_diff", &self.max_time_diff)
             .field("cover", &self.cover)
             .field("handshake_timeout", &self.handshake_timeout)
+            .field("relay_idle_timeout", &self.relay_idle_timeout)
             .field("max_client_hello_bytes", &self.max_client_hello_bytes)
             .field("xudp", &self.xudp)
             .field("xudp_limiter", &self.xudp_limiter)
@@ -463,7 +543,20 @@ pub async fn handle_connection(
     let record = read_client_hello_record(&stream, &config).await?;
     let auth = match ClientHello::parse(&record) {
         Ok(hello) => match authenticate(&hello, &config.reality_config()) {
-            Ok(auth) => Some(auth),
+            Ok(auth) => {
+                let mut session_id = [0u8; 32];
+                if hello.session_id.len() != session_id.len() {
+                    None
+                } else {
+                    session_id.copy_from_slice(hello.session_id);
+                    if config.replay_seen(session_id) {
+                        tracing::debug!("authenticated ClientHello replay; forwarding to cover");
+                        None
+                    } else {
+                        Some(auth)
+                    }
+                }
+            }
             Err(error) => {
                 tracing::debug!(%error, "REALITY authentication failed; forwarding to cover");
                 None
@@ -485,37 +578,47 @@ async fn read_client_hello_record(
     stream: &TcpStream,
     config: &TlsServerConfig,
 ) -> Result<Vec<u8>, TlsServerError> {
-    let mut header = [0u8; TLS_RECORD_HEADER_LEN];
-    timeout(config.handshake_timeout, read_exact(stream, &mut header))
-        .await
-        .map_err(|_| TlsServerError::Timeout {
-            stage: "ClientHello header read",
-        })??;
+    // One absolute deadline covers both the five-byte header and the declared
+    // body. Per-read timeouts would let a patient peer hold a pre-auth slot for
+    // twice the configured handshake budget.
+    timeout(config.handshake_timeout, async {
+        let mut header = [0u8; TLS_RECORD_HEADER_LEN];
+        read_exact(stream, &mut header).await?;
 
-    let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
-    let total = TLS_RECORD_HEADER_LEN + record_len;
-    if total > config.max_client_hello_bytes {
-        return Err(TlsServerError::ClientHelloTooLarge {
-            length: total,
-            max: config.max_client_hello_bytes,
-        });
-    }
+        let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        let total = TLS_RECORD_HEADER_LEN + record_len;
+        if total > config.max_client_hello_bytes {
+            return Err(TlsServerError::ClientHelloTooLarge {
+                length: total,
+                max: config.max_client_hello_bytes,
+            });
+        }
 
-    let mut record = Vec::new();
-    record
-        .try_reserve_exact(total)
-        .map_err(|_| TlsServerError::Allocation)?;
-    record.extend_from_slice(&header);
-    record.resize(total, 0);
-    timeout(
-        config.handshake_timeout,
-        read_exact(stream, &mut record[TLS_RECORD_HEADER_LEN..]),
-    )
+        let mut record = Vec::new();
+        record
+            .try_reserve_exact(total)
+            .map_err(|_| TlsServerError::Allocation)?;
+        record.extend_from_slice(&header);
+        record.resize(total, 0);
+        read_exact(stream, &mut record[TLS_RECORD_HEADER_LEN..]).await?;
+        Ok(record)
+    })
     .await
     .map_err(|_| TlsServerError::Timeout {
-        stage: "ClientHello body read",
-    })??;
-    Ok(record)
+        stage: "ClientHello read",
+    })?
+}
+
+/// Returns the account UUID used for lookup.
+///
+/// Stock Xray zeroes bytes 6-7 of the wire UUID before matching the account;
+/// those bytes carry `vlessRoute` and are not part of the identity. The raw
+/// bytes are still used as the Vision request prefix.
+fn account_id(user_id: &[u8; 16]) -> [u8; 16] {
+    let mut account = *user_id;
+    account[6] = 0;
+    account[7] = 0;
+    account
 }
 
 async fn handle_authenticated(
@@ -536,8 +639,19 @@ async fn handle_authenticated(
         stage: "TLS handshake",
     })??;
 
-    let request = read_vless_request(&mut tls, config.handshake_timeout).await?;
-    if request.user_id.ct_eq(&config.user_id).unwrap_u8() == 0 {
+    let request = timeout(
+        config.handshake_timeout,
+        read_vless_request(&mut tls, config.handshake_timeout),
+    )
+    .await
+    .map_err(|_| TlsServerError::Timeout {
+        stage: "VLESS request read",
+    })??;
+    if account_id(&request.user_id)
+        .ct_eq(&account_id(&config.user_id))
+        .unwrap_u8()
+        == 0
+    {
         return Err(TlsServerError::UnauthorizedUser);
     }
 
@@ -560,7 +674,7 @@ async fn handle_authenticated(
             if request.vision {
                 let rng = SmallRng::seed_from_u64(vision_seed());
                 let vision = VisionStream::new(tls, request.user_id, request.body, rng);
-                relay_vision(vision, target, RELAY_IDLE_TIMEOUT).await?;
+                relay_vision(vision, target, config.relay_idle_timeout).await?;
             } else {
                 let mut target = target;
                 if !request.body.is_empty() {
@@ -570,7 +684,7 @@ async fn handle_authenticated(
                             stage: "initial VLESS body write",
                         })??;
                 }
-                relay_bidirectional(tls, target, RELAY_IDLE_TIMEOUT).await?;
+                relay_bidirectional(tls, target, config.relay_idle_timeout).await?;
             }
 
             Ok(ConnectionOutcome::Authenticated {
@@ -760,9 +874,23 @@ where
 {
     let (mut left_read, mut left_write) = tokio::io::split(left);
     let (mut right_read, mut right_write) = tokio::io::split(right);
+    let activity = Arc::new(RelayActivity::new());
 
-    let left_to_right = copy_direction(&mut left_read, &mut right_write, idle_timeout, None);
-    let right_to_left = copy_direction(&mut right_read, &mut left_write, idle_timeout, None);
+    // Idle is a property of the whole connection, not of each direction. A
+    // download-only or upload-only transfer must not be torn down because the
+    // opposite direction has nothing to send.
+    let left_to_right = copy_direction(
+        &mut left_read,
+        &mut right_write,
+        idle_timeout,
+        Some(&activity),
+    );
+    let right_to_left = copy_direction(
+        &mut right_read,
+        &mut left_write,
+        idle_timeout,
+        Some(&activity),
+    );
     tokio::try_join!(left_to_right, right_to_left)?;
     Ok(())
 }
@@ -813,53 +941,61 @@ async fn relay_vision(
 
     let up_activity = Arc::clone(&activity);
     let up = async move {
-        let (copied_up, raw_read) = copy_direction_until_read_handoff(
-            &mut vision_read,
-            &mut target_write,
-            idle_timeout,
-            &mut read_handoff,
-            Some(&up_activity),
-        )
-        .await?;
-        if !raw_read {
-            tracing::debug!(copied_up, "Vision relay finished without a raw read");
-            return Ok(());
-        }
-
-        tracing::debug!(
-            copied_up,
-            "Vision read switched to raw; starting one-way upload splice"
-        );
-        let config = splice_config(idle_timeout);
-        let relay_activity = Arc::clone(&up_activity);
-        let result = tokio::task::spawn_blocking(move || {
-            copy_one_way(
-                client_read.as_raw_fd(),
-                target_write_splice.as_raw_fd(),
-                &config,
-                Some(&relay_activity),
+        let mut stop_guard = RelayStopGuard::new(&up_activity);
+        let result = async {
+            let (copied_up, raw_read) = copy_direction_until_read_handoff(
+                &mut vision_read,
+                &mut target_write,
+                idle_timeout,
+                &mut read_handoff,
+                Some(&up_activity),
             )
-        })
-        .await
-        .map_err(join_error)?;
-        match result {
-            Ok(stats) => tracing::debug!(
-                copied_up,
-                bytes = stats.bytes_a_to_b,
-                splice_calls = stats.splice_calls,
-                polls = stats.polls,
-                "one-way Vision upload splice finished"
-            ),
-            Err(error) if is_peer_closed(&error) => {
-                tracing::debug!(%error, copied_up, "one-way Vision upload splice peer closed");
+            .await?;
+            if !raw_read {
+                tracing::debug!(copied_up, "Vision relay finished without a raw read");
+                return Ok(());
             }
-            Err(error) => return Err(TlsServerError::Io(error)),
+
+            tracing::debug!(
+                copied_up,
+                "Vision read switched to raw; starting one-way upload splice"
+            );
+            let config = splice_config(idle_timeout);
+            let relay_activity = Arc::clone(&up_activity);
+            let result = tokio::task::spawn_blocking(move || {
+                copy_one_way(
+                    client_read.as_raw_fd(),
+                    target_write_splice.as_raw_fd(),
+                    &config,
+                    Some(&relay_activity),
+                )
+            })
+            .await
+            .map_err(join_error)?;
+            match result {
+                Ok(stats) => tracing::debug!(
+                    copied_up,
+                    bytes = stats.bytes_a_to_b,
+                    splice_calls = stats.splice_calls,
+                    polls = stats.polls,
+                    "one-way Vision upload splice finished"
+                ),
+                Err(error) if is_peer_closed(&error) => {
+                    tracing::debug!(%error, copied_up, "one-way Vision upload splice peer closed");
+                }
+                Err(error) => return Err(TlsServerError::Io(error)),
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        stop_guard.disarm();
+        result
     };
 
     let down_activity = Arc::clone(&activity);
     let down = async move {
+        let mut stop_guard = RelayStopGuard::new(&down_activity);
+        let result = async {
         let (copied_down, raw_write) = copy_direction_until_write_raw(
             &mut target_read,
             &mut vision_write,
@@ -903,6 +1039,9 @@ async fn relay_vision(
             Err(error) => return Err(TlsServerError::Io(error)),
         }
         Ok(())
+        }.await;
+        stop_guard.disarm();
+        result
     };
 
     tokio::try_join!(up, down)?;
@@ -1125,6 +1264,39 @@ fn join_error(error: tokio::task::JoinError) -> TlsServerError {
     TlsServerError::Io(io::Error::other(error))
 }
 
+/// Stops the sibling relay if this future is dropped or fails.
+///
+/// A `spawn_blocking` join handle cannot be aborted after the task starts, and
+/// dropping it detaches the task. The guard therefore publishes a cooperative
+/// stop flag before the handle is lost; the blocking relay checks it at least
+/// every 250 ms. A successful branch disarms the guard so the other direction
+/// can continue normally.
+struct RelayStopGuard<'a> {
+    activity: &'a RelayActivity,
+    armed: bool,
+}
+
+impl<'a> RelayStopGuard<'a> {
+    fn new(activity: &'a RelayActivity) -> Self {
+        Self {
+            activity,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RelayStopGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.activity.stop();
+        }
+    }
+}
+
 async fn copy_direction<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -1237,6 +1409,45 @@ mod tests {
         .expect("test configuration")
     }
 
+    #[test]
+    fn replay_cache_rejects_duplicates_and_stays_bounded() {
+        let mut cache = ReplayCache::new(Duration::from_secs(60));
+        let id = [7u8; 32];
+        assert!(!cache.seen_before(id));
+        assert!(cache.seen_before(id));
+        for index in 0..REPLAY_CACHE_CAPACITY + 32 {
+            let mut next = [0u8; 32];
+            next[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let _ = cache.seen_before(next);
+        }
+        assert!(cache.entries.len() <= REPLAY_CACHE_CAPACITY);
+        assert!(cache.order.len() <= REPLAY_CACHE_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn bidirectional_relay_keeps_a_one_way_transfer_alive() {
+        let (left, mut left_peer) = tokio::io::duplex(1024);
+        let (right, mut right_peer) = tokio::io::duplex(1024);
+        let task = tokio::spawn(relay_bidirectional(left, right, Duration::from_millis(100)));
+
+        for _ in 0..5 {
+            left_peer.write_all(b"x").await.expect("left write");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the idle download direction must not cancel an active upload"
+        );
+        left_peer.shutdown().await.expect("left shutdown");
+        right_peer.shutdown().await.expect("right shutdown");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("relay did not finish")
+            .expect("relay task panicked");
+        assert!(result.is_ok(), "relay failed: {result:?}");
+    }
+
     #[tokio::test]
     async fn cover_limit_is_global_and_bounded() {
         let config = test_config();
@@ -1319,6 +1530,24 @@ mod tests {
         };
         let config = test_config().with_xudp(xudp.clone());
         assert_eq!(config.xudp, xudp);
+    }
+
+    #[test]
+    fn account_id_ignores_vless_route_bytes() {
+        let mut configured = [0x11; 16];
+        configured[6] = 6;
+        configured[7] = 7;
+        let mut routed = configured;
+        routed[6] = 0xaa;
+        routed[7] = 0xbb;
+        assert_eq!(account_id(&configured), account_id(&routed));
+        assert_ne!(account_id(&configured), configured);
+    }
+
+    #[test]
+    fn relay_idle_timeout_can_be_overridden() {
+        let config = test_config().with_relay_idle_timeout(Duration::from_secs(7));
+        assert_eq!(config.relay_idle_timeout, Duration::from_secs(7));
     }
 
     #[test]

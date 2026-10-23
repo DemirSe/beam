@@ -7,10 +7,12 @@ use anyhow::Context;
 use beam_core::address::{Address, NetLocation};
 use beam_core::config::{Config, LogLevel};
 use beam_core::tls::{MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN, TlsServerConfig, handle_connection};
+use beam_core::udp::LegacyUdpConfig;
 use beam_core::xudp::XudpConfig;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::time::sleep;
 
 /// High-performance VLESS + REALITY + Vision server.
 #[derive(Debug, Parser)]
@@ -57,8 +59,25 @@ async fn async_main() -> anyhow::Result<()> {
 
     tracing::info!(listen = %config.server.listen, "beam listening");
 
+    // A transient fd shortage must not turn into a permanent outage. `accept`
+    // can fail with EMFILE/ENFILE, ECONNABORTED, or an interrupted syscall;
+    // keep the listener alive and retry with a bounded backoff instead of
+    // dropping the runtime (and any in-flight blocking relays) on the first
+    // error.
+    let mut accept_backoff = Duration::from_millis(10);
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => {
+                accept_backoff = Duration::from_millis(10);
+                accepted
+            }
+            Err(error) => {
+                tracing::warn!(%error, "listener accept failed; retrying");
+                sleep(accept_backoff).await;
+                accept_backoff = (accept_backoff * 2).min(Duration::from_secs(1));
+                continue;
+            }
+        };
         let permit = semaphore
             .clone()
             .acquire_owned()
@@ -108,6 +127,17 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
     };
     xudp.validate().context("invalid XUDP limits")?;
 
+    let max_packetaddr_destinations = usize::try_from(config.limits.max_udp_destinations)
+        .unwrap_or(usize::MAX)
+        .clamp(1, 65_536);
+    let udp = LegacyUdpConfig {
+        io_timeout: Duration::from_millis(config.limits.handshake_timeout_ms),
+        idle_timeout: Duration::from_millis(config.limits.idle_timeout_ms),
+        max_packetaddr_destinations,
+        ..LegacyUdpConfig::default()
+    };
+    udp.validate().context("invalid legacy UDP limits")?;
+
     let tls = TlsServerConfig::new(
         *config.reality.private_key,
         config.reality.short_ids.clone(),
@@ -122,7 +152,10 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
     )
     .context("failed to build the TLS server configuration")?;
 
-    Ok(tls.with_xudp(xudp))
+    Ok(tls
+        .with_xudp(xudp)
+        .with_udp(udp)
+        .with_relay_idle_timeout(Duration::from_millis(config.limits.idle_timeout_ms)))
 }
 
 fn init_logging(level: LogLevel) {

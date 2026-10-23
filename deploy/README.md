@@ -67,6 +67,17 @@ The unit also sets `MemoryHigh=512M`, `MemoryMax=768M`, and
 `MemorySwapMax=512M`; the code caps unauthenticated cover relays at 32 and
 process-wide XUDP sessions at 256. See `docs/17-resource-hardening.md`.
 
+If the local config differs from the live one, keep the live file and deploy
+only the binary and unit:
+
+```bash
+ssh ... 'tar -xzf ... && sudo env BEAM_KEEP_CONFIG=1 bash /tmp/beam-deploy/bootstrap.sh'
+```
+
+`BEAM_KEEP_CONFIG=1` skips the bundled `beam.toml`, requires the existing
+`/etc/beam/config.toml`, validates it with the new binary, and still updates
+the unit and restarts the service.
+
 ## Identity
 
 The new identity was generated locally. The REALITY public key and client

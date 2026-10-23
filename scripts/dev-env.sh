@@ -11,6 +11,11 @@ fi
 
 export PATH="$HOME/.cargo/bin:$PATH"
 export CC="${CC:-/usr/bin/gcc}"
+# The host has gcc but no `c++` symlink. libfuzzer-sys builds a small C++
+# runtime, so point CXX at the portable wrapper when it is available.
+if [ -x /tmp/opencode/tools/bin/g++-portable ] && [ -z "${CXX:-}" ]; then
+  export CXX=/tmp/opencode/tools/bin/g++-portable
+fi
 export CMAKE_GENERATOR="${CMAKE_GENERATOR:-Ninja}"
 
 if [ -d /tmp/opencode/tools/fedora/usr/lib/gcc/x86_64-redhat-linux/16 ]; then

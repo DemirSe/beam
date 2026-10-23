@@ -47,7 +47,7 @@ Updated: 2026-10-23.
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP/HTTPS interop | **HTTP 200** |
 | Cover-parity harness | Done; gaps documented |
-| Fuzz workspace and scheduled CI | Done; local compile check |
+| Fuzz workspace and manual fuzz CI | Done; 60 s target runs locally |
 | Full-TUN harness v2 | **8/8 PASS** |
 | Full-TUN benchmark harness | Done |
 | No-TUN server-capacity smoke | Done |
@@ -204,8 +204,8 @@ UDP modes:
   blocking-thread pool is about 80 active Vision Direct pairs; the listener
   backlog is 128 and historical `ListenOverflows=102`. The 512/1024×1 MB load
   logs show 49.7 s median and 937 timeouts respectively. Current normal load is
-  tens of connections. The new global XUDP cap (256) and cover cap (32) reduce
-  the burst memory/thread exposure but have not been deployed yet.
+  tens of connections. The global XUDP cap (256) and cover cap (32) reduce the
+  burst memory/thread exposure and are deployed on the live host.
 - The provider L4 firewall/rate limit was not independently verified; the host
   nftables rules are.
 - The local `sing-box` service is not enabled at boot.
@@ -214,6 +214,13 @@ UDP modes:
   `deploy/update-client.py` sets the TUN stack to `system` (and enables the
   service); Hiddify users must set it manually. The server-side 1.3 MiB H3 test
   passes locally with the `system` stack.
+- **H3 requires TUN MTU >=1480 (>=1492 for IPv6) in the local lab.** The
+  failure at 1400 reproduces with stock Xray and all UDP encodings; TCP, UDP
+  echo, DNS, and HTTPS pass at 1400. See `docs/14-tun-harness.md`.
+- `XudpSessionLimiter` now evicts a retained GlobalID socket from any mux
+  stream when the 256-slot global limit is full, instead of rejecting a new
+  live session while optional retention state exists. The cross-stream
+  regression test is in `crates/beam-core/src/xudp/server.rs`.
 
 ## Evidence
 
@@ -227,8 +234,8 @@ UDP modes:
 - `docs/14-tun-harness.md`: full-TUN topology, probes, and control results.
 - `docs/15-production-runbook.md`: live operations, rotation, rollback, and
   monitoring.
-- `docs/17-resource-hardening.md`: XUDP/cover/fuzz hardening audit and pending
-  deployment.
+- `docs/17-resource-hardening.md`: XUDP/cover/fuzz hardening audit, deployment
+  record, and local follow-up tests.
 - `docs/16-local-comparison-2026-10-22.md`: detailed local stock-Xray vs beam
   capacity, full-TUN, compatibility, and cover comparison.
 - `bench/README.md`: benchmark and no-TUN smoke usage.
@@ -249,8 +256,8 @@ bash tests/tun/run.sh --udp-mode legacy
 bash bench/no-tun.sh
 ```
 
-The workspace currently has 237 `beam-core` unit tests, two integration tests,
-and 23 `beam-sys` tests (262 total). The full-TUN harness passes all eight
+The workspace currently has 249 `beam-core` unit tests, two integration tests,
+and 23 `beam-sys` tests (274 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
 gVisor TUN on both beam and stock Xray. The no-TUN server-capacity smoke is

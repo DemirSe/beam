@@ -127,7 +127,8 @@ size starts at 512 KiB; it is not increased without a new measurement.
 1. Decode XUDP frames from the VLESS stream.
 2. Create or reuse a UDP socket per destination.
 3. Enforce destination and concurrency limits.
-4. Relay replies with source filtering.
+4. Relay replies with the actual source (no source allowlist; matches stock
+   Xray, as documented in `docs/08-vision-xudp-spec.md`).
 5. Expire idle sessions and release sockets.
 6. Support legacy VLESS UDP for clients that do not use XUDP.
 

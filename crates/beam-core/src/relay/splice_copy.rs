@@ -1,6 +1,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use beam_sys::{PollEvents, PollFd, SpliceFlags, pipe, poll, splice};
@@ -42,6 +43,11 @@ const BATCH_RESET: Duration = Duration::from_millis(100);
 /// Rate-check window used to decide whether a bulk direction is still slow.
 const BATCH_RATE_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 const BATCH_RATE_WINDOW_TIME: Duration = Duration::from_millis(50);
+
+/// Maximum time a blocking one-way relay sleeps in `poll` while a shared
+/// activity clock is present. This bounds cancellation latency when the other
+/// direction fails and no data arrives on this one.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Relay tuning and limits.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,6 +288,7 @@ pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Resul
 #[derive(Debug)]
 pub struct RelayActivity {
     last: Mutex<Instant>,
+    stopped: AtomicBool,
 }
 
 impl RelayActivity {
@@ -290,6 +297,7 @@ impl RelayActivity {
     pub fn new() -> Self {
         Self {
             last: Mutex::new(Instant::now()),
+            stopped: AtomicBool::new(false),
         }
     }
 
@@ -304,6 +312,17 @@ impl RelayActivity {
     #[must_use]
     pub fn elapsed(&self) -> Option<Duration> {
         self.last.lock().ok().map(|last| last.elapsed())
+    }
+
+    /// Asks every relay sharing this clock to stop.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    /// Returns `true` after [`Self::stop`].
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
     }
 }
 
@@ -376,6 +395,9 @@ fn run_one_way(
     let mut shutdown_started: Option<Instant> = None;
 
     loop {
+        if activity_clock.is_some_and(RelayActivity::is_stopped) {
+            return Ok(());
+        }
         let now = Instant::now();
         let local_elapsed = now.saturating_duration_since(last_activity);
         let idle_elapsed = activity_clock
@@ -444,6 +466,11 @@ fn run_one_way(
         stats.polls = stats.polls.saturating_add(1);
         let poll_timeout =
             inactivity_limit(config, shutdown_started.is_some()).saturating_sub(idle_elapsed);
+        let poll_timeout = if activity_clock.is_some() {
+            poll_timeout.min(STOP_POLL_INTERVAL)
+        } else {
+            poll_timeout
+        };
         match poll(&mut fds, Some(poll_timeout)) {
             Ok(_) => {
                 direction.read_ready = !fds[0].revents().is_empty() || !fds[1].revents().is_empty();
@@ -920,6 +947,39 @@ mod tests {
         assert_eq!(stats.half_closes, 1);
         assert!(stats.splice_calls > 0);
         assert!(stats.polls > 0);
+    }
+
+    #[test]
+    fn stop_wakes_a_blocked_one_way_relay() {
+        let (_client, relay_a, relay_b, _target) = relay_pair();
+        let activity = Arc::new(super::RelayActivity::new());
+        let relay_activity = Arc::clone(&activity);
+        let config = RelayConfig {
+            idle_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(30),
+            ..config()
+        };
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| {
+                beam_sys::set_nonblocking(relay_a.as_raw_fd())?;
+                beam_sys::set_nonblocking(relay_b.as_raw_fd())?;
+                copy_one_way(
+                    relay_a.as_raw_fd(),
+                    relay_b.as_raw_fd(),
+                    &config,
+                    Some(&relay_activity),
+                )
+            })();
+            let _ = sender.send(result);
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        activity.stop();
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stopped relay did not wake");
+        assert!(result.is_ok(), "stopped relay failed: {result:?}");
     }
 
     #[test]

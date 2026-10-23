@@ -136,6 +136,16 @@ bssh 'rm -rf /tmp/beam-deploy && mkdir -p /tmp/beam-deploy && tar -xzf /tmp/beam
 installs binary/config/unit, installs the UDP sysctl drop-in, validates the
 config, restarts the service (so an active process picks up the new binary and
 unit), and checks 443.
+
+If the local `~/.config/beam/beam.toml` differs from the live config (for
+example local `max_connections=64`/`log=warn` versus live 1024/`info`), update
+only the binary and unit and preserve `/etc/beam/config.toml`:
+```bash
+bssh 'rm -rf /tmp/beam-deploy && mkdir -p /tmp/beam-deploy && tar -xzf /tmp/beam-deploy.tar.gz -C /tmp/beam-deploy && sudo -n env BEAM_KEEP_CONFIG=1 bash /tmp/beam-deploy/bootstrap.sh'
+```
+`BEAM_KEEP_CONFIG=1` skips the config install but still requires the live file,
+validates it with the new binary, installs the unit, restarts, and checks 443.
+The bundle's `beam.toml` is ignored in that mode.
 Health checks:
 ```bash
 bssh 'systemctl is-active beam; systemctl is-enabled beam; systemctl show beam -p NRestarts --value'
@@ -313,6 +323,13 @@ measured and a targeted MSS clamp is not sufficient.
   TUN on both beam and stock Xray; a `system` TUN passes 1.3 MiB. The updated
   `update-client.py` sets `system`; Hiddify users must select it manually before
   treating this as a server regression.
+- **HTTP/3 needs TUN MTU >=1480 on this client stack.** The local 2026-10-23
+  matrix passes the H3 probe at 1480/1492/1500 and fails at 1280/1300/1400/1450
+  with beam and with stock Xray, across all UDP encodings and both `system` and
+  `gvisor` TUN stacks. TCP, 1200-byte UDP, DNS, and HTTPS are unaffected at
+  1400. The production requirement remains MTU 1400; do not attribute H3 stalls
+  to beam without first retrying at 1480 (IPv6-safe 1492) or accepting the H3
+  gap.
 - A 5-minute post-hardening soak and the read-only audit are complete. A light
   24-hour background soak was resumed on 2026-10-22 15:42 UTC
   (`/tmp/opencode/soak-24h-live3/`); the privileged quiet syscall/wakeup gates
