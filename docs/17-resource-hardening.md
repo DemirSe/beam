@@ -244,8 +244,11 @@ Residual issues not fixed in this pass:
 
 - TLS `close_notify` is not surfaced as EOF; an unclean TCP FIN is treated as
   clean in the record reader.
+- Unknown or mismatched VLESS flows are treated as no-flow; stock rejects them.
 - Post-Direct outer-TLS KeyUpdate on the still-framed direction is not covered
   by an integration test.
+- Reply-task teardown/ordering races under a simultaneous session-id reuse are
+  not covered by an integration test.
 - Source filtering remains deliberately disabled for stock parity; see
   `docs/08-vision-xudp-spec.md`.
 - Cover-cap exhaustion remains an intentional fail-fast security trade-off.
