@@ -1077,6 +1077,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_limit_does_not_evict_an_active_session_in_another_stream() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let config = Arc::new(XudpConfig {
+            max_sessions: 2,
+            session_idle_timeout: Duration::from_secs(30),
+            close_expiry: Duration::from_secs(30),
+            io_timeout: Duration::from_secs(2),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::new(1);
+        let (mut first, first_task) = start_mux_with_limiter(Arc::clone(&config), limiter.clone());
+        let (mut second, second_task) = start_mux_with_limiter(config, limiter);
+        let mut buffer = Vec::new();
+
+        write_frame(&mut first, new_spec(1, &destination, b"active", None)).await;
+        let reply = read_frame(&mut first, &mut buffer)
+            .await
+            .expect("first session must echo");
+        assert_eq!(reply.payload, b"active");
+
+        write_frame(&mut second, new_spec(2, &destination, b"rejected", None)).await;
+        let end = read_frame(&mut second, &mut buffer)
+            .await
+            .expect("the rejected New must receive End");
+        assert_eq!(end.session_id, 2);
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(end.option.has_error());
+
+        // The active session in the first stream still owns the permit.
+        write_frame(&mut first, keep_spec(1, None, b"still")).await;
+        let reply = read_frame(&mut first, &mut buffer)
+            .await
+            .expect("active session must survive global pressure");
+        assert_eq!(reply.payload, b"still");
+
+        write_frame(&mut first, FrameSpec::new(1, SessionStatus::End)).await;
+        let _ = read_frame(&mut first, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+
+        finish(first, first_task).await;
+        finish(second, second_task).await;
+    }
+
+    #[tokio::test]
     async fn new_domain_destination() {
         let v4 = spawn_ipv4_echo().await;
         let port = v4.address.port();
