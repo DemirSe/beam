@@ -169,8 +169,10 @@ The fixed local binary (`feat/deep-hardening`) was tested beyond the unit suite:
 |---|---|
 | 10,000-connection churn, concurrency 64 | **10,000/10,000 HTTP 200** in 67 s; RSS 7,804 → 8,640 KiB; threads 2 → 2; fds 10 → 10 |
 | 10,000-connection churn, concurrency 256 | **10,000/10,000 HTTP 200** in 55 s; RSS 7,760 → 9,032 KiB; threads 2 → 2; fds 10 → 10 |
+| 10,000-connection churn after fixes | **10,000/10,000 HTTP 200** in 56 s; RSS 7,908 → 9,220 KiB; threads 2 → 2; fds 10 → 10 |
 | Malformed TLS/handshake stress | 2,000 random or truncated connections: process alive; RSS 6,516 → 7,292 KiB; fds 10 → 10; threads 9 → 9 |
 | Slow ClientHello header | 32 connections sent only the 5-byte record header: all timed out and closed by ~13 s; fds 42 → 10; process alive |
+| Replay filter | Stock fixture: first send returned a 1,637-byte server flight; exact resend was forwarded to the closed cover and got EOF |
 | Accept error under fd pressure | `RLIMIT_NOFILE=64`, 120 idle sockets: EMFILE warnings and backoff; process/listener survived; a new connection succeeded after close |
 | Cover flood | 100 simultaneous unauthenticated TLS probes: exactly **32** reached the cover; authenticated HTTP stayed **200** with 2.1–2.8 ms response time |
 | Cover down | Authenticated VLESS/TCP still returned 200 with `dest` closed; unauthenticated probe saw EOF |
@@ -179,7 +181,8 @@ The fixed local binary (`feat/deep-hardening`) was tested beyond the unit suite:
 | TCP integrity, 64 MiB upload | SHA-256 match; 200; 0.108 s; RSS 8,084 KiB, 10 fds |
 | Full TUN XUDP, MTU 1500 | **8/8 PASS** with the fixed binary |
 | Full TUN XUDP, MTU 1400 | 7/8 PASS; only H3, reproduced with stock Xray |
-| 1-hour mixed TCP/UDP soak | In progress; see `/tmp/opencode/deep-campaign/soak-live/` |
+| Mixed TCP/UDP soak | 276 iterations (23 min) before a rebuild: 0 errors; RSS 8,224 → 8,460 KiB; threads 9; fds 12. A fresh 1 h run is still in progress. |
+| Final full-TUN matrix, MTU 1500 | **8/8** for `xudp`, `legacy`, and `packetaddr`; 1.3 MiB H3 body also **8/8** |
 
 The cover cap and cross-stream retained eviction are independent: the cap
 protects the blocking pool, while retained eviction protects new UDP flows from
@@ -189,7 +192,8 @@ optional session state.
 
 The deep local audit found several operational/security issues outside the
 first deployment. These are fixed and covered locally but are **not on the live
-VPS** until a later deploy:
+VPS** until a later deploy. Local branch binary SHA-256:
+`bd17ac26928d4e659a0f7596f959b5a66f0f8314288c7720220882e4ea88287b`.
 
 - **Accept-loop survival.** An `accept(2)` error such as `EMFILE` no longer
   terminates the process. The loop logs, backs off from 10 ms to 1 s, and keeps
@@ -212,6 +216,8 @@ VPS** until a later deploy:
   replay is forwarded to the cover instead of starting another authenticated
   handshake. This is a deliberate deviation from stock REALITY's no-cache
   behavior.
+- **No TLS 1.3 tickets.** Rustls' two default tickets are disabled to match
+  stock REALITY's post-handshake shape.
 - **Absolute pre-auth deadlines.** One deadline now covers the ClientHello
   record, and one covers the VLESS request, instead of resetting the timeout on
   every partial read.
@@ -238,7 +244,8 @@ Residual issues not fixed in this pass:
 
 - TLS `close_notify` is not surfaced as EOF; an unclean TCP FIN is treated as
   clean in the record reader.
-- TLS 1.3 session tickets remain enabled; stock REALITY does not send them.
+- Post-Direct outer-TLS KeyUpdate on the still-framed direction is not covered
+  by an integration test.
 - Source filtering remains deliberately disabled for stock parity; see
   `docs/08-vision-xudp-spec.md`.
 - Cover-cap exhaustion remains an intentional fail-fast security trade-off.
