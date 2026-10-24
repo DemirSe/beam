@@ -213,7 +213,7 @@ buffer. This removes one allocation and one full ciphertext copy per record.
   `7671abdb`/`50df25e7` binaries; the final `f33f07fe` binary was separately
   checked with full-TUN, large H3, no-TUN, and the verified bulk runs above.
 
-## Upload CPU follow-up (not deployed, not benchmarked)
+## Upload CPU follow-up (locally benchmarked, not deployed)
 
 A local-only follow-up reduces upload/read-path copying:
 
@@ -222,25 +222,32 @@ A local-only follow-up reduces upload/read-path copying:
   pre-data phase.
 - `VisionStream` copies large block content (>= 4 KiB) straight into the
   caller's buffer; only an excess tail goes through `read_out`.
-- `VisionStream::plan_and_queue` uses a stack chunk table instead of a `Vec`
-  allocation on every `poll_write`.
+- A stack chunk table for `VisionStream::plan_and_queue` was tried and then
+  reverted: the A/B showed no reliable gain and a possible download-CPU noise
+  signal, so the original `Vec` path stays.
 
-`cargo fmt`, clippy, and the full test suite pass (**287 tests**). A local
-quick A/B against `f33f07fe` (two repetitions, noisy host) measured:
+Method: no-TUN stock Xray SOCKS client, HTTP POST, server CPU summed from
+`/proc/<pid>/task/*/schedstat` (nanosecond resolution), 1 GiB per sample,
+10 samples per arm, alternating old/new order, pinned server/client/target/
+driver cores. The download control used the same harness with HTTP GET.
 
-| Scenario | f33f | upload-follow-up |
+| Scenario | `f33f07fe` | upload follow-up |
 |---|---:|---:|
-| TCP upload 1 flow, server CPU/GiB | 0.6132 s | **0.5938 s** (-3.2%) |
-| TCP upload 4 flows, server CPU/GiB | 0.6176 s | **0.6144 s** (-0.5%) |
-| TCP upload throughput | ~3.0/2.8 Gbit/s | parity |
-| 120×16 MiB HTTPS | 120/120 | **120/120**, 2.98 s |
+| Upload 1 flow, 1 GiB, CPU/GiB | 0.9451 s | **0.8901 s** (-5.8%) |
+| Upload 1 flow, wall time | 1.1733 s | **1.1107 s** (-5.3%) |
+| Upload 4 flows × 128 MiB, CPU/GiB | 0.9521 s | **0.9071 s** (-4.7%) |
+| Upload 4 flows, wall time | 0.6015 s | **0.5803 s** (-3.5%) |
+| Download 1 flow, 1 GiB, CPU/GiB | 0.5257 s | 0.5194 s (-1.2%) |
+| Download 1 flow, wall time | 1.5295 s | 1.5443 s (+1.0%, noise) |
+| 120×16 MiB HTTPS | 120/120 | **120/120**, 3.06 s |
 | TLS 1.2-only 8×4 MiB | 8/8 | **8/8** |
+| Full-TUN 8/8 + 1.33 MiB H3 | pass | **pass** |
 
-Full-TUN was **8/8** with the 1,333,889-byte H3 body, and RSS was slightly lower
-(8.4–8.9 MiB vs 9.5–10.2 MiB in the quick runs). The gain is modest and the
-download CPU delta was within noise. This follow-up remains **not deployed**;
-the live binary is still `f33f07fe…`. The next step is a clean multi-repetition
-no-TUN and mobile upload comparison before rollout.
+The upload gain is consistent (about 5%), the download CPU control is slightly
+lower rather than higher, and RSS stayed around 8 MiB. `cargo fmt`, clippy, and
+the full test suite pass (**287 tests**). This follow-up remains **not deployed**;
+the live binary is still `f33f07fe…`. A mobile upload test is the next step
+before rollout.
 
 ## Remaining work
 

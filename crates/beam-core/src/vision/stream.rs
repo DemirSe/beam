@@ -37,9 +37,6 @@ const MAX_INNER_TLS_BODY: usize = 16_384 + 256;
 /// trigger sees the same record boundary as the stock writer.
 const MAX_WRITE_BATCH: usize = 5 + MAX_INNER_TLS_BODY;
 
-/// Maximum number of Vision content chunks in one write batch.
-const MAX_WRITE_CHUNKS: usize = MAX_WRITE_BATCH.div_ceil(MAX_CONTENT_LEN);
-
 /// Maximum empty Vision blocks processed in one `poll_read` call before
 /// yielding to the executor.
 const MAX_EMPTY_BLOCKS_PER_POLL: usize = 64;
@@ -327,24 +324,10 @@ where
         accepted: &[u8],
         complete_app_data_records: bool,
     ) -> io::Result<bool> {
-        // A single write batch is bounded by MAX_WRITE_BATCH, so the chunk
-        // table fits on the stack. Avoid a Vec allocation on every poll_write.
-        let mut chunk_table: [&[u8]; MAX_WRITE_CHUNKS] = [&[]; MAX_WRITE_CHUNKS];
-        let mut chunk_count = 0usize;
-        for chunk in accepted.chunks(MAX_CONTENT_LEN) {
-            let Some(slot) = chunk_table.get_mut(chunk_count) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Vision write batch exceeded its chunk table",
-                ));
-            };
-            *slot = chunk;
-            chunk_count += 1;
-        }
-        let chunks = &chunk_table[..chunk_count];
+        let chunks: Vec<&[u8]> = accepted.chunks(MAX_CONTENT_LEN).collect();
         let plan = self
             .writer
-            .plan_write(chunks, complete_app_data_records, &mut self.rng);
+            .plan_write(&chunks, complete_app_data_records, &mut self.rng);
 
         for (index, block_plan) in plan.blocks.iter().enumerate() {
             let Some(content) = chunks.get(index) else {
