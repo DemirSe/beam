@@ -18,7 +18,7 @@ service down without authenticating.
 The accept loop now:
 
 - accepts continuously;
-- takes a small, separate pre-auth permit (16–128 depending on
+- takes a small, separate pre-auth permit (16–256 depending on
   `max_connections`) only for the ClientHello/REALITY phase;
 - drops excess pre-auth connections instead of blocking the loop;
 - acquires the authenticated connection permit only after REALITY succeeds;
@@ -31,6 +31,12 @@ reproduced the old failure and verifies the fix:
 |---|---|
 | old `bd17ac26…` | timed out after 6.00 s with `000` |
 | new | HTTP 200 in 0.005 s |
+
+A second check holds 128 one-byte sockets against the production-shaped
+`max_connections=1024` config and then makes one legitimate request. With the
+128-slot build the request was reset while the slots were full; with the final
+256-slot budget it returned HTTP 200 in 5 ms. An attacker can always fill any
+fixed budget, but the accept loop and authenticated data path no longer stop.
 
 The pre-auth ClientHello deadline is capped at 5 s even when the configured
 handshake timeout is 10 s.
@@ -145,6 +151,8 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 
 - Unknown non-empty VLESS flows are rejected instead of silently relayed as
   unframed bytes; a typo cannot corrupt the destination stream.
+- Legacy VLESS UDP and packetaddr streams are capped at 64 process-wide, so
+  compatibility mode cannot bind sockets outside the XUDP budget.
 - Destination dials are capped at 5 s.
 - Pipe-size warnings are emitted once, then debug-level.
 - Splice batching only enables between 2 MiB/s and 500 MiB/s, so paced video,
@@ -171,7 +179,13 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 - No-TUN capacity: beam **913.7 MB/s** vs stock **651.8 MB/s** = **1.402x**
   (previous beam run 890.5 MB/s; same harness, noisy host).
 - Churn: 3,000 requests at concurrency 32 in **15 s**, 5,000 at 64 in **26 s**,
-  all HTTP 200, RSS +0.9 MiB, threads 2, fds 10.
+  and **10,000 at 64 in 55 s**, all HTTP 200, RSS +1.1 MiB, threads 2, fds 10.
+- Concurrent HTTPS: 120 simultaneous 16 MiB Vision Direct downloads all
+  completed, 1.28 s wall time, server RSS 17.9 MiB and 115 threads at peak.
+  This lands at the splice budget without a stalled handoff.
+- Forced fallback: with `BEAM_MAX_BLOCKING_THREADS=8` (one splice permit) and
+  four concurrent 8 MiB HTTPS downloads, all four completed (1.01 s) through
+  the async path, proving that budget exhaustion no longer hangs a handoff.
 - Quick full-TUN (host load was high, so headline-ineligible):
   TCP download 1.051x/1.012x, upload 1.024x/1.006x, HTTPS 1.029x, UDP echo
   **1.232x** (52.10 vs 42.28 kpps), RSS 0.252x stock, server CPU/GiB
@@ -184,7 +198,8 @@ buffer. This removes one allocation and one full ciphertext copy per record.
   encrypted-flight size); the authenticated path still does not dial the cover.
 - XUDP reply scheduling is FIFO; a very large QUIC burst can still delay DNS.
   Per-session fairness and counters are the next step.
-- Legacy VLESS UDP/packetaddr are not covered by the 256-session XUDP limiter.
+- Legacy UDP/packetaddr now have a separate 64-stream cap but are still not
+  part of the XUDP 256-session budget.
 - Domain destinations are resolved per `New`/address `Keep`; a bounded TTL
   cache would remove repeated resolver round trips.
 - Host conntrack (`nf_conntrack_max=8192`, 5-day established timeout) and pipe

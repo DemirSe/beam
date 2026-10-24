@@ -71,7 +71,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     // Pre-auth slots bound ClientHello reads, not data-path relays. Keep this
     // small enough that a scanner flood cannot pin every permit, but large
     // enough for a browser's parallel connection burst.
-    let max_pending_handshakes = max_connections.clamp(16, 128);
+    let max_pending_handshakes = max_connections.clamp(16, 256);
     let authenticated = Arc::new(Semaphore::new(max_connections));
     let preauth = Arc::new(Semaphore::new(max_pending_handshakes));
     // Leave room in the blocking pool for cover relays, DNS resolution, and

@@ -246,7 +246,7 @@ tune after a 24-hour soak.
 | Egress | the two VPS addresses | ISP address | tunnel down; start sing-box |
 
 The live `max_connections` is 1024 and the pre-auth ClientHello deadline is
-5 s. Admission is split: up to 128 connections may hold a pre-auth slot, and
+5 s. Admission is split: up to 256 connections may hold a pre-auth slot, and
 the 1024 authenticated permits are acquired only after REALITY succeeds. An
 unauthenticated flood therefore drops new probes instead of blocking the accept
 loop. Each Vision Direct relay can hold up to two blocking splice tasks and
