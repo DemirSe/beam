@@ -178,7 +178,7 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: **286 tests** pass (260 core unit tests, 2 TLS
+- `cargo test --workspace`: **287 tests** pass (261 core unit tests, 2 TLS
   adapter integration tests, 1 stock ClientHello fixture, 23 beam-sys unit
   tests).
 - Full-TUN harness: **8/8 PASS** (`xudp`, MTU 1500) and a 1,333,889-byte H3
@@ -212,6 +212,23 @@ buffer. This removes one allocation and one full ciphertext copy per record.
   saturated in every run. Those quick runs used the intermediate
   `7671abdb`/`50df25e7` binaries; the final `f33f07fe` binary was separately
   checked with full-TUN, large H3, no-TUN, and the verified bulk runs above.
+
+## Upload CPU follow-up (not deployed, not benchmarked)
+
+A local-only follow-up reduces upload/read-path copying:
+
+- `TlsStream` now reads rustls plaintext directly into the caller's `ReadBuf`
+  instead of stack -> `Vec` -> caller. Handshake buffering remains for the
+  pre-data phase.
+- `VisionStream` copies large block content (>= 4 KiB) straight into the
+  caller's buffer; only an excess tail goes through `read_out`.
+- `VisionStream::plan_and_queue` uses a stack chunk table instead of a `Vec`
+  allocation on every `poll_write`.
+
+`cargo fmt`, clippy, and the full test suite pass (**287 tests**). Per the
+operator's instruction, this follow-up was **not benchmarked and not deployed**;
+the live binary remains `f33f07fe…`. The next step is a no-TUN CPU/GiB
+comparison and a mobile upload test before any rollout.
 
 ## Remaining work
 

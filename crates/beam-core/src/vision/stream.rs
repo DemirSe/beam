@@ -37,6 +37,9 @@ const MAX_INNER_TLS_BODY: usize = 16_384 + 256;
 /// trigger sees the same record boundary as the stock writer.
 const MAX_WRITE_BATCH: usize = 5 + MAX_INNER_TLS_BODY;
 
+/// Maximum number of Vision content chunks in one write batch.
+const MAX_WRITE_CHUNKS: usize = MAX_WRITE_BATCH.div_ceil(MAX_CONTENT_LEN);
+
 /// Maximum empty Vision blocks processed in one `poll_read` call before
 /// yielding to the executor.
 const MAX_EMPTY_BLOCKS_PER_POLL: usize = 64;
@@ -324,10 +327,24 @@ where
         accepted: &[u8],
         complete_app_data_records: bool,
     ) -> io::Result<bool> {
-        let chunks: Vec<&[u8]> = accepted.chunks(MAX_CONTENT_LEN).collect();
+        // A single write batch is bounded by MAX_WRITE_BATCH, so the chunk
+        // table fits on the stack. Avoid a Vec allocation on every poll_write.
+        let mut chunk_table: [&[u8]; MAX_WRITE_CHUNKS] = [&[]; MAX_WRITE_CHUNKS];
+        let mut chunk_count = 0usize;
+        for chunk in accepted.chunks(MAX_CONTENT_LEN) {
+            let Some(slot) = chunk_table.get_mut(chunk_count) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Vision write batch exceeded its chunk table",
+                ));
+            };
+            *slot = chunk;
+            chunk_count += 1;
+        }
+        let chunks = &chunk_table[..chunk_count];
         let plan = self
             .writer
-            .plan_write(&chunks, complete_app_data_records, &mut self.rng);
+            .plan_write(chunks, complete_app_data_records, &mut self.rng);
 
         for (index, block_plan) in plan.blocks.iter().enumerate() {
             let Some(content) = chunks.get(index) else {
@@ -435,6 +452,9 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.as_mut().get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let mut empty_blocks = 0usize;
         let mut coalescing = false;
         loop {
@@ -499,9 +519,21 @@ where
                     }
                     let content = block.content;
                     let content_len = content.len();
+                    // Large blocks (typically one inner TLS record) are
+                    // copied straight into the caller instead of taking an
+                    // extra trip through read_out.
+                    let direct_content = content_len >= READ_CHUNK && this.read_out.is_empty();
                     if !content.is_empty() {
                         this.writer.inspect(content);
-                        this.read_out.extend_from_slice(content);
+                        if direct_content {
+                            let count = content_len.min(buf.remaining());
+                            buf.put_slice(&content[..count]);
+                            if count < content_len {
+                                this.read_out.extend_from_slice(&content[count..]);
+                            }
+                        } else {
+                            this.read_out.extend_from_slice(content);
+                        }
                     }
                     this.read_buf_offset = this.read_buf_offset.saturating_add(used);
                     if this.read_buf_offset >= this.read_buf.len() {
@@ -521,6 +553,9 @@ where
                         tracing::debug!(content = content_len, "Vision reader switched to Direct");
                     }
                     if content_len > 0 {
+                        if direct_content {
+                            return Poll::Ready(Ok(()));
+                        }
                         if this.read_out.len() >= MAX_READ_OUT {
                             return Poll::Ready(Ok(()));
                         }
@@ -1062,6 +1097,21 @@ mod tests {
         // The 2,000 one-byte blocks must be coalesced into a small number of
         // reads, not returned one block at a time.
         assert!(reads < 10, "tiny blocks were not coalesced: {reads} reads");
+    }
+
+    #[tokio::test]
+    async fn reader_returns_a_large_block_in_one_read() {
+        let payload = vec![0x5a_u8; 8000];
+        let raw = block_bytes(Some(USER_ID), Command::Continue, &payload, 0);
+        let (mut peer, client) = duplex(64 * 1024);
+        peer.write_all(&raw).await.expect("write large block");
+        peer.shutdown().await.expect("shutdown large writer");
+
+        let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(17));
+        let mut buffer = vec![0u8; 16 * 1024];
+        let count = vision.read(&mut buffer).await.expect("read large block");
+        assert_eq!(count, payload.len());
+        assert_eq!(&buffer[..count], &payload[..]);
     }
 
     #[tokio::test]

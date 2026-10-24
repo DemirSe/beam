@@ -303,6 +303,9 @@ impl TlsStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), TlsStreamError>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         loop {
             if self.plaintext_offset < self.plaintext.len() {
                 let remaining = &self.plaintext[self.plaintext_offset..];
@@ -355,7 +358,12 @@ impl TlsStream {
                     self.pending_offset = 0;
                 }
                 self.conn.process_new_packets()?;
-                self.drain_plaintext()?;
+                if self.drain_plaintext_into(buf)? {
+                    return Poll::Ready(Ok(()));
+                }
+                if self.closed {
+                    return Poll::Ready(Ok(()));
+                }
             }
             self.pending.clear();
             self.pending_offset = 0;
@@ -365,6 +373,12 @@ impl TlsStream {
             // A close_notify may have been processed in the loop above. Do not
             // block on the socket after observing it; the relay must see EOF
             // without waiting for an unrelated wakeup.
+            if self.closed {
+                return Poll::Ready(Ok(()));
+            }
+            if self.drain_plaintext_into(buf)? {
+                return Poll::Ready(Ok(()));
+            }
             if self.closed {
                 return Poll::Ready(Ok(()));
             }
@@ -378,9 +392,8 @@ impl TlsStream {
                     // application close.
                     self.conn.read_tls(&mut &[][..])?;
                     self.conn.process_new_packets()?;
-                    self.drain_plaintext()?;
-                    if self.plaintext_offset < self.plaintext.len() {
-                        continue;
+                    if self.drain_plaintext_into(buf)? {
+                        return Poll::Ready(Ok(()));
                     }
                     return Poll::Ready(Ok(()));
                 }
@@ -492,6 +505,30 @@ impl TlsStream {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(error) => return Err(TlsStreamError::Io(error)),
             }
+        }
+    }
+
+    /// Reads rustls plaintext directly into the caller's buffer.
+    ///
+    /// The normal data path used to copy every plaintext byte stack -> Vec ->
+    /// caller. This keeps the byte in the caller's `ReadBuf` and lets rustls
+    /// retain any excess for the next poll. Returns `true` when at least one
+    /// byte was written.
+    fn drain_plaintext_into(&mut self, buf: &mut ReadBuf<'_>) -> Result<bool, TlsStreamError> {
+        if buf.remaining() == 0 {
+            return Ok(false);
+        }
+        match self.conn.reader().read(buf.initialize_unfilled()) {
+            Ok(0) => {
+                self.closed = true;
+                Ok(false)
+            }
+            Ok(count) => {
+                buf.advance(count);
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(TlsStreamError::Io(error)),
         }
     }
 
