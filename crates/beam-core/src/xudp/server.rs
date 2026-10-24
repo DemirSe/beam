@@ -272,6 +272,11 @@ where
             let _ = writer_failed.send(true);
             return Err(error);
         }
+        // Release the reply-budget permits before waiting for the next frame.
+        // Holding them across `recv().await` would let idle mux streams pin the
+        // process-wide budget indefinitely.
+        frames.clear();
+        batch.clear();
     }
 
     timeout(io_timeout, writer.shutdown())

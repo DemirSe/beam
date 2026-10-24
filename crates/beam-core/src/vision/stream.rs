@@ -66,6 +66,9 @@ pub struct VisionStream<S, R = SmallRng> {
     writer: VisionWriterState,
     write_direct: bool,
     pending_direct_switch: bool,
+    /// The raw switch is active, but the carry must finish before the relay
+    /// may start writing the socket from another task.
+    direct_publish_pending: bool,
     direct_tx: watch::Sender<bool>,
     write_direct_tx: watch::Sender<bool>,
     read_handoff_tx: watch::Sender<bool>,
@@ -105,6 +108,7 @@ where
             writer: VisionWriterState::new(),
             write_direct: false,
             pending_direct_switch: false,
+            direct_publish_pending: false,
             direct_tx,
             write_direct_tx,
             read_handoff_tx,
@@ -177,6 +181,15 @@ where
 
     fn publish_write_direct(&self) {
         self.write_direct_tx.send_replace(self.write_is_raw());
+    }
+
+    /// Publishes the raw-write handoff only after any carried tail is written.
+    fn publish_direct_when_drained(&mut self) {
+        if self.direct_publish_pending && self.write_carry.is_empty() {
+            self.publish_direct();
+            self.publish_write_direct();
+            self.direct_publish_pending = false;
+        }
     }
 
     /// Drops the consumed prefix of the framing buffer.
@@ -286,6 +299,7 @@ where
                 Poll::Pending => return Poll::Pending,
             }
         }
+        self.publish_direct_when_drained();
         Poll::Ready(Ok(()))
     }
 
@@ -362,12 +376,15 @@ where
             self.inner.switch_write_to_raw();
             self.write_direct = true;
             self.pending_direct_switch = false;
-            self.publish_direct();
-            self.publish_write_direct();
+            self.direct_publish_pending = true;
             tracing::debug!("Vision writer switched to raw");
         }
 
-        if self.write_direct && !self.write_carry.is_empty() {
+        if !self.writer.padding_enabled() && !self.write_carry.is_empty() {
+            // Direct and End both stop framing. The carried tail now belongs
+            // to the outer byte stream: for Direct it is raw socket data, for
+            // End it is ordinary outer-TLS plaintext. It must be written
+            // before any later poll_write.
             match self.poll_flush_raw_carry(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => {
@@ -376,6 +393,8 @@ where
                 }
                 Poll::Pending => return Poll::Pending,
             }
+        } else {
+            self.publish_direct_when_drained();
         }
 
         self.pending_accept = None;
@@ -384,9 +403,10 @@ where
 
     fn finish_direct_switch(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.pending_direct_switch {
-            if self.write_direct && !self.write_carry.is_empty() {
+            if !self.writer.padding_enabled() && !self.write_carry.is_empty() {
                 return self.poll_flush_raw_carry(cx);
             }
+            self.publish_direct_when_drained();
             return Poll::Ready(Ok(()));
         }
         match Pin::new(&mut self.inner).poll_flush(cx) {
@@ -394,8 +414,7 @@ where
                 self.inner.switch_write_to_raw();
                 self.write_direct = true;
                 self.pending_direct_switch = false;
-                self.publish_direct();
-                self.publish_write_direct();
+                self.direct_publish_pending = true;
                 tracing::debug!("Vision writer switched to raw");
                 self.poll_flush_raw_carry(cx)
             }
@@ -584,12 +603,14 @@ where
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                     Poll::Pending => return Poll::Pending,
                 }
-            } else if this.write_direct && !this.write_carry.is_empty() {
+            } else if !this.write_carry.is_empty() {
                 match this.poll_flush_raw_carry(cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                     Poll::Pending => return Poll::Pending,
                 }
+            } else {
+                this.publish_direct_when_drained();
             }
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
@@ -597,6 +618,10 @@ where
             return Poll::Ready(Ok(0));
         }
 
+        // Only a detected TLS stream gets record-alignment buffering. A
+        // non-TLS protocol whose data happens to start with 0x16/0x03 must
+        // not be held waiting for a record that will never complete.
+        let carry_ok = this.writer.is_tls() || this.writer.is_tls12_or_above();
         let accepted;
         let switch_direct = if !this.write_carry.is_empty() {
             let room = MAX_WRITE_BATCH.saturating_sub(this.write_carry.len());
@@ -608,13 +633,22 @@ where
             if prefix == this.write_carry.len() {
                 let data = std::mem::take(&mut this.write_carry);
                 this.plan_and_queue(&data, true)?
-            } else if prefix > 0 && is_partial_tls_record(&this.write_carry[prefix..]) {
+            } else if prefix > 0 {
                 let tail = this.write_carry.split_off(prefix);
                 let data = std::mem::take(&mut this.write_carry);
                 let switch = this.plan_and_queue(&data, true)?;
-                this.write_carry = tail;
-                switch
-            } else if prefix == 0 && is_partial_tls_record(&this.write_carry) {
+                let tls_after = this.writer.is_tls() || this.writer.is_tls12_or_above();
+                if switch
+                    || !this.writer.padding_enabled()
+                    || (tls_after && is_partial_tls_record(&tail))
+                {
+                    this.write_carry = tail;
+                    switch
+                } else {
+                    this.plan_and_queue(&tail, false)?;
+                    false
+                }
+            } else if carry_ok && is_partial_tls_record(&this.write_carry) {
                 false
             } else {
                 let data = std::mem::take(&mut this.write_carry);
@@ -626,10 +660,21 @@ where
             let prefix = complete_tls_records_len(&buf[..take]);
             if prefix == take {
                 this.plan_and_queue(&buf[..take], true)?
-            } else if prefix > 0 && is_partial_tls_record(&buf[prefix..take]) {
-                this.write_carry.extend_from_slice(&buf[prefix..take]);
-                this.plan_and_queue(&buf[..prefix], true)?
-            } else if prefix == 0 && is_partial_tls_record(&buf[..take]) {
+            } else if prefix > 0 {
+                let tail = buf[prefix..take].to_vec();
+                let switch = this.plan_and_queue(&buf[..prefix], true)?;
+                let tls_after = this.writer.is_tls() || this.writer.is_tls12_or_above();
+                if switch
+                    || !this.writer.padding_enabled()
+                    || (tls_after && is_partial_tls_record(&tail))
+                {
+                    this.write_carry = tail;
+                    switch
+                } else {
+                    this.plan_and_queue(&tail, false)?;
+                    false
+                }
+            } else if carry_ok && is_partial_tls_record(&buf[..take]) {
                 this.write_carry.extend_from_slice(&buf[..take]);
                 false
             } else {
@@ -671,19 +716,30 @@ where
             if this.write_direct {
                 let data = std::mem::take(&mut this.write_carry);
                 this.write_queue.extend_from_slice(&data);
-            } else if !this.pending_direct_switch {
-                // A pending Direct switch owns the carry; it must be flushed
-                // raw after `finish_direct_switch`, not framed through TLS.
+            } else if !this.pending_direct_switch && this.writer.padding_enabled() {
+                // Still framing: finish the partial record as a Vision block.
                 let data = std::mem::take(&mut this.write_carry);
                 if let Err(error) = this.plan_and_queue(&data, false) {
                     return Poll::Ready(Err(error));
                 }
             }
+            // With framing stopped, End/Direct carry is written after the
+            // queued closing block, either through outer TLS or raw.
         }
         match this.poll_flush_queue(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Pending => return Poll::Pending,
+        }
+        if !this.writer.padding_enabled()
+            && !this.pending_direct_switch
+            && !this.write_carry.is_empty()
+        {
+            match this.poll_flush_raw_carry(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
         match this.finish_direct_switch(cx) {
             Poll::Ready(Ok(())) => {}
@@ -870,7 +926,7 @@ mod tests {
 
     #[tokio::test]
     async fn long_padding_uses_tls_detection() {
-        let hello = [0x16, 0x03, 0x01, 0x00, 0x00, 0x01, 0x01];
+        let hello = [0x16, 0x03, 0x01, 0x00, 0x02, 0x01, 0x01];
         let raw = writer_output(&[&hello], 2).await;
         let blocks = read_raw_blocks(&raw);
         assert_eq!(blocks.len(), 1);
@@ -1138,6 +1194,44 @@ mod tests {
             assert_eq!(block.content, app, "chunk size {chunk}");
             assert_eq!(&raw[used..], &next, "chunk size {chunk}");
         }
+    }
+
+    #[tokio::test]
+    async fn end_carry_is_flushed_before_later_writes() {
+        let (client, mut peer) = duplex(64 * 1024);
+        let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(16));
+        // Cipher 0x1305 is recognized as TLS but does not enable XTLS, so the
+        // first complete app record plans End rather than Direct.
+        let mut hello = server_hello();
+        hello[76..78].copy_from_slice(&[0x13, 0x05]);
+        vision.writer.inspect(&hello);
+        assert!(vision.writer.is_tls());
+        assert!(!vision.writer.enable_xtls());
+
+        let app = app_data_record(b"payload");
+        let next = app_data_record(b"next");
+        let mut first = app.clone();
+        first.extend_from_slice(&next[..3]);
+        vision
+            .write_all(&first)
+            .await
+            .expect("write End block plus partial raw");
+        vision
+            .write_all(&next[3..])
+            .await
+            .expect("write remaining raw");
+        vision.shutdown().await.expect("shutdown Vision writer");
+
+        let mut raw = Vec::new();
+        peer.read_to_end(&mut raw)
+            .await
+            .expect("read raw Vision output");
+        let (block, used) = parse_block(&raw, true)
+            .expect("End block must parse")
+            .expect("End block must be complete");
+        assert_eq!(block.command, Command::End);
+        assert_eq!(block.content, app);
+        assert_eq!(&raw[used..], &next);
     }
 
     #[tokio::test]

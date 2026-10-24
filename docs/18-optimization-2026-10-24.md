@@ -90,9 +90,9 @@ was reported as clean.
 
 `TlsStream` now records a clean `close_notify`, returns EOF once buffered
 plaintext is drained, and lets rustls classify socket EOF (`UnexpectedEof`
-when the peer never sent `close_notify`). A regression sends `close_notify`
-while keeping the TCP socket open and asserts that the server sees EOF within
-one second.
+when the peer never sent `close_notify`). The relay treats that error as a
+half-close, so a bare FIN does not abort the opposite direction. Regressions
+cover `close_notify` with TCP kept open and the bare-FIN relay case.
 
 ### Vision reader: linear parsing and coalesced writes
 
@@ -118,9 +118,11 @@ records, a busy server could keep a connection framed for its entire lifetime.
 
 The writer now carries at most one partial TLS record (handshake or
 application data) across `poll_write` calls, processes the complete prefix,
-and still switches to Direct when the application-data record completes. If Direct is planned, the carried raw tail is
-appended after the queued Direct block. A regression splits a record inside
-the header and again inside the body and asserts the Direct block and raw tail.
+and still switches to Direct when the application-data record completes. If
+Direct is planned, the carried raw tail is written after the queued Direct
+block; if End is planned, it is flushed through outer TLS before any later
+write. Regressions cover split headers, split bodies, Direct tails in the same
+write, End/partial tails, and one-byte write boundaries.
 
 ### TLS record reads use one buffer
 
@@ -142,7 +144,8 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 - A closed GlobalID socket is drained (bounded) before retention; if it still
   has queued data, it is dropped instead of being retained with stale replies.
 - Reply writes batch already-queued frames (up to 32 frames / 64 KiB) and flush
-  once per batch. A full `End` queue no longer tears down unrelated flows.
+  once per batch. A full `End` queue no longer tears down unrelated flows;
+  reply-budget permits are released before waiting for the next frame.
 - Domain resolution in the mux read loop is bounded to 2 s instead of the
   generic 10 s I/O timeout.
 - The reply batch buffers are allocated lazily.
@@ -168,20 +171,20 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: **283 tests** pass (257 core unit tests, 2 TLS
+- `cargo test --workspace`: **286 tests** pass (260 core unit tests, 2 TLS
   adapter integration tests, 1 stock ClientHello fixture, 23 other integration
   tests).
 - Full-TUN harness: **8/8 PASS** (`xudp`, MTU 1500) and a 1,333,889-byte H3
   body passes.
-- New regressions: non-TLS cover fallback, `close_notify`, split-record
-  Direct, 2,000 tiny Vision blocks, XUDP stop-before-first-poll permit
-  release.
+- New regressions: non-TLS cover fallback, `close_notify`, bare-FIN
+  half-close, split-record Direct/End tails, 2,000 tiny Vision blocks, XUDP
+  stop-before-first-poll permit release, and empty/unknown VLESS flows.
 - No-TUN capacity: beam **913.7 MB/s** vs stock **651.8 MB/s** = **1.402x**
   (previous beam run 890.5 MB/s; same harness, noisy host).
 - Churn: 3,000 requests at concurrency 32 in **15 s**, 5,000 at 64 in **26 s**,
-  **10,000 at 64 in 55 s**, and **50,000 at 128 in 274 s**; every request
-  returned HTTP 200, RSS moved 7.8 → 9.5 MiB, threads stayed at 2, and fds
-  stayed at 10.
+  **10,000 at 64 in 55 s**, **50,000 at 128 in 274 s**, and **100,000 at 128
+  in 566 s**; every request returned HTTP 200, RSS moved 8.2 → 10.3 MiB,
+  threads stayed at 2, and fds stayed at 10.
 - Concurrent HTTPS: 120 simultaneous 16 MiB Vision Direct downloads all
   completed, 1.28 s wall time, server RSS 17.9 MiB and 115 threads at peak.
   This lands at the splice budget without a stalled handoff.
@@ -206,9 +209,11 @@ buffer. This removes one allocation and one full ciphertext copy per record.
   part of the XUDP 256-session budget.
 - Domain destinations are resolved per `New`/address `Keep`; a bounded TTL
   cache would remove repeated resolver round trips.
-- Host conntrack (`nf_conntrack_max=8192`, 5-day established timeout) and pipe
-  page limits are live-only tuning and should be raised/shipped before a 10k
-  churn test.
+- Host conntrack was raised to 65536 (1 h established / 30 s TIME_WAIT) and
+  shipped in `deploy/`; a 10k churn against the live host has not been run.
+  Pipe page limits remain live-only tuning.
+- SIGHUP is logged and ignored; hot reload is not implemented.
+
 ## Deployment
 
 Deployed on 2026-10-24 02:08 UTC with `BEAM_KEEP_CONFIG=1`:

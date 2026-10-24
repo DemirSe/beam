@@ -537,8 +537,8 @@ impl VisionWriterState {
     /// `chunks` are the writer's plaintext buffers in order. Each returned
     /// block corresponds to one chunk. `complete_app_data_records` must be true
     /// only when the concatenation of `chunks` is one or more complete TLS
-    /// application-data records and nothing else; it is the caller's
-    /// complete-record check.
+    /// records (handshake, change-cipher-spec, alert, or application data) and
+    /// nothing else; it is the caller's complete-record check.
     ///
     /// The first block of the direction carries the UUID. A write that triggers
     /// Direct puts Direct on its last block and Continue on earlier blocks.

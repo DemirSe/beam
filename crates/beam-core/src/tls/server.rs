@@ -776,6 +776,14 @@ async fn read_client_hello_record(
     Ok(ClientHelloRead::Complete(record))
 }
 
+/// Returns whether a VLESS flow value is supported.
+///
+/// Stock accepts an absent or explicitly empty flow (no Vision) and rejects
+/// unknown non-empty values.
+fn is_supported_flow(flow: Option<&str>) -> bool {
+    flow.is_none_or(|flow| flow.is_empty() || flow == crate::vless::VISION_FLOW)
+}
+
 /// Returns the account UUID used for lookup.
 ///
 /// Stock Xray zeroes bytes 6-7 of the wire UUID before matching the account;
@@ -824,11 +832,7 @@ async fn handle_authenticated(
     }
     // Stock rejects an unknown flow instead of silently treating the body as
     // unframed bytes. A typo would otherwise corrupt every destination read.
-    if request
-        .flow
-        .as_deref()
-        .is_some_and(|flow| flow != crate::vless::VISION_FLOW)
-    {
+    if !is_supported_flow(request.flow.as_deref()) {
         return Err(VlessError::UnsupportedFlow.into());
     }
 
@@ -1334,7 +1338,13 @@ where
             }
         };
         let count = match read {
-            Ok(result) => result?,
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                // A bare TCP FIN is a half-close, not a fatal relay error.
+                // Let the opposite direction finish and half-close normally.
+                break;
+            }
+            Ok(Err(error)) => return Err(TlsServerError::Io(error)),
             Err(_) => {
                 if activity_clock
                     .and_then(RelayActivity::elapsed)
@@ -1422,7 +1432,13 @@ where
             }
         };
         let count = match read {
-            Ok(result) => result?,
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                // A bare TCP FIN is a half-close, not a fatal relay error.
+                // Let the opposite direction finish and half-close normally.
+                break;
+            }
+            Ok(Err(error)) => return Err(TlsServerError::Io(error)),
             Err(_) => {
                 if activity_clock
                     .and_then(RelayActivity::elapsed)
@@ -1569,7 +1585,13 @@ where
         }
         let read = timeout(idle_timeout, reader.read(&mut buffer)).await;
         let count = match read {
-            Ok(result) => result?,
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                // A bare TCP FIN is a half-close, not a fatal relay error.
+                // Let the opposite direction finish and half-close normally.
+                break;
+            }
+            Ok(Err(error)) => return Err(TlsServerError::Io(error)),
             Err(_) => {
                 if activity_clock.is_some_and(RelayActivity::is_stopped) {
                     break;
@@ -1630,6 +1652,36 @@ fn is_peer_closed(error: &io::Error) -> bool {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
+
+    struct UnexpectedEofReader;
+
+    impl AsyncRead for UnexpectedEofReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)))
+        }
+    }
+
+    #[test]
+    fn empty_and_vision_flows_are_supported_but_unknown_ones_are_not() {
+        assert!(is_supported_flow(None));
+        assert!(is_supported_flow(Some("")));
+        assert!(is_supported_flow(Some(crate::vless::VISION_FLOW)));
+        assert!(!is_supported_flow(Some("xtls-rprx-vision-typo")));
+    }
+
+    #[tokio::test]
+    async fn bare_fin_is_a_half_close_not_a_fatal_relay_error() {
+        let mut reader = UnexpectedEofReader;
+        let mut writer = tokio::io::sink();
+        let copied = copy_direction(&mut reader, &mut writer, Duration::from_secs(1), None)
+            .await
+            .expect("bare FIN must be a clean half-close");
+        assert_eq!(copied, 0);
+    }
 
     fn test_config() -> TlsServerConfig {
         TlsServerConfig::new(

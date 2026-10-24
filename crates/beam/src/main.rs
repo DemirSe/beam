@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     let max_blocking_threads = std::env::var("BEAM_MAX_BLOCKING_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (1..=4096).contains(value))
+        .filter(|value| (1..=512).contains(value))
         .unwrap_or(160);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .max_blocking_threads(max_blocking_threads)

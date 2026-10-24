@@ -370,7 +370,7 @@ impl TlsStream {
                     // arrived earlier yields a clean EOF; a bare FIN yields
                     // UnexpectedEof instead of being reported as a clean
                     // application close.
-                    let _ = self.conn.read_tls(&mut &[][..]);
+                    self.conn.read_tls(&mut &[][..])?;
                     self.conn.process_new_packets()?;
                     self.drain_plaintext()?;
                     if self.plaintext_offset < self.plaintext.len() {

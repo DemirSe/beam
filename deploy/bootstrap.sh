@@ -69,18 +69,20 @@ for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$
   fi
 done
 
-# Validate the bundle before replacing the running binary. The old service is
-# still in memory if this fails, but a broken installed binary would otherwise
-# turn the next restart or reboot into an outage.
-if [ "$KEEP_CONFIG" = "1" ]; then
-  "$BIN" --check -c "$INSTALL_CONFIG"
-else
-  "$BIN" --check -c "$CONFIG"
-fi
-
-# Install beside the destination and rename, so a crash or full disk cannot
-# leave a truncated binary or unit file in place.
+# Install beside the destination and validate there before replacing the
+# running binary. `/tmp` may be mounted noexec, and a broken installed binary
+# would turn the next restart or reboot into an outage.
 install -m 0755 -o root -g root "$BIN" "$INSTALL_BIN.new"
+if [ "$KEEP_CONFIG" = "1" ]; then
+  CHECK_CONFIG="$INSTALL_CONFIG"
+else
+  CHECK_CONFIG="$CONFIG"
+fi
+if ! "$INSTALL_BIN.new" --check -c "$CHECK_CONFIG"; then
+  rm -f "$INSTALL_BIN.new"
+  echo "bootstrap: new binary failed --check; live binary unchanged" >&2
+  exit 1
+fi
 mv -f "$INSTALL_BIN.new" "$INSTALL_BIN"
 if [ "$KEEP_CONFIG" = "0" ]; then
   install -m 0640 -o root -g beam "$CONFIG" "$INSTALL_CONFIG.new"
@@ -94,11 +96,16 @@ if [ -f "$CONNTRACK" ]; then
   install -m 0644 -o root -g root "$CONNTRACK" "$INSTALL_CONNTRACK.new"
   mv -f "$INSTALL_CONNTRACK.new" "$INSTALL_CONNTRACK"
 fi
-# conntrack keys may not exist until nftables first loads the module. A
-# failure here must not abort the binary/unit rollout; the file applies at
-# the next boot as well.
-sysctl --system >/dev/null 2>&1 || \
-  echo "bootstrap: warning: some sysctl keys could not be applied yet" >&2
+# The primary UDP buffer file is required; a typo or permission failure must
+# fail the rollout rather than silently losing H3 headroom.
+sysctl -p "$INSTALL_SYSCTL" >/dev/null
+if [ -f "$INSTALL_CONNTRACK" ]; then
+  # conntrack keys may not exist until nftables first loads the module. A
+  # failure here must not abort the binary/unit rollout; the file applies at
+  # the next boot as well.
+  sysctl -p "$INSTALL_CONNTRACK" >/dev/null 2>&1 || \
+    echo "bootstrap: warning: conntrack sysctl keys are not available yet" >&2
+fi
 
 runuser -u beam -- "$INSTALL_BIN" --check -c "$INSTALL_CONFIG"
 
