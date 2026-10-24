@@ -225,10 +225,22 @@ A local-only follow-up reduces upload/read-path copying:
 - `VisionStream::plan_and_queue` uses a stack chunk table instead of a `Vec`
   allocation on every `poll_write`.
 
-`cargo fmt`, clippy, and the full test suite pass (**287 tests**). Per the
-operator's instruction, this follow-up was **not benchmarked and not deployed**;
-the live binary remains `f33f07fe…`. The next step is a no-TUN CPU/GiB
-comparison and a mobile upload test before any rollout.
+`cargo fmt`, clippy, and the full test suite pass (**287 tests**). A local
+quick A/B against `f33f07fe` (two repetitions, noisy host) measured:
+
+| Scenario | f33f | upload-follow-up |
+|---|---:|---:|
+| TCP upload 1 flow, server CPU/GiB | 0.6132 s | **0.5938 s** (-3.2%) |
+| TCP upload 4 flows, server CPU/GiB | 0.6176 s | **0.6144 s** (-0.5%) |
+| TCP upload throughput | ~3.0/2.8 Gbit/s | parity |
+| 120×16 MiB HTTPS | 120/120 | **120/120**, 2.98 s |
+| TLS 1.2-only 8×4 MiB | 8/8 | **8/8** |
+
+Full-TUN was **8/8** with the 1,333,889-byte H3 body, and RSS was slightly lower
+(8.4–8.9 MiB vs 9.5–10.2 MiB in the quick runs). The gain is modest and the
+download CPU delta was within noise. This follow-up remains **not deployed**;
+the live binary is still `f33f07fe…`. The next step is a clean multi-repetition
+no-TUN and mobile upload comparison before rollout.
 
 ## Remaining work
 
