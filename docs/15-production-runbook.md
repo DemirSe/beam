@@ -22,7 +22,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
 | Unit / backups | `/etc/systemd/system/beam.service` 0644; `*.bak-<UTC stamp>` beside each installed file |
-| Hardening | Deployed 2026-10-24 02:03 UTC: binary `7671abdb…` (pre-auth admission, cover fast fallback, Vision/XUDP fixes); global XUDP 256 + 60 s idle, cover 32, legacy UDP 64, `MemoryHigh=512M`/`MemoryMax=768M`/`MemorySwapMax=512M`; live config preserved; backups `20261024T020342Z` |
+| Hardening | Deployed 2026-10-24 02:08 UTC: binary `615ef24d…` (pre-auth admission, cover fast fallback, Vision/XUDP fixes); global XUDP 256 + 60 s idle, cover 32, legacy UDP 64, `MemoryHigh=512M`/`MemoryMax=768M`/`MemorySwapMax=512M`; live config preserved; backups `20261024T020829Z` |
 | Earlier hardening | 2026-10-23 18:10 UTC binary `bd17ac26…`; backups `20261023T181052Z` |
 | Conntrack | `/etc/sysctl.d/99-beam-conntrack.conf`: max 65536, established 3600 s, TIME_WAIT 30 s |
 | Local client | sing-box, `/etc/sing-box/config.json` 0600, active but disabled at boot |
