@@ -168,7 +168,7 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: **282 tests** pass (256 core unit tests, 2 TLS
+- `cargo test --workspace`: **283 tests** pass (257 core unit tests, 2 TLS
   adapter integration tests, 1 stock ClientHello fixture, 23 other integration
   tests).
 - Full-TUN harness: **8/8 PASS** (`xudp`, MTU 1500) and a 1,333,889-byte H3
@@ -188,10 +188,12 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 - Forced fallback: with `BEAM_MAX_BLOCKING_THREADS=8` (one splice permit) and
   four concurrent 8 MiB HTTPS downloads, all four completed (1.01 s) through
   the async path, proving that budget exhaustion no longer hangs a handoff.
-- Quick full-TUN (host load was high, so headline-ineligible):
-  TCP download 1.051x/1.012x, upload 1.024x/1.006x, HTTPS 1.029x, UDP echo
-  **1.232x** (52.10 vs 42.28 kpps), RSS 0.252x stock, server CPU/GiB
-  0.755–0.876x stock.
+- Quick full-TUN (host load was high, so headline-ineligible): across two
+  runs TCP download was 1.01–1.05x, upload 1.01–1.43x, HTTPS 1.03–1.31x,
+  and UDP echo **1.23–1.96x** (beam held 50–52 kpps while the stock arm
+  varied 25–42 kpps). RSS was 0.24–0.25x stock and server CPU/GiB was
+  0.73–0.88x stock. Treat the ratios as directional; the client core was
+  saturated in every run.
 
 ## Remaining work
 

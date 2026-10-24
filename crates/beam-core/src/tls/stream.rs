@@ -210,7 +210,7 @@ impl TlsStream {
         if !self.read_raw || !self.write_raw {
             return Err(TlsStreamError::RawNotEnabled);
         }
-        if self.record.is_partial() {
+        if self.record.is_partial() || self.pending_offset < self.pending.len() {
             return Err(TlsStreamError::PartialRecord);
         }
 
@@ -231,9 +231,6 @@ impl TlsStream {
         let mut inbound = Vec::new();
         if self.plaintext_offset < self.plaintext.len() {
             inbound.extend_from_slice(&self.plaintext[self.plaintext_offset..]);
-        }
-        if self.pending_offset < self.pending.len() {
-            inbound.extend_from_slice(&self.pending[self.pending_offset..]);
         }
 
         Ok(RawTls {
@@ -815,12 +812,11 @@ mod tests {
         let (mut client, server) = loopback_pair().await;
         let mut stream = test_stream(server);
         stream.plaintext = b"plain".to_vec();
-        stream.pending = b"pending".to_vec();
         stream.switch_read_to_raw();
         stream.switch_write_to_raw();
 
         let raw = stream.into_raw().expect("raw handoff");
-        assert_eq!(raw.inbound, b"plainpending");
+        assert_eq!(raw.inbound, b"plain");
         assert!(raw.outbound.is_empty());
 
         // The socket is still usable.
@@ -829,6 +825,19 @@ mod tests {
         let mut received = [0u8; 2];
         client.read_exact(&mut received).await.expect("raw read");
         assert_eq!(&received, b"ok");
+    }
+
+    #[tokio::test]
+    async fn raw_handoff_rejects_unfed_outer_ciphertext() {
+        let (_client, server) = loopback_pair().await;
+        let mut stream = test_stream(server);
+        stream.pending = b"outer-ciphertext".to_vec();
+        stream.switch_read_to_raw();
+        stream.switch_write_to_raw();
+        assert!(matches!(
+            stream.into_raw(),
+            Err(TlsStreamError::PartialRecord)
+        ));
     }
 
     async fn loopback_pair() -> (TcpStream, TcpStream) {
