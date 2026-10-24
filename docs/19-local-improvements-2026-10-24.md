@@ -256,19 +256,14 @@ Raw samples, manifests, and logs are under `/tmp/opencode`:
 - `upgrade-tls-download-ab-20261024T130722Z`,
   `upgrade-tls-download-swap-ab-20261024T132424Z` — download control
 - `upgrade-tls-tun-20261024T132532Z` — full TUN
-- `combined-tun-20261024T135729Z` — combined full TUN
-- `combined-churn-20261024T140323Z` — combined churn
-- `combined-upload-ab-20261024T140400Z` — combined 1 GiB upload
-- `combined-download-ab2-20261024T140540Z` — combined 1 GiB download
-- `combined-xudp-v6-ab-20261024T140650Z`,
-  `combined-xudp-v6-ab2-20261024T140817Z`,
-  `combined-xudp-v6-swap-20261024T141333Z` — combined IPv6 echo, 20k
-- `combined-xudp-v6-long-20261024T142137Z` — combined IPv6 echo, 100k
-- `xudp-only-v6-long-20261024T142502Z`,
-  `relay-xudp-v6-long-20261024T142328Z`,
-  `tls-xudp-v6-long-20261024T142637Z` — isolation, 100k
-- `combined-relay-idle-ab-20261024T141657Z` — combined idle relay
-- `combined-xudp-burst-ab-20261024T141907Z` — combined UDP burst
+- `combined-true-tun-20261024T143223Z` — combined full TUN
+- `combined-true-churn-20261024T143228Z` — combined churn
+- `combined-true-upload-ab-20261024T143306Z` — combined 1 GiB upload
+- `combined-true-download-ab-20261024T143423Z` — combined 1 GiB download
+- `combined-true-xudp-v6-ab-20261024T144029Z` — combined IPv6 echo, 20k
+- `combined-true-xudp-v6-long-20261024T143855Z` — combined IPv6 echo, 100k
+- `combined-true-relay-idle-ab-20261024T143621Z` — combined idle relay
+- `combined-true-xudp-burst-20261024T144149Z` — combined UDP burst
 - `upgrade-report-data.json` — consolidated numbers used above
 
 Harness sources: `/tmp/opencode/run-xudp-ab.sh`,
@@ -279,50 +274,38 @@ Harness sources: `/tmp/opencode/run-xudp-ab.sh`,
 ## Combined local test
 
 All three branches were cherry-picked onto
-`improve/combined-local-2026-10-24` (tip `c3728a0`) and tested as one binary:
+`improve/combined-local-2026-10-24` (tip `b6f18f3`) and tested as one binary:
 
 - Combined binary:
-  `aa51e6d9bf9196cc681cea8a312b1f67438b244574d180dff335ec275079f6b2`
+  `9d417394a46a27a83168fa146ca358ae1cba01d154d73fb153cfd0adfd0c3b9b`
 - `cargo fmt --all --check`: PASS
 - `cargo clippy --workspace --all-targets -- -D warnings`: PASS
-- `cargo test --workspace`: PASS (299)
+- `cargo test --workspace`: PASS (300)
 - Full TUN, 8 probes: **8/8 PASS**
-- Churn: 5,000/5,000 HTTP 200, 26 s, fds 10 → 10, threads 2 → 2,
-  RSS 7,884 → 8,808 KiB
+- Churn: 5,000/5,000 HTTP 200, 28 s, fds 10 → 10, threads 2 → 2,
+  RSS 7,728 → 8,884 KiB
 
 Performance controls against the same stock binary:
 
 | Test | Stock | Combined | Paired result |
 |---|---:|---:|---:|
-| 1 GiB upload CPU/GiB | 0.8032 s | 0.8000 s | -1.5% median, 4/6 |
-| 1 GiB download CPU/GiB (10 reps) | 0.4823 s | 0.4849 s | -0.5% paired median, 6/10 |
-| Idle relay CPU / 5 s, 120 directions | 5.406 ms | 0.712 ms | **-86.8%**, 10/10 |
+| 1 GiB upload CPU/GiB | 0.8172 s | 0.8183 s | +0.1% paired median, 3/6 |
+| 1 GiB download CPU/GiB (10 reps) | 0.4750 s | 0.4827 s | +0.4% paired median, 5/10 |
+| Idle relay CPU / 5 s, 120 directions | 5.354 ms | 0.701 ms | **-86.9%**, 10/10 |
 | Idle relay polls/s | 586.2 | 24.0 | **-95.9%** |
-| Idle relay stop latency | 247.1 ms | 3.5 ms | **-98.6%** |
-| XUDP 300k burst CPU | 0.6195 s | 0.6154 s | -0.3% median, 3/6 |
-| XUDP IPv6 echo CPU, 20k | 0.3684 s | 0.3735 s | **+1.2%**, 2/8 |
-| XUDP IPv6 echo CPU, 100k | 1.8445 s | 1.8737 s | **+1.6%**, 0/4 |
+| Idle relay stop latency | 246.4 ms | 3.6 ms | **-98.6%** |
+| XUDP 300k burst CPU | 0.6224 s | 0.6160 s | -0.9% median, 4/6 |
+| XUDP IPv6 echo CPU, 20k | 0.3706 s | 0.3748 s | +0.6% median, 3/8 |
+| XUDP IPv6 echo CPU, 100k | 1.8445 s | 1.8654 s | +0.3% median, 2/4 |
 
-The combined binary preserves the relay win and the small TLS upload gain.
-Download is neutral within noise. The XUDP IPv6 echo result is the one
-inconsistency. Longer 100k-packet samples confirm a repeatable +1.6% on the
-combined binary, so this is not merely short-sample jitter. Isolation runs on
-the same harness (4 samples each) gave:
-
-| Build | IPv6 echo CPU delta vs stock | Wins |
-|---|---:|---:|
-| XUDP only | -0.8% | 2/4 |
-| Relay only | +0.2% | 1/4 |
-| TLS only | +1.1% | 1/4 |
-| All three | +1.6% | 0/4 |
-
-The combined build does not reproduce the XUDP-only gain. The most likely
-explanation is code layout plus a small-record TLS interaction; the exact
-IPv6 sizing test still proves the reserve no longer grows, but a combined-build
-IPv6 CPU gain is **not** claimed. Re-measure the final deployment binary before
-attributing a production CPU win to it. No correctness or stability regression
-was observed: full TUN and 5,000-request churn pass, and the XUDP burst path is
-neutral.
+The combined binary preserves the relay win. Upload, download, and XUDP CPU are
+neutral within noise in this build; the individual XUDP-only IPv6 gain is not
+reproduced when all three patches are linked together. The exact IPv6 sizing
+test still proves the reserve no longer grows, but a combined-build IPv6 CPU
+gain is **not** claimed. The same applies to the TLS upload gain: it was
+consistent in the isolated TLS runs, but the six-sample combined run is neutral.
+No correctness or stability regression was observed: full TUN, 5,000-request
+churn, and the XUDP burst path all pass.
 
 ## Merge order and open items
 
