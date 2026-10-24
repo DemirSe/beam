@@ -803,9 +803,26 @@ impl MuxState {
             idle
         };
 
-        for active in idle {
+        let mut idle = idle.into_iter();
+        while let Some(active) = idle.next() {
             tracing::debug!(session_id = active.session.id, "XUDP session expired");
-            self.close_active(active, CloseReason::Idle).await?;
+            if let Err(error) = self.close_active(active, CloseReason::Idle).await {
+                // The table no longer owns these sessions, so an early return
+                // would detach their reply tasks and leak the sockets and
+                // global permits. Stop and abort every remaining task before
+                // propagating the first close error.
+                tracing::debug!(
+                    %error,
+                    "XUDP idle-session close failed; stopping remaining sessions"
+                );
+                for remaining in idle {
+                    remaining.session.stop();
+                    if let Some(task) = remaining.reply_task {
+                        task.abort();
+                    }
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -855,18 +872,22 @@ fn lock_table(table: &Mutex<SessionTable>) -> MutexGuard<'_, SessionTable> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MuxError, handle_mux_stream};
+    use super::{MuxError, MuxState, handle_mux_stream};
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{
         Frame, FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_PAYLOAD_LEN, SessionStatus,
         TargetNetwork, XudpError, encode_frame, parse_frame,
     };
-    use crate::xudp::session::{XudpConfig, XudpConfigError, XudpSessionLimiter};
+    use crate::xudp::session::{
+        ActiveSession, Session, SessionTable, SocketFamily, XudpConfig, XudpConfigError,
+        XudpSessionLimiter, spawn_reply_task,
+    };
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
     use tokio::time::{sleep, timeout};
 
@@ -892,6 +913,42 @@ mod tests {
         let (client, server) = tokio::io::duplex(256 * 1024);
         let task = tokio::spawn(handle_mux_stream(server, config, limiter));
         (client, task)
+    }
+
+    async fn insert_test_session(state: &MuxState, id: u16) {
+        let socket = Arc::new(
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("test session socket must bind"),
+        );
+        let permit = state
+            .limiter
+            .try_acquire()
+            .expect("test session permit must be available");
+        let session = Arc::new(Session::new(
+            id,
+            None,
+            socket,
+            SocketFamily::V4,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Some(permit),
+        ));
+        let reply_task = spawn_reply_task(
+            Arc::clone(&session),
+            state.outbound.clone(),
+            Arc::clone(&state.table),
+            Arc::clone(&state.config),
+            state.limiter.clone(),
+        );
+        let replaced = state
+            .table
+            .lock()
+            .expect("test session table")
+            .insert(ActiveSession {
+                session,
+                reply_task: Some(reply_task),
+            });
+        assert!(replaced.is_none(), "test session id must be unique");
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1599,6 +1656,112 @@ mod tests {
             result,
             Err(MuxError::TruncatedFrame { buffered: 4 })
         ));
+    }
+
+    #[tokio::test]
+    async fn sweep_stops_remaining_sessions_when_writer_is_closed() {
+        let config = Arc::new(XudpConfig {
+            max_sessions: 2,
+            session_idle_timeout: Duration::from_millis(30),
+            close_expiry: Duration::from_secs(1),
+            max_queued_replies: 4,
+            io_timeout: Duration::from_millis(200),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::new(2);
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let (outbound, inbound) = mpsc::channel(4);
+        drop(inbound);
+        let state = MuxState {
+            config: Arc::clone(&config),
+            table: Arc::clone(&table),
+            outbound: outbound.clone(),
+            limiter: limiter.clone(),
+        };
+
+        insert_test_session(&state, 21).await;
+        insert_test_session(&state, 22).await;
+        sleep(Duration::from_millis(60)).await;
+
+        let result = state.sweep().await;
+        assert!(
+            matches!(result, Err(MuxError::WriterClosed)),
+            "sweep must report the closed writer: {result:?}"
+        );
+        assert_eq!(
+            table.lock().expect("test session table").total(),
+            0,
+            "sweep must remove every expired session"
+        );
+
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                let Some(first) = limiter.try_acquire() else {
+                    sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                if let Some(second) = limiter.try_acquire() {
+                    drop((first, second));
+                    break;
+                }
+                drop(first);
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sweep leaked a global session permit");
+    }
+
+    #[tokio::test]
+    async fn sweep_queues_one_end_for_every_idle_session() {
+        let config = Arc::new(XudpConfig {
+            max_sessions: 2,
+            session_idle_timeout: Duration::from_millis(30),
+            close_expiry: Duration::from_secs(1),
+            max_queued_replies: 4,
+            io_timeout: Duration::from_millis(200),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::new(2);
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let (outbound, mut inbound) = mpsc::channel(8);
+        let state = MuxState {
+            config: Arc::clone(&config),
+            table: Arc::clone(&table),
+            outbound: outbound.clone(),
+            limiter: limiter.clone(),
+        };
+
+        insert_test_session(&state, 31).await;
+        insert_test_session(&state, 32).await;
+        sleep(Duration::from_millis(60)).await;
+
+        state.sweep().await.expect("healthy sweep must succeed");
+
+        let mut ended = Vec::new();
+        for _ in 0..2 {
+            let queued = timeout(TEST_TIMEOUT, inbound.recv())
+                .await
+                .expect("sweep did not queue both End frames")
+                .expect("sweep closed the outbound queue");
+            let (frame, used) = parse_frame(&queued.bytes)
+                .expect("sweep queued a malformed frame")
+                .expect("sweep queued an incomplete frame");
+            assert_eq!(used, queued.bytes.len());
+            assert_eq!(frame.status, SessionStatus::End);
+            ended.push(frame.session_id);
+        }
+        ended.sort_unstable();
+        assert_eq!(ended, [31, 32]);
+        assert!(
+            inbound.try_recv().is_err(),
+            "sweep must queue exactly one End per expired session"
+        );
+        assert_eq!(
+            table.lock().expect("test session table").total(),
+            0,
+            "healthy sweep must remove every expired session"
+        );
     }
 
     #[tokio::test]
