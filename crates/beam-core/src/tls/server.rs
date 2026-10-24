@@ -1538,9 +1538,10 @@ fn join_error(error: tokio::task::JoinError) -> TlsServerError {
 ///
 /// A `spawn_blocking` join handle cannot be aborted after the task starts, and
 /// dropping it detaches the task. The guard therefore publishes a cooperative
-/// stop flag before the handle is lost; the blocking relay checks it at least
-/// every 250 ms. A successful branch disarms the guard so the other direction
-/// can continue normally.
+/// stop flag before the handle is lost; the shared eventfd wakes a blocked
+/// relay immediately, with the older 250 ms check as a fallback when the
+/// descriptor cannot be created. A successful branch disarms the guard so the
+/// other direction can continue normally.
 struct RelayStopGuard<'a> {
     activity: &'a RelayActivity,
     armed: bool,
