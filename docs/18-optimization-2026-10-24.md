@@ -179,6 +179,9 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 - New regressions: non-TLS cover fallback, `close_notify`, bare-FIN
   half-close, split-record Direct/End tails, 2,000 tiny Vision blocks, XUDP
   stop-before-first-poll permit release, and empty/unknown VLESS flows.
+- A local TLS 1.2-only origin (which takes the End path, not Direct) completed
+  eight concurrent 4 MiB downloads through the stock SOCKS client without a
+  TLS error. This specifically exercises the End carry flush.
 - No-TUN capacity: beam **913.7 MB/s** vs stock **651.8 MB/s** = **1.402x**
   (previous beam run 890.5 MB/s; same harness, noisy host).
 - Churn: 3,000 requests at concurrency 32 in **15 s**, 5,000 at 64 in **26 s**,

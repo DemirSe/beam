@@ -219,6 +219,11 @@ def main() -> int:
     )
     parser.add_argument("--cert", required=True, type=Path)
     parser.add_argument("--key", required=True, type=Path)
+    parser.add_argument(
+        "--tls-max-12",
+        action="store_true",
+        help="force the HTTPS origin to TLS 1.2 for fallback-path tests",
+    )
     args = parser.parse_args()
 
     global QUIET
@@ -253,6 +258,8 @@ def main() -> int:
     tls = _Server((tls_host, tls_port), Handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
+    if args.tls_max_12:
+        context.maximum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certfile=str(args.cert), keyfile=str(args.key))
     tls.socket = context.wrap_socket(tls.socket, server_side=True)
     servers.append(tls)
