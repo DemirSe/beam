@@ -103,7 +103,10 @@ pub trait RawTlsHandoff: AsyncRead + AsyncWrite + Unpin {
     fn switch_write_to_raw(&mut self);
 
     /// Take any already-decrypted plaintext not yet delivered to the caller.
-    fn take_plaintext(&mut self) -> Vec<u8>;
+    ///
+    /// Implementations must first drain any plaintext still buffered inside
+    /// the TLS stack; otherwise a Direct handoff can bypass those bytes.
+    fn take_plaintext(&mut self) -> Result<Vec<u8>, TlsStreamError>;
 
     /// Duplicates the underlying socket for a one-way splice.
     fn try_clone_socket(&self) -> io::Result<TcpStream> {
@@ -196,13 +199,18 @@ impl TlsStream {
     }
 
     /// Takes buffered decrypted plaintext, preserving order.
-    pub fn take_plaintext(&mut self) -> Vec<u8> {
+    ///
+    /// `drain_plaintext` first moves any bytes still held inside rustls into
+    /// the local buffer. A Direct handoff must not leave plaintext behind:
+    /// after `switch_read_to_raw` the relay reads the socket directly.
+    pub fn take_plaintext(&mut self) -> Result<Vec<u8>, TlsStreamError> {
+        self.drain_plaintext()?;
         if self.plaintext_offset == 0 {
-            return std::mem::take(&mut self.plaintext);
+            return Ok(std::mem::take(&mut self.plaintext));
         }
         self.plaintext.drain(..self.plaintext_offset);
         self.plaintext_offset = 0;
-        std::mem::take(&mut self.plaintext)
+        Ok(std::mem::take(&mut self.plaintext))
     }
 
     /// Consumes the stream and returns the raw socket plus ordered prefixes.
@@ -214,6 +222,9 @@ impl TlsStream {
             return Err(TlsStreamError::PartialRecord);
         }
 
+        // Move any plaintext still buffered inside rustls before returning
+        // the raw socket. `into_raw` otherwise silently drops it.
+        self.drain_plaintext()?;
         if self.outgoing_offset > 0 {
             self.outgoing.drain(..self.outgoing_offset);
             self.outgoing_offset = 0;
@@ -635,7 +646,7 @@ impl RawTlsHandoff for TlsStream {
         TlsStream::switch_write_to_raw(self);
     }
 
-    fn take_plaintext(&mut self) -> Vec<u8> {
+    fn take_plaintext(&mut self) -> Result<Vec<u8>, TlsStreamError> {
         TlsStream::take_plaintext(self)
     }
 
@@ -768,6 +779,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::sync::oneshot;
     use tokio::time::timeout;
 
     async fn read_record<R>(reader: &mut RecordRead, socket: &mut R) -> io::Result<Option<Vec<u8>>>
@@ -1020,6 +1032,89 @@ mod tests {
             .await
             .expect("read response");
         assert_eq!(&response, b"pong");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn raw_handoff_keeps_plaintext_still_buffered_in_rustls() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_config = test_server_config();
+        let payload: Vec<u8> = (0..12_000).map(|value| (value % 251) as u8).collect();
+        let expected_tail = payload[4096..].to_vec();
+        let (tail_tx, tail_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let conn = ServerConnection::new(server_config).expect("server connection");
+            let mut tls = TlsStream::accept(socket, conn, Vec::new())
+                .await
+                .expect("server handshake");
+            let mut first = vec![0u8; 4096];
+            tls.read_exact(&mut first).await.expect("read prefix");
+            tls.switch_read_to_raw();
+            let tail = tls.take_plaintext().expect("drain buffered plaintext");
+            tail_tx.send(tail).expect("send tail");
+        });
+
+        let socket = TcpStream::connect(address).await.expect("client connect");
+        let connector = tokio_rustls::TlsConnector::from(test_client_config());
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut client = connector
+            .connect(name, socket)
+            .await
+            .expect("client handshake");
+        client.write_all(&payload).await.expect("write payload");
+        client.flush().await.expect("flush payload");
+        let tail = timeout(Duration::from_secs(2), tail_rx)
+            .await
+            .expect("plaintext tail timed out")
+            .expect("tail task");
+        assert_eq!(tail, expected_tail);
+        drop(client);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn into_raw_keeps_plaintext_still_buffered_in_rustls() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_config = test_server_config();
+        let payload: Vec<u8> = (0..12_000).map(|value| (value % 251) as u8).collect();
+        let expected_tail = payload[4096..].to_vec();
+        let (tail_tx, tail_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let conn = ServerConnection::new(server_config).expect("server connection");
+            let mut tls = TlsStream::accept(socket, conn, Vec::new())
+                .await
+                .expect("server handshake");
+            let mut first = vec![0u8; 4096];
+            tls.read_exact(&mut first).await.expect("read prefix");
+            tls.switch_read_to_raw();
+            tls.switch_write_to_raw();
+            let raw = tls.into_raw().expect("raw handoff");
+            tail_tx.send(raw.inbound).expect("send inbound");
+        });
+
+        let socket = TcpStream::connect(address).await.expect("client connect");
+        let connector = tokio_rustls::TlsConnector::from(test_client_config());
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut client = connector
+            .connect(name, socket)
+            .await
+            .expect("client handshake");
+        client.write_all(&payload).await.expect("write payload");
+        client.flush().await.expect("flush payload");
+        let inbound = timeout(Duration::from_secs(2), tail_rx)
+            .await
+            .expect("raw inbound timed out")
+            .expect("inbound task");
+        assert_eq!(inbound, expected_tail);
+        drop(client);
         server.await.expect("server task");
     }
 

@@ -530,17 +530,27 @@ where
                     }
                     if command == Command::Direct {
                         this.inner.switch_read_to_raw();
-                        this.direct_plaintext = this.inner.take_plaintext();
+                        this.direct_plaintext = this.inner.take_plaintext()?;
                         this.direct_plaintext_offset = 0;
                         this.publish_direct();
                         tracing::debug!(content = content_len, "Vision reader switched to Direct");
+                    }
+                    // End and Direct stop framing. Buffered block content must
+                    // be delivered before passthrough bytes and before the raw
+                    // read handoff is published, so stop coalescing even when
+                    // the closing block itself is empty.
+                    if !this.reader.is_framed() {
+                        coalescing = false;
                     }
                     if content_len > 0 {
                         if direct_content {
                             return Poll::Ready(Ok(()));
                         }
                         if this.read_out.len() >= MAX_READ_OUT {
-                            return Poll::Ready(Ok(()));
+                            // Drain the batch through the normal output path;
+                            // an empty success would be read as EOF.
+                            coalescing = false;
+                            continue;
                         }
                         // Keep parsing complete blocks while framing is still
                         // active; if Direct/End switched the mode, return the
@@ -551,8 +561,11 @@ where
 
                     empty_blocks += 1;
                     if empty_blocks >= MAX_EMPTY_BLOCKS_PER_POLL {
-                        if !this.read_out.is_empty() {
-                            return Poll::Ready(Ok(()));
+                        if !this.read_out.is_empty() || !this.reader.is_framed() {
+                            // Drain buffered output before yielding; an empty
+                            // success would be read as EOF.
+                            coalescing = false;
+                            continue;
                         }
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
@@ -862,8 +875,8 @@ mod tests {
 
         fn switch_write_to_raw(&mut self) {}
 
-        fn take_plaintext(&mut self) -> Vec<u8> {
-            Vec::new()
+        fn take_plaintext(&mut self) -> Result<Vec<u8>, TlsStreamError> {
+            Ok(Vec::new())
         }
 
         fn into_raw(self) -> Result<RawTls, TlsStreamError> {
@@ -1155,6 +1168,133 @@ mod tests {
         assert!(vision.read_is_raw());
         assert!(!vision.write_is_raw());
         assert!(*handoff.borrow());
+    }
+
+    #[tokio::test]
+    async fn empty_end_flushes_coalesced_content_before_passthrough() {
+        // One poll sees Continue("a"), empty End, then passthrough "b".
+        // "a" must come out first even though End stops framing.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block_bytes(Some(USER_ID), Command::Continue, b"a", 0));
+        raw.extend_from_slice(&block_bytes(None, Command::End, b"", 0));
+        raw.extend_from_slice(b"b");
+
+        let (mut peer, client) = duplex(64 * 1024);
+        peer.shutdown().await.expect("shutdown End writer");
+        let mut vision = VisionStream::new(client, USER_ID, raw, rng(18));
+        let mut output = Vec::new();
+        vision
+            .read_to_end(&mut output)
+            .await
+            .expect("read End stream");
+        assert_eq!(output, b"ab");
+    }
+
+    #[tokio::test]
+    async fn empty_end_returns_coalesced_content_without_more_input() {
+        // End ends framing, but the coalesced batch must not wait for the
+        // socket or be mistaken for EOF.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block_bytes(Some(USER_ID), Command::Continue, b"a", 0));
+        raw.extend_from_slice(&block_bytes(None, Command::End, b"", 0));
+
+        let (_peer, client) = duplex(64 * 1024);
+        let mut vision = VisionStream::new(client, USER_ID, raw, rng(19));
+        let mut buffer = [0u8; 8];
+        let count = timeout(Duration::from_secs(1), vision.read(&mut buffer))
+            .await
+            .expect("coalesced content was withheld")
+            .expect("read coalesced content");
+        assert_eq!(&buffer[..count], b"a");
+    }
+
+    #[tokio::test]
+    async fn empty_direct_flushes_coalesced_content_before_handoff() {
+        // Direct ends framing. The raw handoff must not be published and the
+        // socket must not be polled while block content is still buffered.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block_bytes(Some(USER_ID), Command::Continue, b"a", 0));
+        raw.extend_from_slice(&block_bytes(None, Command::Direct, b"", 0));
+
+        let (mut peer, client) = duplex(64 * 1024);
+        let mut vision = VisionStream::new(client, USER_ID, raw, rng(20));
+        let handoff = vision.read_handoff_watch();
+        let mut buffer = [0u8; 8];
+        let count = timeout(Duration::from_secs(1), vision.read(&mut buffer))
+            .await
+            .expect("coalesced content was withheld")
+            .expect("read coalesced content");
+        assert_eq!(&buffer[..count], b"a");
+        assert!(
+            !*handoff.borrow(),
+            "raw handoff published before buffered content was delivered"
+        );
+
+        peer.write_all(b"b").await.expect("write raw byte");
+        let count = timeout(Duration::from_secs(1), vision.read(&mut buffer))
+            .await
+            .expect("raw read timed out")
+            .expect("read raw byte");
+        assert_eq!(&buffer[..count], b"b");
+        assert!(*handoff.borrow(), "raw handoff was not published");
+    }
+
+    #[tokio::test]
+    async fn empty_direct_keeps_order_with_trailing_bytes() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block_bytes(Some(USER_ID), Command::Continue, b"a", 0));
+        raw.extend_from_slice(&block_bytes(None, Command::Direct, b"", 0));
+        raw.extend_from_slice(b"b");
+
+        let (mut peer, client) = duplex(64 * 1024);
+        peer.shutdown().await.expect("shutdown raw writer");
+        let mut vision = VisionStream::new(client, USER_ID, raw, rng(21));
+        let mut output = Vec::new();
+        vision
+            .read_to_end(&mut output)
+            .await
+            .expect("read Direct stream");
+        assert_eq!(output, b"ab");
+    }
+
+    #[tokio::test]
+    async fn empty_block_limit_returns_coalesced_content() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block_bytes(Some(USER_ID), Command::Continue, b"a", 0));
+        for _ in 0..MAX_EMPTY_BLOCKS_PER_POLL {
+            raw.extend_from_slice(&block_bytes(None, Command::Continue, b"", 0));
+        }
+
+        let (_peer, client) = duplex(64 * 1024);
+        let mut vision = VisionStream::new(client, USER_ID, raw, rng(22));
+        let mut buffer = [0u8; 8];
+        let count = timeout(Duration::from_secs(1), vision.read(&mut buffer))
+            .await
+            .expect("empty-block limit withheld buffered content")
+            .expect("read buffered content");
+        assert_eq!(&buffer[..count], b"a");
+    }
+
+    #[tokio::test]
+    async fn read_out_limit_returns_coalesced_content() {
+        let content = vec![0x5a_u8; 4_000];
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block_bytes(Some(USER_ID), Command::Continue, &content, 0));
+        for _ in 0..(MAX_READ_OUT / content.len()) {
+            raw.extend_from_slice(&block_bytes(None, Command::Continue, &content, 0));
+        }
+        let expected = content.len() * (1 + MAX_READ_OUT / content.len());
+        assert!(expected > MAX_READ_OUT);
+
+        let (_peer, client) = duplex(256 * 1024);
+        let mut vision = VisionStream::new(client, USER_ID, raw, rng(23));
+        let mut buffer = vec![0u8; expected];
+        let count = timeout(Duration::from_secs(1), vision.read(&mut buffer))
+            .await
+            .expect("read_out limit withheld buffered content")
+            .expect("read buffered content");
+        assert_eq!(count, expected);
+        assert!(buffer[..count].iter().all(|byte| *byte == 0x5a));
     }
 
     #[tokio::test]
