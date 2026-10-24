@@ -38,31 +38,41 @@ impl EventFd {
     pub fn notify(&self) -> io::Result<()> {
         let value = 1_u64;
         let length = std::mem::size_of::<u64>();
-        // SAFETY: `value` is a live `u64` and `length` is exactly its size.
-        // `write` reads at most that many bytes and does not retain the
-        // pointer. The descriptor is owned by `self` and remains open for the
-        // duration of the call.
-        let written = unsafe {
-            libc::write(
-                self.fd.as_raw_fd(),
-                (&raw const value).cast::<libc::c_void>(),
-                length,
-            )
-        };
-        if written == length as isize {
-            return Ok(());
-        }
-        if written < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::WouldBlock {
+        loop {
+            // SAFETY: `value` is a live `u64` and `length` is exactly its size.
+            // `write` reads at most that many bytes and does not retain the
+            // pointer. The descriptor is owned by `self` and remains open for
+            // the duration of the call.
+            let written = unsafe {
+                libc::write(
+                    self.fd.as_raw_fd(),
+                    (&raw const value).cast::<libc::c_void>(),
+                    length,
+                )
+            };
+            if written == length as isize {
                 return Ok(());
             }
-            return Err(error);
+            if written < 0 {
+                let error = io::Error::last_os_error();
+                // A signal may interrupt the write before the counter is
+                // incremented. Retrying is nonblocking and keeps a stop from
+                // falling back to the full idle timeout.
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // Counter overflow means the descriptor is already readable,
+                // so the wakeup goal is satisfied.
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "eventfd write wrote a partial value",
+            ));
         }
-        Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "eventfd write wrote a partial value",
-        ))
     }
 }
 
