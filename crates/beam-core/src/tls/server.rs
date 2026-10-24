@@ -219,6 +219,10 @@ pub enum TlsServerError {
     #[error("VLESS UDP error: {0}")]
     Udp(#[from] UdpError),
 
+    /// The process-wide legacy UDP stream limit is already in use.
+    #[error("legacy VLESS UDP stream limit reached")]
+    LegacyUdpLimited,
+
     /// A Vision request asked for legacy UDP.
     #[error("VLESS UDP with the Vision flow is not supported; clients must use XUDP")]
     VisionUdpUnsupported,
@@ -271,6 +275,8 @@ pub struct TlsServerConfig {
     /// forwarding. Keep a reserve for cover relays and DNS, and fall back to
     /// the async copy path when this cap is reached.
     splice_permits: Arc<Semaphore>,
+    /// Global cap on legacy VLESS UDP / packetaddr streams.
+    legacy_udp_permits: Arc<Semaphore>,
     /// Global cap on unauthenticated cover relays.
     cover_permits: Arc<Semaphore>,
     /// Bounded exact-replay filter for authenticated ClientHellos.
@@ -330,6 +336,7 @@ impl TlsServerConfig {
             certificate: TemporaryCertificate::generate()?,
             connection_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             splice_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+            legacy_udp_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             cover_permits: Arc::new(Semaphore::new(COVER_MAX_CONCURRENCY)),
             replay_cache: Mutex::new(ReplayCache::new(REPLAY_CACHE_TTL)),
         })
@@ -358,6 +365,13 @@ impl TlsServerConfig {
     #[must_use]
     pub fn with_splice_limiter(mut self, permits: Arc<Semaphore>) -> Self {
         self.splice_permits = permits;
+        self
+    }
+
+    /// Overrides the process-wide legacy UDP stream limit.
+    #[must_use]
+    pub fn with_legacy_udp_limiter(mut self, permits: Arc<Semaphore>) -> Self {
+        self.legacy_udp_permits = permits;
         self
     }
 
@@ -477,6 +491,10 @@ impl fmt::Debug for TlsServerConfig {
             .field("udp", &self.udp)
             .field("cover_max_concurrency", &COVER_MAX_CONCURRENCY)
             .field("splice_available", &self.splice_permits.available_permits())
+            .field(
+                "legacy_udp_available",
+                &self.legacy_udp_permits.available_permits(),
+            )
             .finish()
     }
 }
@@ -862,6 +880,12 @@ async fn handle_authenticated(
             if request.vision {
                 return Err(TlsServerError::VisionUdpUnsupported);
             }
+            // Legacy UDP/packetaddr binds one or two sockets per VLESS stream
+            // and is outside the XUDP session limiter. Bound it separately so
+            // compatibility mode cannot consume the whole memory budget.
+            let _legacy_permit = Arc::clone(&config.legacy_udp_permits)
+                .try_acquire_owned()
+                .map_err(|_| TlsServerError::LegacyUdpLimited)?;
             let destination = request
                 .destination
                 .ok_or(TlsServerError::MissingDestination)?;

@@ -79,11 +79,15 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     // path instead of queueing forever in `spawn_blocking`.
     let max_splice_tasks = max_blocking_threads.saturating_sub(40).max(1);
     let splice_permits = Arc::new(Semaphore::new(max_splice_tasks));
+    // Legacy/packetaddr UDP is compatibility-only; keep its socket count well
+    // below the XUDP cap because packetaddr binds two sockets per stream.
+    let legacy_udp_permits = Arc::new(Semaphore::new(64));
 
     let tls_config = Arc::new(
         build_tls_config(&config)?
             .with_connection_limiter(Arc::clone(&authenticated))
-            .with_splice_limiter(splice_permits),
+            .with_splice_limiter(splice_permits)
+            .with_legacy_udp_limiter(legacy_udp_permits),
     );
     let listener = TcpListener::bind(config.server.listen)
         .await
