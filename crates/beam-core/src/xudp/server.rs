@@ -791,6 +791,9 @@ impl MuxState {
     }
 
     /// Expires idle sessions and retained sockets.
+    ///
+    /// This runs once per sweep interval, not on the per-packet path.
+    #[cold]
     async fn sweep(&self) -> Result<(), MuxError> {
         let now = Instant::now();
         let idle = {
@@ -815,12 +818,7 @@ impl MuxState {
                     %error,
                     "XUDP idle-session close failed; stopping remaining sessions"
                 );
-                for remaining in idle {
-                    remaining.session.stop();
-                    if let Some(task) = remaining.reply_task {
-                        task.abort();
-                    }
-                }
+                abort_sessions(idle);
                 return Err(error);
             }
         }
@@ -860,6 +858,21 @@ fn drain_retained_socket(socket: &UdpSocket) -> bool {
         socket.try_recv_from(&mut buffer),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock
     )
+}
+
+/// Stops reply tasks that were removed from the table but not closed.
+///
+/// This is only reached after a sweep close fails. Keeping it out of the hot
+/// sweep path also keeps the normal expiry loop compact.
+#[cold]
+#[inline(never)]
+fn abort_sessions(remaining: impl Iterator<Item = ActiveSession>) {
+    for remaining in remaining {
+        remaining.session.stop();
+        if let Some(task) = remaining.reply_task {
+            task.abort();
+        }
+    }
 }
 
 /// Locks the session table, recovering from a poisoned mutex.
