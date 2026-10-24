@@ -8,11 +8,13 @@
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
+pub mod eventfd;
 pub mod fd;
 pub mod poll;
 pub mod socket;
 pub mod splice;
 
+pub use eventfd::EventFd;
 pub use fd::{set_cloexec, set_nonblocking};
 pub use poll::{PollEvents, PollFd, poll};
 pub use socket::{set_reuse_addr, set_tcp_keepalive, set_tcp_nodelay, set_udp_recv_buffer};

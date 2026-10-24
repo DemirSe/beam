@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use beam_sys::{PollEvents, PollFd, SpliceFlags, pipe, poll, splice};
+use beam_sys::{EventFd, PollEvents, PollFd, SpliceFlags, pipe, poll, splice};
 
 /// Avoid one warning per relay if the kernel refuses the pipe-size request.
 static PIPE_SIZE_WARNED: AtomicBool = AtomicBool::new(false);
@@ -61,9 +61,10 @@ const BATCH_RESET: Duration = Duration::from_millis(100);
 const BATCH_RATE_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 const BATCH_RATE_WINDOW_TIME: Duration = Duration::from_millis(50);
 
-/// Maximum time a blocking one-way relay sleeps in `poll` while a shared
-/// activity clock is present. This bounds cancellation latency when the other
-/// direction fails and no data arrives on this one.
+/// Fallback cancellation poll interval when an eventfd cannot be created.
+///
+/// The normal path wakes immediately through the shared [`EventFd`]; this
+/// bound only keeps cancellation working if descriptor creation failed.
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Relay tuning and limits.
@@ -306,6 +307,12 @@ pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Resul
 pub struct RelayActivity {
     last: Mutex<Instant>,
     stopped: AtomicBool,
+    /// Wakes every direction blocked in `poll` when [`Self::stop`] runs.
+    ///
+    /// Eventfd creation is best-effort: if the process is out of descriptors,
+    /// the relay keeps the older bounded-poll fallback instead of failing the
+    /// connection.
+    stop_fd: Option<EventFd>,
 }
 
 impl RelayActivity {
@@ -315,6 +322,7 @@ impl RelayActivity {
         Self {
             last: Mutex::new(Instant::now()),
             stopped: AtomicBool::new(false),
+            stop_fd: EventFd::new().ok(),
         }
     }
 
@@ -331,15 +339,25 @@ impl RelayActivity {
         self.last.lock().ok().map(|last| last.elapsed())
     }
 
-    /// Asks every relay sharing this clock to stop.
+    /// Asks every relay sharing this clock to stop and wakes blocked pollers.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+        if let Some(stop_fd) = &self.stop_fd
+            && let Err(error) = stop_fd.notify()
+        {
+            tracing::debug!(%error, "could not wake a stopped relay");
+        }
     }
 
     /// Returns `true` after [`Self::stop`].
     #[must_use]
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Returns the wakeup descriptor used in `poll`, when one is available.
+    fn stop_fd(&self) -> Option<RawFd> {
+        self.stop_fd.as_ref().map(AsRawFd::as_raw_fd)
     }
 }
 
@@ -410,6 +428,7 @@ fn run_one_way(
     let mut committed = 0_u64;
     let mut last_activity = Instant::now();
     let mut shutdown_started: Option<Instant> = None;
+    let stop_fd = activity_clock.and_then(RelayActivity::stop_fd);
 
     loop {
         if activity_clock.is_some_and(RelayActivity::is_stopped) {
@@ -479,11 +498,14 @@ fn run_one_way(
             poll_source(direction),
             poll_pipe_write(direction),
             poll_sink(direction),
+            stop_fd.map_or(PollFd::ignored(), |fd| PollFd::new(fd, PollEvents::READ)),
         ];
         stats.polls = stats.polls.saturating_add(1);
         let poll_timeout =
             inactivity_limit(config, shutdown_started.is_some()).saturating_sub(idle_elapsed);
-        let poll_timeout = if activity_clock.is_some() {
+        // An eventfd wakes both directions immediately. Only the fallback
+        // path, used when descriptor creation failed, needs a periodic poll.
+        let poll_timeout = if activity_clock.is_some() && stop_fd.is_none() {
             poll_timeout.min(STOP_POLL_INTERVAL)
         } else {
             poll_timeout
@@ -997,6 +1019,55 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("stopped relay did not wake");
         assert!(result.is_ok(), "stopped relay failed: {result:?}");
+    }
+
+    #[test]
+    fn a_stopped_relay_does_not_poll_periodically() {
+        let (_client, relay_a, relay_b, _target) = relay_pair();
+        let activity = Arc::new(super::RelayActivity::new());
+        assert!(
+            activity.stop_fd().is_some(),
+            "the test requires eventfd support"
+        );
+        let relay_activity = Arc::clone(&activity);
+        let config = RelayConfig {
+            idle_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(30),
+            ..config()
+        };
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| {
+                beam_sys::set_nonblocking(relay_a.as_raw_fd())?;
+                beam_sys::set_nonblocking(relay_b.as_raw_fd())?;
+                copy_one_way(
+                    relay_a.as_raw_fd(),
+                    relay_b.as_raw_fd(),
+                    &config,
+                    Some(&relay_activity),
+                )
+            })();
+            let _ = sender.send(result);
+        });
+
+        // The old fallback polled every 250 ms purely to observe cancellation.
+        thread::sleep(Duration::from_millis(600));
+        let started = Instant::now();
+        activity.stop();
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stopped relay did not wake");
+        let stats = result.expect("stopped relay failed");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "cancellation took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            stats.polls <= 2,
+            "an idle eventfd relay polled {} times",
+            stats.polls
+        );
     }
 
     #[test]
