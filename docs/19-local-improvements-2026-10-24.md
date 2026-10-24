@@ -307,17 +307,45 @@ consistent in the isolated TLS runs, but the six-sample combined run is neutral.
 No correctness or stability regression was observed: full TUN, 5,000-request
 churn, and the XUDP burst path all pass.
 
+## Deployment
+
+Deployed on 2026-10-24 14:51 UTC with `BEAM_KEEP_CONFIG=1`:
+
+- Live binary:
+  `9d417394a46a27a83168fa146ca358ae1cba01d154d73fb153cfd0adfd0c3b9b`
+- Live config SHA-256 unchanged:
+  `c0abace24e0f839a3ae3c1300d3f79b94ccfee437df5e7a4d8ec67b1b2722a02`
+- Backups created by `bootstrap.sh` with stamp `20261024T145131Z`
+  (`/usr/local/bin/beam.bak-20261024T145131Z` is the previous
+  `d017c131…` binary).
+- Service active, `NRestarts=0`, listener `0.0.0.0:443`, config check passed,
+  no journal warnings.
+- RSS after the live checks: 6.8 MiB; tasks 48; UDP errors 0;
+  `TcpExtListenDrops` did not move from 103.
+
+Post-deploy live client checks on the mobile hotspot:
+
+| Check | Result |
+|---|---|
+| DNS A, 10 queries | 10/10 |
+| IPv6 HTTPS | 200 |
+| `example.com` TTFB | 0.253 s |
+| H3/QUIC | refused client-side (expected block) |
+| 32 MiB download | 200, 33,554,432 bytes, 4.91 MB/s |
+| 8 MiB upload | 200, 8,388,608 bytes, 4.32 MB/s |
+| 4 MiB random upload SHA-256 | matched, 1 s |
+| 16 MiB random download SHA-256 | matched, 6.00 MB/s |
+
+The temporary VPS hash server, HTTP server, 158.94.216.103 alias, and remote
+temporary files were removed after the checks.
+
 ## Merge order and open items
 
-All three branches are independent and based on `6616db2`; none is merged or
-pushed. `improve/combined-local-2026-10-24` contains all three and passed the
-combined test above. If merging separately, the suggested order is:
+The three changes were merged into `main` as `471bb24` (relay), `8eb846e`
+(EINTR fix), `0c52337` (TLS), and `6826172` (XUDP), then deployed as
+`9d417394…`. The original per-change branches and
+`improve/combined-local-2026-10-24` remain for reference.
 
-1. TLS record recycling (lowest risk, measured upload win).
-2. Relay eventfd (small structural change, clear idle/cancel win).
-3. XUDP reply admission (IPv6 sizing is proven; the combined CPU gain is not).
-
-A live deploy remains a separate step. The live server remains on
-`d017c131…`; no config, service, or deployment artifact was changed by this
-pass. The 24-hour soak and privileged syscall/wakeup gates from
-`docs/18-optimization-2026-10-24.md` remain pending.
+The 24-hour soak and the privileged syscall/wakeup gates from
+`docs/18-optimization-2026-10-24.md` remain pending. The live rollback binary
+is `/usr/local/bin/beam.bak-20261024T145131Z`; the config did not change.
