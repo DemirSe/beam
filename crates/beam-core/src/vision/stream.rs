@@ -700,15 +700,21 @@ where
     }
 }
 
-/// Returns the length of the complete application-data records at the start
-/// of `data`. A partial or non-TLS tail is not included.
+/// Returns the length of complete TLS records at the start of `data`.
+///
+/// This covers handshake, change-cipher-spec, alert, and application-data
+/// records so a ServerHello and the first application record are aligned
+/// independently. A partial or non-TLS tail is not included.
 fn complete_tls_records_len(data: &[u8]) -> usize {
     let mut offset = 0usize;
     while let Some(remaining) = data.get(offset..) {
         let Some(header) = remaining.get(..5) else {
             break;
         };
-        if header[0] != 0x17 || header[1] != 0x03 || header[2] != 0x03 {
+        if !matches!(header[0], 0x14..=0x17)
+            || header[1] != 0x03
+            || !matches!(header[2], 0x01 | 0x03)
+        {
             break;
         }
         let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
@@ -726,10 +732,15 @@ fn complete_tls_records_len(data: &[u8]) -> usize {
     offset
 }
 
-/// Returns `true` if `data` is a prefix of one application-data record.
+/// Returns `true` if `data` is a prefix of one TLS record.
 fn is_partial_tls_record(data: &[u8]) -> bool {
-    const PREFIX: &[u8] = &[0x17, 0x03, 0x03];
-    if data.is_empty() || !PREFIX.starts_with(&data[..data.len().min(PREFIX.len())]) {
+    if data.is_empty() || !matches!(data[0], 0x14..=0x17) {
+        return false;
+    }
+    if data.len() >= 2 && data[1] != 0x03 {
+        return false;
+    }
+    if data.len() >= 3 && !matches!(data[2], 0x01 | 0x03) {
         return false;
     }
     if data.len() < 5 {
@@ -1063,6 +1074,70 @@ mod tests {
         assert_eq!(&raw[used..], b"raw");
         assert!(vision.write_is_raw());
         assert!(!vision.read_is_raw());
+    }
+
+    #[tokio::test]
+    async fn handshake_and_partial_app_share_a_write() {
+        let (client, mut peer) = duplex(64 * 1024);
+        let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(15));
+        let hello = server_hello();
+        let app = app_data_record(b"payload");
+        let mut first = hello.clone();
+        first.extend_from_slice(&app[..5]);
+        vision
+            .write_all(&first)
+            .await
+            .expect("write handshake plus app header");
+        vision.write_all(&app[5..]).await.expect("write app body");
+        vision.shutdown().await.expect("shutdown Vision writer");
+
+        let mut raw = Vec::new();
+        peer.read_to_end(&mut raw)
+            .await
+            .expect("read raw Vision output");
+        let (first_block, first_used) = parse_block(&raw, true)
+            .expect("first block must parse")
+            .expect("first block must be complete");
+        assert_eq!(first_block.command, Command::Continue);
+        assert_eq!(first_block.content, hello);
+        let (direct, direct_used) = parse_block(&raw[first_used..], false)
+            .expect("Direct block must parse")
+            .expect("Direct block must be complete");
+        assert_eq!(direct.command, Command::Direct);
+        assert_eq!(direct.content, app);
+        assert_eq!(&raw[first_used + direct_used..], b"");
+    }
+
+    #[tokio::test]
+    async fn direct_survives_arbitrary_write_boundaries() {
+        for chunk in [1usize, 2, 3, 5, 7, 11] {
+            let (client, mut peer) = duplex(64 * 1024);
+            let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(14));
+            vision.writer.inspect(&server_hello());
+
+            let app = app_data_record(b"boundary-payload");
+            let next = app_data_record(b"next-record");
+            let mut wire = app.clone();
+            wire.extend_from_slice(&next);
+            for piece in wire.chunks(chunk) {
+                vision
+                    .write_all(piece)
+                    .await
+                    .expect("write arbitrary boundary");
+            }
+            vision.shutdown().await.expect("shutdown Vision writer");
+
+            let mut raw = Vec::new();
+            peer.read_to_end(&mut raw)
+                .await
+                .expect("read raw Vision output");
+            let (block, used) = parse_block(&raw, true)
+                .expect("Direct block must parse")
+                .expect("Direct block must be complete");
+            assert_eq!(block.command, Command::Direct, "chunk size {chunk}");
+            assert_eq!(block.content, app, "chunk size {chunk}");
+            assert_eq!(&raw[used..], &next, "chunk size {chunk}");
+        }
     }
 
     #[tokio::test]

@@ -116,9 +116,9 @@ The Direct trigger only fired when the buffer handed to `poll_write` ended on a
 complete inner TLS record. Because `read()` boundaries do not align with TLS
 records, a busy server could keep a connection framed for its entire lifetime.
 
-The writer now carries at most one partial application-data record across
-`poll_write` calls, processes the complete prefix, and still switches to Direct
-when the record completes. If Direct is planned, the carried raw tail is
+The writer now carries at most one partial TLS record (handshake or
+application data) across `poll_write` calls, processes the complete prefix,
+and still switches to Direct when the application-data record completes. If Direct is planned, the carried raw tail is
 appended after the queued Direct block. A regression splits a record inside
 the header and again inside the body and asserts the Direct block and raw tail.
 
@@ -168,7 +168,7 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: **279 tests** pass (253 core unit tests, 2 TLS
+- `cargo test --workspace`: **282 tests** pass (256 core unit tests, 2 TLS
   adapter integration tests, 1 stock ClientHello fixture, 23 other integration
   tests).
 - Full-TUN harness: **8/8 PASS** (`xudp`, MTU 1500) and a 1,333,889-byte H3
