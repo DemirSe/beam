@@ -318,11 +318,17 @@ where
     loop {
         // Consume every complete frame before waiting for more input. This
         // handles coalesced frames and a frame split across reads equally.
+        // Track a cursor and compact once: draining after every frame would
+        // repeatedly move the remaining batch, which is quadratic for small
+        // coalesced frames.
+        let mut consumed = 0;
         loop {
-            match frame::parse_frame(&buffer) {
+            match frame::parse_frame(&buffer[consumed..]) {
                 Ok(Some((parsed, used))) => {
                     state.handle_frame(&parsed).await?;
-                    buffer.drain(..used);
+                    debug_assert!(used > 0);
+                    consumed += used;
+                    debug_assert!(consumed <= buffer.len());
                     empty_since = if state.has_sessions() {
                         None
                     } else {
@@ -332,6 +338,12 @@ where
                 Ok(None) => break,
                 Err(error) => return Err(MuxError::Frame(error)),
             }
+        }
+
+        // Compact before the bounds check and the read arm below. Those paths
+        // must observe only bytes that are still part of an incomplete frame.
+        if consumed > 0 {
+            buffer.drain(..consumed);
         }
 
         if buffer.len() > MAX_BUFFERED_LEN {
@@ -1870,6 +1882,64 @@ mod tests {
             .expect("End must be acknowledged");
 
         finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn dense_frames_are_parsed_across_reads() {
+        let (mut client, task) = start_mux(test_config());
+        let mut frames = Vec::with_capacity(1365 * 6 + 6);
+        for id in 0..1365 {
+            encode_frame(&mut frames, FrameSpec::new(id, SessionStatus::KeepAlive))
+                .expect("KeepAlive must encode");
+        }
+        timeout(TEST_TIMEOUT, client.write_all(&frames))
+            .await
+            .expect("write")
+            .expect("write failed");
+
+        // A second write forces the next read to start from a fully consumed
+        // buffer instead of an incomplete tail.
+        let mut extra = Vec::new();
+        encode_frame(&mut extra, FrameSpec::new(65_535, SessionStatus::KeepAlive))
+            .expect("KeepAlive must encode");
+        timeout(TEST_TIMEOUT, client.write_all(&extra))
+            .await
+            .expect("write")
+            .expect("write failed");
+
+        drop(client);
+        let result = timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("mux handler did not finish")
+            .expect("mux handler panicked");
+        assert!(result.is_ok(), "dense frames failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn dense_frames_keep_an_incomplete_tail() {
+        let (mut client, task) = start_mux(test_config());
+        let mut frames = Vec::with_capacity(1360 * 6 + 4);
+        for id in 0..1360 {
+            encode_frame(&mut frames, FrameSpec::new(id, SessionStatus::KeepAlive))
+                .expect("KeepAlive must encode");
+        }
+        // Metadata prefix plus two bytes of the session id: a genuinely
+        // incomplete frame that must survive the single compaction.
+        frames.extend_from_slice(&[0x00, 0x04, 0x00, 0x07]);
+        timeout(TEST_TIMEOUT, client.write_all(&frames))
+            .await
+            .expect("write")
+            .expect("write failed");
+        drop(client);
+
+        let result = timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("mux handler did not finish")
+            .expect("mux handler panicked");
+        assert!(
+            matches!(result, Err(MuxError::TruncatedFrame { buffered: 4 })),
+            "dense frame tail was not preserved: {result:?}"
+        );
     }
 
     #[tokio::test]
