@@ -7,10 +7,12 @@ BIN="$HERE/beam"
 CONFIG="$HERE/beam.toml"
 UNIT="$HERE/beam.service"
 SYSCTL="$HERE/99-beam.conf"
+CONNTRACK="$HERE/99-beam-conntrack.conf"
 INSTALL_BIN=/usr/local/bin/beam
 INSTALL_CONFIG=/etc/beam/config.toml
 INSTALL_UNIT=/etc/systemd/system/beam.service
 INSTALL_SYSCTL=/etc/sysctl.d/99-beam.conf
+INSTALL_CONNTRACK=/etc/sysctl.d/99-beam-conntrack.conf
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 # Keep a live config when only the binary/unit are being updated. The bundle
@@ -61,7 +63,7 @@ if ! id beam >/dev/null 2>&1; then
 fi
 
 install -d -m 0750 -o root -g beam /etc/beam
-for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL"; do
+for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK"; do
   if [ -e "$old" ]; then
     cp -a "$old" "$old.bak-$STAMP"
   fi
@@ -88,7 +90,15 @@ install -m 0644 -o root -g root "$UNIT" "$INSTALL_UNIT.new"
 mv -f "$INSTALL_UNIT.new" "$INSTALL_UNIT"
 install -m 0644 -o root -g root "$SYSCTL" "$INSTALL_SYSCTL.new"
 mv -f "$INSTALL_SYSCTL.new" "$INSTALL_SYSCTL"
-sysctl --system >/dev/null
+if [ -f "$CONNTRACK" ]; then
+  install -m 0644 -o root -g root "$CONNTRACK" "$INSTALL_CONNTRACK.new"
+  mv -f "$INSTALL_CONNTRACK.new" "$INSTALL_CONNTRACK"
+fi
+# conntrack keys may not exist until nftables first loads the module. A
+# failure here must not abort the binary/unit rollout; the file applies at
+# the next boot as well.
+sysctl --system >/dev/null 2>&1 || \
+  echo "bootstrap: warning: some sysctl keys could not be applied yet" >&2
 
 runuser -u beam -- "$INSTALL_BIN" --check -c "$INSTALL_CONFIG"
 
