@@ -179,7 +179,9 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 - No-TUN capacity: beam **913.7 MB/s** vs stock **651.8 MB/s** = **1.402x**
   (previous beam run 890.5 MB/s; same harness, noisy host).
 - Churn: 3,000 requests at concurrency 32 in **15 s**, 5,000 at 64 in **26 s**,
-  and **10,000 at 64 in 55 s**, all HTTP 200, RSS +1.1 MiB, threads 2, fds 10.
+  **10,000 at 64 in 55 s**, and **50,000 at 128 in 274 s**; every request
+  returned HTTP 200, RSS moved 7.8 → 9.5 MiB, threads stayed at 2, and fds
+  stayed at 10.
 - Concurrent HTTPS: 120 simultaneous 16 MiB Vision Direct downloads all
   completed, 1.28 s wall time, server RSS 17.9 MiB and 115 threads at peak.
   This lands at the splice budget without a stalled handoff.
@@ -207,14 +209,14 @@ buffer. This removes one allocation and one full ciphertext copy per record.
   churn test.
 ## Deployment
 
-Deployed on 2026-10-24 01:13 UTC with `BEAM_KEEP_CONFIG=1`:
+Deployed on 2026-10-24 01:34 UTC with `BEAM_KEEP_CONFIG=1`:
 
 - Binary SHA-256:
-  `22d1ac1c957f9b503cbdc546b79b545b1829aa000b4e934974028f0032561cca`
+  `22595335646f72419fe3912a9f2677eb58b15f5bfd6d491285752436f4302f92`
 - Live config SHA-256 is unchanged:
   `c0abace24e0f839a3ae3c1300d3f79b94ccfee437df5e7a4d8ec67b1b2722a02`
   (`log.level = "warn"`, 1024 connections, 10 s handshake, 300 s TCP idle).
-- Backups were created by `bootstrap.sh` with stamp `20261024T011320Z`.
+- Backups were created by `bootstrap.sh` with stamp `20261024T013442Z`.
 - Service active, `NRestarts=0`, listener `0.0.0.0:443`, cgroup peak 2.9 MiB
   immediately after start.
 - IPv4/IPv6 egress, HTTPS, HTTP, DNS, and the local TUN MTU 1500 client pass.

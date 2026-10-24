@@ -366,7 +366,7 @@ deployed with `BEAM_KEEP_CONFIG=1`:
 
 ### 2026-10-24 optimization pass
 
-Deployed on 2026-10-24 01:13 UTC (binary `22d1ac1c…`) with the live config
+Deployed on 2026-10-24 01:34 UTC (binary `22595335…`) with the live config
 preserved. The pass fixed an XUDP reply-task stop race that could leak a socket
 and a global permit forever, capped XUDP session idleness at 60 s, drained
 retained sockets before reuse, and bounded Vision splice tasks with an async
