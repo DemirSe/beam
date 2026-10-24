@@ -748,8 +748,49 @@ async fn reply_loop(
                             );
                             continue;
                         }
+                        let Some(frame_len) = reply_frame_len(source, len) else {
+                            tracing::trace!(
+                                session_id = session.id,
+                                length = len,
+                                "XUDP reply size overflows; dropping a datagram"
+                            );
+                            continue;
+                        };
+
+                        // Reserve the queue slot and the aggregate byte budget
+                        // before allocating or encoding. A reply that cannot be
+                        // admitted is dropped without paying for its frame.
+                        let permit = match outbound.try_reserve() {
+                            Ok(permit) => permit,
+                            Err(mpsc::error::TrySendError::Full(())) => {
+                                tracing::trace!(
+                                    session_id = session.id,
+                                    "XUDP reply queue is full; dropping a datagram"
+                                );
+                                continue;
+                            }
+                            // The stream writer is gone; the main loop is
+                            // shutting the mux stream down.
+                            Err(mpsc::error::TrySendError::Closed(())) => break,
+                        };
+                        let Some(budget) = limiter.try_reserve_reply(frame_len) else {
+                            tracing::trace!(
+                                session_id = session.id,
+                                "XUDP aggregate reply budget is full; dropping a datagram"
+                            );
+                            continue;
+                        };
+
+                        let mut frame = Vec::new();
+                        if frame.try_reserve_exact(frame_len).is_err() {
+                            tracing::trace!(
+                                session_id = session.id,
+                                length = frame_len,
+                                "XUDP reply allocation failed; dropping a datagram"
+                            );
+                            continue;
+                        }
                         let source = socket_addr_to_location(source);
-                        let mut frame = Vec::with_capacity(len + 24);
                         let spec = FrameSpec {
                             session_id: session.id,
                             status: SessionStatus::Keep,
@@ -762,25 +803,7 @@ async fn reply_loop(
                         if frame::encode_frame(&mut frame, spec).is_err() {
                             continue;
                         }
-                        let Some(budget) = limiter.try_reserve_reply(frame.len()) else {
-                            tracing::trace!(
-                                session_id = session.id,
-                                "XUDP aggregate reply budget is full; dropping a datagram"
-                            );
-                            continue;
-                        };
-                        match outbound.try_send(QueuedFrame::new(frame, Some(budget))) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                tracing::trace!(
-                                    session_id = session.id,
-                                    "XUDP reply queue is full; dropping a datagram"
-                                );
-                            }
-                            // The stream writer is gone; the main loop is
-                            // shutting the mux stream down.
-                            Err(mpsc::error::TrySendError::Closed(_)) => break,
-                        }
+                        permit.send(QueuedFrame::new(frame, Some(budget)));
                     }
                     Ok(Err(error)) => {
                         tracing::debug!(
@@ -817,6 +840,29 @@ async fn reply_loop(
             .await;
         }
     }
+}
+
+/// Returns the exact encoded size of a UDP reply frame.
+///
+/// A reply always carries a `Keep + Data` frame with an IP source address, so
+/// the metadata size is fixed for a given address family. Reserving this exact
+/// size avoids a hidden growth when an IPv6 source needs 28 overhead bytes
+/// rather than the 24 that fit an IPv4 source.
+pub(crate) fn reply_frame_len(source: SocketAddr, payload_len: usize) -> Option<usize> {
+    let address_len = match source {
+        SocketAddr::V4(_) => 4,
+        SocketAddr::V6(_) => 16,
+    };
+    let overhead = frame::METADATA_PREFIX_LEN
+        + 2 // session id
+        + 1 // status
+        + 1 // option
+        + 1 // network
+        + 2 // port
+        + 1 // address type
+        + address_len
+        + 2; // payload length
+    payload_len.checked_add(overhead)
 }
 
 /// Encodes an `End` frame. An empty vector means encoding failed, which cannot
@@ -866,11 +912,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::{
         DEFAULT_MAX_GLOBAL_SESSIONS, ResolveError, Session, SessionTable, SocketFamily, XudpConfig,
-        XudpConfigError, XudpSessionLimiter, encode_end_frame, resolve_destination,
-        socket_addr_to_location,
+        XudpConfigError, XudpSessionLimiter, encode_end_frame, reply_frame_len,
+        resolve_destination, socket_addr_to_location,
     };
     use crate::address::{Address, NetLocation};
-    use crate::xudp::frame::{FrameOption, SessionStatus, parse_frame};
+    use crate::xudp::frame::{
+        FrameOption, FrameSpec, SessionStatus, TargetNetwork, encode_frame, parse_frame,
+    };
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
@@ -978,6 +1026,51 @@ mod tests {
             XudpSessionLimiter::default().max(),
             DEFAULT_MAX_GLOBAL_SESSIONS
         );
+    }
+
+    #[test]
+    fn reply_frame_len_is_exact_for_both_families() {
+        let sources = [
+            SocketAddr::from(([127, 0, 0, 1], 1234)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 1234)),
+        ];
+
+        for source in sources {
+            for payload_len in [0, 1, 64, 1200, 8192] {
+                let frame_len = reply_frame_len(source, payload_len)
+                    .expect("a bounded payload must have a frame length");
+                let mut frame = Vec::new();
+                frame
+                    .try_reserve_exact(frame_len)
+                    .expect("the test frame must fit in memory");
+                let capacity = frame.capacity();
+                let payload = vec![0_u8; payload_len];
+                let source = socket_addr_to_location(source);
+                let spec = FrameSpec {
+                    session_id: 7,
+                    status: SessionStatus::Keep,
+                    option: FrameOption::DATA,
+                    network: Some(TargetNetwork::Udp),
+                    destination: Some(&source),
+                    global_id: None,
+                    payload: &payload,
+                };
+
+                encode_frame(&mut frame, spec).expect("a reply frame must encode");
+                assert_eq!(
+                    frame.len(),
+                    frame_len,
+                    "reply_frame_len must match encode_frame for {source:?} and {payload_len} bytes"
+                );
+                assert_eq!(
+                    frame.capacity(),
+                    capacity,
+                    "an exact reservation must not grow while encoding"
+                );
+            }
+        }
+
+        assert!(reply_frame_len(SocketAddr::from(([127, 0, 0, 1], 1)), usize::MAX).is_none());
     }
 
     #[test]
