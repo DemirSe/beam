@@ -205,9 +205,9 @@ Local changes and measurements are recorded in
   8/8 with a 1.33 MiB H3 body; UDP echo is 1.232x stock in the latest quick
   run (host was noisy).
 
-The live VPS was updated on 2026-10-24 02:08 UTC with
+The live VPS was updated on 2026-10-24 02:32 UTC with
 `BEAM_KEEP_CONFIG=1`: binary
-`615ef24d2c8d10b5c4507476e41fc7b02758e4ce173d96117389028163f2c71a`,
+`50df25e7bd364722be3259c623760e151805600259f089bd5751cf60f4b7bdd2`,
 unchanged config hash
 `c0abace24e0f839a3ae3c1300d3f79b94ccfee437df5e7a4d8ec67b1b2722a02`,
 `NRestarts=0`, no warning entries, cover certificate and IPv4/IPv6/DNS
