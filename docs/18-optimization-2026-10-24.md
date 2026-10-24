@@ -193,9 +193,9 @@ buffer. This removes one allocation and one full ciphertext copy per record.
   **624.7 MB/s** = **1.398x**; an earlier run measured 913.7 vs 651.8
   (**1.402x**). Same harness, noisy host.
 - Churn: 3,000 requests at concurrency 32 in **15 s**, 5,000 at 64 in **26 s**,
-  **10,000 at 64 in 55 s**, **50,000 at 128 in 274 s**, and **100,000 at 128
-  in 566 s**; every request returned HTTP 200, RSS moved 8.2 → 10.3 MiB,
-  threads stayed at 2, and fds stayed at 10.
+  **10,000 at 64 in 55 s**, **50,000 at 128 in 274 s**, and a final-binary
+  **100,000 at 128 in 582 s**; every request returned HTTP 200, RSS moved
+  7.9 → 10.5 MiB, threads stayed at 2, and fds stayed at 10.
 - Concurrent HTTPS: 120 simultaneous 16 MiB Vision Direct downloads all
   completed with body lengths verified, 3.00 s wall time, server RSS 16.9 MiB
   and 96 threads at peak. This lands near the splice budget without a stalled
