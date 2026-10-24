@@ -213,7 +213,7 @@ buffer. This removes one allocation and one full ciphertext copy per record.
   `7671abdb`/`50df25e7` binaries; the final `f33f07fe` binary was separately
   checked with full-TUN, large H3, no-TUN, and the verified bulk runs above.
 
-## Upload CPU follow-up (audited, locally benchmarked, not deployed)
+## Upload CPU follow-up (audited, benchmarked, deployed)
 
 A local-only follow-up reduces upload/read-path copying:
 
@@ -269,8 +269,43 @@ The upload gain is consistent (5–7%), the download control is flat within
 noise, and RSS stayed around 8 MiB. `cargo fmt`, clippy, and the full test
 suite pass (**296 tests**), including a real-TLS Vision Direct integration
 test with a small caller buffer, rustls-held plaintext, and subsequent raw
-socket bytes. This follow-up remains **not deployed**; the live binary is
-still `f33f07fe…`. A mobile upload test is the next step before rollout.
+socket bytes.
+
+Deployed on 2026-10-24 12:31 UTC with `BEAM_KEEP_CONFIG=1`; the live binary
+is now `d017c131…` and the config hash is unchanged. The post-deploy mobile
+hotspot run passed download/upload, DNS, IPv6, and payload-integrity checks;
+see the deployment section for details.
+
+## Mobile hotspot validation
+
+After deployment the client ran on a phone hotspot (`Demir`, signal 100%,
+1170 Mbit/s link, TUN MTU 1500). Direct-vs-VPN samples alternated:
+
+| Test | Direct | VPN TUN |
+|---|---:|---:|
+| Download median, 3×32 MiB | 13.66 MB/s* | 14.56 MB/s* |
+| Upload median, 3×8 MiB | 135 KB/s | 102 KB/s |
+| `example.com` TTFB | 354–453 ms | 475–618 ms |
+| DNS | — | 10/10 |
+| IPv6 HTTPS | unavailable | **200** |
+| H3/QUIC | — | refused (client block) |
+
+\*One direct download sample fell to 4.31 MB/s; mobile throughput varied
+widely, so the VPN/direct comparison is directional only. All six 8 MiB
+uploads returned 200 with exact byte counts. The mobile uplink (~0.1–0.3 MB/s)
+was the bottleneck, not beam.
+
+Receiver-side integrity through the live tunnel:
+
+- Random 4 MiB upload: client and receiver SHA-256 both
+  `cf83b7711e8ae6855e7dfce0d49971c41806620c9e9de8e53deb2ccaa638f78a`
+  (12 s).
+- Random 32 MiB download: both sides
+  `aca592fa47aae9017a9777c9d084b8dda205618305e0ca10432b7826e9675d57`
+  (9.89 MB/s).
+
+The server stayed active with `NRestarts=0`, no UDP errors, and no journal
+warnings during the run.
 
 ## Remaining work
 
@@ -293,7 +328,18 @@ still `f33f07fe…`. A mobile upload test is the next step before rollout.
 
 ## Deployment
 
-Deployed on 2026-10-24 10:05 UTC with `BEAM_KEEP_CONFIG=1`:
+Deployed on 2026-10-24 12:31 UTC with `BEAM_KEEP_CONFIG=1` (upload follow-up):
+
+- Binary SHA-256:
+  `d017c1311f2075fe546fe80d97af938208514f35fac9044acda50c2a7f777842`
+- Live config SHA-256 unchanged:
+  `c0abace24e0f839a3ae3c1300d3f79b94ccfee437df5e7a4d8ec67b1b2722a02`.
+- Backups were created by `bootstrap.sh` with stamp `20261024T123121Z`.
+- Service active, `NRestarts=0`, listener `0.0.0.0:443`, config check passed.
+- Post-deploy mobile hotspot TUN: 4 MiB upload and 32 MiB download SHA-256
+  matched end to end, DNS 10/10, IPv6 200, H3 still refused client-side.
+
+Earlier deployment, 2026-10-24 10:05 UTC with `BEAM_KEEP_CONFIG=1`:
 
 - Binary SHA-256:
   `f33f07fe7d7ef24d4d9fd8ae52b591c79e1028c79e77f65e8584029df0e1eb2c`
