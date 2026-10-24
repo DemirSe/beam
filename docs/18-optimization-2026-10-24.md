@@ -213,7 +213,7 @@ buffer. This removes one allocation and one full ciphertext copy per record.
   `7671abdb`/`50df25e7` binaries; the final `f33f07fe` binary was separately
   checked with full-TUN, large H3, no-TUN, and the verified bulk runs above.
 
-## Upload CPU follow-up (locally benchmarked, not deployed)
+## Upload CPU follow-up (audited, locally benchmarked, not deployed)
 
 A local-only follow-up reduces upload/read-path copying:
 
@@ -226,28 +226,50 @@ A local-only follow-up reduces upload/read-path copying:
   reverted: the A/B showed no reliable gain and a possible download-CPU noise
   signal, so the original `Vec` path stays.
 
-Method: no-TUN stock Xray SOCKS client, HTTP POST, server CPU summed from
-`/proc/<pid>/task/*/schedstat` (nanosecond resolution), 1 GiB per sample,
-10 samples per arm, alternating old/new order, pinned server/client/target/
-driver cores. The download control used the same harness with HTTP GET.
+An adversarial review (GPT-6.1 Sol, high reasoning) initially returned
+**DO NOT DEPLOY** and found three ordering/loss bugs before this benchmark:
 
-| Scenario | `f33f07fe` | upload follow-up |
+- Raw handoff dropped plaintext still buffered inside rustls. `take_plaintext`
+  and `into_raw` now drain rustls first, and real-TLS regressions cover both
+  paths.
+- Empty `End`/`Direct` blocks could leave coalescing enabled, so passthrough
+  or raw bytes were returned before buffered block content, and the read
+  handoff could be published too early. Framing transitions now stop
+  coalescing and drain `read_out` first.
+- The empty-block limit and `MAX_READ_OUT` paths returned an empty success
+  with data buffered, which callers read as EOF. Both now drain buffered
+  output before returning.
+
+Method: no-TUN stock Xray SOCKS client, HTTP POST, server CPU summed from
+`/proc/<pid>/task/*/schedstat` (nanosecond resolution), 1 GiB (or 4 × 128 MiB)
+per sample, 10 samples per arm, per-sample alternating old/new order, pinned
+server/client/target/driver cores. The download control used the same harness
+with HTTP GET. The baseline is `f33f07fe…`; the candidate is `d017c131…`.
+Earlier coarse-tick A/B numbers are superseded by this run.
+
+| Scenario | `f33f07fe` | follow-up `d017c131` |
 |---|---:|---:|
-| Upload 1 flow, 1 GiB, CPU/GiB | 0.9451 s | **0.8901 s** (-5.8%) |
-| Upload 1 flow, wall time | 1.1733 s | **1.1107 s** (-5.3%) |
-| Upload 4 flows × 128 MiB, CPU/GiB | 0.9521 s | **0.9071 s** (-4.7%) |
-| Upload 4 flows, wall time | 0.6015 s | **0.5803 s** (-3.5%) |
-| Download 1 flow, 1 GiB, CPU/GiB | 0.5257 s | 0.5194 s (-1.2%) |
-| Download 1 flow, wall time | 1.5295 s | 1.5443 s (+1.0%, noise) |
-| 120×16 MiB HTTPS | 120/120 | **120/120**, 3.06 s |
+| Upload 1 flow, 1 GiB, CPU/GiB | 0.9287 s | **0.8617 s** (-7.2%) |
+| Upload 1 flow, wall time | 1.1894 s | **1.0824 s** (-9.0%) |
+| Upload 4 flows × 128 MiB, CPU/GiB | 0.9208 s | **0.8734 s** (-5.1%) |
+| Upload 4 flows, wall time | 0.5785 s | **0.5508 s** (-4.8%) |
+| Download 1 flow, 1 GiB, CPU/GiB | 0.4946 s | 0.4907 s (-0.8%, noise) |
+| Download 1 flow, wall time | 1.4007 s | 1.4198 s (+1.4%, noise) |
+| 120×16 MiB HTTPS | 120/120 | **120/120**, 2.99 s |
 | TLS 1.2-only 8×4 MiB | 8/8 | **8/8** |
 | Full-TUN 8/8 + 1.33 MiB H3 | pass | **pass** |
 
-The upload gain is consistent (about 5%), the download CPU control is slightly
-lower rather than higher, and RSS stayed around 8 MiB. `cargo fmt`, clippy, and
-the full test suite pass (**287 tests**). This follow-up remains **not deployed**;
-the live binary is still `f33f07fe…`. A mobile upload test is the next step
-before rollout.
+Raw samples, binary hashes, logs, and configs are retained at:
+
+- `/tmp/opencode/upload-ab-20261024T120443Z` (1 GiB, 1 flow)
+- `/tmp/opencode/upload-ab-20261024T120631Z` (4 × 128 MiB)
+- `/tmp/opencode/download-ab-20261024T120810Z` (1 GiB download control)
+
+The upload gain is consistent (5–7%), the download control is flat within
+noise, and RSS stayed around 8 MiB. `cargo fmt`, clippy, and the full test
+suite pass (**295 tests**). This follow-up remains **not deployed**; the live
+binary is still `f33f07fe…`. A mobile upload test is the next step before
+rollout.
 
 ## Remaining work
 
