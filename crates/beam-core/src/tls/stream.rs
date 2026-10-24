@@ -1119,6 +1119,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vision_direct_handoff_preserves_rustls_plaintext_and_raw_bytes() {
+        use crate::vision::{Command, VisionStream, encode_block};
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_config = test_server_config();
+        let user_id = [0x42u8; 16];
+        // The Direct block and the passthrough bytes share one outer TLS
+        // record. A small caller buffer forces the Direct content through
+        // read_out, leaving part of the record inside rustls at the handoff.
+        let content = vec![0x5a_u8; 4096];
+        let passthrough = vec![0x33u8; 8000];
+        let raw_tail = b"raw";
+        let mut wire = Vec::new();
+        encode_block(&mut wire, Some(user_id), Command::Direct, &content, 0)
+            .expect("encode Direct block");
+        wire.extend_from_slice(&passthrough);
+
+        let mut expected = content.clone();
+        expected.extend_from_slice(&passthrough);
+        expected.extend_from_slice(raw_tail);
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let conn = ServerConnection::new(server_config).expect("server connection");
+            let tls = TlsStream::accept(socket, conn, Vec::new())
+                .await
+                .expect("server handshake");
+            let mut vision =
+                VisionStream::new(tls, user_id, Vec::new(), SmallRng::seed_from_u64(31));
+            let handoff = vision.read_handoff_watch();
+            let mut output = Vec::new();
+            let mut buffer = [0u8; 100];
+            loop {
+                let count = timeout(Duration::from_secs(2), vision.read(&mut buffer))
+                    .await
+                    .expect("Vision read timed out")
+                    .expect("Vision read");
+                if count == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buffer[..count]);
+            }
+            (output, *handoff.borrow())
+        });
+
+        let socket = TcpStream::connect(address).await.expect("client connect");
+        let connector = tokio_rustls::TlsConnector::from(test_client_config());
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut client = connector
+            .connect(name, socket)
+            .await
+            .expect("client handshake");
+        client.write_all(&wire).await.expect("write Vision wire");
+        client.flush().await.expect("flush Vision wire");
+        let (socket, _) = client.get_mut();
+        socket.write_all(raw_tail).await.expect("write raw tail");
+        socket.shutdown().await.expect("shutdown raw tail");
+
+        let (output, handed_off) = timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server timed out")
+            .expect("server task");
+        assert!(handed_off, "read handoff was not published");
+        assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
     async fn close_notify_is_clean_eof_without_tcp_fin() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
