@@ -292,7 +292,8 @@ impl TlsStream {
             if self.pending_offset < self.pending.len() {
                 continue;
             }
-            match self.record.poll(&mut self.socket, cx) {
+            let recycled = std::mem::take(&mut self.pending);
+            match self.record.poll(&mut self.socket, cx, recycled) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(TlsStreamError::Io(error))),
                 Poll::Ready(Ok(None)) => {
@@ -393,7 +394,8 @@ impl TlsStream {
             if self.closed {
                 return Poll::Ready(Ok(()));
             }
-            match self.record.poll(&mut self.socket, cx) {
+            let recycled = std::mem::take(&mut self.pending);
+            match self.record.poll(&mut self.socket, cx, recycled) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(TlsStreamError::Io(error))),
                 Poll::Ready(Ok(None)) => {
@@ -675,10 +677,23 @@ impl RecordRead {
         self.header_filled != 0 || !self.body.is_empty()
     }
 
-    fn poll<R>(&mut self, socket: &mut R, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>>
+    fn poll<R>(
+        &mut self,
+        socket: &mut R,
+        cx: &mut Context<'_>,
+        recycled: Vec<u8>,
+    ) -> Poll<io::Result<Option<Vec<u8>>>>
     where
         R: AsyncRead + Unpin,
     {
+        // Reuse the previous record's allocation when no ciphertext is
+        // partially buffered. A partial record keeps its own buffer; recycling
+        // partially consumed ciphertext would corrupt the next read.
+        if self.body.is_empty() {
+            self.body = recycled;
+            self.body.clear();
+        }
+
         loop {
             if self.header_filled < TLS_RECORD_HEADER_LEN {
                 let mut buf = ReadBuf::new(&mut self.header[self.header_filled..]);
@@ -705,10 +720,12 @@ impl RecordRead {
 
                 validate_header(&self.header)?;
                 let length = usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
-                // Store the header and body in one buffer. The old path
-                // allocated a body Vec and then copied it into a second record
-                // Vec for every TLS record.
-                let mut record = Vec::new();
+                // Store the header and body in one buffer and reuse the
+                // allocation from the previous record. The capacity is bounded
+                // by the validated record length and never recycled from a
+                // partially consumed record.
+                let mut record = std::mem::take(&mut self.body);
+                record.clear();
                 record
                     .try_reserve_exact(TLS_RECORD_HEADER_LEN + length)
                     .map_err(|_| TlsStreamError::Allocation)?;
@@ -782,11 +799,23 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::time::timeout;
 
-    async fn read_record<R>(reader: &mut RecordRead, socket: &mut R) -> io::Result<Option<Vec<u8>>>
+    async fn read_record<R>(
+        reader: &mut RecordRead,
+        socket: &mut R,
+        recycled: Vec<u8>,
+    ) -> io::Result<Option<Vec<u8>>>
     where
         R: AsyncRead + Unpin,
     {
-        poll_fn(|cx| reader.poll(socket, cx)).await
+        let mut recycled = Some(recycled);
+        poll_fn(|cx| {
+            // The first poll moves the previous allocation into `RecordRead`.
+            // If the record is incomplete, that buffer stays in `body`; later
+            // polls do not need to pass it again.
+            let buffer = recycled.take().unwrap_or_default();
+            reader.poll(socket, cx, buffer)
+        })
+        .await
     }
 
     fn record(content_type: u8, body: &[u8]) -> Vec<u8> {
@@ -812,7 +841,7 @@ mod tests {
         });
 
         let mut reader = RecordRead::default();
-        let parsed = read_record(&mut reader, &mut socket)
+        let parsed = read_record(&mut reader, &mut socket, Vec::new())
             .await
             .expect("record read")
             .expect("complete record");
@@ -824,7 +853,7 @@ mod tests {
     async fn record_read_keeps_coalesced_records_and_read_ahead() {
         let (mut peer, mut socket) = duplex(64 * 1024);
         let first = record(0x17, b"first");
-        let second = record(0x16, b"second");
+        let second = record(0x16, b"2");
         let mut wire = Vec::new();
         wire.extend_from_slice(&first);
         wire.extend_from_slice(&second);
@@ -832,16 +861,18 @@ mod tests {
         peer.write_all(&wire).await.expect("write wire bytes");
 
         let mut reader = RecordRead::default();
-        let parsed_first = read_record(&mut reader, &mut socket)
+        let parsed_first = read_record(&mut reader, &mut socket, Vec::new())
             .await
             .expect("first record read")
             .expect("first record");
-        let parsed_second = read_record(&mut reader, &mut socket)
+        assert_eq!(parsed_first, first);
+        let first_capacity = parsed_first.capacity();
+        let parsed_second = read_record(&mut reader, &mut socket, parsed_first)
             .await
             .expect("second record read")
             .expect("second record");
-        assert_eq!(parsed_first, first);
         assert_eq!(parsed_second, second);
+        assert_eq!(parsed_second.capacity(), first_capacity);
 
         let mut raw = [0u8; 3];
         socket.read_exact(&mut raw).await.expect("raw bytes");
@@ -856,7 +887,7 @@ mod tests {
         peer.write_all(&header).await.expect("write header");
 
         let mut reader = RecordRead::default();
-        let error = read_record(&mut reader, &mut socket)
+        let error = read_record(&mut reader, &mut socket, Vec::new())
             .await
             .expect_err("oversized record must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
