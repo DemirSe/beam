@@ -267,9 +267,10 @@ Raw samples, binary hashes, logs, and configs are retained at:
 
 The upload gain is consistent (5–7%), the download control is flat within
 noise, and RSS stayed around 8 MiB. `cargo fmt`, clippy, and the full test
-suite pass (**295 tests**). This follow-up remains **not deployed**; the live
-binary is still `f33f07fe…`. A mobile upload test is the next step before
-rollout.
+suite pass (**296 tests**), including a real-TLS Vision Direct integration
+test with a small caller buffer, rustls-held plaintext, and subsequent raw
+socket bytes. This follow-up remains **not deployed**; the live binary is
+still `f33f07fe…`. A mobile upload test is the next step before rollout.
 
 ## Remaining work
 
