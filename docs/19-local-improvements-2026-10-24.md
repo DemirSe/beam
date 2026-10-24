@@ -327,13 +327,14 @@ neutral.
 ## Merge order and open items
 
 All three branches are independent and based on `6616db2`; none is merged or
-pushed. Suggested order if the user approves:
+pushed. `improve/combined-local-2026-10-24` contains all three and passed the
+combined test above. If merging separately, the suggested order is:
 
 1. TLS record recycling (lowest risk, measured upload win).
 2. Relay eventfd (small structural change, clear idle/cancel win).
-3. XUDP reply admission (IPv6 win plus a defensive allocation change).
+3. XUDP reply admission (IPv6 sizing is proven; the combined CPU gain is not).
 
-A combined smoke run and a live deploy are still separate steps. The live
-server remains on `d017c131…`; no config, service, or deployment artifact was
-changed by this pass. The 24-hour soak and privileged syscall/wakeup gates from
+A live deploy remains a separate step. The live server remains on
+`d017c131…`; no config, service, or deployment artifact was changed by this
+pass. The 24-hour soak and privileged syscall/wakeup gates from
 `docs/18-optimization-2026-10-24.md` remain pending.
