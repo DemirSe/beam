@@ -114,8 +114,8 @@ sudo systemctl restart systemd-resolved
 resolvectl query example.com
 ```
 
-`bootstrap.sh` installs `99-beam.conf` under `/etc/sysctl.d/` and runs
-`sysctl --system`. The SSH/firewall/resolver files are intentionally not
+`bootstrap.sh` installs `99-beam.conf` under `/etc/sysctl.d/` and applies it
+with `sysctl -p`; the optional conntrack file is applied separately. The SSH/firewall/resolver files are intentionally not
 installed by `bootstrap.sh`: a mistake there can lock out the host.
 
 ## Rollback

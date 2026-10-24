@@ -205,9 +205,9 @@ Local changes and measurements are recorded in
   8/8 with a 1.33 MiB H3 body; UDP echo is 1.232x stock in the latest quick
   run (host was noisy).
 
-The live VPS was updated on 2026-10-24 02:32 UTC with
+The live VPS was updated on 2026-10-24 10:05 UTC with
 `BEAM_KEEP_CONFIG=1`: binary
-`50df25e7bd364722be3259c623760e151805600259f089bd5751cf60f4b7bdd2`,
+`f33f07fe7d7ef24d4d9fd8ae52b591c79e1028c79e77f65e8584029df0e1eb2c`,
 unchanged config hash
 `c0abace24e0f839a3ae3c1300d3f79b94ccfee437df5e7a4d8ec67b1b2722a02`,
 `NRestarts=0`, no warning entries, cover certificate and IPv4/IPv6/DNS
@@ -215,11 +215,12 @@ verified. Host conntrack was raised to 65536 with a 1 h established timeout.
 
 ## In progress
 
-- A light 24-hour background soak started on 2026-10-22 12:52 UTC from the
-  laptop: 1 MiB HTTPS, DNS, small H3 and IPv6 every 5 minutes, with server
-  RSS/fd/thread samples. It was paused for the detailed benchmark and resumed
-  at 15:42 UTC. Logs: `/tmp/opencode/soak-24h-live3/`; stop with
-  `kill 2089354`. This is not the privileged quiet syscall/wakeup acceptance.
+- A low-rate live observation ran for about four hours on 2026-10-24
+  (HTTPS + DNS + IPv6 every minute, 1 MiB HTTPS every ten minutes), across
+  several deployments; about 2.5 hours were on the final binary. It is not a
+  final-binary 24-hour soak, and its fd/restart sampler columns were malformed
+  due to missing fd permissions. A clean 24-hour acceptance run and the
+  privileged quiet syscall/wakeup gates remain open.
 - H3 over the TCP tunnel can still show ~10.5 s Google completion outliers at
   TUN MTU 1500 even though HTTP/2 is stable and TUN/server drop counters stay
   at zero; this is QUIC PTO/TCP HOL, not an MTU drop. gVisor still stalls large
@@ -295,9 +296,10 @@ bash tests/tun/run.sh --udp-mode legacy
 bash bench/no-tun.sh
 ```
 
-The workspace currently has 249 `beam-core` unit tests, two integration tests,
-and 23 `beam-sys` tests (274 total). The full-TUN harness passes all eight
+The workspace currently has 260 `beam-core` unit tests, two TLS adapter
+integration tests, one stock-ClientHello fixture, and 23 `beam-sys` tests
+(286 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
-gVisor TUN on both beam and stock Xray. The no-TUN server-capacity smoke is
-~1.5x stock.
+gVisor TUN on both beam and stock Xray. The final-binary no-TUN server-capacity smoke is
+**1.398x** stock (873.1 vs 624.7 MB/s).

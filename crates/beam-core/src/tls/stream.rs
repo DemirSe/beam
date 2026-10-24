@@ -362,6 +362,12 @@ impl TlsStream {
             if self.plaintext_offset < self.plaintext.len() {
                 continue;
             }
+            // A close_notify may have been processed in the loop above. Do not
+            // block on the socket after observing it; the relay must see EOF
+            // without waiting for an unrelated wakeup.
+            if self.closed {
+                return Poll::Ready(Ok(()));
+            }
             match self.record.poll(&mut self.socket, cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(TlsStreamError::Io(error))),
@@ -997,9 +1003,9 @@ mod tests {
             tls.read_exact(&mut request).await.expect("read request");
             assert_eq!(&request, b"ping");
             let mut eof = [0u8; 1];
-            let count = timeout(Duration::from_secs(1), tls.read(&mut eof))
+            let count = timeout(Duration::from_millis(200), tls.read(&mut eof))
                 .await
-                .expect("close_notify must be delivered as EOF")
+                .expect("close_notify must be delivered as EOF without another socket wakeup")
                 .expect("read after close_notify");
             assert_eq!(count, 0);
         });

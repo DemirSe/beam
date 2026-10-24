@@ -436,8 +436,9 @@ where
     ) -> Poll<io::Result<()>> {
         let this = self.as_mut().get_mut();
         let mut empty_blocks = 0usize;
+        let mut coalescing = false;
         loop {
-            if this.read_out_offset < this.read_out.len() {
+            if !coalescing && this.read_out_offset < this.read_out.len() {
                 let remaining = &this.read_out[this.read_out_offset..];
                 let count = remaining.len().min(buf.remaining());
                 buf.put_slice(&remaining[..count]);
@@ -523,6 +524,10 @@ where
                         if this.read_out.len() >= MAX_READ_OUT {
                             return Poll::Ready(Ok(()));
                         }
+                        // Keep parsing complete blocks while framing is still
+                        // active; if Direct/End switched the mode, return the
+                        // accumulated block content before the raw remainder.
+                        coalescing = this.reader.is_framed();
                         continue;
                     }
 
@@ -536,6 +541,13 @@ where
                     }
                 }
                 Ok(None) => {
+                    if !this.read_out.is_empty() {
+                        // We have complete content but the next block is
+                        // incomplete. Return the batch before waiting for more
+                        // input.
+                        coalescing = false;
+                        continue;
+                    }
                     this.compact_read_buf();
                     let available = this.read_buf.len();
                     if available >= MAX_BLOCK_LEN {
@@ -1035,12 +1047,21 @@ mod tests {
 
         let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(11));
         let mut output = Vec::new();
-        vision
-            .read_to_end(&mut output)
-            .await
-            .expect("read tiny blocks");
+        let mut buffer = [0u8; 8192];
+        let mut reads = 0usize;
+        loop {
+            let count = vision.read(&mut buffer).await.expect("read tiny blocks");
+            if count == 0 {
+                break;
+            }
+            reads += 1;
+            output.extend_from_slice(&buffer[..count]);
+        }
         assert_eq!(output.len(), 2_000);
         assert!(output.iter().all(|byte| *byte == b'x'));
+        // The 2,000 one-byte blocks must be coalesced into a small number of
+        // reads, not returned one block at a time.
+        assert!(reads < 10, "tiny blocks were not coalesced: {reads} reads");
     }
 
     #[tokio::test]

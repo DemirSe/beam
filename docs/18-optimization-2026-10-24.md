@@ -57,7 +57,9 @@ The reader now validates the five-byte header first:
 
 `crates/beam-core/tests/tls_server.rs` now has a mock-cover regression that
 sends an HTTP request and asserts that the cover receives the prefix and
-answers. The exact-ClientHello fallback test still passes.
+answers. The exact-ClientHello fallback test still passes. Oversized and
+stalled-partial first records use the same forward path but do not yet have a
+dedicated timing/cover-capture regression.
 
 ### The blocking relay pool has a hard cap and an async fallback
 
@@ -67,12 +69,15 @@ queued a handoff with no deadline: the connection stopped forwarding while
 still holding its admission permit. A process-wide splice semaphore now
 reserves 40 threads for cover relays/dials and falls back to the bounded async
 copy path when the splice budget is exhausted. The fallback is slower but
-never hangs.
+never hangs. The reserve assumes the production 160-thread pool; setting
+`BEAM_MAX_BLOCKING_THREADS` below about 40 is a test-only configuration.
 
 Accepted and destination sockets now also set TCP keepalive (60 s idle, 15 s
-interval), and a half-closed Vision direction uses a 30 s shutdown timeout
-instead of the 300 s relay idle timeout. Dead mobile mappings release their
-thread and pipe sooner.
+interval). A Vision direction that has itself reached EOF uses a 30 s
+shutdown timeout instead of the 300 s relay idle timeout. The sibling
+direction keeps the normal idle deadline until it finishes; a shared sibling
+deadline is not implemented. Dead mobile mappings release their thread and
+pipe sooner.
 
 ### Graceful shutdown without a long outage
 
@@ -92,7 +97,9 @@ was reported as clean.
 plaintext is drained, and lets rustls classify socket EOF (`UnexpectedEof`
 when the peer never sent `close_notify`). The relay treats that error as a
 half-close, so a bare FIN does not abort the opposite direction. Regressions
-cover `close_notify` with TCP kept open and the bare-FIN relay case.
+cover `close_notify` with TCP kept open and the bare-FIN relay case; the
+`close_notify` assertion uses a 200 ms deadline so an unrelated socket wakeup
+cannot mask a missing EOF check.
 
 ### Vision reader: linear parsing and coalesced writes
 
@@ -172,7 +179,7 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`: **286 tests** pass (260 core unit tests, 2 TLS
-  adapter integration tests, 1 stock ClientHello fixture, 23 other integration
+  adapter integration tests, 1 stock ClientHello fixture, 23 beam-sys unit
   tests).
 - Full-TUN harness: **8/8 PASS** (`xudp`, MTU 1500) and a 1,333,889-byte H3
   body passes.
@@ -181,25 +188,30 @@ buffer. This removes one allocation and one full ciphertext copy per record.
   stop-before-first-poll permit release, and empty/unknown VLESS flows.
 - A local TLS 1.2-only origin (which takes the End path, not Direct) completed
   eight concurrent 4 MiB downloads through the stock SOCKS client without a
-  TLS error. This specifically exercises the End carry flush.
-- No-TUN capacity: beam **913.7 MB/s** vs stock **651.8 MB/s** = **1.402x**
-  (previous beam run 890.5 MB/s; same harness, noisy host).
+  TLS error; body lengths were verified (1.05 s). This exercises the End carry flush.
+- No-TUN capacity on the final binary: beam **873.1 MB/s** vs stock
+  **624.7 MB/s** = **1.398x**; an earlier run measured 913.7 vs 651.8
+  (**1.402x**). Same harness, noisy host.
 - Churn: 3,000 requests at concurrency 32 in **15 s**, 5,000 at 64 in **26 s**,
   **10,000 at 64 in 55 s**, **50,000 at 128 in 274 s**, and **100,000 at 128
   in 566 s**; every request returned HTTP 200, RSS moved 8.2 → 10.3 MiB,
   threads stayed at 2, and fds stayed at 10.
 - Concurrent HTTPS: 120 simultaneous 16 MiB Vision Direct downloads all
-  completed, 1.28 s wall time, server RSS 17.9 MiB and 115 threads at peak.
-  This lands at the splice budget without a stalled handoff.
+  completed with body lengths verified, 3.00 s wall time, server RSS 16.9 MiB
+  and 96 threads at peak. This lands near the splice budget without a stalled
+  handoff.
 - Forced fallback: with `BEAM_MAX_BLOCKING_THREADS=8` (one splice permit) and
-  four concurrent 8 MiB HTTPS downloads, all four completed (1.01 s) through
-  the async path, proving that budget exhaustion no longer hangs a handoff.
+  four concurrent 8 MiB HTTPS downloads, all four completed (1.05 s) with
+  verified body lengths through the async path, proving that budget
+  exhaustion no longer hangs a handoff.
 - Quick full-TUN (host load was high, so headline-ineligible): across two
   runs TCP download was 1.01–1.05x, upload 1.01–1.43x, HTTPS 1.03–1.31x,
   and UDP echo **1.23–1.96x** (beam held 50–52 kpps while the stock arm
   varied 25–42 kpps). RSS was 0.24–0.25x stock and server CPU/GiB was
   0.73–0.88x stock. Treat the ratios as directional; the client core was
-  saturated in every run.
+  saturated in every run. Those quick runs used the intermediate
+  `7671abdb`/`50df25e7` binaries; the final `f33f07fe` binary was separately
+  checked with full-TUN, large H3, no-TUN, and the verified bulk runs above.
 
 ## Remaining work
 
@@ -216,17 +228,20 @@ buffer. This removes one allocation and one full ciphertext copy per record.
   shipped in `deploy/`; a 10k churn against the live host has not been run.
   Pipe page limits remain live-only tuning.
 - SIGHUP is logged and ignored; hot reload is not implemented.
+- `flush()` intentionally does not emit an incomplete inner TLS record; the
+  next write or `shutdown()` completes it. A caller that flushes mid-record
+  must send the remainder before expecting downstream bytes.
 
 ## Deployment
 
-Deployed on 2026-10-24 02:32 UTC with `BEAM_KEEP_CONFIG=1`:
+Deployed on 2026-10-24 10:05 UTC with `BEAM_KEEP_CONFIG=1`:
 
 - Binary SHA-256:
-  `50df25e7bd364722be3259c623760e151805600259f089bd5751cf60f4b7bdd2`
+  `f33f07fe7d7ef24d4d9fd8ae52b591c79e1028c79e77f65e8584029df0e1eb2c`
 - Live config SHA-256 is unchanged:
   `c0abace24e0f839a3ae3c1300d3f79b94ccfee437df5e7a4d8ec67b1b2722a02`
   (`log.level = "warn"`, 1024 connections, 10 s handshake, 300 s TCP idle).
-- Backups were created by `bootstrap.sh` with stamp `20261024T023205Z`.
+- Backups were created by `bootstrap.sh` with stamp `20261024T100534Z`.
 - Service active, `NRestarts=0`, listener `0.0.0.0:443`, cgroup peak 2.9 MiB
   immediately after start.
 - IPv4/IPv6 egress, HTTPS, HTTP, DNS, and the local TUN MTU 1500 client pass.
@@ -236,5 +251,8 @@ Deployed on 2026-10-24 02:32 UTC with `BEAM_KEEP_CONFIG=1`:
 - Host conntrack was raised to 65536 with 1 h established / 30 s TIME_WAIT
   timeouts and persisted in `/etc/sysctl.d/99-beam-conntrack.conf`; the repo now
   carries `deploy/99-beam-conntrack.conf`.
-- A low-rate live soak (HTTPS + DNS + IPv6 every minute, 1 MiB HTTPS every ten
-  minutes) is running to validate the deployed binary.
+- A low-rate live observation (HTTPS + DNS + IPv6 every minute, 1 MiB HTTPS
+  every ten minutes) ran for about four hours across several deployments;
+  about 2.5 hours were on the final binary. It is not a final-binary 24-hour
+  soak, and its fd/restart columns were malformed because the sampler ran
+  without permission to read the service fd table.

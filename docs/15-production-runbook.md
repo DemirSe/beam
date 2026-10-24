@@ -17,12 +17,12 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 
 | Item | State |
 |---|---|
-| Host | Debian 13.6, x86_64, 1 vCPU, 1 GiB RAM, 1 GiB swap; kernel 6.12.113 active |
+| Host | Debian 13.7, x86_64, 1 vCPU, 1 GiB RAM, 1 GiB swap; kernel 6.12.113 active |
 | Service | `beam.service`, active and enabled, `User=beam`, `0.0.0.0:443`; cover `whatsapp.net:443`; limits 1024 connections / 10 s handshake; systemd exposure 1.7 OK |
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
 | Unit / backups | `/etc/systemd/system/beam.service` 0644; `*.bak-<UTC stamp>` beside each installed file |
-| Hardening | Deployed 2026-10-24 02:32 UTC: binary `50df25e7…` (pre-auth admission, cover fast fallback, Vision/XUDP fixes); global XUDP 256 + 60 s idle, cover 32, legacy UDP 64, `MemoryHigh=512M`/`MemoryMax=768M`/`MemorySwapMax=512M`; live config preserved; backups `20261024T023205Z` |
+| Hardening | Deployed 2026-10-24 10:05 UTC: binary `f33f07fe…` (pre-auth admission, cover fast fallback, Vision/XUDP fixes); global XUDP 256 + 60 s idle, cover 32, legacy UDP 64, `MemoryHigh=512M`/`MemoryMax=768M`/`MemorySwapMax=512M`; live config preserved; backups `20261024T100534Z` |
 | Earlier hardening | 2026-10-23 18:10 UTC binary `bd17ac26…`; backups `20261023T181052Z` |
 | Conntrack | `/etc/sysctl.d/99-beam-conntrack.conf`: max 65536, established 3600 s, TIME_WAIT 30 s |
 | Local client | sing-box, `/etc/sing-box/config.json` 0600, active but disabled at boot |
@@ -345,12 +345,14 @@ measured and a targeted MSS clamp is not sufficient.
   client is now **MTU 1500**; 1400 remains the fallback that loses H3. The
   2026-10-24 mobile hotspot run used outer MSS 1388 with no TUN drops. See
   `docs/14-tun-harness.md`.
-- A 5-minute post-hardening soak and the read-only audit are complete. A light
-  24-hour background soak was resumed on 2026-10-22 15:42 UTC
-  (`/tmp/opencode/soak-24h-live3/`); the privileged quiet syscall/wakeup gates
-  remain open.
-- No per-IP connection cap; the 1024-connection global cap, 10 s pre-auth timeout,
-  30 s cover timeout and provider firewall are the current mitigation.
+- A 5-minute post-hardening soak and the read-only audit are complete. A
+  low-rate four-hour live observation ran on 2026-10-24 across several
+  deployments (about 2.5 hours on the final binary); its fd/restart sampler
+  columns were malformed. A clean final-binary 24-hour soak and the privileged
+  quiet syscall/wakeup gates remain open.
+- No per-IP connection cap; the 1024-connection global cap, 256 pre-auth slots
+  with a 5 s ClientHello deadline, 30 s cover timeout and provider firewall are
+  the current mitigation.
 - HTTPS upload acceleration needs Vision Direct before the body (e.g.
   `Expect: 100-continue`). Fully framed uploads stay async at ~1.34-1.37 s/GiB
   versus ~0.11 s/GiB with early Direct; this is a performance gap, not correctness.

@@ -366,10 +366,10 @@ deployed with `BEAM_KEEP_CONFIG=1`:
 
 ### 2026-10-24 optimization pass
 
-Deployed on 2026-10-24 02:32 UTC (binary `50df25e7…`) with the live config
+Deployed on 2026-10-24 10:05 UTC (binary `f33f07fe…`) with the live config
 preserved. The pass fixed an XUDP reply-task stop race that could leak a socket
 and a global permit forever, capped XUDP session idleness at 60 s, drained
-retained sockets before reuse, and bounded Vision splice tasks with an async
+retained sockets before retention, and bounded Vision splice tasks with an async
 fallback. It also separates pre-auth admission from authenticated capacity,
 adds a fast cover fallback for non-TLS probes, and adds a 64-stream legacy UDP
 cap. See `docs/18-optimization-2026-10-24.md` for the full change list and
