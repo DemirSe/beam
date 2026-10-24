@@ -50,6 +50,13 @@ const MAX_BUFFERED_LEN: usize = MAX_FRAME_LEN + READ_CHUNK_LEN;
 /// to `net.core.rmem_max`; the production host raises that limit.
 const UDP_RECV_BUFFER_BYTES: usize = 1024 * 1024;
 
+/// Upper bound on one domain resolution inside the mux read loop.
+///
+/// The read loop is shared by every flow on the mux. The generic I/O timeout
+/// is 10 s in production, which is long enough for one slow resolver to stall
+/// DNS and QUIC frames for unrelated sessions.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Upper bound on mux read inactivity.
 ///
 /// Sessions expire independently, so this is only a backstop for a stream
@@ -185,13 +192,20 @@ where
     // shutdown budget by the session limit.
     let active = lock_table(&table).drain_active();
     for entry in &active {
+        // A spawned reply task may not have been polled yet. Marking the
+        // session closed makes its initial check fail even if the watch
+        // notification is missed; `send_replace` also stores the stop value
+        // when no receiver has subscribed.
+        entry.session.mark_closed();
         entry.session.stop();
     }
     let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
     for entry in active {
-        if let Some(task) = entry.reply_task {
+        if let Some(mut task) = entry.reply_task {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let _ = timeout(remaining, task).await;
+            if timeout(remaining, &mut task).await.is_err() {
+                task.abort();
+            }
         }
     }
     lock_table(&table).clear_expiring();
@@ -204,6 +218,18 @@ where
     result
 }
 
+/// Maximum frames coalesced into one stream write.
+///
+/// A DNS or QUIC burst often reaches the reply queue as several small frames.
+/// Coalescing them avoids one Vision block, TLS record, and socket write per
+/// datagram without waiting for more input: `try_recv` only takes frames that
+/// are already queued, so a lone frame keeps its normal latency.
+const MAX_WRITE_BATCH_FRAMES: usize = 32;
+
+/// Soft byte target for one coalesced stream write. One extra frame can cross
+/// the target, so the hard bound is this plus one maximum-size frame.
+const MAX_WRITE_BATCH_BYTES: usize = 64 * 1024;
+
 /// Serializes frames from the reply tasks and the read loop.
 async fn write_loop<W>(
     mut writer: W,
@@ -214,8 +240,35 @@ async fn write_loop<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    // Allocate lazily: a mux stream that never carries a reply should not pay
+    // for a 64 KiB batch buffer. Capacity grows to the frame/batch bound on
+    // first use and is then reused.
+    let mut batch = Vec::new();
+    // Keep the frames alive until the write completes so their aggregate
+    // reply-budget permits are held for exactly as long as the bytes wait.
+    let mut frames: Vec<QueuedFrame> = Vec::new();
+
     while let Some(frame) = inbound.recv().await {
-        if let Err(error) = write_frame(&mut writer, &frame.bytes, io_timeout).await {
+        batch.clear();
+        frames.clear();
+        batch.extend_from_slice(&frame.bytes);
+        frames.push(frame);
+
+        while frames.len() < MAX_WRITE_BATCH_FRAMES {
+            match inbound.try_recv() {
+                Ok(frame) => {
+                    batch.extend_from_slice(&frame.bytes);
+                    frames.push(frame);
+                    if batch.len() >= MAX_WRITE_BATCH_BYTES {
+                        break;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        if let Err(error) = write_frame(&mut writer, &batch, io_timeout).await {
             let _ = writer_failed.send(true);
             return Err(error);
         }
@@ -376,7 +429,13 @@ impl MuxState {
 
         // Resolution happens before touching any session state: a domain that
         // cannot be resolved must not evict a retained socket.
-        let resolved = match resolve_destination(destination, None, self.config.io_timeout).await {
+        let resolved = match resolve_destination(
+            destination,
+            None,
+            self.config.io_timeout.min(RESOLVE_TIMEOUT),
+        )
+        .await
+        {
             Ok(address) => address,
             Err(error) => {
                 tracing::debug!(
@@ -538,8 +597,12 @@ impl MuxState {
 
         let destination = match parsed.destination.as_ref() {
             Some(location) => {
-                match resolve_destination(location, Some(session.family), self.config.io_timeout)
-                    .await
+                match resolve_destination(
+                    location,
+                    Some(session.family),
+                    self.config.io_timeout.min(RESOLVE_TIMEOUT),
+                )
+                .await
                 {
                     Ok(address) => {
                         session.set_destination(address);
@@ -647,8 +710,10 @@ impl MuxState {
         } = active;
         let first = session.mark_closed();
         session.stop();
-        if let Some(task) = reply_task {
-            let _ = timeout(self.config.io_timeout, task).await;
+        if let Some(mut task) = reply_task
+            && timeout(self.config.io_timeout, &mut task).await.is_err()
+        {
+            task.abort();
         }
 
         if !first {
@@ -664,6 +729,7 @@ impl MuxState {
         let permit = session.take_permit();
         if reason.retains_socket()
             && !session.failed()
+            && drain_retained_socket(&session.socket)
             && let Some(global_id) = session.global_id
         {
             let now = Instant::now();
@@ -706,9 +772,16 @@ impl MuxState {
         {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(MuxError::WriterClosed),
-            Err(_) => Err(MuxError::Timeout {
-                stage: "frame write",
-            }),
+            Err(_) => {
+                // The peer is not reading. A missing End only affects this
+                // flow; tearing down the whole mux would kill unrelated DNS
+                // and QUIC sessions.
+                tracing::debug!(
+                    session_id = id,
+                    "XUDP End frame could not be queued before the write deadline"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -744,6 +817,29 @@ enum DuplicateStatus {
     DifferentGlobalId,
 }
 
+/// Drains a closed GlobalID socket before it is retained.
+///
+/// A retained socket has no reader for up to `close_expiry`; datagrams still
+/// queued would otherwise consume the kernel receive buffer and be delivered
+/// to a future session as stale replies. Return `false` when the socket still
+/// has more than the bounded drain budget, in which case retaining it is not
+/// worth the stale state.
+fn drain_retained_socket(socket: &UdpSocket) -> bool {
+    const DRAIN_BUDGET: usize = 64;
+    let mut buffer = [0u8; 2048];
+    for _ in 0..DRAIN_BUDGET {
+        match socket.try_recv_from(&mut buffer) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return true,
+            Err(_) => return false,
+        }
+    }
+    matches!(
+        socket.try_recv_from(&mut buffer),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    )
+}
+
 /// Locks the session table, recovering from a poisoned mutex.
 fn lock_table(table: &Mutex<SessionTable>) -> MutexGuard<'_, SessionTable> {
     match table.lock() {
@@ -767,7 +863,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tokio::net::UdpSocket;
     use tokio::task::JoinHandle;
-    use tokio::time::timeout;
+    use tokio::time::{sleep, timeout};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -953,6 +1049,36 @@ mod tests {
             .expect("empty stream did not close")
             .expect("mux handler panicked");
         assert!(result.is_ok(), "empty stream close failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_a_session_whose_reply_task_has_not_run() {
+        // A spawned task is not polled until the current task yields. If the
+        // mux closes in that window, `watch::Sender::send` would drop the stop
+        // value and the reply task would keep the socket and global permit
+        // forever. Use a one-slot limiter so a leaked permit is visible.
+        let limiter = XudpSessionLimiter::new(1);
+        let (mut client, task) = start_mux_with_limiter(test_config(), limiter.clone());
+        let destination = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::new(192, 0, 2, 1)),
+            port: 9,
+        };
+
+        // An empty New binds the socket but performs no send, so the handler
+        // can reach EOF without yielding to the reply task.
+        write_frame(&mut client, new_spec(1, &destination, b"", None)).await;
+        drop(client);
+
+        let result = timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("mux handler did not finish")
+            .expect("mux handler panicked");
+        assert!(result.is_ok(), "mux handler failed: {result:?}");
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            limiter.try_acquire().is_some(),
+            "shutdown leaked the session's global permit"
+        );
     }
 
     #[tokio::test]

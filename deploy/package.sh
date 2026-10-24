@@ -9,7 +9,7 @@ OUT="${BEAM_BUNDLE_OUT:-/tmp/opencode/beam-deploy-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 [ -f "$SECRETS" ] || { echo "package: missing secrets file $SECRETS" >&2; exit 1; }
 source "$ROOT/scripts/dev-env.sh"
-cargo build --manifest-path "$ROOT/Cargo.toml" --release -p beam
+cargo build --locked --manifest-path "$ROOT/Cargo.toml" --release -p beam
 
 rm -rf "$OUT"
 install -d -m 0700 "$OUT"

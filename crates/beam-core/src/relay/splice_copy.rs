@@ -6,6 +6,17 @@ use std::time::{Duration, Instant};
 
 use beam_sys::{PollEvents, PollFd, SpliceFlags, pipe, poll, splice};
 
+/// Avoid one warning per relay if the kernel refuses the pipe-size request.
+static PIPE_SIZE_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_pipe_size_once(error: &io::Error, pipe_size: usize, message: &'static str) {
+    if !PIPE_SIZE_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(%error, pipe_size, "{message}");
+    } else {
+        tracing::debug!(%error, pipe_size, "{message}");
+    }
+}
+
 /// Default kernel pipe capacity used for each direction.
 pub const DEFAULT_PIPE_SIZE: usize = 512 * 1024;
 
@@ -29,6 +40,12 @@ const BATCH_THRESHOLD: u64 = 256 * 1024;
 
 /// Directions below this measured rate start batching.
 const BATCH_RATE_LIMIT: f64 = 500.0 * 1024.0 * 1024.0;
+
+/// Paced streams below this rate must not pay the batching sleep.
+///
+/// Video calls and games send small datagrams every few milliseconds. Waiting
+/// 500 µs to coalesce them adds latency without creating a useful burst.
+const BATCH_MIN_RATE: f64 = 2.0 * 1024.0 * 1024.0;
 
 /// A batching direction above this rate stops batching again.
 const BATCH_DISABLE_RATE: f64 = 800.0 * 1024.0 * 1024.0;
@@ -247,10 +264,10 @@ pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Resul
     for fd in [a_pipe_write.as_raw_fd(), b_pipe_write.as_raw_fd()] {
         match beam_sys::set_pipe_size(fd, config.pipe_size) {
             Ok(actual) => tracing::debug!(requested = config.pipe_size, actual, "relay pipe sized"),
-            Err(error) => tracing::warn!(
-                ?error,
-                pipe_size = config.pipe_size,
-                "could not resize relay pipe; using the kernel default"
+            Err(error) => warn_pipe_size_once(
+                &error,
+                config.pipe_size,
+                "could not resize relay pipe; using the kernel default",
             ),
         }
     }
@@ -353,10 +370,10 @@ pub fn copy_one_way(
     let (pipe_read, pipe_write) = pipe()?;
     match beam_sys::set_pipe_size(pipe_write.as_raw_fd(), config.pipe_size) {
         Ok(actual) => tracing::debug!(requested = config.pipe_size, actual, "one-way pipe sized"),
-        Err(error) => tracing::warn!(
-            ?error,
-            pipe_size = config.pipe_size,
-            "could not resize one-way relay pipe; using the kernel default"
+        Err(error) => warn_pipe_size_once(
+            &error,
+            config.pipe_size,
+            "could not resize one-way relay pipe; using the kernel default",
         ),
     }
 
@@ -641,10 +658,10 @@ fn maybe_update_batch(direction: &mut Direction) {
     if seconds > 0.0 {
         let rate = bytes as f64 / seconds;
         if direction.batch_enabled {
-            if rate > BATCH_DISABLE_RATE {
+            if rate > BATCH_DISABLE_RATE || rate < BATCH_MIN_RATE {
                 direction.batch_enabled = false;
             }
-        } else if rate < BATCH_RATE_LIMIT {
+        } else if (BATCH_MIN_RATE..BATCH_RATE_LIMIT).contains(&rate) {
             direction.batch_enabled = true;
         }
     }

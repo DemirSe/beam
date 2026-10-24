@@ -96,6 +96,10 @@ pub enum VlessError {
         reason: &'static str,
     },
 
+    /// The client selected a flow this server does not implement.
+    #[error("unsupported VLESS flow")]
+    UnsupportedFlow,
+
     /// The destination address is malformed or truncated.
     #[error("invalid VLESS destination: {0}")]
     Address(#[from] AddressError),

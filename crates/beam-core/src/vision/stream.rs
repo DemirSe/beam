@@ -41,6 +41,12 @@ const MAX_WRITE_BATCH: usize = 5 + MAX_INNER_TLS_BODY;
 /// yielding to the executor.
 const MAX_EMPTY_BLOCKS_PER_POLL: usize = 64;
 
+/// Maximum plaintext coalesced from complete Vision blocks in one poll.
+///
+/// Returning several blocks together prevents one tiny destination write per
+/// six-byte block and keeps a bounded amount of memory per connection.
+const MAX_READ_OUT: usize = 64 * 1024;
+
 /// A Vision-framed stream over an outer TLS stream.
 ///
 /// `R` is the padding RNG. It defaults to [`SmallRng`]; callers may inject a
@@ -52,6 +58,7 @@ pub struct VisionStream<S, R = SmallRng> {
     reader: VisionReaderState,
     first_read_block: bool,
     read_buf: Vec<u8>,
+    read_buf_offset: usize,
     read_out: Vec<u8>,
     read_out_offset: usize,
     direct_plaintext: Vec<u8>,
@@ -65,6 +72,8 @@ pub struct VisionStream<S, R = SmallRng> {
     rng: R,
     write_queue: Vec<u8>,
     write_queue_offset: usize,
+    /// Tail of an inner TLS record that arrived split across two writes.
+    write_carry: Vec<u8>,
     pending_accept: Option<usize>,
 }
 
@@ -88,6 +97,7 @@ where
             reader: VisionReaderState::new(),
             first_read_block: true,
             read_buf: initial_body,
+            read_buf_offset: 0,
             read_out: Vec::new(),
             read_out_offset: 0,
             direct_plaintext: Vec::new(),
@@ -101,6 +111,7 @@ where
             rng,
             write_queue: Vec::new(),
             write_queue_offset: 0,
+            write_carry: Vec::new(),
             pending_accept: None,
         }
     }
@@ -168,6 +179,26 @@ where
         self.write_direct_tx.send_replace(self.write_is_raw());
     }
 
+    /// Drops the consumed prefix of the framing buffer.
+    ///
+    /// Blocks are consumed with a cursor; compacting only when more input is
+    /// needed keeps parsing linear instead of shifting the tail for every
+    /// tiny block.
+    fn compact_read_buf(&mut self) {
+        if self.read_buf_offset == 0 {
+            return;
+        }
+        if self.read_buf_offset >= self.read_buf.len() {
+            self.read_buf.clear();
+            self.read_buf_offset = 0;
+            return;
+        }
+        self.read_buf.copy_within(self.read_buf_offset.., 0);
+        let remaining = self.read_buf.len() - self.read_buf_offset;
+        self.read_buf.truncate(remaining);
+        self.read_buf_offset = 0;
+    }
+
     /// Consumes the stream once both directions have switched to Direct.
     pub fn into_raw(self) -> Result<RawTls, TlsStreamError> {
         if !self.read_is_raw() || !self.write_is_raw() {
@@ -177,12 +208,14 @@ where
         let Self {
             inner,
             read_buf,
+            read_buf_offset,
             read_out,
             read_out_offset,
             direct_plaintext,
             direct_plaintext_offset,
             write_queue,
             write_queue_offset,
+            write_carry,
             ..
         } = self;
 
@@ -190,7 +223,7 @@ where
         if read_out_offset < read_out.len() {
             inbound.extend_from_slice(&read_out[read_out_offset..]);
         }
-        inbound.extend_from_slice(&read_buf);
+        inbound.extend_from_slice(&read_buf[read_buf_offset..]);
         if direct_plaintext_offset < direct_plaintext.len() {
             inbound.extend_from_slice(&direct_plaintext[direct_plaintext_offset..]);
         }
@@ -199,9 +232,10 @@ where
         inbound.extend_from_slice(&raw.inbound);
         raw.inbound = inbound;
 
-        if write_queue_offset < write_queue.len() {
+        if write_queue_offset < write_queue.len() || !write_carry.is_empty() {
             let mut outbound = Vec::new();
             outbound.extend_from_slice(&write_queue[write_queue_offset..]);
+            outbound.extend_from_slice(&write_carry);
             outbound.extend_from_slice(&raw.outbound);
             raw.outbound = outbound;
         }
@@ -228,6 +262,30 @@ where
         }
         self.write_queue.clear();
         self.write_queue_offset = 0;
+        Poll::Ready(Ok(()))
+    }
+
+    /// Writes the carried raw tail after the inner stream switched to raw.
+    ///
+    /// The tail belongs to the same inner TLS record as the Direct block but
+    /// arrived after the complete-record prefix. It must not be flushed
+    /// through outer TLS; it follows the switch on the raw socket.
+    fn poll_flush_raw_carry(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while !self.write_carry.is_empty() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.write_carry) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "Vision raw socket accepted zero carried bytes",
+                    )));
+                }
+                Poll::Ready(Ok(count)) => {
+                    self.write_carry.drain(..count);
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
         Poll::Ready(Ok(()))
     }
 
@@ -309,12 +367,26 @@ where
             tracing::debug!("Vision writer switched to raw");
         }
 
+        if self.write_direct && !self.write_carry.is_empty() {
+            match self.poll_flush_raw_carry(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => {
+                    self.pending_accept = None;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
         self.pending_accept = None;
         Poll::Ready(Ok(accepted))
     }
 
     fn finish_direct_switch(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.pending_direct_switch {
+            if self.write_direct && !self.write_carry.is_empty() {
+                return self.poll_flush_raw_carry(cx);
+            }
             return Poll::Ready(Ok(()));
         }
         match Pin::new(&mut self.inner).poll_flush(cx) {
@@ -325,7 +397,7 @@ where
                 self.publish_direct();
                 self.publish_write_direct();
                 tracing::debug!("Vision writer switched to raw");
-                Poll::Ready(Ok(()))
+                self.poll_flush_raw_carry(cx)
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => Poll::Pending,
@@ -359,12 +431,19 @@ where
             }
 
             if !this.reader.is_framed() {
-                if !this.read_buf.is_empty() {
-                    let count = this.read_buf.len().min(buf.remaining());
-                    buf.put_slice(&this.read_buf[..count]);
-                    this.read_buf.drain(..count);
+                if this.read_buf_offset < this.read_buf.len() {
+                    let remaining = &this.read_buf[this.read_buf_offset..];
+                    let count = remaining.len().min(buf.remaining());
+                    buf.put_slice(&remaining[..count]);
+                    this.read_buf_offset += count;
+                    if this.read_buf_offset == this.read_buf.len() {
+                        this.read_buf.clear();
+                        this.read_buf_offset = 0;
+                    }
                     return Poll::Ready(Ok(()));
                 }
+                this.read_buf.clear();
+                this.read_buf_offset = 0;
                 if this.direct_plaintext_offset < this.direct_plaintext.len() {
                     let remaining = &this.direct_plaintext[this.direct_plaintext_offset..];
                     let count = remaining.len().min(buf.remaining());
@@ -385,7 +464,10 @@ where
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
 
-            match parse_block(&this.read_buf, this.first_read_block) {
+            match parse_block(
+                &this.read_buf[this.read_buf_offset..],
+                this.first_read_block,
+            ) {
                 Ok(Some((block, used))) => {
                     let command = block.command;
                     let uuid = block.uuid;
@@ -395,8 +477,17 @@ where
                             "Vision first block does not carry the request UUID",
                         )));
                     }
-                    let content = block.content.to_vec();
-                    this.read_buf.drain(..used);
+                    let content = block.content;
+                    let content_len = content.len();
+                    if !content.is_empty() {
+                        this.writer.inspect(content);
+                        this.read_out.extend_from_slice(content);
+                    }
+                    this.read_buf_offset = this.read_buf_offset.saturating_add(used);
+                    if this.read_buf_offset >= this.read_buf.len() {
+                        this.read_buf.clear();
+                        this.read_buf_offset = 0;
+                    }
                     this.first_read_block = false;
 
                     if let Err(error) = this.reader.on_command(command) {
@@ -407,32 +498,34 @@ where
                         this.direct_plaintext = this.inner.take_plaintext();
                         this.direct_plaintext_offset = 0;
                         this.publish_direct();
-                        tracing::debug!(
-                            content = content.len(),
-                            "Vision reader switched to Direct"
-                        );
+                        tracing::debug!(content = content_len, "Vision reader switched to Direct");
                     }
-                    if !content.is_empty() {
-                        this.writer.inspect(&content);
-                        this.read_out = content;
-                        this.read_out_offset = 0;
+                    if content_len > 0 {
+                        if this.read_out.len() >= MAX_READ_OUT {
+                            return Poll::Ready(Ok(()));
+                        }
                         continue;
                     }
 
                     empty_blocks += 1;
                     if empty_blocks >= MAX_EMPTY_BLOCKS_PER_POLL {
+                        if !this.read_out.is_empty() {
+                            return Poll::Ready(Ok(()));
+                        }
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
                 }
                 Ok(None) => {
-                    if this.read_buf.len() >= MAX_BLOCK_LEN {
+                    this.compact_read_buf();
+                    let available = this.read_buf.len();
+                    if available >= MAX_BLOCK_LEN {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "Vision block exceeds the maximum block size",
                         )));
                     }
-                    let room = MAX_BLOCK_LEN - this.read_buf.len();
+                    let room = MAX_BLOCK_LEN - available;
                     let read_limit = room.min(READ_CHUNK);
                     let mut temporary = [0u8; READ_CHUNK];
                     let mut read_buf = ReadBuf::new(&mut temporary[..read_limit]);
@@ -442,7 +535,7 @@ where
                         Poll::Ready(Ok(())) => {
                             let filled = read_buf.filled();
                             if filled.is_empty() {
-                                if this.read_buf.is_empty() {
+                                if available == 0 {
                                     return Poll::Ready(Ok(()));
                                 }
                                 return Poll::Ready(Err(io::Error::new(
@@ -491,6 +584,12 @@ where
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                     Poll::Pending => return Poll::Pending,
                 }
+            } else if this.write_direct && !this.write_carry.is_empty() {
+                match this.poll_flush_raw_carry(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
+                }
             }
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
@@ -498,24 +597,56 @@ where
             return Poll::Ready(Ok(0));
         }
 
-        let take = buf.len().min(MAX_WRITE_BATCH);
-        let complete = is_complete_app_data_records(&buf[..take]);
-        match this.plan_and_queue(&buf[..take], complete) {
-            Ok(switch_direct) => {
-                if switch_direct {
-                    tracing::debug!(
-                        accepted = take,
-                        complete_app_data_records = complete,
-                        enable_xtls = this.writer.enable_xtls(),
-                        filter_budget = this.writer.filter_budget(),
-                        "Vision writer planned Direct"
-                    );
-                }
-                this.pending_direct_switch = switch_direct;
+        let accepted;
+        let switch_direct = if !this.write_carry.is_empty() {
+            let room = MAX_WRITE_BATCH.saturating_sub(this.write_carry.len());
+            let take = buf.len().min(room);
+            this.write_carry.extend_from_slice(&buf[..take]);
+            accepted = take;
+
+            let prefix = complete_tls_records_len(&this.write_carry);
+            if prefix == this.write_carry.len() {
+                let data = std::mem::take(&mut this.write_carry);
+                this.plan_and_queue(&data, true)?
+            } else if prefix > 0 && is_partial_tls_record(&this.write_carry[prefix..]) {
+                let tail = this.write_carry.split_off(prefix);
+                let data = std::mem::take(&mut this.write_carry);
+                let switch = this.plan_and_queue(&data, true)?;
+                this.write_carry = tail;
+                switch
+            } else if prefix == 0 && is_partial_tls_record(&this.write_carry) {
+                false
+            } else {
+                let data = std::mem::take(&mut this.write_carry);
+                this.plan_and_queue(&data, false)?
             }
-            Err(error) => return Poll::Ready(Err(error)),
+        } else {
+            let take = buf.len().min(MAX_WRITE_BATCH);
+            accepted = take;
+            let prefix = complete_tls_records_len(&buf[..take]);
+            if prefix == take {
+                this.plan_and_queue(&buf[..take], true)?
+            } else if prefix > 0 && is_partial_tls_record(&buf[prefix..take]) {
+                this.write_carry.extend_from_slice(&buf[prefix..take]);
+                this.plan_and_queue(&buf[..prefix], true)?
+            } else if prefix == 0 && is_partial_tls_record(&buf[..take]) {
+                this.write_carry.extend_from_slice(&buf[..take]);
+                false
+            } else {
+                this.plan_and_queue(&buf[..take], false)?
+            }
+        };
+
+        if switch_direct {
+            tracing::debug!(
+                accepted,
+                enable_xtls = this.writer.enable_xtls(),
+                filter_budget = this.writer.filter_budget(),
+                "Vision writer planned Direct"
+            );
         }
-        this.pending_accept = Some(take);
+        this.pending_direct_switch = switch_direct;
+        this.pending_accept = Some(accepted);
         this.finish_pending_write(cx)
     }
 
@@ -536,6 +667,19 @@ where
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.as_mut().get_mut();
+        if !this.write_carry.is_empty() {
+            if this.write_direct {
+                let data = std::mem::take(&mut this.write_carry);
+                this.write_queue.extend_from_slice(&data);
+            } else if !this.pending_direct_switch {
+                // A pending Direct switch owns the carry; it must be flushed
+                // raw after `finish_direct_switch`, not framed through TLS.
+                let data = std::mem::take(&mut this.write_carry);
+                if let Err(error) = this.plan_and_queue(&data, false) {
+                    return Poll::Ready(Err(error));
+                }
+            }
+        }
         match this.poll_flush_queue(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -556,34 +700,43 @@ where
     }
 }
 
-fn is_complete_app_data_records(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
+/// Returns the length of the complete application-data records at the start
+/// of `data`. A partial or non-TLS tail is not included.
+fn complete_tls_records_len(data: &[u8]) -> usize {
     let mut offset = 0usize;
-    while offset < data.len() {
-        let Some(remaining) = data.get(offset..) else {
-            return false;
-        };
+    while let Some(remaining) = data.get(offset..) {
         let Some(header) = remaining.get(..5) else {
-            return false;
+            break;
         };
         if header[0] != 0x17 || header[1] != 0x03 || header[2] != 0x03 {
-            return false;
+            break;
         }
         let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
         if length > MAX_INNER_TLS_BODY {
-            return false;
+            break;
         }
         let Some(end) = offset.checked_add(5 + length) else {
-            return false;
+            break;
         };
         if end > data.len() {
-            return false;
+            break;
         }
         offset = end;
     }
-    true
+    offset
+}
+
+/// Returns `true` if `data` is a prefix of one application-data record.
+fn is_partial_tls_record(data: &[u8]) -> bool {
+    const PREFIX: &[u8] = &[0x17, 0x03, 0x03];
+    if data.is_empty() || !PREFIX.starts_with(&data[..data.len().min(PREFIX.len())]) {
+        return false;
+    }
+    if data.len() < 5 {
+        return true;
+    }
+    let length = usize::from(u16::from_be_bytes([data[3], data[4]]));
+    length <= MAX_INNER_TLS_BODY && data.len() < 5 + length
 }
 
 fn vision_error(error: VisionError) -> io::Error {
@@ -801,6 +954,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reader_coalesces_many_tiny_blocks() {
+        // 2,000 five-byte framing blocks exercise the cursor path that would
+        // previously memmove the reassembly tail for every block.
+        let mut raw = Vec::new();
+        for index in 0..2_000 {
+            let uuid = (index == 0).then_some(USER_ID);
+            raw.extend_from_slice(&block_bytes(uuid, Command::Continue, b"x", 0));
+        }
+        let (mut peer, client) = duplex(256 * 1024);
+        peer.write_all(&raw).await.expect("write tiny blocks");
+        peer.shutdown().await.expect("shutdown tiny writer");
+
+        let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(11));
+        let mut output = Vec::new();
+        vision
+            .read_to_end(&mut output)
+            .await
+            .expect("read tiny blocks");
+        assert_eq!(output.len(), 2_000);
+        assert!(output.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[tokio::test]
     async fn reader_handles_empty_padding_only_blocks() {
         let mut raw = Vec::new();
         raw.extend_from_slice(&block_bytes(Some(USER_ID), Command::Continue, b"", 900));
@@ -887,5 +1063,75 @@ mod tests {
         assert_eq!(&raw[used..], b"raw");
         assert!(vision.write_is_raw());
         assert!(!vision.read_is_raw());
+    }
+
+    #[tokio::test]
+    async fn direct_tail_in_the_same_write_is_raw() {
+        let (client, mut peer) = duplex(64 * 1024);
+        let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(13));
+        vision.writer.inspect(&server_hello());
+
+        let app = app_data_record(b"payload");
+        let next = app_data_record(b"next");
+        let mut first = app.clone();
+        first.extend_from_slice(&next[..3]);
+        vision
+            .write_all(&first)
+            .await
+            .expect("write complete record plus partial next");
+        vision
+            .write_all(&next[3..])
+            .await
+            .expect("complete raw tail");
+        vision.shutdown().await.expect("shutdown Vision writer");
+
+        let mut raw = Vec::new();
+        peer.read_to_end(&mut raw)
+            .await
+            .expect("read raw Vision output");
+        let (block, used) = parse_block(&raw, true)
+            .expect("Direct block must parse")
+            .expect("Direct block must be complete");
+        assert_eq!(block.command, Command::Direct);
+        assert_eq!(block.content, app);
+        assert_eq!(&raw[used..], &next);
+    }
+
+    #[tokio::test]
+    async fn split_app_data_record_still_triggers_direct() {
+        let (client, mut peer) = duplex(64 * 1024);
+        let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(12));
+        vision.writer.inspect(&server_hello());
+
+        let app = app_data_record(b"split-payload");
+        // Split inside the TLS header and again inside the body. The writer
+        // must carry the partial record instead of framing an incomplete one
+        // and losing the Direct transition.
+        vision
+            .write_all(&app[..2])
+            .await
+            .expect("write header prefix");
+        vision
+            .write_all(&app[2..9])
+            .await
+            .expect("write header remainder and body prefix");
+        vision
+            .write_all(&app[9..])
+            .await
+            .expect("write body remainder");
+        vision.write_all(b"raw-tail").await.expect("write raw tail");
+        vision.shutdown().await.expect("shutdown Vision writer");
+
+        let mut raw = Vec::new();
+        peer.read_to_end(&mut raw)
+            .await
+            .expect("read raw Vision output");
+        let (block, used) = parse_block(&raw, true)
+            .expect("Direct block must parse")
+            .expect("Direct block must be complete");
+        assert_eq!(block.command, Command::Direct);
+        assert_eq!(block.content, app);
+        assert_eq!(&raw[used..], b"raw-tail");
+        assert!(vision.write_is_raw());
     }
 }

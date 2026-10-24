@@ -58,6 +58,86 @@ impl ServerCertVerifier for NoVerifier {
 }
 
 #[tokio::test]
+async fn non_tls_probe_is_forwarded_to_cover_without_waiting_for_a_record() {
+    timeout(Duration::from_secs(5), non_tls_probe_test())
+        .await
+        .expect("non-TLS cover fallback timed out");
+}
+
+async fn non_tls_probe_test() {
+    let cover_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind cover");
+    let cover_address = cover_listener.local_addr().expect("cover address");
+    let (capture_tx, capture_rx) = oneshot::channel();
+    let cover_task = tokio::spawn(async move {
+        let (mut stream, _) = cover_listener.accept().await.expect("accept cover");
+        let mut buffer = vec![0u8; 4096];
+        let count = stream.read(&mut buffer).await.expect("cover read");
+        capture_tx
+            .send(buffer[..count].to_vec())
+            .expect("cover capture");
+        stream.write_all(b"cover-http").await.expect("cover write");
+        stream.shutdown().await.expect("cover shutdown");
+    });
+
+    let beam_config = Arc::new(
+        TlsServerConfig::new(
+            [0x11; 32],
+            vec!["0123456789abcdef".to_string()],
+            vec!["whatsapp.net".to_string()],
+            [0, 0, 0],
+            [255, 255, 255],
+            None,
+            NetLocation {
+                address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                port: cover_address.port(),
+            },
+            Duration::from_secs(1),
+            TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            [0x22; 16],
+        )
+        .expect("beam config"),
+    );
+    let beam_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind beam");
+    let beam_address = beam_listener.local_addr().expect("beam address");
+    let beam_task = tokio::spawn(async move {
+        let (stream, _) = beam_listener.accept().await.expect("accept beam");
+        handle_connection(stream, beam_config).await
+    });
+
+    let mut client = TcpStream::connect(beam_address)
+        .await
+        .expect("connect to beam");
+    // A real cover answers an HTTP request immediately. The old path waited
+    // for the record length decoded from bytes 3-4, which is nonsense here.
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: probe\r\n\r\n")
+        .await
+        .expect("client write");
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .await
+        .expect("read cover response");
+    assert_eq!(response, b"cover-http");
+    // The cover has half-closed; close the client write side so the
+    // bidirectional splice can finish both directions.
+    drop(client);
+
+    let captured = capture_rx.await.expect("cover capture");
+    assert!(
+        captured.starts_with(b"GET /"),
+        "cover must receive the HTTP prefix, got {captured:?}"
+    );
+    let outcome = beam_task.await.expect("beam task").expect("beam handler");
+    assert_eq!(outcome, ConnectionOutcome::CoverForwarded);
+    cover_task.await.expect("cover task");
+}
+
+#[tokio::test]
 async fn tls_server_cover_fallback_forwards_exact_client_hello() {
     timeout(Duration::from_secs(10), cover_fallback_test())
         .await

@@ -243,16 +243,17 @@ tune after a 24-hour soak.
 | 443 listener | present | missing briefly during restart | missing otherwise; page |
 | Egress | the two VPS addresses | ISP address | tunnel down; start sing-box |
 
-The live `max_connections` is 1024 and the pre-auth handshake timeout is 10 s.
-Each Vision Direct relay can hold up to two blocking splice tasks and 512 KiB
-pipes; the Tokio blocking pool is capped at 160 threads. The XUDP reply queue is
-512 frames and session sockets request a 1 MiB receive buffer. The live service
-now runs the **process-wide 256-session XUDP cap** (active plus retained
-sockets), the **32 cover-relay cap**, and `MemoryHigh=512M`/`MemoryMax=768M`/
-`MemorySwapMax=512M`. If RSS exceeds 256 MiB, threads exceed 160, swap is used,
-or p95 latency rises, lower `max_connections` to 256. `max_udp_destinations`
-also consumes one socket/fd per destination; the live value is 1024, while the
-process-wide cap is 256. Check
+The live `max_connections` is 1024 and the pre-auth ClientHello deadline is
+5 s. Admission is split: up to 128 connections may hold a pre-auth slot, and
+the 1024 authenticated permits are acquired only after REALITY succeeds. An
+unauthenticated flood therefore drops new probes instead of blocking the accept
+loop. Each Vision Direct relay can hold up to two blocking splice tasks and
+512 KiB pipes; a process-wide splice semaphore covers about 60 pairs and turns
+excess directions into the bounded async copy path, so the pool cannot queue a
+handoff forever. The XUDP reply queue is 512 frames and session sockets request
+a 1 MiB receive buffer. XUDP sessions expire after at most **60 s** of
+idleness (the TCP relay idle timeout remains 300 s), under the **process-wide
+256-session cap**; the **32 cover-relay cap** is separate. Check
 
 ```bash
 bssh 'systemctl show beam -p MemoryHigh -p MemoryMax -p MemorySwapMax'
@@ -268,22 +269,29 @@ bssh 'sudo -n systemctl restart beam'
 ```
 Edit only `[limits]`; keep the file root:beam 0640. The example's 1024 default matches the live value.
 
+`SIGTERM` closes the listener, drains for at most 2 s, then bounds blocking
+splices with a 3 s runtime shutdown. `SIGHUP` is logged and ignored; use
+`systemctl restart` to reload. Expect a restart to reset active streams, not to
+hang for the 90 s systemd default.
+
 ### Connection admission and relay capacity
 
 `max_connections=1024` is an admission cap, not a promise of 1024 concurrent
 bulk relays. The listener backlog is **128** (Tokio/mio default), the live SYN
 backlog is **128**, and historical load tests recorded **102** accept-queue
 overflows/drops; current 30 s deltas are zero. Each Vision Direct connection
-can pin up to **two** `spawn_blocking` splice tasks, so the 160-thread pool
-supports roughly **80 active relay pairs**. A local 512×1 MB load completed,
-but with a 49.7 s median latency; a 1024×1 MB load produced 937 timeouts and
-927 partial bodies, with 162 threads. Do not raise the blocking pool blindly
-on the 1 GiB host; lower `max_connections` or move the relay to an
-epoll/io_uring design if bulk concurrency matters. The current normal load is
-tens of connections, where the pool is not saturated. Unauthenticated cover
-relays are separately capped at **32** in the repo so a probe burst cannot fill
-the shared blocking pool. XUDP sessions are capped at **256 process-wide** in
-addition to the per-stream limit.
+can pin up to **two** `spawn_blocking` splice tasks. The 160-thread pool is
+split into a 120-task splice budget plus reserve for cover relays and dials;
+above the budget, a direction uses the async copy path instead of queueing
+indefinitely. A local 512×1 MB load completed, but with a 49.7 s median
+latency; a 1024×1 MB load produced 937 timeouts and 927 partial bodies, with
+162 threads. Do not raise the blocking pool blindly on the 1 GiB host; lower
+`max_connections` or move the relay to an epoll/io_uring design if bulk
+concurrency matters. The current normal load is tens of connections, where
+the pool is not saturated. Unauthenticated cover relays are separately capped
+at **32** in the repo so a probe burst cannot fill the shared blocking pool.
+XUDP sessions are capped at **256 process-wide** in addition to the per-stream
+limit, and expire after 60 s of idleness.
 
 ### Network tuning during the 2026-10-23 hotspot test
 

@@ -2,14 +2,22 @@
 Description=beam VLESS REALITY Vision server
 After=network-online.target nss-lookup.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
 User=beam
 Group=beam
+ExecStartPre=/usr/local/bin/beam --check -c /etc/beam/config.toml
 ExecStart=/usr/local/bin/beam -c /etc/beam/config.toml
 Restart=on-failure
-RestartSec=2s
+RestartSec=3s
+TimeoutStartSec=15s
+TimeoutStopSec=20s
+TasksMax=512
+OOMPolicy=stop
+RestrictRealtime=yes
 LimitNOFILE=65536
 MemoryHigh=512M
 MemoryMax=768M

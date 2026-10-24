@@ -184,6 +184,30 @@ UDP modes:
 - Post-deploy IPv4/IPv6 egress, HTTPS, HTTP, DNS, the cover certificate, and
   `NRestarts=0` were verified. See `docs/17-resource-hardening.md`.
 
+## 2026-10-24 optimization pass
+
+Local changes and measurements are recorded in
+`docs/18-optimization-2026-10-24.md`. Highlights:
+
+- Pre-auth admission is separated from authenticated capacity; an idle-socket
+  regression that timed out the old binary now returns HTTP 200 in 5 ms.
+- Non-TLS and over-limit first records are forwarded to the cover instead of
+  waiting for a bogus record body.
+- Vision splice threads are capped with an async fallback; keepalive and a 30 s
+  post-half-close bound release stale mobile flows.
+- TLS `close_notify` is honored as EOF; unknown VLESS flows are rejected.
+- Vision reads are linear and coalesced; partial inner TLS records no longer
+  prevent Direct.
+- XUDP stop/teardown leaks, stale 300 s sessions, retained-socket stale data,
+  and per-frame reply flushes are fixed.
+- SIGTERM drains for 2 s and exits through a 3 s runtime bound.
+- Local capacity remains **1.402x** stock (913.7 vs 651.8 MB/s); full-TUN is
+  8/8 with a 1.33 MiB H3 body; UDP echo is 1.232x stock in the latest quick
+  run (host was noisy).
+
+The live VPS is still on `bd17ac26…` until the deployment is explicitly
+scheduled and verified.
+
 ## In progress
 
 - A light 24-hour background soak started on 2026-10-22 12:52 UTC from the

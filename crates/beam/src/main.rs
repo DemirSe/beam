@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,13 +7,16 @@ use std::time::Duration;
 use anyhow::Context;
 use beam_core::address::{Address, NetLocation};
 use beam_core::config::{Config, LogLevel};
-use beam_core::tls::{MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN, TlsServerConfig, handle_connection};
+use beam_core::tls::{
+    MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN, TlsServerConfig, handle_connection_admitted,
+};
 use beam_core::udp::LegacyUdpConfig;
 use beam_core::xudp::XudpConfig;
 use clap::Parser;
 use tokio::net::TcpListener;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 /// High-performance VLESS + REALITY + Vision server.
 #[derive(Debug, Parser)]
@@ -29,17 +33,29 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     // Each Vision Direct relay can occupy up to two blocking splice tasks.
-    // 160 threads covers about 80 active relay pairs; max_connections is an
-    // admission cap, not a promise of 1024 concurrent bulk relays.
+    // The default covers about 80 active relay pairs; max_connections is an
+    // admission cap, not a promise of 1024 concurrent bulk relays. Operators
+    // can raise the pool for a burst-heavy host without changing the
+    // admission limit.
+    let max_blocking_threads = std::env::var("BEAM_MAX_BLOCKING_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=4096).contains(value))
+        .unwrap_or(160);
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .max_blocking_threads(160)
+        .max_blocking_threads(max_blocking_threads)
         .enable_all()
         .build()
         .context("failed to build the Tokio runtime")?;
-    runtime.block_on(async_main())
+    let result = runtime.block_on(async_main(max_blocking_threads));
+    // A blocking splice cannot be aborted once it has started. The shutdown
+    // path drains normal connections briefly; this bound is the final backstop
+    // for a wedged relay so systemd can restart the service.
+    runtime.shutdown_timeout(Duration::from_secs(3));
+    result
 }
 
-async fn async_main() -> anyhow::Result<()> {
+async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Config::from_path(&cli.config)
         .with_context(|| format!("failed to load `{}`", cli.config.display()))?;
@@ -51,13 +67,50 @@ async fn async_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let tls_config = Arc::new(build_tls_config(&config)?);
+    let max_connections = config.limits.max_connections as usize;
+    // Pre-auth slots bound ClientHello reads, not data-path relays. Keep this
+    // small enough that a scanner flood cannot pin every permit, but large
+    // enough for a browser's parallel connection burst.
+    let max_pending_handshakes = max_connections.clamp(16, 128);
+    let authenticated = Arc::new(Semaphore::new(max_connections));
+    let preauth = Arc::new(Semaphore::new(max_pending_handshakes));
+    // Leave room in the blocking pool for cover relays, DNS resolution, and
+    // destination dials. Vision directions above this cap use the async copy
+    // path instead of queueing forever in `spawn_blocking`.
+    let max_splice_tasks = max_blocking_threads.saturating_sub(40).max(1);
+    let splice_permits = Arc::new(Semaphore::new(max_splice_tasks));
+
+    let tls_config = Arc::new(
+        build_tls_config(&config)?
+            .with_connection_limiter(Arc::clone(&authenticated))
+            .with_splice_limiter(splice_permits),
+    );
     let listener = TcpListener::bind(config.server.listen)
         .await
         .with_context(|| format!("failed to bind `{}`", config.server.listen))?;
-    let semaphore = Arc::new(Semaphore::new(config.limits.max_connections as usize));
 
-    tracing::info!(listen = %config.server.listen, "beam listening");
+    tracing::info!(
+        listen = %config.server.listen,
+        max_connections,
+        max_pending_handshakes,
+        "beam listening"
+    );
+
+    let mut sigterm = signal(SignalKind::terminate()).context("failed to watch SIGTERM")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("failed to watch SIGINT")?;
+    let mut sighup = signal(SignalKind::hangup()).context("failed to watch SIGHUP")?;
+    tokio::spawn(async move {
+        while sighup.recv().await.is_some() {
+            tracing::warn!("SIGHUP ignored; restart the service to reload configuration");
+        }
+    });
+    let shutdown = async move {
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = sigint.recv() => {}
+        }
+    };
+    tokio::pin!(shutdown);
 
     // A transient fd shortage must not turn into a permanent outage. `accept`
     // can fail with EMFILE/ENFILE, ECONNABORTED, or an interrupted syscall;
@@ -66,37 +119,80 @@ async fn async_main() -> anyhow::Result<()> {
     // error.
     let mut accept_backoff = Duration::from_millis(10);
     loop {
-        let (stream, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
             Ok(accepted) => {
                 accept_backoff = Duration::from_millis(10);
                 accepted
             }
             Err(error) => {
                 tracing::warn!(%error, "listener accept failed; retrying");
-                sleep(accept_backoff).await;
+                tokio::select! {
+                    _ = &mut shutdown => break,
+                    _ = sleep(accept_backoff) => {}
+                }
                 accept_backoff = (accept_backoff * 2).min(Duration::from_secs(1));
                 continue;
             }
         };
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .context("connection limiter closed")?;
+        // Never block the accept loop on data-path capacity. If every
+        // pre-auth slot is held, drop this connection and keep draining the
+        // kernel backlog; a stalled accept loop turns a handshake flood into a
+        // total outage.
+        let preauth_permit = match Arc::clone(&preauth).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::debug!(%peer, "pre-auth handshake limit reached; dropping");
+                drop(stream);
+                tokio::task::yield_now().await;
+                continue;
+            }
+        };
         let tls_config = Arc::clone(&tls_config);
 
         tokio::spawn(async move {
-            let _permit = permit;
             if let Err(error) = stream.set_nodelay(true) {
                 tracing::debug!(%peer, %error, "could not set TCP_NODELAY");
             }
+            if let Err(error) = beam_sys::set_tcp_keepalive(
+                stream.as_raw_fd(),
+                Duration::from_secs(60),
+                Duration::from_secs(15),
+            ) {
+                tracing::debug!(%peer, %error, "could not set TCP keepalive");
+            }
 
-            match handle_connection(stream, tls_config).await {
+            match handle_connection_admitted(stream, tls_config, Some(preauth_permit)).await {
                 Ok(outcome) => tracing::debug!(%peer, ?outcome, "connection finished"),
                 Err(error) => tracing::debug!(%peer, %error, "connection failed"),
             }
         });
     }
+
+    // Stop accepting immediately, then let established connections finish.
+    // New work is not started. A relay that ignores the idle timeout is
+    // bounded by the runtime shutdown deadline in `main`.
+    drop(listener);
+    tracing::info!("shutdown signal received; draining connections");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while authenticated.available_permits() < max_connections
+        || preauth.available_permits() < max_pending_handshakes
+    {
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                authenticated_remaining = max_connections - authenticated.available_permits(),
+                preauth_remaining = max_pending_handshakes - preauth.available_permits(),
+                "shutdown drain deadline reached; closing remaining connections"
+            );
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    tracing::info!("shutdown complete");
+    Ok(())
 }
 
 fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
@@ -117,7 +213,12 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         .clamp(1, usize::from(u16::MAX) + 1);
     let xudp = XudpConfig {
         max_sessions,
-        session_idle_timeout: Duration::from_millis(config.limits.idle_timeout_ms),
+        // Xray/sing-box XUDP clients generally close a flow with the TCP
+        // stream, not an `End` frame. Reusing the 300 s TCP idle timeout lets
+        // stale UDP sessions consume the 256-slot global cap. Cap the UDP
+        // session idle clock independently; the TCP relay timeout is unchanged.
+        session_idle_timeout: Duration::from_millis(config.limits.idle_timeout_ms)
+            .min(Duration::from_secs(60)),
         io_timeout: Duration::from_millis(config.limits.handshake_timeout_ms),
         // A single HTTP/3 body can arrive as hundreds of UDP datagrams while
         // the outer TCP stream drains. Keep a larger bounded reply queue so a
@@ -159,7 +260,19 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
 }
 
 fn init_logging(level: LogLevel) {
+    let env_override = std::env::var_os("RUST_LOG").is_some();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level.as_str()));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .init();
+    if env_override {
+        tracing::warn!("RUST_LOG is set and overrides the configured log level");
+    }
+    if matches!(level, LogLevel::Debug | LogLevel::Trace) {
+        tracing::warn!(
+            "diagnostic logging is enabled; peer addresses and destinations may be recorded"
+        );
+    }
 }

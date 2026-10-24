@@ -67,12 +67,27 @@ for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL"; d
   fi
 done
 
-install -m 0755 -o root -g root "$BIN" "$INSTALL_BIN"
-if [ "$KEEP_CONFIG" = "0" ]; then
-  install -m 0640 -o root -g beam "$CONFIG" "$INSTALL_CONFIG"
+# Validate the bundle before replacing the running binary. The old service is
+# still in memory if this fails, but a broken installed binary would otherwise
+# turn the next restart or reboot into an outage.
+if [ "$KEEP_CONFIG" = "1" ]; then
+  "$BIN" --check -c "$INSTALL_CONFIG"
+else
+  "$BIN" --check -c "$CONFIG"
 fi
-install -m 0644 -o root -g root "$UNIT" "$INSTALL_UNIT"
-install -m 0644 -o root -g root "$SYSCTL" "$INSTALL_SYSCTL"
+
+# Install beside the destination and rename, so a crash or full disk cannot
+# leave a truncated binary or unit file in place.
+install -m 0755 -o root -g root "$BIN" "$INSTALL_BIN.new"
+mv -f "$INSTALL_BIN.new" "$INSTALL_BIN"
+if [ "$KEEP_CONFIG" = "0" ]; then
+  install -m 0640 -o root -g beam "$CONFIG" "$INSTALL_CONFIG.new"
+  mv -f "$INSTALL_CONFIG.new" "$INSTALL_CONFIG"
+fi
+install -m 0644 -o root -g root "$UNIT" "$INSTALL_UNIT.new"
+mv -f "$INSTALL_UNIT.new" "$INSTALL_UNIT"
+install -m 0644 -o root -g root "$SYSCTL" "$INSTALL_SYSCTL.new"
+mv -f "$INSTALL_SYSCTL.new" "$INSTALL_SYSCTL"
 sysctl --system >/dev/null
 
 runuser -u beam -- "$INSTALL_BIN" --check -c "$INSTALL_CONFIG"

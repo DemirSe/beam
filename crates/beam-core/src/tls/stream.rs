@@ -133,6 +133,8 @@ pub struct TlsStream {
     pending_write: Option<usize>,
     read_raw: bool,
     write_raw: bool,
+    /// rustls reported a clean `close_notify`.
+    closed: bool,
 }
 
 impl TlsStream {
@@ -164,6 +166,7 @@ impl TlsStream {
             pending_write: None,
             read_raw: false,
             write_raw: false,
+            closed: false,
         };
         poll_fn(|cx| stream.poll_handshake(cx)).await?;
         Ok(stream)
@@ -326,6 +329,13 @@ impl TlsStream {
                 }
             }
 
+            // A client close_notify is a clean half-close even when its TCP
+            // socket stays open. Once rustls reports it, stop reading the
+            // socket so the relay can half-close the destination promptly.
+            if self.closed {
+                return Poll::Ready(Ok(()));
+            }
+
             if self.read_raw {
                 if self.record.is_partial() || self.pending_offset < self.pending.len() {
                     return Poll::Ready(Err(TlsStreamError::PartialRecord));
@@ -358,7 +368,19 @@ impl TlsStream {
             match self.record.poll(&mut self.socket, cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(TlsStreamError::Io(error))),
-                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(None)) => {
+                    // Let rustls classify the TCP EOF. A close_notify that
+                    // arrived earlier yields a clean EOF; a bare FIN yields
+                    // UnexpectedEof instead of being reported as a clean
+                    // application close.
+                    let _ = self.conn.read_tls(&mut &[][..]);
+                    self.conn.process_new_packets()?;
+                    self.drain_plaintext()?;
+                    if self.plaintext_offset < self.plaintext.len() {
+                        continue;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
                 Poll::Ready(Ok(Some(record))) => {
                     self.pending = record;
                     self.pending_offset = 0;
@@ -450,7 +472,10 @@ impl TlsStream {
         let mut buffer = [0u8; READ_CHUNK];
         loop {
             match self.conn.reader().read(&mut buffer) {
-                Ok(0) => return Ok(()),
+                Ok(0) => {
+                    self.closed = true;
+                    return Ok(());
+                }
                 Ok(count) => {
                     if self.plaintext_offset > 0 {
                         self.plaintext.drain(..self.plaintext_offset);
@@ -629,16 +654,23 @@ impl RecordRead {
 
                 validate_header(&self.header)?;
                 let length = usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
-                let mut body = Vec::new();
-                body.try_reserve_exact(length)
+                // Store the header and body in one buffer. The old path
+                // allocated a body Vec and then copied it into a second record
+                // Vec for every TLS record.
+                let mut record = Vec::new();
+                record
+                    .try_reserve_exact(TLS_RECORD_HEADER_LEN + length)
                     .map_err(|_| TlsStreamError::Allocation)?;
-                body.resize(length, 0);
-                self.body = body;
+                record.extend_from_slice(&self.header);
+                record.resize(TLS_RECORD_HEADER_LEN + length, 0);
+                self.body = record;
                 self.body_filled = 0;
             }
 
-            if self.body_filled < self.body.len() {
-                let mut buf = ReadBuf::new(&mut self.body[self.body_filled..]);
+            let body_len = self.body.len() - TLS_RECORD_HEADER_LEN;
+            if self.body_filled < body_len {
+                let mut buf =
+                    ReadBuf::new(&mut self.body[TLS_RECORD_HEADER_LEN + self.body_filled..]);
                 match Pin::new(&mut *socket).poll_read(cx, &mut buf) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -651,20 +683,14 @@ impl RecordRead {
                             )));
                         }
                         self.body_filled += filled;
-                        if self.body_filled < self.body.len() {
+                        if self.body_filled < body_len {
                             continue;
                         }
                     }
                 }
             }
 
-            let body = std::mem::take(&mut self.body);
-            let mut record = Vec::new();
-            record
-                .try_reserve_exact(TLS_RECORD_HEADER_LEN + body.len())
-                .map_err(|_| TlsStreamError::Allocation)?;
-            record.extend_from_slice(&self.header);
-            record.extend_from_slice(&body);
+            let record = std::mem::take(&mut self.body);
             self.header_filled = 0;
             self.body_filled = 0;
             return Poll::Ready(Ok(Some(record)));
@@ -700,7 +726,9 @@ fn validate_header(header: &[u8; TLS_RECORD_HEADER_LEN]) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::time::timeout;
 
     async fn read_record<R>(reader: &mut RecordRead, socket: &mut R) -> io::Result<Option<Vec<u8>>>
     where
@@ -828,6 +856,7 @@ mod tests {
             pending_write: None,
             read_raw: false,
             write_raw: false,
+            closed: false,
         }
     }
 
@@ -940,5 +969,58 @@ mod tests {
             .expect("read response");
         assert_eq!(&response, b"pong");
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn close_notify_is_clean_eof_without_tcp_fin() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_config = test_server_config();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let conn = ServerConnection::new(server_config).expect("server connection");
+            let mut tls = TlsStream::accept(socket, conn, Vec::new())
+                .await
+                .expect("server handshake");
+            let mut request = [0u8; 4];
+            tls.read_exact(&mut request).await.expect("read request");
+            assert_eq!(&request, b"ping");
+            let mut eof = [0u8; 1];
+            let count = timeout(Duration::from_secs(1), tls.read(&mut eof))
+                .await
+                .expect("close_notify must be delivered as EOF")
+                .expect("read after close_notify");
+            assert_eq!(count, 0);
+        });
+
+        let socket = TcpStream::connect(address).await.expect("client connect");
+        let connector = tokio_rustls::TlsConnector::from(test_client_config());
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut client = connector
+            .connect(name, socket)
+            .await
+            .expect("client handshake");
+        client.write_all(b"ping").await.expect("write request");
+        {
+            let (socket, connection) = client.get_mut();
+            connection.send_close_notify();
+            let mut wire = Vec::new();
+            while connection.wants_write() {
+                connection
+                    .write_tls(&mut wire)
+                    .expect("encode close_notify");
+            }
+            socket.write_all(&wire).await.expect("write close_notify");
+            socket.flush().await.expect("flush close_notify");
+        }
+        // Keep the client object (and its TCP socket) alive while the server
+        // observes the close_notify. Dropping it here would also send FIN.
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server did not observe close_notify")
+            .expect("server task");
+        drop(client);
     }
 }

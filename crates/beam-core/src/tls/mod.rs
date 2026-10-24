@@ -16,5 +16,6 @@ pub use client_hello::{
 };
 pub use server::{
     ConnectionOutcome, ReplayStream, TlsServerConfig, TlsServerError, handle_connection,
+    handle_connection_admitted,
 };
 pub use stream::{RawTls, RawTlsHandoff, TlsStream, TlsStreamError};

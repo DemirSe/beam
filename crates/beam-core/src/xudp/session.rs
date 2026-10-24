@@ -511,8 +511,13 @@ impl Session {
     }
 
     /// Stops the reply task. Sending is idempotent.
+    ///
+    /// `send_replace` stores the value even when the reply task has not yet
+    /// subscribed. `send` returns an error in that window and leaves the
+    /// value at `false`, so a task spawned just before mux shutdown would
+    /// miss the stop and keep its socket and global permit forever.
     pub(crate) fn stop(&self) {
-        let _ = self.stop.send(true);
+        self.stop.send_replace(true);
     }
 
     /// Returns a receiver that observes [`Self::stop`].

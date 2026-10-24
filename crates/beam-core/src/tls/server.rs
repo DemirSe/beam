@@ -30,7 +30,7 @@ use sha2::Sha512;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
@@ -64,6 +64,18 @@ const COVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// starve the VPN data path. The limit is global rather than per-IP because
 /// the deployment intentionally does not filter by client address.
 const COVER_MAX_CONCURRENCY: usize = 32;
+
+/// Maximum time a connection may hold a pre-auth slot for its ClientHello.
+///
+/// This is intentionally shorter than the full TLS/VLESS handshake timeout: an
+/// unauthenticated peer should not be able to pin admission capacity for the
+/// deployment's 10 s handshake budget.
+const PREAUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on a destination TCP dial. The server is normally a datacenter
+/// hop away from the target; a blackholed address should not hold a permit for
+/// the full client handshake budget.
+const MAX_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bound on remembered authenticated ClientHello session ids.
 const REPLAY_CACHE_CAPACITY: usize = 4_096;
@@ -131,6 +143,9 @@ pub enum ConnectionOutcome {
     /// The connection was not authenticated and was closed because the cover
     /// concurrency limit was reached.
     CoverLimited,
+    /// The REALITY handshake succeeded but the authenticated connection limit
+    /// was already in use.
+    ConnectionLimited,
     /// The REALITY handshake succeeded and the VLESS command was observed.
     Authenticated {
         /// The VLESS command from the request.
@@ -245,6 +260,17 @@ pub struct TlsServerConfig {
     pub udp: LegacyUdpConfig,
     provider: Arc<CryptoProvider>,
     certificate: TemporaryCertificate,
+    /// Global cap on authenticated connections. The accept loop bounds
+    /// unauthenticated handshakes separately, so a pre-auth flood cannot
+    /// exhaust this permit pool.
+    connection_permits: Arc<Semaphore>,
+    /// Process-wide cap on blocking Vision splice tasks.
+    ///
+    /// `spawn_blocking` has no queue deadline; once Tokio's blocking pool is
+    /// full, a handoff waits forever and the connection silently stops
+    /// forwarding. Keep a reserve for cover relays and DNS, and fall back to
+    /// the async copy path when this cap is reached.
+    splice_permits: Arc<Semaphore>,
     /// Global cap on unauthenticated cover relays.
     cover_permits: Arc<Semaphore>,
     /// Bounded exact-replay filter for authenticated ClientHellos.
@@ -302,6 +328,8 @@ impl TlsServerConfig {
             udp: LegacyUdpConfig::default(),
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             certificate: TemporaryCertificate::generate()?,
+            connection_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+            splice_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             cover_permits: Arc::new(Semaphore::new(COVER_MAX_CONCURRENCY)),
             replay_cache: Mutex::new(ReplayCache::new(REPLAY_CACHE_TTL)),
         })
@@ -311,6 +339,25 @@ impl TlsServerConfig {
     #[must_use]
     pub fn with_xudp(mut self, xudp: XudpConfig) -> Self {
         self.xudp = xudp;
+        self
+    }
+
+    /// Overrides the authenticated connection limiter.
+    ///
+    /// The accept loop holds a separate, smaller pre-auth permit until the
+    /// REALITY ClientHello is classified. This semaphore is acquired only
+    /// after authentication, so unauthenticated half-open connections cannot
+    /// consume the VPN's data-path capacity.
+    #[must_use]
+    pub fn with_connection_limiter(mut self, permits: Arc<Semaphore>) -> Self {
+        self.connection_permits = permits;
+        self
+    }
+
+    /// Overrides the process-wide blocking splice task limit.
+    #[must_use]
+    pub fn with_splice_limiter(mut self, permits: Arc<Semaphore>) -> Self {
+        self.splice_permits = permits;
         self
     }
 
@@ -367,12 +414,11 @@ impl TlsServerConfig {
     fn build_server_config(&self, auth_key: &[u8]) -> Result<rustls::ServerConfig, TlsServerError> {
         let certificate = self.signed_certificate(auth_key)?;
         let chain = vec![CertificateDer::from(certificate)];
-        let key = PrivatePkcs8KeyDer::from(self.certificate.private_key_der.to_vec());
-        let signing_key = rustls::crypto::aws_lc_rs::sign::any_eddsa_type(&key)
-            .map_err(TlsServerError::Rustls)?;
-        let certified =
-            CertifiedKey::new(chain, Arc::new(RealitySigningKey { inner: signing_key }));
-        certified.keys_match().map_err(TlsServerError::Rustls)?;
+        // The Ed25519 key and certificate are generated together once at
+        // startup. Only the certificate signature changes per connection, so
+        // reusing the parsed signing key avoids a private-key parse and an
+        // Ed25519 sign/verify `keys_match` on every handshake.
+        let certified = CertifiedKey::new(chain, Arc::clone(&self.certificate.signing_key));
 
         let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -430,14 +476,15 @@ impl fmt::Debug for TlsServerConfig {
             .field("xudp_limiter", &self.xudp_limiter)
             .field("udp", &self.udp)
             .field("cover_max_concurrency", &COVER_MAX_CONCURRENCY)
+            .field("splice_available", &self.splice_permits.available_permits())
             .finish()
     }
 }
 
 struct TemporaryCertificate {
     certificate_der: Vec<u8>,
-    private_key_der: Zeroizing<Vec<u8>>,
     public_key: [u8; 32],
+    signing_key: Arc<dyn SigningKey>,
 }
 
 impl TemporaryCertificate {
@@ -453,11 +500,15 @@ impl TemporaryCertificate {
             .public_key_raw()
             .try_into()
             .map_err(|_| TlsServerError::Certificate)?;
+        let private_key_der = Zeroizing::new(key_pair.serialize_der());
+        let parsed = PrivatePkcs8KeyDer::from(private_key_der.to_vec());
+        let inner = rustls::crypto::aws_lc_rs::sign::any_eddsa_type(&parsed)
+            .map_err(TlsServerError::Rustls)?;
 
         Ok(Self {
             certificate_der: certificate.der().to_vec(),
-            private_key_der: Zeroizing::new(key_pair.serialize_der()),
             public_key,
+            signing_key: Arc::new(RealitySigningKey { inner }),
         })
     }
 }
@@ -535,12 +586,40 @@ impl AsyncWrite for ReplayStream {
     }
 }
 
-/// Handles one accepted TCP connection.
+/// Handles one accepted TCP connection without a pre-auth permit.
+///
+/// This is the compatibility entry point used by tests and embedders. The
+/// production accept loop uses [`handle_connection_admitted`] so a pre-auth
+/// flood is bounded separately from authenticated capacity.
 pub async fn handle_connection(
     stream: TcpStream,
     config: Arc<TlsServerConfig>,
 ) -> Result<ConnectionOutcome, TlsServerError> {
-    let record = read_client_hello_record(&stream, &config).await?;
+    handle_connection_admitted(stream, config, None).await
+}
+
+/// Handles one accepted TCP connection.
+///
+/// `preauth` is held only until the ClientHello is classified. An
+/// authenticated connection then acquires a separate connection permit; an
+/// unauthenticated probe releases the pre-auth permit before it is forwarded
+/// to the cover, whose own concurrency cap bounds it.
+pub async fn handle_connection_admitted(
+    mut stream: TcpStream,
+    config: Arc<TlsServerConfig>,
+    preauth: Option<OwnedSemaphorePermit>,
+) -> Result<ConnectionOutcome, TlsServerError> {
+    let read = read_client_hello_record(&mut stream, &config).await?;
+    let record = match read {
+        ClientHelloRead::Complete(record) => record,
+        ClientHelloRead::Forward(prefix) => {
+            drop(preauth);
+            if prefix.is_empty() {
+                return Ok(ConnectionOutcome::CoverForwarded);
+            }
+            return forward_to_cover(stream, &prefix, &config).await;
+        }
+    };
     let auth = match ClientHello::parse(&record) {
         Ok(hello) => match authenticate(&hello, &config.reality_config()) {
             Ok(auth) => {
@@ -569,44 +648,114 @@ pub async fn handle_connection(
     };
 
     match auth {
-        Some(auth) => handle_authenticated(stream, record, auth, &config).await,
-        None => forward_to_cover(stream, &record, &config).await,
+        Some(auth) => {
+            let permit = match Arc::clone(&config.connection_permits).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tracing::debug!("authenticated connection limit reached; closing");
+                    return Ok(ConnectionOutcome::ConnectionLimited);
+                }
+            };
+            drop(preauth);
+            handle_authenticated(stream, record, auth, &config, permit).await
+        }
+        None => {
+            drop(preauth);
+            forward_to_cover(stream, &record, &config).await
+        }
     }
 }
 
+/// Result of reading the initial bytes from a connection.
+enum ClientHelloRead {
+    /// A complete TLS record was read and should be parsed.
+    Complete(Vec<u8>),
+    /// The peer did not send a plausible, complete ClientHello. Forward the
+    /// bytes already read (possibly only the five-byte header) to the cover,
+    /// then relay the rest byte-for-byte.
+    Forward(Vec<u8>),
+}
+
+fn is_plausible_tls_record_header(header: &[u8; TLS_RECORD_HEADER_LEN]) -> bool {
+    header[0] == 0x16 && header[1] == 0x03 && matches!(header[2], 0x01 | 0x03)
+}
+
+/// Reads the initial TLS record.
+///
+/// A non-TLS prefix or an over-limit record is returned immediately so a
+/// prober sees the cover respond instead of beam waiting for a body that will
+/// never arrive. If the peer stalls or closes mid-record, the bytes already
+/// received are forwarded to the cover too.
 async fn read_client_hello_record(
-    stream: &TcpStream,
+    stream: &mut TcpStream,
     config: &TlsServerConfig,
-) -> Result<Vec<u8>, TlsServerError> {
+) -> Result<ClientHelloRead, TlsServerError> {
     // One absolute deadline covers both the five-byte header and the declared
     // body. Per-read timeouts would let a patient peer hold a pre-auth slot for
     // twice the configured handshake budget.
-    timeout(config.handshake_timeout, async {
-        let mut header = [0u8; TLS_RECORD_HEADER_LEN];
-        read_exact(stream, &mut header).await?;
+    let deadline = Instant::now() + config.handshake_timeout.min(PREAUTH_HANDSHAKE_TIMEOUT);
+    let mut header = [0u8; TLS_RECORD_HEADER_LEN];
+    let mut filled = 0usize;
 
-        let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
-        let total = TLS_RECORD_HEADER_LEN + record_len;
-        if total > config.max_client_hello_bytes {
-            return Err(TlsServerError::ClientHelloTooLarge {
-                length: total,
-                max: config.max_client_hello_bytes,
-            });
+    while filled < header.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(ClientHelloRead::Forward(header[..filled].to_vec()));
         }
+        let read = match timeout(remaining, stream.read(&mut header[filled..])).await {
+            Err(_) => return Ok(ClientHelloRead::Forward(header[..filled].to_vec())),
+            Ok(read) => read,
+        };
+        match read {
+            Ok(0) => return Ok(ClientHelloRead::Forward(header[..filled].to_vec())),
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+    }
 
-        let mut record = Vec::new();
-        record
-            .try_reserve_exact(total)
-            .map_err(|_| TlsServerError::Allocation)?;
-        record.extend_from_slice(&header);
-        record.resize(total, 0);
-        read_exact(stream, &mut record[TLS_RECORD_HEADER_LEN..]).await?;
-        Ok(record)
-    })
-    .await
-    .map_err(|_| TlsServerError::Timeout {
-        stage: "ClientHello read",
-    })?
+    // HTTP, SSH, random junk, and records too large for the configured bound
+    // are not ClientHellos. Give the cover the header now; the client may
+    // already have sent more bytes and the splice will carry them.
+    let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+    let total = TLS_RECORD_HEADER_LEN.saturating_add(record_len);
+    if !is_plausible_tls_record_header(&header) || total > config.max_client_hello_bytes {
+        return Ok(ClientHelloRead::Forward(header.to_vec()));
+    }
+
+    let mut record = Vec::new();
+    record
+        .try_reserve_exact(total)
+        .map_err(|_| TlsServerError::Allocation)?;
+    record.extend_from_slice(&header);
+    record.resize(total, 0);
+    filled = TLS_RECORD_HEADER_LEN;
+
+    while filled < total {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            record.truncate(filled);
+            return Ok(ClientHelloRead::Forward(record));
+        }
+        let read = match timeout(remaining, stream.read(&mut record[filled..])).await {
+            Err(_) => {
+                record.truncate(filled);
+                return Ok(ClientHelloRead::Forward(record));
+            }
+            Ok(read) => read,
+        };
+        match read {
+            Ok(0) => {
+                record.truncate(filled);
+                return Ok(ClientHelloRead::Forward(record));
+            }
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+    }
+
+    Ok(ClientHelloRead::Complete(record))
 }
 
 /// Returns the account UUID used for lookup.
@@ -626,6 +775,7 @@ async fn handle_authenticated(
     record: Vec<u8>,
     auth: Auth,
     config: &TlsServerConfig,
+    _connection_permit: OwnedSemaphorePermit,
 ) -> Result<ConnectionOutcome, TlsServerError> {
     let server_config = Arc::new(config.build_server_config(&auth.auth_key[..])?);
     let connection =
@@ -654,13 +804,22 @@ async fn handle_authenticated(
     {
         return Err(TlsServerError::UnauthorizedUser);
     }
+    // Stock rejects an unknown flow instead of silently treating the body as
+    // unframed bytes. A typo would otherwise corrupt every destination read.
+    if request
+        .flow
+        .as_deref()
+        .is_some_and(|flow| flow != crate::vless::VISION_FLOW)
+    {
+        return Err(VlessError::UnsupportedFlow.into());
+    }
 
     match request.command {
         Command::Tcp => {
             let destination = request
                 .destination
                 .ok_or(TlsServerError::MissingDestination)?;
-            let target = dial(&destination, config.handshake_timeout).await?;
+            let target = dial(&destination, config.handshake_timeout.min(MAX_DIAL_TIMEOUT)).await?;
 
             timeout(
                 config.handshake_timeout,
@@ -674,7 +833,13 @@ async fn handle_authenticated(
             if request.vision {
                 let rng = SmallRng::seed_from_u64(vision_seed());
                 let vision = VisionStream::new(tls, request.user_id, request.body, rng);
-                relay_vision(vision, target, config.relay_idle_timeout).await?;
+                relay_vision(
+                    vision,
+                    target,
+                    config.relay_idle_timeout,
+                    Arc::clone(&config.splice_permits),
+                )
+                .await?;
             } else {
                 let mut target = target;
                 if !request.body.is_empty() {
@@ -798,6 +963,7 @@ struct OwnedRequest {
     command: Command,
     destination: Option<NetLocation>,
     vision: bool,
+    flow: Option<String>,
     body: Vec<u8>,
 }
 
@@ -834,6 +1000,7 @@ where
                     command: header.command,
                     destination: header.destination,
                     vision: header.addons.is_vision(),
+                    flow: header.addons.flow.map(str::to_owned),
                     body: body.to_vec(),
                 });
             }
@@ -852,7 +1019,7 @@ async fn dial(
         Address::Ipv6(address) => address.to_string(),
         Address::Domain(domain) => domain.clone(),
     };
-    timeout(
+    let stream = timeout(
         dial_timeout,
         TcpStream::connect((host.as_str(), destination.port)),
     )
@@ -860,7 +1027,22 @@ async fn dial(
     .map_err(|_| TlsServerError::Timeout {
         stage: "destination dial",
     })?
-    .map_err(TlsServerError::Io)
+    .map_err(TlsServerError::Io)?;
+
+    // Small request headers and interactive replies must not wait for
+    // Nagle/delayed-ACK interaction on the outbound socket. The accepted
+    // client socket already sets this in `main`.
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(%error, "could not set TCP_NODELAY on the destination");
+    }
+    if let Err(error) = beam_sys::set_tcp_keepalive(
+        stream.as_raw_fd(),
+        Duration::from_secs(60),
+        Duration::from_secs(15),
+    ) {
+        tracing::debug!(%error, "could not set TCP keepalive on the destination");
+    }
+    Ok(stream)
 }
 
 async fn relay_bidirectional<A, B>(
@@ -912,6 +1094,7 @@ async fn relay_vision(
     vision: VisionStream<TlsStream>,
     target: TcpStream,
     idle_timeout: Duration,
+    splice_permits: Arc<Semaphore>,
 ) -> Result<(), TlsServerError> {
     let activity = Arc::new(RelayActivity::new());
     let mut write_direct = vision.write_direct_watch();
@@ -940,6 +1123,7 @@ async fn relay_vision(
     let (mut target_read, mut target_write) = tokio::io::split(target);
 
     let up_activity = Arc::clone(&activity);
+    let up_splice_permits = Arc::clone(&splice_permits);
     let up = async move {
         let mut stop_guard = RelayStopGuard::new(&up_activity);
         let result = async {
@@ -956,6 +1140,21 @@ async fn relay_vision(
                 return Ok(());
             }
 
+            let Some(splice_permit) = up_splice_permits.try_acquire_owned().ok() else {
+                tracing::debug!(
+                    copied_up,
+                    "Vision splice task limit reached; using async upload copy"
+                );
+                copy_direction(
+                    &mut vision_read,
+                    &mut target_write,
+                    idle_timeout,
+                    Some(&up_activity),
+                )
+                .await?;
+                return Ok(());
+            };
+
             tracing::debug!(
                 copied_up,
                 "Vision read switched to raw; starting one-way upload splice"
@@ -963,6 +1162,7 @@ async fn relay_vision(
             let config = splice_config(idle_timeout);
             let relay_activity = Arc::clone(&up_activity);
             let result = tokio::task::spawn_blocking(move || {
+                let _splice_permit = splice_permit;
                 copy_one_way(
                     client_read.as_raw_fd(),
                     target_write_splice.as_raw_fd(),
@@ -993,6 +1193,7 @@ async fn relay_vision(
     };
 
     let down_activity = Arc::clone(&activity);
+    let down_splice_permits = Arc::clone(&splice_permits);
     let down = async move {
         let mut stop_guard = RelayStopGuard::new(&down_activity);
         let result = async {
@@ -1009,6 +1210,21 @@ async fn relay_vision(
             return Ok(());
         }
 
+        let Some(splice_permit) = down_splice_permits.try_acquire_owned().ok() else {
+            tracing::debug!(
+                copied_down,
+                "Vision splice task limit reached; using async download copy"
+            );
+            copy_direction(
+                &mut target_read,
+                &mut vision_write,
+                idle_timeout,
+                Some(&down_activity),
+            )
+            .await?;
+            return Ok(());
+        };
+
         tracing::debug!(
             copied_down,
             "Vision write switched to raw; starting one-way download splice"
@@ -1016,6 +1232,7 @@ async fn relay_vision(
         let config = splice_config(idle_timeout);
         let relay_activity = Arc::clone(&down_activity);
         let result = tokio::task::spawn_blocking(move || {
+            let _splice_permit = splice_permit;
             copy_one_way(
                 target_read_splice.as_raw_fd(),
                 client_write.as_raw_fd(),
@@ -1074,7 +1291,14 @@ where
             return Ok((relayed, true));
         }
 
+        // Poll the read first. The handoff publish and a raw read can become
+        // ready in the same poll; if the handoff branch won, a completed read
+        // would be dropped and its bytes lost. Reading before returning is
+        // safe because the handoff only happens after every framed byte has
+        // been drained, so the bytes belong to the raw prefix.
         let read = tokio::select! {
+            biased;
+            read = timeout(idle_timeout, reader.read(&mut buffer)) => read,
             changed = read_handoff.changed() => {
                 if changed.is_err() {
                     break;
@@ -1084,7 +1308,6 @@ where
                 }
                 continue;
             }
-            read = timeout(idle_timeout, reader.read(&mut buffer)) => read,
         };
         let count = match read {
             Ok(result) => result?,
@@ -1158,7 +1381,12 @@ where
             return Ok((relayed, true));
         }
 
+        // As on the read side, prefer a completed read over a simultaneous
+        // raw-write handoff. The read bytes are still part of the ordered
+        // target-to-client stream and must be written before the handoff.
         let read = tokio::select! {
+            biased;
+            read = timeout(idle_timeout, reader.read(&mut buffer)) => read,
             changed = write_raw.changed() => {
                 if changed.is_err() {
                     break;
@@ -1168,7 +1396,6 @@ where
                 }
                 continue;
             }
-            read = timeout(idle_timeout, reader.read(&mut buffer)) => read,
         };
         let count = match read {
             Ok(result) => result?,
@@ -1257,7 +1484,10 @@ async fn relay_splice(
 fn splice_config(idle_timeout: Duration) -> RelayConfig {
     RelayConfig::new()
         .with_idle_timeout(idle_timeout)
-        .with_shutdown_timeout(idle_timeout)
+        // A half-closed direction no longer needs the full VPN idle budget.
+        // Bound it so a finished mobile flow releases its blocking thread and
+        // kernel pipe promptly instead of lingering for five minutes.
+        .with_shutdown_timeout(Duration::from_secs(30))
 }
 
 fn join_error(error: tokio::task::JoinError) -> TlsServerError {
@@ -1310,10 +1540,16 @@ where
     let mut buffer = [0u8; RELAY_BUFFER_LEN];
     let mut relayed = 0_u64;
     loop {
+        if activity_clock.is_some_and(RelayActivity::is_stopped) {
+            break;
+        }
         let read = timeout(idle_timeout, reader.read(&mut buffer)).await;
         let count = match read {
             Ok(result) => result?,
             Err(_) => {
+                if activity_clock.is_some_and(RelayActivity::is_stopped) {
+                    break;
+                }
                 if activity_clock
                     .and_then(RelayActivity::elapsed)
                     .is_some_and(|elapsed| elapsed < idle_timeout)
@@ -1364,25 +1600,6 @@ fn is_peer_closed(error: &io::Error) -> bool {
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::ConnectionReset
     )
-}
-
-async fn read_exact(stream: &TcpStream, buffer: &mut [u8]) -> io::Result<()> {
-    let mut read = 0usize;
-    while read < buffer.len() {
-        stream.readable().await?;
-        match stream.try_read(&mut buffer[read..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "stream closed before the TLS record was complete",
-                ));
-            }
-            Ok(count) => read += count,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1512,11 +1729,9 @@ mod tests {
     #[test]
     fn reality_signing_key_forces_ed25519() {
         let config = test_config();
-        let key = PrivatePkcs8KeyDer::from(config.certificate.private_key_der.to_vec());
-        let inner =
-            rustls::crypto::aws_lc_rs::sign::any_eddsa_type(&key).expect("test Ed25519 key");
-        let key = RealitySigningKey { inner };
-        let signer = key
+        let signer = config
+            .certificate
+            .signing_key
             .choose_scheme(&[])
             .expect("the stock Chrome fingerprint offers no Ed25519 scheme");
         assert_eq!(signer.scheme(), SignatureScheme::ED25519);

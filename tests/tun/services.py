@@ -50,6 +50,9 @@ def request_log(message: str) -> None:
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # The stock HTTPServer backlog of 5 turns a 64-way churn run into SYN
+    # retry latency on the target, not on the server under test.
+    request_queue_size = 256
 
 
 class _Server6(_Server):
