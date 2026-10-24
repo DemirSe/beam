@@ -205,8 +205,13 @@ Local changes and measurements are recorded in
   8/8 with a 1.33 MiB H3 body; UDP echo is 1.232x stock in the latest quick
   run (host was noisy).
 
-The live VPS is still on `bd17ac26…` until the deployment is explicitly
-scheduled and verified.
+The live VPS was updated on 2026-10-24 01:13 UTC with
+`BEAM_KEEP_CONFIG=1`: binary
+`22d1ac1c957f9b503cbdc546b79b545b1829aa000b4e934974028f0032561cca`,
+unchanged config hash
+`c0abace24e0f839a3ae3c1300d3f79b94ccfee437df5e7a4d8ec67b1b2722a02`,
+`NRestarts=0`, no warning entries, cover certificate and IPv4/IPv6/DNS
+verified. Host conntrack was raised to 65536 with a 1 h established timeout.
 
 ## In progress
 

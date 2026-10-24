@@ -364,15 +364,16 @@ deployed with `BEAM_KEEP_CONFIG=1`:
   1388 passed 64 MiB TCP, 1.33 MiB H3, IPv6 H3, and upload with zero TUN
   drops; see `docs/14-tun-harness.md`.
 
-### 2026-10-24 local optimization pass
+### 2026-10-24 optimization pass
 
-Not yet deployed at the time of writing. The local pass fixed an XUDP
-reply-task stop race that could leak a socket and a global permit forever,
-capped XUDP session idleness at 60 s, drained retained sockets before reuse,
-and bounded Vision splice tasks with an async fallback. It also separates
-pre-auth admission from authenticated capacity and adds a fast cover fallback
-for non-TLS probes. See `docs/18-optimization-2026-10-24.md` for the full
-change list and measurements.
+Deployed on 2026-10-24 01:13 UTC (binary `22d1ac1c…`) with the live config
+preserved. The pass fixed an XUDP reply-task stop race that could leak a socket
+and a global permit forever, capped XUDP session idleness at 60 s, drained
+retained sockets before reuse, and bounded Vision splice tasks with an async
+fallback. It also separates pre-auth admission from authenticated capacity,
+adds a fast cover fallback for non-TLS probes, and adds a 64-stream legacy UDP
+cap. See `docs/18-optimization-2026-10-24.md` for the full change list and
+measurements.
 
 Post-deploy checks still recommended under representative load:
 

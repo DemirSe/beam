@@ -190,5 +190,24 @@ buffer. This removes one allocation and one full ciphertext copy per record.
 - Host conntrack (`nf_conntrack_max=8192`, 5-day established timeout) and pipe
   page limits are live-only tuning and should be raised/shipped before a 10k
   churn test.
-- Production deployment of this pass must use `BEAM_KEEP_CONFIG=1` and verify
-  the live config hash, listener, cover certificate, DNS, and IPv6 afterward.
+## Deployment
+
+Deployed on 2026-10-24 01:13 UTC with `BEAM_KEEP_CONFIG=1`:
+
+- Binary SHA-256:
+  `22d1ac1c957f9b503cbdc546b79b545b1829aa000b4e934974028f0032561cca`
+- Live config SHA-256 is unchanged:
+  `c0abace24e0f839a3ae3c1300d3f79b94ccfee437df5e7a4d8ec67b1b2722a02`
+  (`log.level = "warn"`, 1024 connections, 10 s handshake, 300 s TCP idle).
+- Backups were created by `bootstrap.sh` with stamp `20261024T011320Z`.
+- Service active, `NRestarts=0`, listener `0.0.0.0:443`, cgroup peak 2.9 MiB
+  immediately after start.
+- IPv4/IPv6 egress, HTTPS, HTTP, DNS, and the local TUN MTU 1500 client pass.
+- The cover path returns the real WhatsApp certificate (`302`, verify 0), and
+  a plain HTTP GET to the live listener receives the cover's TLS alert instead
+  of a silent timeout.
+- Host conntrack was raised to 65536 with 1 h established / 30 s TIME_WAIT
+  timeouts and persisted in `/etc/sysctl.d/99-beam-conntrack.conf`; the repo now
+  carries `deploy/99-beam-conntrack.conf`.
+- A low-rate live soak (HTTPS + DNS + IPv6 every minute, 1 MiB HTTPS every ten
+  minutes) is running to validate the deployed binary.
