@@ -8,11 +8,15 @@ CONFIG="$HERE/beam.toml"
 UNIT="$HERE/beam.service"
 SYSCTL="$HERE/99-beam.conf"
 CONNTRACK="$HERE/99-beam-conntrack.conf"
+MTU_SCRIPT="$HERE/beam-mtu.sh"
+MTU_UNIT="$HERE/beam-mtu.service"
 INSTALL_BIN=/usr/local/bin/beam
 INSTALL_CONFIG=/etc/beam/config.toml
 INSTALL_UNIT=/etc/systemd/system/beam.service
 INSTALL_SYSCTL=/etc/sysctl.d/99-beam.conf
 INSTALL_CONNTRACK=/etc/sysctl.d/99-beam-conntrack.conf
+INSTALL_MTU_SCRIPT=/usr/local/sbin/beam-mtu
+INSTALL_MTU_UNIT=/etc/systemd/system/beam-mtu.service
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 # Keep a live config when only the binary/unit are being updated. The bundle
@@ -63,7 +67,8 @@ if ! id beam >/dev/null 2>&1; then
 fi
 
 install -d -m 0750 -o root -g beam /etc/beam
-for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK"; do
+for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK" \
+  "$INSTALL_MTU_SCRIPT" "$INSTALL_MTU_UNIT"; do
   if [ -e "$old" ]; then
     cp -a "$old" "$old.bak-$STAMP"
   fi
@@ -96,6 +101,12 @@ if [ -f "$CONNTRACK" ]; then
   install -m 0644 -o root -g root "$CONNTRACK" "$INSTALL_CONNTRACK.new"
   mv -f "$INSTALL_CONNTRACK.new" "$INSTALL_CONNTRACK"
 fi
+if [ -f "$MTU_SCRIPT" ] && [ -f "$MTU_UNIT" ]; then
+  install -m 0755 -o root -g root "$MTU_SCRIPT" "$INSTALL_MTU_SCRIPT.new"
+  mv -f "$INSTALL_MTU_SCRIPT.new" "$INSTALL_MTU_SCRIPT"
+  install -m 0644 -o root -g root "$MTU_UNIT" "$INSTALL_MTU_UNIT.new"
+  mv -f "$INSTALL_MTU_UNIT.new" "$INSTALL_MTU_UNIT"
+fi
 # The primary UDP buffer file is required; a typo or permission failure must
 # fail the rollout rather than silently losing H3 headroom.
 sysctl -p "$INSTALL_SYSCTL" >/dev/null
@@ -111,6 +122,12 @@ runuser -u beam -- "$INSTALL_BIN" --check -c "$INSTALL_CONFIG"
 
 systemctl daemon-reload
 systemctl enable beam
+if [ -x "$INSTALL_MTU_SCRIPT" ]; then
+  systemctl enable beam-mtu.service
+  systemctl restart beam-mtu.service
+  systemctl is-active --quiet beam-mtu.service || \
+    echo "bootstrap: warning: beam-mtu.service did not apply the CDN MSS clamps" >&2
+fi
 # Always restart: an already-running process keeps the old binary, config, and
 # unit properties until it is replaced.
 systemctl restart beam

@@ -276,6 +276,8 @@ verified. Host conntrack was raised to 65536 with a 1 h established timeout.
   monitoring.
 - `docs/17-resource-hardening.md`: XUDP/cover/fuzz hardening audit, deployment
   record, and local follow-up tests.
+- `docs/22-path-mtu-2026-10-27.md`: Meta/Vercel 1460-byte PMTU black hole,
+  route-specific MSS clamp, and live verification.
 - `docs/16-local-comparison-2026-10-22.md`: detailed local stock-Xray vs beam
   capacity, full-TUN, compatibility, and cover comparison.
 - `bench/README.md`: benchmark and no-TUN smoke usage.
