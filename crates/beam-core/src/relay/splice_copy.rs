@@ -1,6 +1,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -17,16 +18,27 @@ fn warn_pipe_size_once(error: &io::Error, pipe_size: usize, message: &'static st
     }
 }
 
-/// Default kernel pipe capacity used for each direction.
+/// Conservative kernel pipe capacity used for each direction.
 pub const DEFAULT_PIPE_SIZE: usize = 512 * 1024;
+
+/// Larger pipe capacity available through `BEAM_PIPE_SIZE`.
+///
+/// The Linux per-user pipe-page soft limit defaults to 16,384 pages (64 MiB).
+/// Two 1 MiB pipes per Vision connection consume that whole budget after about
+/// 32 concurrent relays, so 1 MiB is opt-in only: set `BEAM_PIPE_SIZE=1048576`
+/// and raise `fs.pipe-user-pages-soft` to 65,536 pages (256 MiB). The default
+/// remains 512 KiB and has no concurrency regression.
+pub const LARGE_PIPE_SIZE: usize = 1024 * 1024;
 
 /// Smallest accepted pipe size.
 pub const MIN_PIPE_SIZE: usize = 4096;
 
 /// Largest accepted pipe size.
 ///
-/// The architecture document starts the relay at 512 KiB. A larger value needs
-/// a new measurement, so the accepted range stays deliberately small.
+/// 1 MiB was measured against 512 KiB on TLS Direct; see
+/// `docs/21-tls-pipe-2026-10-27.md`. It is selected only through the
+/// `BEAM_PIPE_SIZE` override, and the operator must also raise the host
+/// pipe-page soft limit for high-concurrency safety.
 pub const MAX_PIPE_SIZE: usize = 1024 * 1024;
 
 /// Maximum bytes moved by one fill or drain phase in one loop iteration.
@@ -96,11 +108,35 @@ pub struct RelayConfig {
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
-            pipe_size: DEFAULT_PIPE_SIZE,
+            pipe_size: default_pipe_size(),
             max_bytes: None,
             idle_timeout: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(30),
         }
+    }
+}
+
+/// Chooses the pipe size from the optional `BEAM_PIPE_SIZE` override.
+///
+/// The value is read once at process start. It must be a power of two between
+/// [`MIN_PIPE_SIZE`] and [`MAX_PIPE_SIZE`]. An absent, malformed, or
+/// out-of-range value keeps the conservative 512 KiB default.
+pub fn default_pipe_size() -> usize {
+    static PIPE_SIZE: OnceLock<usize> = OnceLock::new();
+    *PIPE_SIZE.get_or_init(|| pipe_size_from_env(std::env::var("BEAM_PIPE_SIZE").ok().as_deref()))
+}
+
+fn pipe_size_from_env(value: Option<&str>) -> usize {
+    let Some(raw) = value else {
+        return DEFAULT_PIPE_SIZE;
+    };
+    let Ok(size) = raw.parse::<usize>() else {
+        return DEFAULT_PIPE_SIZE;
+    };
+    if size.is_power_of_two() && (MIN_PIPE_SIZE..=MAX_PIPE_SIZE).contains(&size) {
+        size
+    } else {
+        DEFAULT_PIPE_SIZE
     }
 }
 
@@ -845,8 +881,8 @@ fn inactivity_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PIPE_SIZE, MAX_PIPE_SIZE, MIN_PIPE_SIZE, RelayConfig, RelayStats,
-        copy_bidirectional, copy_one_way,
+        DEFAULT_PIPE_SIZE, LARGE_PIPE_SIZE, MAX_PIPE_SIZE, MIN_PIPE_SIZE, RelayConfig, RelayStats,
+        copy_bidirectional, copy_one_way, pipe_size_from_env,
     };
     use std::io::{self, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
@@ -1363,6 +1399,16 @@ mod tests {
         assert_eq!(stats.bytes_b_to_a, 4);
         assert_eq!(stats.eofs, 2);
         assert_eq!(stats.half_closes, 2);
+    }
+
+    #[test]
+    fn pipe_size_override_is_bounded_and_optional() {
+        assert_eq!(pipe_size_from_env(None), DEFAULT_PIPE_SIZE);
+        assert_eq!(pipe_size_from_env(Some("")), DEFAULT_PIPE_SIZE);
+        assert_eq!(pipe_size_from_env(Some("1000")), DEFAULT_PIPE_SIZE);
+        assert_eq!(pipe_size_from_env(Some("1048576")), LARGE_PIPE_SIZE);
+        assert_eq!(pipe_size_from_env(Some("524288")), DEFAULT_PIPE_SIZE);
+        assert_eq!(pipe_size_from_env(Some("8388608")), DEFAULT_PIPE_SIZE);
     }
 
     #[test]
