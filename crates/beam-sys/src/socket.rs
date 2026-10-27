@@ -23,6 +23,37 @@ pub fn set_tcp_keepalive(fd: RawFd, idle: Duration, interval: Duration) -> io::R
     setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, interval)
 }
 
+/// Sets the TCP maximum segment size for `fd`.
+///
+/// On Linux this must be called before `connect` to change the MSS advertised
+/// in the SYN and the maximum payload used for local sends. The kernel clamps
+/// the value to its supported range.
+pub fn set_tcp_maxseg(fd: RawFd, mss: u16) -> io::Result<()> {
+    if mss == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TCP maximum segment size must be positive",
+        ));
+    }
+    setsockopt_int(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_MAXSEG,
+        libc::c_int::from(mss),
+    )
+}
+
+/// Returns the current TCP maximum segment size for `fd`.
+pub fn get_tcp_maxseg(fd: RawFd) -> io::Result<u16> {
+    let value = getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_MAXSEG)?;
+    u16::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TCP maximum segment size does not fit in u16",
+        )
+    })
+}
+
 /// Enables `SO_REUSEADDR` on `fd`.
 pub fn set_reuse_addr(fd: RawFd) -> io::Result<()> {
     setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)
@@ -66,6 +97,30 @@ fn duration_secs(value: Duration, name: &str) -> io::Result<libc::c_int> {
     })
 }
 
+fn getsockopt_int(fd: RawFd, level: libc::c_int, name: libc::c_int) -> io::Result<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut length = size_of::<libc::c_int>() as libc::socklen_t;
+
+    // SAFETY: `value` is a live `c_int` and `length` describes exactly its
+    // size. `getsockopt` writes at most that many bytes and does not retain
+    // the pointer. The kernel validates the descriptor and option name.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            name,
+            (&raw mut value).cast::<libc::c_void>(),
+            &mut length,
+        )
+    };
+
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(value)
+    }
+}
+
 fn setsockopt_int(
     fd: RawFd,
     level: libc::c_int,
@@ -96,7 +151,10 @@ fn setsockopt_int(
 
 #[cfg(test)]
 mod tests {
-    use super::{set_reuse_addr, set_tcp_keepalive, set_tcp_nodelay, set_udp_recv_buffer};
+    use super::{
+        get_tcp_maxseg, set_reuse_addr, set_tcp_keepalive, set_tcp_maxseg, set_tcp_nodelay,
+        set_udp_recv_buffer,
+    };
     use std::io;
     use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::os::fd::AsRawFd;
@@ -115,6 +173,17 @@ mod tests {
 
         set_tcp_nodelay(client.as_raw_fd()).unwrap();
         set_tcp_nodelay(server.as_raw_fd()).unwrap();
+    }
+
+    #[test]
+    fn tcp_maxseg_accepts_loopback_stream_and_rejects_zero() {
+        let (client, _server) = loopback_pair();
+
+        set_tcp_maxseg(client.as_raw_fd(), 1400).unwrap();
+        assert!(get_tcp_maxseg(client.as_raw_fd()).is_ok());
+
+        let error = set_tcp_maxseg(client.as_raw_fd(), 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

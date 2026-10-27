@@ -63,12 +63,9 @@ ssh -i ~/.ssh/id_ed25519_netlen_demir demir@<server> \
 
 `bootstrap.sh` stops/disables `xray.service` and `xray-compare.service`, creates
 the `beam` user, installs the binary/config/unit, installs the UDP sysctl
-drop-in and the global MSS-clamp unit, validates the config as `beam`, restarts
-the service (so an active process picks up the new binary/unit), and checks
-that 443 is listening. Old binary, config, unit, and sysctl files are backed
-up with a timestamp suffix. `beam-mtu.service` advertises `advmss 1400` on the
-IPv4 default route for the measured 1460-byte PMTU paths; see
-`docs/22-path-mtu-2026-10-27.md`.
+drop-in, validates the config as `beam`, restarts the service (so an active
+process picks up the new binary/unit), and checks that 443 is listening. Old
+binary, config, unit, and sysctl files are backed up with a timestamp suffix.
 The unit also sets `MemoryHigh=512M`, `MemoryMax=768M`, and
 `MemorySwapMax=512M`; the code caps unauthenticated cover relays at 32 and
 process-wide XUDP sessions at 256. See `docs/17-resource-hardening.md`.

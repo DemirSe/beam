@@ -29,7 +29,7 @@ use rustls::{SignatureAlgorithm, SignatureScheme};
 use sha2::Sha512;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
@@ -76,6 +76,16 @@ const PREAUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// hop away from the target; a blackholed address should not hold a permit for
 /// the full client handshake budget.
 const MAX_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TCP maximum segment size used for destination connections.
+///
+/// The production path to some CDN prefixes has a 1460-byte PMTU but
+/// advertises a 1500-byte MSS and drops larger packets without returning ICMP
+/// fragmentation-needed. Setting this before connect limits both the MSS
+/// advertised in our SYN and the local send size, so downloads and uploads
+/// stay below that path MTU. 1400 leaves room for TCP timestamps and the
+/// IP/TCP headers.
+const TARGET_MSS: u16 = 1400;
 
 /// Bound on remembered authenticated ClientHello session ids.
 const REPLAY_CACHE_CAPACITY: usize = 4_096;
@@ -1047,30 +1057,64 @@ async fn dial(
         Address::Ipv6(address) => address.to_string(),
         Address::Domain(domain) => domain.clone(),
     };
-    let stream = timeout(
-        dial_timeout,
-        TcpStream::connect((host.as_str(), destination.port)),
-    )
-    .await
-    .map_err(|_| TlsServerError::Timeout {
-        stage: "destination dial",
-    })?
-    .map_err(TlsServerError::Io)?;
+    let deadline = tokio::time::Instant::now() + dial_timeout;
+    let addresses =
+        tokio::time::timeout_at(deadline, lookup_host((host.as_str(), destination.port)))
+            .await
+            .map_err(|_| TlsServerError::Timeout {
+                stage: "destination dial",
+            })?
+            .map_err(TlsServerError::Io)?
+            .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(TlsServerError::Io(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "destination resolved to no addresses",
+        )));
+    }
 
-    // Small request headers and interactive replies must not wait for
-    // Nagle/delayed-ACK interaction on the outbound socket. The accepted
-    // client socket already sets this in `main`.
-    if let Err(error) = stream.set_nodelay(true) {
-        tracing::debug!(%error, "could not set TCP_NODELAY on the destination");
+    let mut last_error = None;
+    for address in addresses {
+        let socket = match address.is_ipv4() {
+            true => TcpSocket::new_v4(),
+            false => TcpSocket::new_v6(),
+        }
+        .map_err(TlsServerError::Io)?;
+        // This must happen before connect: Linux uses TCP_MAXSEG for both the
+        // MSS option in the SYN and the local send limit only when it is set
+        // while the socket is still unconnected.
+        if let Err(error) = beam_sys::set_tcp_maxseg(socket.as_raw_fd(), TARGET_MSS) {
+            tracing::debug!(%error, "could not set TCP_MAXSEG on the destination");
+        }
+        match tokio::time::timeout_at(deadline, socket.connect(address)).await {
+            Ok(Ok(stream)) => {
+                // Small request headers and interactive replies must not wait
+                // for Nagle/delayed-ACK interaction on the outbound socket.
+                // The accepted client socket already sets this in `main`.
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::debug!(%error, "could not set TCP_NODELAY on the destination");
+                }
+                if let Err(error) = beam_sys::set_tcp_keepalive(
+                    stream.as_raw_fd(),
+                    Duration::from_secs(60),
+                    Duration::from_secs(15),
+                ) {
+                    tracing::debug!(%error, "could not set TCP keepalive on the destination");
+                }
+                return Ok(stream);
+            }
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                return Err(TlsServerError::Timeout {
+                    stage: "destination dial",
+                });
+            }
+        }
     }
-    if let Err(error) = beam_sys::set_tcp_keepalive(
-        stream.as_raw_fd(),
-        Duration::from_secs(60),
-        Duration::from_secs(15),
-    ) {
-        tracing::debug!(%error, "could not set TCP keepalive on the destination");
-    }
-    Ok(stream)
+
+    Err(TlsServerError::Io(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AddrNotAvailable, "no destination address")
+    })))
 }
 
 async fn relay_bidirectional<A, B>(
@@ -1672,6 +1716,32 @@ mod tests {
         assert!(is_supported_flow(Some("")));
         assert!(is_supported_flow(Some(crate::vless::VISION_FLOW)));
         assert!(!is_supported_flow(Some("xtls-rprx-vision-typo")));
+    }
+
+    #[tokio::test]
+    async fn dial_limits_target_mss_and_connects() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(stream);
+        });
+        let destination = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: address.port(),
+        };
+
+        let stream = dial(&destination, Duration::from_secs(2))
+            .await
+            .expect("dial");
+        let mss = beam_sys::get_tcp_maxseg(stream.as_raw_fd()).expect("target MSS");
+        assert!(
+            mss <= TARGET_MSS,
+            "target MSS {mss} exceeded the configured {TARGET_MSS}"
+        );
+        server.await.expect("server task");
     }
 
     #[tokio::test]
