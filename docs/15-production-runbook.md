@@ -32,7 +32,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | SSH | key-only `demir`; root and `debian` disabled; X11 off; `MaxAuthTries 3`; `LoginGraceTime 30` |
 | Resolver | systemd-resolved DNS-over-TLS + DNSSEC; LLMNR/mDNS off |
 | UDP tuning | `/etc/sysctl.d/99-beam.conf` sets `rmem_max=wmem_max=4 MiB` |
-| Network tuning | `/etc/sysctl.d/99-beam-net.conf` sets `tcp_congestion_control=bbr` and `default_qdisc=fq`; `beam-qdisc.service` reapplies `fq` to `eth0` at boot; `beam-mtu.service` clamps MSS for the measured 1460-byte Meta/Vercel paths |
+| Network tuning | `/etc/sysctl.d/99-beam-net.conf` sets `tcp_congestion_control=bbr` and `default_qdisc=fq`; `beam-qdisc.service` reapplies `fq` to `eth0` at boot; `beam-mtu.service` advertises MSS 1400 on the IPv4 default route for 1460-byte PMTU paths |
 
 Old stock Xray is absent; only TCP/443 and SSH 22 are exposed. The unit sets
 `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
@@ -304,7 +304,7 @@ smaller spread. CPU remained idle outside the transfer and the qdisc reported
 zero drops. Run `sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc`
 and `/sbin/tc qdisc show dev eth0` after a reboot; expect `bbr` and `fq`.
 
-### Targeted MSS clamp; MTU probing stays disabled
+### Global MSS clamp; MTU probing stays disabled
 
 `net.ipv4.tcp_mtu_probing` remains **0**. On a lossy mobile path it is not a
 free win: after `tcp_retries1` (3 here) RTO retries the kernel enables probing
@@ -313,18 +313,20 @@ can halve `search_low` down to `tcp_mtu_probe_floor` (48). SACK/DSACK can also
 suppress the recovery probe. The live outer MSS is 1348–1448, so a false
 positive costs roughly 24–29% payload per segment before recovery.
 
-On 2026-10-27 a real PMTU black hole was measured on two CDN prefixes:
-Meta/Instagram `57.144.0.0/16` and Vercel `76.76.21.0/24` have a **1460-byte
-path MTU** but advertise a 1500-byte MSS and return no ICMP fragmentation
-message. A TLS ClientHello went out and no ServerHello came back; small HTTP
-responses still worked. `beam-mtu.service` applies route-specific
-`advmss 1400` for only those prefixes. Normal 1500-byte paths keep their full
-MSS. See `docs/22-path-mtu-2026-10-27.md`.
+On 2026-10-27 a real PMTU black hole was measured on Meta/Instagram
+`57.144.0.0/16` and Vercel `76.76.21.0/24`: both have a **1460-byte path MTU**
+but advertise a 1500-byte MSS and return no ICMP fragmentation message. A TLS
+ClientHello went out and no ServerHello came back; small HTTP responses still
+worked. `tcp_mtu_probing` cannot fix the receive direction because the peer
+keeps using our advertised MSS. `beam-mtu.service` therefore sets **`advmss
+1400` on the IPv4 default route**; every outbound TCP connection advertises the
+same safe MSS, with no per-prefix list. See
+`docs/22-path-mtu-2026-10-27.md`.
 
 Check after a reboot:
 
 ```bash
-ip route show | grep advmss
+ip route show default
 systemctl is-active beam-mtu.service
 curl -4 -sS -o /dev/null -w '%{http_code}\n' https://artificialanalysis.ai/
 ```
@@ -345,8 +347,9 @@ curl -4 -sS -o /dev/null -w '%{http_code}\n' https://artificialanalysis.ai/
   416 B versus 5 / 3085 B (temporary Ed25519 certificate). See `docs/10-cover-parity.md`.
 - A real PMTU black hole exists on the VPS's path to Meta/Instagram
   `57.144.0.0/16` and Vercel `76.76.21.0/24`; both have a 1460-byte path MTU.
-  `beam-mtu.service` clamps only those routes to `advmss 1400`. The binary and
-  wire behavior are unchanged. See `docs/22-path-mtu-2026-10-27.md`.
+  `beam-mtu.service` advertises `advmss 1400` globally on the IPv4 default
+  route, so no per-prefix list is needed. The binary and wire behavior are
+  unchanged. See `docs/22-path-mtu-2026-10-27.md`.
 - Large HTTP/3 bodies through the production TUN can still show completion
   outliers. The original 20–45 s stalls were consistent with the 1400 MTU
   failure. At 1500 the 2026-10-24 TT Mobil hotspot run passed 1.33 MiB H3 and
