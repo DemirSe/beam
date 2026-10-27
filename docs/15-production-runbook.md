@@ -250,11 +250,8 @@ The live `max_connections` is 1024 and the pre-auth ClientHello deadline is
 the 1024 authenticated permits are acquired only after REALITY succeeds. An
 unauthenticated flood therefore drops new probes instead of blocking the accept
 loop. Each Vision Direct relay can hold up to two blocking splice tasks and
-512 KiB pipes by default. A 1 MiB pipe is an explicit opt-in:
-`BEAM_PIPE_SIZE=1048576` plus a host pipe-page soft limit of at least 65,536
-pages (256 MiB). Without both, beam keeps the conservative 512 KiB size. A
-process-wide splice semaphore covers about 60 pairs and turns excess
-directions into the bounded async copy path, so the pool cannot queue a
+512 KiB pipes; a process-wide splice semaphore covers about 60 pairs and turns
+excess directions into the bounded async copy path, so the pool cannot queue a
 handoff forever. The XUDP reply queue is 512 frames and session sockets request
 a 1 MiB receive buffer. XUDP sessions expire after at most **60 s** of
 idleness (the TCP relay idle timeout remains 300 s), under the **process-wide

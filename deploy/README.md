@@ -118,12 +118,6 @@ resolvectl query example.com
 with `sysctl -p`; the optional conntrack file is applied separately. The SSH/firewall/resolver files are intentionally not
 installed by `bootstrap.sh`: a mistake there can lock out the host.
 
-`99-beam-pipe.conf` and `beam-pipe.conf` are optional and are **not** installed
-by `bootstrap.sh`. Together they raise `fs.pipe-user-pages-soft` to 65536 pages
-(256 MiB) and set `BEAM_PIPE_SIZE=1048576`, enabling 1 MiB Vision Direct pipes.
-The conservative default (512 KiB) has no concurrency regression; see
-`docs/21-tls-pipe-2026-10-27.md`.
-
 ## Rollback
 
 - Binary: `/usr/local/bin/beam.bak-<stamp>`

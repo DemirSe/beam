@@ -119,13 +119,8 @@ Ed25519 CertificateVerify scheme to match stock REALITY behavior.
 7. Relay with `splice(2)` in both directions when the raw-fd gates pass.
 8. Fall back to a bounded buffered copy on the exceptional paths.
 
-The relay must remain fair between directions and must not busy-loop. The
-default pipe is 512 KiB. An operator may opt in to a 1 MiB pipe with
-`BEAM_PIPE_SIZE=1048576`; this also requires raising the host pipe-page soft
-limit to at least 65,536 pages (256 MiB). The measured profile and the
-concurrency caveat are in `docs/21-tls-pipe-2026-10-27.md`. The Debian default
-(16,384 pages) keeps 512 KiB, so the larger pipe cannot silently regress
-concurrency.
+The relay must remain fair between directions and must not busy-loop. Pipe
+size starts at 512 KiB; it is not increased without a new measurement.
 
 ### UDP
 
