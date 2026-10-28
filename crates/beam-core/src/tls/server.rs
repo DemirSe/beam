@@ -36,6 +36,7 @@ use zeroize::Zeroizing;
 
 use crate::address::{Address, NetLocation};
 use crate::admission::{IpLimiter, IpPermit};
+use crate::metrics::Metrics;
 use crate::prepend_stream::PrependStream;
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
 use crate::relay::{RelayActivity, RelayConfig, copy_bidirectional, copy_one_way};
@@ -296,6 +297,8 @@ pub struct TlsServerConfig {
     legacy_udp_permits: Arc<Semaphore>,
     /// Global and per-source cap on unauthenticated cover relays.
     cover_limiter: Arc<IpLimiter>,
+    /// Process-wide admission counters.
+    metrics: Arc<Metrics>,
     /// Bounded exact-replay filter for authenticated ClientHellos.
     replay_cache: Mutex<ReplayCache>,
 }
@@ -355,6 +358,7 @@ impl TlsServerConfig {
             splice_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             legacy_udp_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             cover_limiter: Arc::new(IpLimiter::new(COVER_MAX_CONCURRENCY, COVER_MAX_PER_IP)),
+            metrics: Arc::new(Metrics::default()),
             replay_cache: Mutex::new(ReplayCache::new(REPLAY_CACHE_TTL)),
         })
     }
@@ -364,6 +368,12 @@ impl TlsServerConfig {
     pub fn with_xudp(mut self, xudp: XudpConfig) -> Self {
         self.xudp = xudp;
         self
+    }
+
+    /// Returns the process-wide admission counters.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Overrides the authenticated connection limiter.
@@ -688,6 +698,7 @@ pub async fn handle_connection_admitted(
             let permit = match Arc::clone(&config.connection_permits).try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
+                    config.metrics.record_connection_limit();
                     tracing::debug!("authenticated connection limit reached; closing");
                     return Ok(ConnectionOutcome::ConnectionLimited);
                 }
@@ -991,6 +1002,7 @@ async fn forward_to_cover(
     let _cover_permit = match config.cover_limiter.try_acquire(peer.ip()) {
         Ok(permit) => permit,
         Err(reject) => {
+            config.metrics.record_cover_limit();
             tracing::debug!(%peer, ?reject, "cover limit reached; closing probe");
             return Ok(ConnectionOutcome::CoverLimited);
         }

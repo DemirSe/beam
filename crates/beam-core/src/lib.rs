@@ -5,6 +5,7 @@
 pub mod address;
 pub mod admission;
 pub mod config;
+pub mod metrics;
 pub mod prepend_stream;
 pub mod reality;
 pub mod relay;

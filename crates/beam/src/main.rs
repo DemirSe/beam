@@ -12,7 +12,7 @@ use beam_core::tls::{
     MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN, TlsServerConfig, handle_connection_admitted,
 };
 use beam_core::udp::LegacyUdpConfig;
-use beam_core::xudp::XudpConfig;
+use beam_core::xudp::{XudpConfig, XudpSessionLimiter};
 use clap::Parser;
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::signal::unix::{SignalKind, signal};
@@ -95,15 +95,39 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
             .with_legacy_udp_limiter(legacy_udp_permits),
     );
     let listener = bind_listener(config.server.listen, config.limits.listen_backlog)?;
+    let metrics = tls_config.metrics();
 
     tracing::info!(
         listen = %config.server.listen,
         max_connections,
         max_pending_handshakes,
         max_preauth_per_ip,
+        max_xudp_sessions = config.limits.max_xudp_sessions,
         listen_backlog = config.limits.listen_backlog,
+        shutdown_drain_ms = config.limits.shutdown_drain_ms,
         "beam listening"
     );
+
+    let metrics_task = Arc::clone(&metrics);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last = metrics_task.snapshot();
+        loop {
+            ticker.tick().await;
+            let current = metrics_task.snapshot();
+            if current != last {
+                tracing::info!(
+                    preauth_rejected = current.preauth_rejected,
+                    cover_limited = current.cover_limited,
+                    connection_limited = current.connection_limited,
+                    accept_errors = current.accept_errors,
+                    "admission counters"
+                );
+                last = current;
+            }
+        }
+    });
 
     let mut sigterm = signal(SignalKind::terminate()).context("failed to watch SIGTERM")?;
     let mut sigint = signal(SignalKind::interrupt()).context("failed to watch SIGINT")?;
@@ -138,6 +162,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                 accepted
             }
             Err(error) => {
+                metrics.record_accept_error();
                 tracing::warn!(%error, "listener accept failed; retrying");
                 tokio::select! {
                     _ = &mut shutdown => break,
@@ -154,6 +179,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         let preauth_permit = match preauth.try_acquire(peer.ip()) {
             Ok(permit) => permit,
             Err(reject) => {
+                metrics.record_preauth_rejection();
                 tracing::debug!(%peer, ?reject, "pre-auth handshake limit reached; dropping");
                 drop(stream);
                 tokio::task::yield_now().await;
@@ -186,7 +212,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     // bounded by the runtime shutdown deadline in `main`.
     drop(listener);
     tracing::info!("shutdown signal received; draining connections");
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_millis(config.limits.shutdown_drain_ms);
     while authenticated.available_permits() < max_connections
         || preauth.available_permits() < max_pending_handshakes
     {
@@ -282,6 +308,9 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
 
     Ok(tls
         .with_xudp(xudp)
+        .with_xudp_limiter(XudpSessionLimiter::new(
+            usize::try_from(config.limits.max_xudp_sessions).unwrap_or(usize::MAX),
+        ))
         .with_udp(udp)
         .with_relay_idle_timeout(Duration::from_millis(config.limits.idle_timeout_ms)))
 }

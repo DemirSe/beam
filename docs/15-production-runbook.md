@@ -279,21 +279,29 @@ hang for the 90 s systemd default.
 ### Connection admission and relay capacity
 
 `max_connections=1024` is an admission cap, not a promise of 1024 concurrent
-bulk relays. The listener backlog is **128** (Tokio/mio default), the live SYN
-backlog is **128**, and historical load tests recorded **102** accept-queue
-overflows/drops; current 30 s deltas are zero. Each Vision Direct connection
-can pin up to **two** `spawn_blocking` splice tasks. The 160-thread pool is
-split into a 120-task splice budget plus reserve for cover relays and dials;
-above the budget, a direction uses the async copy path instead of queueing
-indefinitely. A local 512×1 MB load completed, but with a 49.7 s median
-latency; a 1024×1 MB load produced 937 timeouts and 927 partial bodies, with
-162 threads. Do not raise the blocking pool blindly on the 1 GiB host; lower
-`max_connections` or move the relay to an epoll/io_uring design if bulk
-concurrency matters. The current normal load is tens of connections, where
-the pool is not saturated. Unauthenticated cover relays are separately capped
-at **32** in the repo so a probe burst cannot fill the shared blocking pool.
-XUDP sessions are capped at **256 process-wide** in addition to the per-stream
-limit, and expire after 60 s of idleness.
+bulk relays. The listener backlog is configurable through
+`limits.listen_backlog` (**default 1024**, range 1–65535); the old Tokio/mio
+default was **128**, the live SYN backlog is **128**, and historical load tests
+recorded **102** accept-queue overflows/drops. The listener now sets
+`SO_REUSEADDR` so a restart during `TIME_WAIT` does not fail to bind.
+Unauthenticated admission is bounded to **256** process-wide and
+`limits.max_preauth_per_ip` (**default 128**) per source address; one scanner
+can therefore no longer consume every pre-auth slot. Unauthenticated cover
+relays are capped at **32** process-wide and **8** per source. Each Vision
+Direct connection can pin up to **two** `spawn_blocking` splice tasks. The
+160-thread pool is split into a 120-task splice budget plus reserve for cover
+relays and dials; above the budget, a direction uses the async copy path
+instead of queueing indefinitely. A local 512×1 MB load completed, but with a
+49.7 s median latency; a 1024×1 MB load produced 937 timeouts and 927 partial
+bodies, with 162 threads. Do not raise the blocking pool blindly on the 1 GiB
+host; lower `max_connections` or move the relay to an epoll/io_uring design if
+bulk concurrency matters. The current normal load is tens of connections, where
+the pool is not saturated. XUDP sessions are capped by
+`limits.max_xudp_sessions` (**default 256**, process-wide) in addition to the
+per-stream limit, and expire after 60 s of idleness. Graceful shutdown drains
+for `limits.shutdown_drain_ms` (**default 2000**, max 3000). Admission counters
+(`preauth_rejected`, `cover_limited`, `connection_limited`, `accept_errors`)
+are logged every 60 seconds when they change.
 
 ### Network tuning during the 2026-10-23 hotspot test
 

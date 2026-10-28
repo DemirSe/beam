@@ -316,14 +316,43 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
             name: "max_connections",
         });
     }
+    if raw.max_connections > 65_536 {
+        return Err(ValidationError::LimitTooLarge {
+            name: "max_connections",
+            max: 65_536,
+        });
+    }
     if raw.max_udp_destinations == 0 {
         return Err(ValidationError::ZeroLimit {
             name: "max_udp_destinations",
         });
     }
+    if raw.max_udp_destinations > 65_536 {
+        return Err(ValidationError::LimitTooLarge {
+            name: "max_udp_destinations",
+            max: 65_536,
+        });
+    }
     if raw.max_preauth_per_ip == 0 {
         return Err(ValidationError::ZeroLimit {
             name: "max_preauth_per_ip",
+        });
+    }
+    if raw.max_preauth_per_ip > 65_536 {
+        return Err(ValidationError::LimitTooLarge {
+            name: "max_preauth_per_ip",
+            max: 65_536,
+        });
+    }
+    if raw.max_xudp_sessions == 0 {
+        return Err(ValidationError::ZeroLimit {
+            name: "max_xudp_sessions",
+        });
+    }
+    if raw.max_xudp_sessions > 65_536 {
+        return Err(ValidationError::LimitTooLarge {
+            name: "max_xudp_sessions",
+            max: 65_536,
         });
     }
     if raw.listen_backlog == 0 {
@@ -335,6 +364,17 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
         return Err(ValidationError::LimitTooLarge {
             name: "listen_backlog",
             max: u32::from(u16::MAX),
+        });
+    }
+    if raw.shutdown_drain_ms == 0 {
+        return Err(ValidationError::ZeroLimit {
+            name: "shutdown_drain_ms",
+        });
+    }
+    if raw.shutdown_drain_ms > 3_000 {
+        return Err(ValidationError::LimitTooLarge {
+            name: "shutdown_drain_ms",
+            max: 3_000,
         });
     }
     if raw.handshake_timeout_ms == 0 {
@@ -352,7 +392,9 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
         max_connections: raw.max_connections,
         max_udp_destinations: raw.max_udp_destinations,
         max_preauth_per_ip: raw.max_preauth_per_ip,
+        max_xudp_sessions: raw.max_xudp_sessions,
         listen_backlog: raw.listen_backlog,
+        shutdown_drain_ms: raw.shutdown_drain_ms,
         handshake_timeout_ms: raw.handshake_timeout_ms,
         idle_timeout_ms: raw.idle_timeout_ms,
     })
@@ -391,7 +433,9 @@ level = "warn"
 max_connections = 1024
 max_udp_destinations = 2048
 max_preauth_per_ip = 128
+max_xudp_sessions = 256
 listen_backlog = 1024
+shutdown_drain_ms = 2000
 handshake_timeout_ms = 60000
 idle_timeout_ms = 300000
 "#
@@ -418,7 +462,9 @@ idle_timeout_ms = 300000
         assert_eq!(config.limits.max_connections, 1024);
         assert_eq!(config.limits.max_udp_destinations, 2048);
         assert_eq!(config.limits.max_preauth_per_ip, 128);
+        assert_eq!(config.limits.max_xudp_sessions, 256);
         assert_eq!(config.limits.listen_backlog, 1024);
+        assert_eq!(config.limits.shutdown_drain_ms, 2_000);
         assert_eq!(config.limits.handshake_timeout_ms, 60_000);
         assert_eq!(config.limits.idle_timeout_ms, 300_000);
     }
@@ -469,8 +515,16 @@ idle_timeout_ms = 300000
                 format!("max_preauth_per_ip = \"{CANARY}\""),
             ),
             (
+                "max_xudp_sessions = 256",
+                format!("max_xudp_sessions = \"{CANARY}\""),
+            ),
+            (
                 "listen_backlog = 1024",
                 format!("listen_backlog = \"{CANARY}\""),
+            ),
+            (
+                "shutdown_drain_ms = 2000",
+                format!("shutdown_drain_ms = \"{CANARY}\""),
             ),
             (
                 "handshake_timeout_ms = 60000",
@@ -654,7 +708,9 @@ idle_timeout_ms = 300000
             ("max_connections", "1024"),
             ("max_udp_destinations", "2048"),
             ("max_preauth_per_ip", "128"),
+            ("max_xudp_sessions", "256"),
             ("listen_backlog", "1024"),
+            ("shutdown_drain_ms", "2000"),
             ("handshake_timeout_ms", "60000"),
             ("idle_timeout_ms", "300000"),
         ] {
