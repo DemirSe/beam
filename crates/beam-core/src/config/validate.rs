@@ -94,6 +94,14 @@ pub enum ValidationError {
         /// Name of the invalid field.
         name: &'static str,
     },
+    /// A limit is outside its supported range.
+    #[error("limits.{name} must be at most {max}")]
+    LimitTooLarge {
+        /// Name of the invalid field.
+        name: &'static str,
+        /// Largest supported value.
+        max: u32,
+    },
 }
 
 impl Config {
@@ -313,6 +321,22 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
             name: "max_udp_destinations",
         });
     }
+    if raw.max_preauth_per_ip == 0 {
+        return Err(ValidationError::ZeroLimit {
+            name: "max_preauth_per_ip",
+        });
+    }
+    if raw.listen_backlog == 0 {
+        return Err(ValidationError::ZeroLimit {
+            name: "listen_backlog",
+        });
+    }
+    if raw.listen_backlog > u32::from(u16::MAX) {
+        return Err(ValidationError::LimitTooLarge {
+            name: "listen_backlog",
+            max: u32::from(u16::MAX),
+        });
+    }
     if raw.handshake_timeout_ms == 0 {
         return Err(ValidationError::ZeroLimit {
             name: "handshake_timeout_ms",
@@ -327,6 +351,8 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
     Ok(LimitsConfig {
         max_connections: raw.max_connections,
         max_udp_destinations: raw.max_udp_destinations,
+        max_preauth_per_ip: raw.max_preauth_per_ip,
+        listen_backlog: raw.listen_backlog,
         handshake_timeout_ms: raw.handshake_timeout_ms,
         idle_timeout_ms: raw.idle_timeout_ms,
     })
@@ -364,6 +390,8 @@ level = "warn"
 [limits]
 max_connections = 1024
 max_udp_destinations = 2048
+max_preauth_per_ip = 128
+listen_backlog = 1024
 handshake_timeout_ms = 60000
 idle_timeout_ms = 300000
 "#
@@ -389,6 +417,8 @@ idle_timeout_ms = 300000
         assert_eq!(config.log.level, LogLevel::Warn);
         assert_eq!(config.limits.max_connections, 1024);
         assert_eq!(config.limits.max_udp_destinations, 2048);
+        assert_eq!(config.limits.max_preauth_per_ip, 128);
+        assert_eq!(config.limits.listen_backlog, 1024);
         assert_eq!(config.limits.handshake_timeout_ms, 60_000);
         assert_eq!(config.limits.idle_timeout_ms, 300_000);
     }
@@ -433,6 +463,14 @@ idle_timeout_ms = 300000
             (
                 "max_udp_destinations = 2048",
                 format!("max_udp_destinations = \"{CANARY}\""),
+            ),
+            (
+                "max_preauth_per_ip = 128",
+                format!("max_preauth_per_ip = \"{CANARY}\""),
+            ),
+            (
+                "listen_backlog = 1024",
+                format!("listen_backlog = \"{CANARY}\""),
             ),
             (
                 "handshake_timeout_ms = 60000",
@@ -615,6 +653,8 @@ idle_timeout_ms = 300000
         for (name, value) in [
             ("max_connections", "1024"),
             ("max_udp_destinations", "2048"),
+            ("max_preauth_per_ip", "128"),
+            ("listen_backlog", "1024"),
             ("handshake_timeout_ms", "60000"),
             ("idle_timeout_ms", "300000"),
         ] {
@@ -628,6 +668,20 @@ idle_timeout_ms = 300000
                 other => panic!("unexpected error for {name}: {other}"),
             }
         }
+    }
+
+    #[test]
+    fn rejects_an_oversized_listen_backlog() {
+        let input =
+            config_toml(&private_key()).replace("listen_backlog = 1024", "listen_backlog = 65536");
+        let error = Config::from_toml_str(&input).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::Validation(ValidationError::LimitTooLarge {
+                name: "listen_backlog",
+                max: 65535
+            })
+        ));
     }
 
     #[test]

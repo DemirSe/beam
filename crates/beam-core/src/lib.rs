@@ -3,6 +3,7 @@
 //! Core protocol and server logic for beam.
 
 pub mod address;
+pub mod admission;
 pub mod config;
 pub mod prepend_stream;
 pub mod reality;

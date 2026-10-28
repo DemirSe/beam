@@ -163,6 +163,10 @@ pub struct LimitsConfig {
     pub max_connections: u32,
     /// Maximum concurrent UDP destinations.
     pub max_udp_destinations: u32,
+    /// Maximum pre-auth handshakes from one source address.
+    pub max_preauth_per_ip: u32,
+    /// Listener backlog passed to `listen(2)`.
+    pub listen_backlog: u32,
     /// Handshake timeout in milliseconds.
     pub handshake_timeout_ms: u64,
     /// Idle timeout in milliseconds.
@@ -213,8 +217,20 @@ pub(crate) struct RawLog {
 pub(crate) struct RawLimits {
     pub(crate) max_connections: u32,
     pub(crate) max_udp_destinations: u32,
+    #[serde(default = "default_max_preauth_per_ip")]
+    pub(crate) max_preauth_per_ip: u32,
+    #[serde(default = "default_listen_backlog")]
+    pub(crate) listen_backlog: u32,
     pub(crate) handshake_timeout_ms: u64,
     pub(crate) idle_timeout_ms: u64,
+}
+
+fn default_max_preauth_per_ip() -> u32 {
+    128
+}
+
+fn default_listen_backlog() -> u32 {
+    1024
 }
 
 fn deserialize_secret<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>

@@ -35,6 +35,7 @@ use tokio::time::timeout;
 use zeroize::Zeroizing;
 
 use crate::address::{Address, NetLocation};
+use crate::admission::{IpLimiter, IpPermit};
 use crate::prepend_stream::PrependStream;
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
 use crate::relay::{RelayActivity, RelayConfig, copy_bidirectional, copy_one_way};
@@ -64,6 +65,12 @@ const COVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// starve the VPN data path. The limit is global rather than per-IP because
 /// the deployment intentionally does not filter by client address.
 const COVER_MAX_CONCURRENCY: usize = 32;
+
+/// Maximum unauthenticated cover relays from one source address.
+///
+/// The global cap bounds the shared blocking pool; the per-source cap prevents
+/// one scanner from consuming every cover slot during a probe burst.
+const COVER_MAX_PER_IP: u32 = 8;
 
 /// Maximum time a connection may hold a pre-auth slot for its ClientHello.
 ///
@@ -287,8 +294,8 @@ pub struct TlsServerConfig {
     splice_permits: Arc<Semaphore>,
     /// Global cap on legacy VLESS UDP / packetaddr streams.
     legacy_udp_permits: Arc<Semaphore>,
-    /// Global cap on unauthenticated cover relays.
-    cover_permits: Arc<Semaphore>,
+    /// Global and per-source cap on unauthenticated cover relays.
+    cover_limiter: Arc<IpLimiter>,
     /// Bounded exact-replay filter for authenticated ClientHellos.
     replay_cache: Mutex<ReplayCache>,
 }
@@ -347,7 +354,7 @@ impl TlsServerConfig {
             connection_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             splice_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             legacy_udp_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
-            cover_permits: Arc::new(Semaphore::new(COVER_MAX_CONCURRENCY)),
+            cover_limiter: Arc::new(IpLimiter::new(COVER_MAX_CONCURRENCY, COVER_MAX_PER_IP)),
             replay_cache: Mutex::new(ReplayCache::new(REPLAY_CACHE_TTL)),
         })
     }
@@ -500,6 +507,7 @@ impl fmt::Debug for TlsServerConfig {
             .field("xudp_limiter", &self.xudp_limiter)
             .field("udp", &self.udp)
             .field("cover_max_concurrency", &COVER_MAX_CONCURRENCY)
+            .field("cover_max_per_ip", &COVER_MAX_PER_IP)
             .field("splice_available", &self.splice_permits.available_permits())
             .field(
                 "legacy_udp_available",
@@ -635,7 +643,7 @@ pub async fn handle_connection(
 pub async fn handle_connection_admitted(
     mut stream: TcpStream,
     config: Arc<TlsServerConfig>,
-    preauth: Option<OwnedSemaphorePermit>,
+    preauth: Option<IpPermit>,
 ) -> Result<ConnectionOutcome, TlsServerError> {
     let read = read_client_hello_record(&mut stream, &config).await?;
     let record = match read {
@@ -977,11 +985,13 @@ async fn forward_to_cover(
 ) -> Result<ConnectionOutcome, TlsServerError> {
     // Fail fast rather than queueing an unbounded number of cover relays in
     // the shared blocking pool. The permit is held through the relay so a
-    // cover connection cannot outlive the cap.
-    let _cover_permit = match Arc::clone(&config.cover_permits).try_acquire_owned() {
+    // cover connection cannot outlive the cap, and the per-source bound keeps
+    // one scanner from consuming every global cover slot.
+    let peer = client.peer_addr().map_err(TlsServerError::Io)?;
+    let _cover_permit = match config.cover_limiter.try_acquire(peer.ip()) {
         Ok(permit) => permit,
-        Err(_) => {
-            tracing::debug!("cover concurrency limit reached; closing probe");
+        Err(reject) => {
+            tracing::debug!(%peer, ?reject, "cover limit reached; closing probe");
             return Ok(ConnectionOutcome::CoverLimited);
         }
     };
@@ -1816,26 +1826,54 @@ mod tests {
     async fn cover_limit_is_global_and_bounded() {
         let config = test_config();
         let mut permits = Vec::new();
-        for _ in 0..COVER_MAX_CONCURRENCY {
+        for index in 0..COVER_MAX_CONCURRENCY {
+            let ip = std::net::IpAddr::from([10, 0, 0, index as u8]);
             permits.push(
-                Arc::clone(&config.cover_permits)
-                    .try_acquire_owned()
+                config
+                    .cover_limiter
+                    .try_acquire(ip)
                     .expect("cover permit must be available below the limit"),
             );
         }
         assert!(
-            Arc::clone(&config.cover_permits)
-                .try_acquire_owned()
+            config
+                .cover_limiter
+                .try_acquire(std::net::IpAddr::from([10, 0, 1, 1]))
                 .is_err(),
             "the cover limit must reject one more relay"
         );
         permits.pop();
         assert!(
-            Arc::clone(&config.cover_permits)
-                .try_acquire_owned()
+            config
+                .cover_limiter
+                .try_acquire(std::net::IpAddr::from([10, 0, 1, 1]))
                 .is_ok(),
             "a released cover permit must be reusable"
         );
+    }
+
+    #[test]
+    fn cover_limit_is_bounded_per_source() {
+        let config = test_config();
+        let ip = std::net::IpAddr::from([10, 0, 0, 1]);
+        let mut permits = Vec::new();
+        for _ in 0..COVER_MAX_PER_IP {
+            permits.push(
+                config
+                    .cover_limiter
+                    .try_acquire(ip)
+                    .expect("per-source cover permit must be available"),
+            );
+        }
+        assert_eq!(
+            config
+                .cover_limiter
+                .try_acquire(ip)
+                .expect_err("per-IP cap"),
+            crate::admission::IpLimitReject::PerIp
+        );
+        permits.pop();
+        assert!(config.cover_limiter.try_acquire(ip).is_ok());
     }
 
     #[test]

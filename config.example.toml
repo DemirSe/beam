@@ -22,5 +22,7 @@ level = "warn"
 [limits]
 max_connections = 1024
 max_udp_destinations = 2048
+max_preauth_per_ip = 128
+listen_backlog = 1024
 handshake_timeout_ms = 60000
 idle_timeout_ms = 300000

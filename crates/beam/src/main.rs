@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use beam_core::address::{Address, NetLocation};
+use beam_core::admission::IpLimiter;
 use beam_core::config::{Config, LogLevel};
 use beam_core::tls::{
     MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN, TlsServerConfig, handle_connection_admitted,
@@ -13,7 +14,7 @@ use beam_core::tls::{
 use beam_core::udp::LegacyUdpConfig;
 use beam_core::xudp::XudpConfig;
 use clap::Parser;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, sleep};
@@ -72,8 +73,12 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     // small enough that a scanner flood cannot pin every permit, but large
     // enough for a browser's parallel connection burst.
     let max_pending_handshakes = max_connections.clamp(16, 256);
+    let max_preauth_per_ip = config
+        .limits
+        .max_preauth_per_ip
+        .min(max_pending_handshakes as u32);
     let authenticated = Arc::new(Semaphore::new(max_connections));
-    let preauth = Arc::new(Semaphore::new(max_pending_handshakes));
+    let preauth = Arc::new(IpLimiter::new(max_pending_handshakes, max_preauth_per_ip));
     // Leave room in the blocking pool for cover relays, DNS resolution, and
     // destination dials. Vision directions above this cap use the async copy
     // path instead of queueing forever in `spawn_blocking`.
@@ -89,14 +94,14 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
             .with_splice_limiter(splice_permits)
             .with_legacy_udp_limiter(legacy_udp_permits),
     );
-    let listener = TcpListener::bind(config.server.listen)
-        .await
-        .with_context(|| format!("failed to bind `{}`", config.server.listen))?;
+    let listener = bind_listener(config.server.listen, config.limits.listen_backlog)?;
 
     tracing::info!(
         listen = %config.server.listen,
         max_connections,
         max_pending_handshakes,
+        max_preauth_per_ip,
+        listen_backlog = config.limits.listen_backlog,
         "beam listening"
     );
 
@@ -146,10 +151,10 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         // pre-auth slot is held, drop this connection and keep draining the
         // kernel backlog; a stalled accept loop turns a handshake flood into a
         // total outage.
-        let preauth_permit = match Arc::clone(&preauth).try_acquire_owned() {
+        let preauth_permit = match preauth.try_acquire(peer.ip()) {
             Ok(permit) => permit,
-            Err(_) => {
-                tracing::debug!(%peer, "pre-auth handshake limit reached; dropping");
+            Err(reject) => {
+                tracing::debug!(%peer, ?reject, "pre-auth handshake limit reached; dropping");
                 drop(stream);
                 tokio::task::yield_now().await;
                 continue;
@@ -197,6 +202,24 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     }
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+fn bind_listener(address: SocketAddr, backlog: u32) -> anyhow::Result<TcpListener> {
+    let socket = match address {
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .with_context(|| format!("failed to create a listener socket for `{address}`"))?;
+    socket
+        .set_reuseaddr(true)
+        .with_context(|| format!("failed to set SO_REUSEADDR on `{address}`"))?;
+    socket
+        .bind(address)
+        .with_context(|| format!("failed to bind `{address}`"))?;
+    let listener = socket
+        .listen(backlog)
+        .with_context(|| format!("failed to listen on `{address}` with backlog {backlog}"))?;
+    Ok(listener)
 }
 
 fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
