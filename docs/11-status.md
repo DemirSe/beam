@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-10-23.
+Updated: 2026-10-27.
 
 ## Decisions
 
@@ -35,6 +35,7 @@ Updated: 2026-10-23.
 | Legacy VLESS UDP and packetaddr | Done |
 | Linux fd/socket/splice primitives | Done |
 | Zero-copy splice relay loop | Done |
+| Target-socket MSS clamp (`TCP_MAXSEG 1400`) | Done; deployed 2026-10-27 |
 | REALITY TLS server adapter (rustls) | Done |
 | Cover fallback (byte-exact ClientHello) | Done |
 | Cover concurrency cap | Done (32 relays) |
@@ -213,6 +214,10 @@ unchanged config hash
 `NRestarts=0`, no warning entries, cover certificate and IPv4/IPv6/DNS
 verified. Host conntrack was raised to 65536 with a 1 h established timeout.
 
+On 2026-10-27 the target-socket `TCP_MAXSEG 1400` clamp replaced the host-route
+workaround and was deployed to the VPS; the host `beam-mtu.service` and its
+script were removed. See `docs/23-target-mss-2026-10-27.md`.
+
 ## In progress
 
 - A low-rate live observation ran for about four hours on 2026-10-24
@@ -300,9 +305,9 @@ bash tests/tun/run.sh --udp-mode legacy
 bash bench/no-tun.sh
 ```
 
-The workspace currently has 260 `beam-core` unit tests, two TLS adapter
-integration tests, one stock-ClientHello fixture, and 23 `beam-sys` tests
-(286 total). The full-TUN harness passes all eight
+The workspace currently has 277 `beam-core` unit tests, two TLS adapter
+integration tests, one stock-ClientHello fixture, and 26 `beam-sys` tests
+(306 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
 gVisor TUN on both beam and stock Xray. The final-binary no-TUN server-capacity smoke is

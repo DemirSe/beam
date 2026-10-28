@@ -70,6 +70,11 @@ value before deployment.
 - [`docs/15-production-runbook.md`](docs/15-production-runbook.md)
 - [`docs/16-local-comparison-2026-10-22.md`](docs/16-local-comparison-2026-10-22.md)
 - [`docs/17-resource-hardening.md`](docs/17-resource-hardening.md)
+- [`docs/18-optimization-2026-10-24.md`](docs/18-optimization-2026-10-24.md)
+- [`docs/19-local-improvements-2026-10-24.md`](docs/19-local-improvements-2026-10-24.md)
+- [`docs/20-xudp-edge-hardening-2026-10-24.md`](docs/20-xudp-edge-hardening-2026-10-24.md)
+- [`docs/22-path-mtu-2026-10-27.md`](docs/22-path-mtu-2026-10-27.md)
+- [`docs/23-target-mss-2026-10-27.md`](docs/23-target-mss-2026-10-27.md)
 
 ## Repository layout
 

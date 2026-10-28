@@ -1,5 +1,10 @@
 # Local benchmark harness: stock Xray v26.3.27 vs `beam`
 
+Status: historical design note. The current harness is documented in
+`bench/README.md` (`bench/run.sh`, `bench/no-tun.sh`, and the Python reporters);
+the planned `bench/driver` and `bench/bin/fetch.sh` paths below were never
+committed.
+
 Read-only design aligned with `docs/04-benchmark.md` (goal, gates, local methodology, conditions, scenarios, tools, reporting). It targets the profile in `docs/00-scope.md` and the reference versions in `docs/01-compatibility.md`. No VPS, no repository change, no external network in any measured path. All traffic stays in three local namespaces.
 
 ## Targets and gates (from `docs/04-benchmark.md`; numeric rows are goals, aggregate/no-regression/soak/churn are hard requirements)
