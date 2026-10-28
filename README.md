@@ -75,6 +75,7 @@ value before deployment.
 - [`docs/20-xudp-edge-hardening-2026-10-24.md`](docs/20-xudp-edge-hardening-2026-10-24.md)
 - [`docs/22-path-mtu-2026-10-27.md`](docs/22-path-mtu-2026-10-27.md)
 - [`docs/23-target-mss-2026-10-27.md`](docs/23-target-mss-2026-10-27.md)
+- [`docs/24-open-issues-2026-10-29.md`](docs/24-open-issues-2026-10-29.md)
 
 ## Repository layout
 
