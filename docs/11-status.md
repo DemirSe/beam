@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-10-27.
+Updated: 2026-10-28.
 
 ## Decisions
 
@@ -218,6 +218,15 @@ On 2026-10-27 the target-socket `TCP_MAXSEG 1400` clamp replaced the host-route
 workaround and was deployed to the VPS; the host `beam-mtu.service` and its
 script were removed. See `docs/23-target-mss-2026-10-27.md`.
 
+On 2026-10-28 22:51 UTC the admission-hardening binary was deployed with
+`BEAM_KEEP_CONFIG=1`: SHA-256
+`5f37081a19ee47c07118ebc6b43fb7bf0db295667099a196fafe10b39871e635`.
+The live config was preserved; defaults now add a 128 pre-auth limit per source,
+a 1024 listener backlog with `SO_REUSEADDR`, an 8-per-source cover cap, a
+configurable 256-session XUDP cap, and a configurable 2 s shutdown drain.
+Post-deploy `NRestarts=0`, listener backlog 1024, HTTPS IPv4/IPv6, the cover
+certificate, and the local full-TUN client path were verified.
+
 ## In progress
 
 - A low-rate live observation ran for about four hours on 2026-10-24
@@ -305,9 +314,9 @@ bash tests/tun/run.sh --udp-mode legacy
 bash bench/no-tun.sh
 ```
 
-The workspace currently has 277 `beam-core` unit tests, two TLS adapter
+The workspace currently has 284 `beam-core` unit tests, two TLS adapter
 integration tests, one stock-ClientHello fixture, and 26 `beam-sys` tests
-(306 total). The full-TUN harness passes all eight
+(313 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
 gVisor TUN on both beam and stock Xray. The final-binary no-TUN server-capacity smoke is
