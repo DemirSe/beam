@@ -4,7 +4,7 @@
 //! client used the test REALITY keypair, shortId `0123456789abcdef`, and SNI
 //! `whatsapp.net`. A local TCP proxy saved the first complete TLS record.
 
-use beam_core::tls::ClientHello;
+use beam_core::tls::{ClientHello, ClientHelloError};
 
 const STOCK_CLIENT_HELLO: &[u8] = include_bytes!("fixtures/stock-client-hello.bin");
 
@@ -33,4 +33,27 @@ fn parses_stock_xray_client_hello() {
     );
 
     assert_eq!(hello.raw_record, STOCK_CLIENT_HELLO);
+}
+
+#[test]
+fn a_client_hello_split_across_records_is_rejected_as_truncated() {
+    // TLS permits a ClientHello to span multiple records. beam currently
+    // reads exactly one record, so this test pins the deterministic fallback:
+    // the first record is parsed, found incomplete, and is never mistaken for
+    // an authenticated ClientHello.
+    let record_body = &STOCK_CLIENT_HELLO[5..];
+    let split = 64;
+    assert!(split > 4 && split < record_body.len());
+
+    let mut first_record = Vec::with_capacity(5 + split);
+    first_record.extend_from_slice(&STOCK_CLIENT_HELLO[..5]);
+    first_record[3..5].copy_from_slice(&(split as u16).to_be_bytes());
+    first_record.extend_from_slice(&record_body[..split]);
+
+    let error = ClientHello::parse(&first_record)
+        .expect_err("a partial handshake must not parse as a complete ClientHello");
+    assert!(
+        matches!(error, ClientHelloError::Truncated { .. }),
+        "unexpected error: {error:?}"
+    );
 }
