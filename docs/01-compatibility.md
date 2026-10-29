@@ -56,8 +56,9 @@ outbound: freedom
 ## Wire behaviors to preserve
 
 - TLS 1.3 ClientHello parsing and REALITY authentication.
-- The cover handshake flight and record sizes observed by an unauthenticated
-  peer.
+- Cover SNI, certificate, TLS 1.3/PQ group, and cipher behavior for
+  unauthenticated peers. Byte-identical extension order and encrypted-flight
+  size are **not** required.
 - Vision padding rules in both directions.
 - VLESS response header and addons.
 - XUDP frame layout, session IDs, status codes, and expiry.

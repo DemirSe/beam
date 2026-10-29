@@ -5,6 +5,16 @@ authentication**. Network succeeded from this host; DNS resolved `whatsapp.net` 
 `57.144.249.32` (`mmx-ds.cdn.whatsapp.net`). No VPS or local TLS server was used.
 Work dir: `/tmp/opencode/beam-spike-tls`; `/home/demir/pi/beam` was not modified.
 
+## Decision: SNI-level cover parity is sufficient (2026-10-29)
+
+Byte-for-byte parity with the live `whatsapp.net` handshake is **not a
+requirement**. The acceptance target is the cover SNI, the cover certificate,
+TLS 1.3/PQ group and cipher behavior, and normal forwarding for unauthenticated
+probes. Extension order, record count, and encrypted-flight size are
+diagnostic measurements only; do not implement custom TLS or gate deployment on
+them. The harness below remains useful for detecting accidental changes, not as
+a byte-equality target.
+
 ## Verdict
 - **The cover is PQ-capable.** It negotiates `X25519MLKEM768` (group 0x11ec), TLS 1.3,
   `TLS_AES_128_GCM_SHA256`, ALPN `h2`, with a 2-certificate EC leaf chain.

@@ -47,7 +47,7 @@ Updated: 2026-10-29.
 | Prefix replay stream | Done |
 | Stock Xray no-flow TCP interop | **HTTP 200** |
 | Stock Xray Vision TCP/HTTPS interop | **HTTP 200** |
-| Cover-parity harness | Done; gaps documented |
+| Cover-parity harness | Done; SNI-level accepted, byte flight not required |
 | Fuzz workspace and manual fuzz CI | Done; 60 s target runs locally |
 | Full-TUN harness v2 | **8/8 PASS** |
 | Full-TUN benchmark harness | Done |
@@ -85,8 +85,8 @@ UDP modes:
 - **Compatibility:** beam passes all 8 full-TUN probes in `xudp`,
   `packetaddr`, and `legacy`; stock Xray matches on `xudp`/`legacy` and is
   3/8 on `packetaddr` because Xray has no packetaddr implementation. Cover
-  parity capture passes; the known extension-order and flight-size gaps are
-  unchanged.
+  SNI/certificate/PQ behavior passes; byte-level flight-size and
+  extension-order differences are accepted and not a deployment gate.
 - **No-TUN server-capacity smoke** (stock Xray SOCKS client, 256 MiB plain
   HTTP, separate CPUs): beam **872 MB/s** vs stock **589 MB/s** in the final
   older run (**1.48x**; earlier 1.56x; latest balanced 1.462x). This removes
@@ -261,7 +261,9 @@ returned 200 as sing-box reconnected.
 
 ## Known gaps / not started
 
-- TLS extension-order and encrypted-flight-size parity.
+- TLS extension-order and encrypted-flight-size byte parity is **not
+  required** by the 2026-10-29 SNI-level decision; the diagnostic harness
+  remains.
 - The early upload splice depends on the client sending Direct before the
   body; fully framed uploads stay on the async path.
 - A 24-hour soak and privileged syscall/wakeup gates remain.
