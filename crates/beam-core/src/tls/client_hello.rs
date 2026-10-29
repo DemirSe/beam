@@ -28,6 +28,36 @@ pub const MAX_RECORD_LEN: usize = 16_384;
 /// Maximum ClientHello handshake body that fits in a maximum-size record.
 pub const MAX_CLIENT_HELLO_LEN: usize = MAX_RECORD_LEN - TLS_HANDSHAKE_HEADER_LEN;
 
+/// Maximum number of TLS records accepted for one ClientHello.
+pub const MAX_CLIENT_HELLO_RECORDS: usize = 4;
+
+/// Returns the complete handshake-message length declared by a record body.
+///
+/// This is used only to assemble a ClientHello split across TLS records. It
+/// checks the handshake type, the three-byte length, and the parser limit; it
+/// does not parse extensions or authenticate the message.
+pub fn client_hello_message_len(record_body: &[u8]) -> Result<usize, ClientHelloError> {
+    let mut handshake = Reader::new(record_body);
+    let handshake_type = handshake.u8()?;
+    if handshake_type != HANDSHAKE_TYPE_CLIENT_HELLO {
+        return Err(ClientHelloError::NotClientHello(handshake_type));
+    }
+    let client_hello_len = handshake.u24()?;
+    if client_hello_len > MAX_CLIENT_HELLO_LEN {
+        return Err(ClientHelloError::ClientHelloTooLarge {
+            length: client_hello_len,
+            max: MAX_CLIENT_HELLO_LEN,
+        });
+    }
+    TLS_HANDSHAKE_HEADER_LEN
+        .checked_add(client_hello_len)
+        .ok_or(ClientHelloError::Truncated {
+            offset: 0,
+            needed: client_hello_len,
+            remaining: record_body.len(),
+        })
+}
+
 /// Maximum length of a TLS 1.3 legacy session id.
 pub const MAX_SESSION_ID_LEN: usize = 32;
 

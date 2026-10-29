@@ -41,7 +41,10 @@ use crate::prepend_stream::PrependStream;
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
 use crate::relay::{RelayActivity, RelayConfig, copy_bidirectional, copy_one_way};
 use crate::tls::stream::{TlsStream, TlsStreamError};
-use crate::tls::{ClientHello, MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN};
+use crate::tls::{
+    ClientHello, MAX_CLIENT_HELLO_RECORDS, MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN,
+    client_hello_message_len,
+};
 use crate::udp::{LegacyUdpConfig, UdpError, handle_udp_stream};
 use crate::vision::VisionStream;
 use crate::vless::{Command, MAX_REQUEST_HEADER_LEN, RequestHeader, ResponseHeader, VlessError};
@@ -661,8 +664,8 @@ pub async fn handle_connection_admitted(
     preauth: Option<IpPermit>,
 ) -> Result<ConnectionOutcome, TlsServerError> {
     let read = read_client_hello_record(&mut stream, &config).await?;
-    let record = match read {
-        ClientHelloRead::Complete(record) => record,
+    let (record, wire) = match read {
+        ClientHelloRead::Complete { record, wire } => (record, wire),
         ClientHelloRead::Forward(prefix) => {
             drop(preauth);
             if prefix.is_empty() {
@@ -713,15 +716,17 @@ pub async fn handle_connection_admitted(
         }
         None => {
             drop(preauth);
-            forward_to_cover(stream, &record, &config).await
+            forward_to_cover(stream, &wire, &config).await
         }
     }
 }
 
 /// Result of reading the initial bytes from a connection.
 enum ClientHelloRead {
-    /// A complete TLS record was read and should be parsed.
-    Complete(Vec<u8>),
+    /// A complete ClientHello was assembled. `record` is a normalized
+    /// single-record form for the parser/rustls; `wire` is the original bytes
+    /// to forward byte-for-byte if authentication fails.
+    Complete { record: Vec<u8>, wire: Vec<u8> },
     /// The peer did not send a plausible, complete ClientHello. Forward the
     /// bytes already read (possibly only the five-byte header) to the cover,
     /// then relay the rest byte-for-byte.
@@ -738,10 +743,13 @@ fn is_plausible_tls_record_header(header: &[u8; TLS_RECORD_HEADER_LEN]) -> bool 
 /// prober sees the cover respond instead of beam waiting for a body that will
 /// never arrive. If the peer stalls or closes mid-record, the bytes already
 /// received are forwarded to the cover too.
-async fn read_client_hello_record(
-    stream: &mut TcpStream,
+async fn read_client_hello_record<R>(
+    stream: &mut R,
     config: &TlsServerConfig,
-) -> Result<ClientHelloRead, TlsServerError> {
+) -> Result<ClientHelloRead, TlsServerError>
+where
+    R: AsyncRead + Unpin,
+{
     // One absolute deadline covers both the five-byte header and the declared
     // body. Per-read timeouts would let a patient peer hold a pre-auth slot for
     // twice the configured handshake budget.
@@ -807,7 +815,133 @@ async fn read_client_hello_record(
         }
     }
 
-    Ok(ClientHelloRead::Complete(record))
+    // A TLS ClientHello is normally one record, but TLS permits it to span
+    // several handshake records. Assemble the handshake message under the same
+    // absolute deadline, with separate bounds for the handshake bytes and the
+    // original wire bytes. A peer that stalls mid-assembly is forwarded, with
+    // every byte read so far, exactly like a stalled single record.
+    let Ok(message_len) = client_hello_message_len(&record[TLS_RECORD_HEADER_LEN..]) else {
+        return Ok(ClientHelloRead::Complete {
+            record: record.clone(),
+            wire: record,
+        });
+    };
+    let first_body_len = record.len() - TLS_RECORD_HEADER_LEN;
+    if first_body_len >= message_len {
+        return Ok(ClientHelloRead::Complete {
+            record: record.clone(),
+            wire: record,
+        });
+    }
+
+    let wire_limit = config
+        .max_client_hello_bytes
+        .saturating_add(MAX_CLIENT_HELLO_RECORDS.saturating_sub(1) * TLS_RECORD_HEADER_LEN);
+    let mut wire = record;
+    let mut handshake = Vec::new();
+    handshake
+        .try_reserve_exact(message_len)
+        .map_err(|_| TlsServerError::Allocation)?;
+    handshake.extend_from_slice(&wire[TLS_RECORD_HEADER_LEN..]);
+    let mut records_seen = 1usize;
+
+    while handshake.len() < message_len {
+        if records_seen >= MAX_CLIENT_HELLO_RECORDS {
+            return Ok(ClientHelloRead::Forward(wire));
+        }
+
+        let mut next_header = [0u8; TLS_RECORD_HEADER_LEN];
+        let mut next_filled = 0usize;
+        while next_filled < next_header.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                wire.extend_from_slice(&next_header[..next_filled]);
+                return Ok(ClientHelloRead::Forward(wire));
+            }
+            let read = match timeout(remaining, stream.read(&mut next_header[next_filled..])).await
+            {
+                Err(_) => {
+                    wire.extend_from_slice(&next_header[..next_filled]);
+                    return Ok(ClientHelloRead::Forward(wire));
+                }
+                Ok(read) => read,
+            };
+            match read {
+                Ok(0) => {
+                    wire.extend_from_slice(&next_header[..next_filled]);
+                    return Ok(ClientHelloRead::Forward(wire));
+                }
+                Ok(count) => next_filled += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(TlsServerError::Io(error)),
+            }
+        }
+
+        let next_len = usize::from(u16::from_be_bytes([next_header[3], next_header[4]]));
+        let next_total = TLS_RECORD_HEADER_LEN.saturating_add(next_len);
+        if !is_plausible_tls_record_header(&next_header)
+            || next_len > MAX_RECORD_LEN
+            || wire.len().saturating_add(next_total) > wire_limit
+        {
+            wire.extend_from_slice(&next_header);
+            return Ok(ClientHelloRead::Forward(wire));
+        }
+
+        let start = wire.len();
+        wire.try_reserve_exact(next_total)
+            .map_err(|_| TlsServerError::Allocation)?;
+        wire.resize(start + next_total, 0);
+        wire[start..start + TLS_RECORD_HEADER_LEN].copy_from_slice(&next_header);
+        let mut next_filled = TLS_RECORD_HEADER_LEN;
+        while next_filled < next_total {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                wire.truncate(start + next_filled);
+                return Ok(ClientHelloRead::Forward(wire));
+            }
+            let read = match timeout(remaining, stream.read(&mut wire[start + next_filled..])).await
+            {
+                Err(_) => {
+                    wire.truncate(start + next_filled);
+                    return Ok(ClientHelloRead::Forward(wire));
+                }
+                Ok(read) => read,
+            };
+            match read {
+                Ok(0) => {
+                    wire.truncate(start + next_filled);
+                    return Ok(ClientHelloRead::Forward(wire));
+                }
+                Ok(count) => next_filled += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(TlsServerError::Io(error)),
+            }
+        }
+        handshake.extend_from_slice(&wire[start + TLS_RECORD_HEADER_LEN..start + next_total]);
+        records_seen += 1;
+    }
+
+    if handshake.len() != message_len {
+        // Extra bytes after the ClientHello are not silently discarded.
+        return Ok(ClientHelloRead::Forward(wire));
+    }
+
+    // Normalize the wire records into one record containing exactly the
+    // reassembled handshake message. TLS authenticates the handshake bytes,
+    // not the record segmentation, so rustls and the REALITY AAD see the same
+    // message a single-record client would have sent.
+    let mut normalized = Vec::new();
+    normalized
+        .try_reserve_exact(TLS_RECORD_HEADER_LEN.saturating_add(message_len))
+        .map_err(|_| TlsServerError::Allocation)?;
+    normalized.extend_from_slice(&wire[..3]);
+    normalized.extend_from_slice(&(message_len as u16).to_be_bytes());
+    normalized.extend_from_slice(&handshake[..message_len]);
+
+    Ok(ClientHelloRead::Complete {
+        record: normalized,
+        wire,
+    })
 }
 
 /// Returns whether a VLESS flow value is supported.
@@ -1765,6 +1899,53 @@ mod tests {
             cover_timeout(Duration::from_secs(2)),
             Duration::from_secs(2)
         );
+    }
+
+    #[tokio::test]
+    async fn reassembles_a_client_hello_split_across_records() {
+        const HELLO: &[u8] = include_bytes!("../../tests/fixtures/stock-client-hello.bin");
+        let body = &HELLO[TLS_RECORD_HEADER_LEN..];
+        let split = 100;
+        assert!(split > 4 && split < body.len());
+
+        let mut first = Vec::new();
+        first.extend_from_slice(&HELLO[..3]);
+        first.extend_from_slice(&(split as u16).to_be_bytes());
+        first.extend_from_slice(&body[..split]);
+
+        let rest = &body[split..];
+        let mut second = Vec::new();
+        second.extend_from_slice(&HELLO[..3]);
+        second.extend_from_slice(&(rest.len() as u16).to_be_bytes());
+        second.extend_from_slice(rest);
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let write = async move {
+            writer.write_all(&first).await.expect("first record");
+            writer.write_all(&second).await.expect("second record");
+            writer.shutdown().await.expect("shutdown");
+        };
+        let read = async {
+            read_client_hello_record(&mut reader, &test_config())
+                .await
+                .expect("fragmented ClientHello read")
+        };
+        let (_, read) = tokio::join!(write, read);
+
+        let ClientHelloRead::Complete { record, wire } = read else {
+            panic!("fragmented ClientHello must be reassembled");
+        };
+        assert_eq!(
+            record, HELLO,
+            "normalized record must match the single-record form"
+        );
+        assert_eq!(
+            wire.len(),
+            HELLO.len() + TLS_RECORD_HEADER_LEN,
+            "both original records must be preserved for cover fallback"
+        );
+        let hello = ClientHello::parse(&record).expect("reassembled ClientHello must parse");
+        assert_eq!(hello.server_name, Some("whatsapp.net"));
     }
 
     #[tokio::test]

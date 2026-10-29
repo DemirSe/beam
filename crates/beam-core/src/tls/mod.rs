@@ -11,8 +11,9 @@ pub mod stream;
 pub use client_hello::{
     Alpn, AlpnIter, ClientHello, ClientHelloError, Extension, ExtensionIter, KeyShareEntry,
     KeyShareGroups, KeyShares, MAX_ALPN_PROTOCOLS, MAX_CIPHER_SUITES, MAX_CLIENT_HELLO_LEN,
-    MAX_EXTENSIONS, MAX_KEY_SHARE_ENTRIES, MAX_RECORD_LEN, MAX_SESSION_ID_LEN,
-    TLS_HANDSHAKE_HEADER_LEN, TLS_RECORD_HEADER_LEN, TLS13_VERSION, U16List, U16ListIter,
+    MAX_CLIENT_HELLO_RECORDS, MAX_EXTENSIONS, MAX_KEY_SHARE_ENTRIES, MAX_RECORD_LEN,
+    MAX_SESSION_ID_LEN, TLS_HANDSHAKE_HEADER_LEN, TLS_RECORD_HEADER_LEN, TLS13_VERSION, U16List,
+    U16ListIter, client_hello_message_len,
 };
 pub use server::{
     ConnectionOutcome, ReplayStream, TlsServerConfig, TlsServerError, handle_connection,
