@@ -85,6 +85,11 @@ const PREAUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// the full client handshake budget.
 const MAX_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Clamps a cover dial/write to the same bound as an authenticated dial.
+fn cover_timeout(configured: Duration) -> Duration {
+    configured.min(MAX_DIAL_TIMEOUT)
+}
+
 /// TCP maximum segment size used for destination connections.
 ///
 /// The production path to some CDN prefixes has a 1460-byte PMTU but
@@ -1013,12 +1018,15 @@ async fn forward_to_cover(
         }
     };
 
-    let mut cover = dial(&config.cover, config.handshake_timeout).await?;
-    timeout(config.handshake_timeout, cover.write_all(record))
-        .await
-        .map_err(|_| TlsServerError::Timeout {
-            stage: "cover ClientHello write",
-        })??;
+    let mut cover = dial(&config.cover, cover_timeout(config.handshake_timeout)).await?;
+    timeout(
+        cover_timeout(config.handshake_timeout),
+        cover.write_all(record),
+    )
+    .await
+    .map_err(|_| TlsServerError::Timeout {
+        stage: "cover ClientHello write",
+    })??;
     relay_splice(client, cover, COVER_IDLE_TIMEOUT).await?;
     Ok(ConnectionOutcome::CoverForwarded)
 }
@@ -1748,6 +1756,15 @@ mod tests {
         assert!(is_supported_flow(Some("")));
         assert!(is_supported_flow(Some(crate::vless::VISION_FLOW)));
         assert!(!is_supported_flow(Some("xtls-rprx-vision-typo")));
+    }
+
+    #[test]
+    fn cover_timeout_is_capped_like_an_authenticated_dial() {
+        assert_eq!(cover_timeout(Duration::from_secs(60)), MAX_DIAL_TIMEOUT);
+        assert_eq!(
+            cover_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
     }
 
     #[tokio::test]
