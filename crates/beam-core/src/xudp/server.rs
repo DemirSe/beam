@@ -708,6 +708,16 @@ impl MuxState {
     /// must never prevent a live session from being accepted.
     fn reserve_session_slot(&self) -> bool {
         let mut table = lock_table(&self.table);
+        // Do not let one mux stream consume every global session. The cap
+        // leaves at least half of the global slots for other streams; retained
+        // sockets are still evicted before a live flow is rejected.
+        let active_limit = self
+            .limiter
+            .stream_active_limit()
+            .min(self.config.max_sessions);
+        if table.active_len() >= active_limit {
+            return false;
+        }
         if table.total() < self.config.max_sessions {
             return true;
         }
@@ -1420,6 +1430,41 @@ mod tests {
         assert!(end.option.has_error());
 
         finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn one_stream_cannot_take_all_global_sessions() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let limiter = XudpSessionLimiter::new(4);
+        let (mut first, first_task) = start_mux_with_limiter(test_config(), limiter.clone());
+        let (mut second, second_task) = start_mux_with_limiter(test_config(), limiter);
+        let mut buffer = Vec::new();
+
+        for id in 1..=2 {
+            write_frame(&mut first, new_spec(id, &destination, b"first", None)).await;
+            let reply = read_frame(&mut first, &mut buffer)
+                .await
+                .expect("first stream must admit half the global slots");
+            assert_eq!(reply.session_id, id);
+        }
+        write_frame(&mut first, new_spec(3, &destination, b"reject", None)).await;
+        let end = read_frame(&mut first, &mut buffer)
+            .await
+            .expect("fair-share rejection must receive End");
+        assert_eq!(end.session_id, 3);
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(end.option.has_error());
+
+        write_frame(&mut second, new_spec(4, &destination, b"second", None)).await;
+        let reply = read_frame(&mut second, &mut buffer)
+            .await
+            .expect("the other stream must still be admitted");
+        assert_eq!(reply.session_id, 4);
+        assert_eq!(reply.payload, b"second");
+
+        finish(first, first_task).await;
+        finish(second, second_task).await;
     }
 
     #[tokio::test]

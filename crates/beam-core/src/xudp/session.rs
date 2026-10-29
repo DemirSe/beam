@@ -258,6 +258,12 @@ impl XudpSessionLimiter {
         self.max
     }
 
+    /// Leaves half of the global slots for other mux streams.
+    #[must_use]
+    pub(crate) fn stream_active_limit(&self) -> usize {
+        (self.max / 2).max(1)
+    }
+
     /// Registers one mux stream's session table for global retained eviction.
     pub(crate) fn register_table(&self, table: &Arc<Mutex<SessionTable>>) {
         let mut tables = lock(&self.retained_tables);
@@ -303,7 +309,7 @@ impl XudpSessionLimiter {
         DEFAULT_REPLY_QUEUE_BUDGET
     }
 
-    /// Evicts the oldest retained socket from any registered mux stream.
+    /// Evicts the globally oldest retained socket from any registered stream.
     fn evict_one_retained(&self) -> bool {
         let tables: Vec<Arc<Mutex<SessionTable>>> = {
             let mut tables = lock(&self.retained_tables);
@@ -311,11 +317,28 @@ impl XudpSessionLimiter {
             tables.iter().filter_map(Weak::upgrade).collect()
         };
 
+        // Inspect each table under its own lock, then evict from the single
+        // table holding the earliest expiry. Do not hold two table locks.
+        let mut victim: Option<(Instant, Arc<Mutex<SessionTable>>)> = None;
         for table in tables {
-            if lock(&table).evict_oldest_expiring() {
-                self.metrics.record_xudp_retained_evicted();
-                return true;
+            let Some(expiry) = lock(&table).oldest_expiring_at() else {
+                continue;
+            };
+            let replace = match &victim {
+                None => true,
+                Some((best, _)) => expiry < *best,
+            };
+            if replace {
+                victim = Some((expiry, table));
             }
+        }
+
+        let Some((_, table)) = victim else {
+            return false;
+        };
+        if lock(&table).evict_oldest_expiring() {
+            self.metrics.record_xudp_retained_evicted();
+            return true;
         }
         false
     }
@@ -597,6 +620,11 @@ impl SessionTable {
         self.active.len() + self.expiring.len()
     }
 
+    /// Returns the number of active sessions.
+    pub(crate) fn active_len(&self) -> usize {
+        self.active.len()
+    }
+
     /// Looks up an active session without removing it.
     pub(crate) fn active(&self, id: u16) -> Option<&ActiveSession> {
         self.active.get(&id)
@@ -665,6 +693,11 @@ impl SessionTable {
         let before = self.expiring.len();
         self.expiring.retain(|_, entry| entry.expires_at > now);
         before - self.expiring.len()
+    }
+
+    /// Returns the earliest retained expiry in this table.
+    pub(crate) fn oldest_expiring_at(&self) -> Option<Instant> {
+        self.expiring.values().map(|entry| entry.expires_at).min()
     }
 
     /// Evicts the retained entry that expires first.
@@ -966,9 +999,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_GLOBAL_SESSIONS, ResolveError, Session, SessionTable, SocketFamily, XudpConfig,
-        XudpConfigError, XudpSessionLimiter, encode_end_frame, reply_frame_len,
-        resolve_destination, socket_addr_to_location,
+        DEFAULT_MAX_GLOBAL_SESSIONS, ExpiringSession, ResolveError, Session, SessionTable,
+        SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
+        reply_frame_len, resolve_destination, socket_addr_to_location,
     };
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{
@@ -978,6 +1011,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::UdpSocket;
+    use tokio::time::Instant;
 
     fn ipv4(port: u16) -> NetLocation {
         NetLocation {
@@ -1293,6 +1327,41 @@ mod tests {
         assert_eq!(table.total(), 2);
         assert!(table.take_expiring([7; 8]).is_some());
         assert_eq!(table.total(), 1);
+    }
+
+    #[tokio::test]
+    async fn global_eviction_picks_the_oldest_retained_socket_across_streams() {
+        let limiter = XudpSessionLimiter::new(2);
+        let first = Arc::new(std::sync::Mutex::new(SessionTable::default()));
+        let second = Arc::new(std::sync::Mutex::new(SessionTable::default()));
+        limiter.register_table(&first);
+        limiter.register_table(&second);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let now = Instant::now();
+        first.lock().expect("first table").insert_expiring(
+            [1; 8],
+            ExpiringSession {
+                socket: Arc::clone(&socket),
+                family: SocketFamily::V4,
+                expires_at: now + Duration::from_secs(20),
+                permit: limiter.try_acquire(),
+            },
+        );
+        second.lock().expect("second table").insert_expiring(
+            [2; 8],
+            ExpiringSession {
+                socket,
+                family: SocketFamily::V4,
+                expires_at: now + Duration::from_secs(5),
+                permit: limiter.try_acquire(),
+            },
+        );
+        let permit = limiter
+            .try_acquire_or_evict()
+            .expect("evicting retained state must admit a live slot");
+        drop(permit);
+        assert_eq!(first.lock().expect("first table").total(), 1);
+        assert_eq!(second.lock().expect("second table").total(), 0);
     }
 
     #[tokio::test]
