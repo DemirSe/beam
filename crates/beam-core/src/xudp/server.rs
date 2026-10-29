@@ -27,8 +27,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 
 use super::session::{
-    ActiveSession, ExpiringSession, QueuedFrame, Session, SessionTable, SocketFamily, XudpConfig,
-    XudpConfigError, XudpSessionLimiter, encode_end_frame, resolve_destination, spawn_reply_task,
+    ActiveSession, END_ENQUEUE_TIMEOUT, ExpiringSession, QueuedFrame, Session, SessionTable,
+    SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
+    resolve_destination, spawn_reply_task,
 };
 use crate::xudp::frame::{
     self, Frame, GLOBAL_ID_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN, METADATA_PREFIX_LEN,
@@ -504,10 +505,12 @@ impl MuxState {
                 // permit before asking the global limiter for a fresh slot.
                 drop(retained);
                 if !self.reserve_session_slot() {
+                    self.limiter.metrics().record_xudp_rejected_per_stream();
                     tracing::debug!(session_id = id, "XUDP session limit reached; rejecting New");
                     return self.send_end(id, true).await;
                 }
                 let Some(permit) = self.limiter.try_acquire_or_evict() else {
+                    self.limiter.metrics().record_xudp_rejected_global();
                     tracing::debug!(
                         session_id = id,
                         global_limit = self.limiter.max(),
@@ -782,17 +785,21 @@ impl MuxState {
             return Err(MuxError::Encode);
         }
         match timeout(
-            self.config.io_timeout,
+            self.config.io_timeout.min(END_ENQUEUE_TIMEOUT),
             self.outbound.send(QueuedFrame::new(frame, None)),
         )
         .await
         {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(MuxError::WriterClosed),
+            Ok(Err(_)) => {
+                self.limiter.metrics().record_xudp_end_dropped();
+                Err(MuxError::WriterClosed)
+            }
             Err(_) => {
                 // The peer is not reading. A missing End only affects this
                 // flow; tearing down the whole mux would kill unrelated DNS
                 // and QUIC sessions.
+                self.limiter.metrics().record_xudp_end_dropped();
                 tracing::debug!(
                     session_id = id,
                     "XUDP End frame could not be queued before the write deadline"
@@ -904,8 +911,8 @@ mod tests {
         TargetNetwork, XudpError, encode_frame, parse_frame,
     };
     use crate::xudp::session::{
-        ActiveSession, Session, SessionTable, SocketFamily, XudpConfig, XudpConfigError,
-        XudpSessionLimiter, spawn_reply_task,
+        ActiveSession, QueuedFrame, Session, SessionTable, SocketFamily, XudpConfig,
+        XudpConfigError, XudpSessionLimiter, spawn_reply_task,
     };
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
@@ -914,9 +921,45 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::{Instant, sleep, timeout};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn end_enqueue_is_bounded_when_the_queue_is_full() {
+        let config = Arc::new(XudpConfig {
+            max_queued_replies: 2,
+            io_timeout: Duration::from_secs(10),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::default();
+        let (outbound, _inbound) = mpsc::channel(config.max_queued_replies);
+        outbound
+            .send(QueuedFrame::new(vec![1], None))
+            .await
+            .expect("first slot");
+        outbound
+            .send(QueuedFrame::new(vec![2], None))
+            .await
+            .expect("second slot");
+        let state = MuxState {
+            config: Arc::clone(&config),
+            table: Arc::new(Mutex::new(SessionTable::default())),
+            outbound,
+            limiter: limiter.clone(),
+        };
+
+        let started = Instant::now();
+        state
+            .send_end(7, true)
+            .await
+            .expect("a full queue must drop End without failing the mux");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "End waited for the full io_timeout"
+        );
+        assert_eq!(limiter.metrics().snapshot().xudp_end_dropped, 1);
+    }
 
     fn test_config() -> Arc<XudpConfig> {
         Arc::new(XudpConfig {

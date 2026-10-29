@@ -889,6 +889,7 @@ async fn handle_authenticated(
                     target,
                     config.relay_idle_timeout,
                     Arc::clone(&config.splice_permits),
+                    Arc::clone(&config.metrics),
                 )
                 .await?;
             } else {
@@ -916,9 +917,13 @@ async fn handle_authenticated(
             // Legacy UDP/packetaddr binds one or two sockets per VLESS stream
             // and is outside the XUDP session limiter. Bound it separately so
             // compatibility mode cannot consume the whole memory budget.
-            let _legacy_permit = Arc::clone(&config.legacy_udp_permits)
-                .try_acquire_owned()
-                .map_err(|_| TlsServerError::LegacyUdpLimited)?;
+            let _legacy_permit = match Arc::clone(&config.legacy_udp_permits).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    config.metrics.record_legacy_udp_limit();
+                    return Err(TlsServerError::LegacyUdpLimited);
+                }
+            };
             let destination = request
                 .destination
                 .ok_or(TlsServerError::MissingDestination)?;
@@ -1189,6 +1194,7 @@ async fn relay_vision(
     target: TcpStream,
     idle_timeout: Duration,
     splice_permits: Arc<Semaphore>,
+    metrics: Arc<Metrics>,
 ) -> Result<(), TlsServerError> {
     let activity = Arc::new(RelayActivity::new());
     let mut write_direct = vision.write_direct_watch();
@@ -1218,6 +1224,7 @@ async fn relay_vision(
 
     let up_activity = Arc::clone(&activity);
     let up_splice_permits = Arc::clone(&splice_permits);
+    let up_metrics = Arc::clone(&metrics);
     let up = async move {
         let mut stop_guard = RelayStopGuard::new(&up_activity);
         let result = async {
@@ -1235,6 +1242,7 @@ async fn relay_vision(
             }
 
             let Some(splice_permit) = up_splice_permits.try_acquire_owned().ok() else {
+                up_metrics.record_splice_fallback();
                 tracing::debug!(
                     copied_up,
                     "Vision splice task limit reached; using async upload copy"
@@ -1288,6 +1296,7 @@ async fn relay_vision(
 
     let down_activity = Arc::clone(&activity);
     let down_splice_permits = Arc::clone(&splice_permits);
+    let down_metrics = Arc::clone(&metrics);
     let down = async move {
         let mut stop_guard = RelayStopGuard::new(&down_activity);
         let result = async {
@@ -1305,6 +1314,7 @@ async fn relay_vision(
         }
 
         let Some(splice_permit) = down_splice_permits.try_acquire_owned().ok() else {
+            down_metrics.record_splice_fallback();
             tracing::debug!(
                 copied_down,
                 "Vision splice task limit reached; using async download copy"

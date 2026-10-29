@@ -109,22 +109,46 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     );
 
     let metrics_task = Arc::clone(&metrics);
+    let preauth_gauge = Arc::clone(&preauth);
+    let authenticated_gauge = Arc::clone(&authenticated);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last = metrics_task.snapshot();
+        let mut last_preauth_active =
+            max_pending_handshakes.saturating_sub(preauth_gauge.available_permits());
+        let mut last_authenticated_active =
+            max_connections.saturating_sub(authenticated_gauge.available_permits());
         loop {
             ticker.tick().await;
             let current = metrics_task.snapshot();
-            if current != last {
+            let preauth_active =
+                max_pending_handshakes.saturating_sub(preauth_gauge.available_permits());
+            let authenticated_active =
+                max_connections.saturating_sub(authenticated_gauge.available_permits());
+            if current != last
+                || preauth_active != last_preauth_active
+                || authenticated_active != last_authenticated_active
+            {
                 tracing::info!(
                     preauth_rejected = current.preauth_rejected,
                     cover_limited = current.cover_limited,
                     connection_limited = current.connection_limited,
                     accept_errors = current.accept_errors,
-                    "admission counters"
+                    xudp_rejected_per_stream = current.xudp_rejected_per_stream,
+                    xudp_rejected_global = current.xudp_rejected_global,
+                    xudp_retained_evicted = current.xudp_retained_evicted,
+                    xudp_replies_dropped = current.xudp_replies_dropped,
+                    xudp_end_dropped = current.xudp_end_dropped,
+                    legacy_udp_limited = current.legacy_udp_limited,
+                    splice_fallback = current.splice_fallback,
+                    preauth_active,
+                    authenticated_active,
+                    "runtime counters"
                 );
                 last = current;
+                last_preauth_active = preauth_active;
+                last_authenticated_active = authenticated_active;
             }
         }
     });
@@ -305,12 +329,16 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         user_id,
     )
     .context("failed to build the TLS server configuration")?;
+    let metrics = tls.metrics();
 
     Ok(tls
         .with_xudp(xudp)
-        .with_xudp_limiter(XudpSessionLimiter::new(
-            usize::try_from(config.limits.max_xudp_sessions).unwrap_or(usize::MAX),
-        ))
+        .with_xudp_limiter(
+            XudpSessionLimiter::new(
+                usize::try_from(config.limits.max_xudp_sessions).unwrap_or(usize::MAX),
+            )
+            .with_metrics(metrics),
+        )
         .with_udp(udp)
         .with_relay_idle_timeout(Duration::from_millis(config.limits.idle_timeout_ms)))
 }

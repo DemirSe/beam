@@ -48,6 +48,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 
 use crate::address::{Address, NetLocation};
+use crate::metrics::Metrics;
 use crate::xudp::frame::{
     self, FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_PAYLOAD_LEN, SessionStatus, TargetNetwork,
 };
@@ -211,6 +212,8 @@ pub struct XudpSessionLimiter {
     retained_tables: Arc<Mutex<Vec<Weak<Mutex<SessionTable>>>>>,
     /// Process-wide byte budget for reply frames waiting on stream writers.
     reply_budget: Arc<Semaphore>,
+    /// Process-wide counters for XUDP decisions.
+    metrics: Arc<Metrics>,
 }
 
 impl fmt::Debug for XudpSessionLimiter {
@@ -232,7 +235,21 @@ impl XudpSessionLimiter {
             permits: Arc::new(Semaphore::new(max)),
             retained_tables: Arc::new(Mutex::new(Vec::new())),
             reply_budget: Arc::new(Semaphore::new(DEFAULT_REPLY_QUEUE_BUDGET)),
+            metrics: Arc::new(Metrics::default()),
         }
+    }
+
+    /// Uses the process-wide metrics instance.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Returns the process-wide metrics instance.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Returns the configured global session limit.
@@ -296,6 +313,7 @@ impl XudpSessionLimiter {
 
         for table in tables {
             if lock(&table).evict_oldest_expiring() {
+                self.metrics.record_xudp_retained_evicted();
                 return true;
             }
         }
@@ -700,6 +718,19 @@ pub(crate) fn spawn_reply_task(
     tokio::spawn(reply_loop(session, outbound, table, config, limiter))
 }
 
+/// Largest number of reply-queue slots held back for control frames.
+const MAX_CONTROL_QUEUE_RESERVE: usize = 8;
+
+/// Longest an `End` frame may wait for queue space.
+pub(crate) const END_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Slots data replies must leave free for `End` frames.
+pub(crate) fn control_queue_reserve(max_queued_replies: usize) -> usize {
+    max_queued_replies
+        .saturating_sub(1)
+        .min(MAX_CONTROL_QUEUE_RESERVE)
+}
+
 /// Reads datagrams until the session stops or the socket fails.
 ///
 /// Replies are `Keep + Data` frames carrying the actual source address. They
@@ -722,6 +753,7 @@ async fn reply_loop(
     // instead of silently truncating it to the configured maximum.
     let mut buffer = vec![0u8; config.max_datagram_size.saturating_add(1)];
     let mut failed = false;
+    let metrics = limiter.metrics();
 
     loop {
         tokio::select! {
@@ -738,6 +770,7 @@ async fn reply_loop(
                         session.touch();
                         if len == 0 {
                             // Stock XUDP writers drop zero-length datagrams.
+                            metrics.record_xudp_reply_dropped();
                             continue;
                         }
                         if len > config.max_datagram_size {
@@ -746,6 +779,7 @@ async fn reply_loop(
                                 length = len,
                                 "XUDP reply exceeds the configured limit; dropping a datagram"
                             );
+                            metrics.record_xudp_reply_dropped();
                             continue;
                         }
                         let Some(frame_len) = reply_frame_len(source, len) else {
@@ -754,8 +788,21 @@ async fn reply_loop(
                                 length = len,
                                 "XUDP reply size overflows; dropping a datagram"
                             );
+                            metrics.record_xudp_reply_dropped();
                             continue;
                         };
+
+                        // Keep a small FIFO reserve for End control frames.
+                        // Data stops before the queue is completely full, so a
+                        // closing session does not wait behind the last burst.
+                        if outbound.capacity() <= control_queue_reserve(config.max_queued_replies) {
+                            tracing::trace!(
+                                session_id = session.id,
+                                "XUDP reply queue is reserving control capacity; dropping a datagram"
+                            );
+                            metrics.record_xudp_reply_dropped();
+                            continue;
+                        }
 
                         // Reserve the queue slot and the aggregate byte budget
                         // before allocating or encoding. A reply that cannot be
@@ -767,6 +814,7 @@ async fn reply_loop(
                                     session_id = session.id,
                                     "XUDP reply queue is full; dropping a datagram"
                                 );
+                                metrics.record_xudp_reply_dropped();
                                 continue;
                             }
                             // The stream writer is gone; the main loop is
@@ -778,6 +826,7 @@ async fn reply_loop(
                                 session_id = session.id,
                                 "XUDP aggregate reply budget is full; dropping a datagram"
                             );
+                            metrics.record_xudp_reply_dropped();
                             continue;
                         };
 
@@ -788,6 +837,7 @@ async fn reply_loop(
                                 length = frame_len,
                                 "XUDP reply allocation failed; dropping a datagram"
                             );
+                            metrics.record_xudp_reply_dropped();
                             continue;
                         }
                         let source = socket_addr_to_location(source);
@@ -801,6 +851,7 @@ async fn reply_loop(
                             payload: &buffer[..len],
                         };
                         if frame::encode_frame(&mut frame, spec).is_err() {
+                            metrics.record_xudp_reply_dropped();
                             continue;
                         }
                         permit.send(QueuedFrame::new(frame, Some(budget)));
@@ -831,13 +882,17 @@ async fn reply_loop(
 
         let end = encode_end_frame(session.id, true);
         if !end.is_empty() {
-            // Best effort with a bound. The queue may be full, but this is the
-            // only place that reports a failed relay.
-            let _ = timeout(
-                config.io_timeout,
+            // Best effort with a short bound. The queue may be full, but this
+            // is the only place that reports a failed relay.
+            match timeout(
+                config.io_timeout.min(END_ENQUEUE_TIMEOUT),
                 outbound.send(QueuedFrame::new(end, None)),
             )
-            .await;
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => metrics.record_xudp_end_dropped(),
+            }
         }
     }
 }
