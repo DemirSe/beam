@@ -28,9 +28,9 @@ fn body_len() -> Result<usize> {
     let len: usize = raw
         .parse()
         .with_context(|| format!("invalid H3_BODY_BYTES: {raw}"))?;
-    if !(MARKER.len()..=16 * 1024 * 1024).contains(&len) {
+    if !(MARKER.len()..=64 * 1024 * 1024).contains(&len) {
         bail!(
-            "H3_BODY_BYTES must be between {} and 16777216",
+            "H3_BODY_BYTES must be between {} and 67108864",
             MARKER.len()
         );
     }
