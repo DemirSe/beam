@@ -245,6 +245,16 @@ cover certificate, and the local TUN path were verified. The first TUN request
 immediately after restart hit a transient connection-refused window; retries
 returned 200 as sing-box reconnected.
 
+On 2026-10-29 18:20 UTC the final hardening binary was deployed with
+`BEAM_KEEP_CONFIG=1`: SHA-256
+`9e26cb55ba161a2413d6d2cdbebbfb3998a58d15b026289ccf29182458825a8e`.
+It adds multi-record ClientHello assembly (including split handshake headers),
+the per-mux XUDP active cap/global-oldest eviction, and the 64 MiB H3 test-origin
+cap. Live config was preserved; `NRestarts=0`, backlog 1024, HTTPS IPv4/IPv6,
+cover certificate, and the local TUN path were verified. The 24 h soak,
+privileged syscall/wakeup gates, cgroup OOM sampling, and final-candidate fuzz
+remain open release-acceptance items.
+
 ## In progress
 
 - A low-rate live observation ran for about four hours on 2026-10-24
