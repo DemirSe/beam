@@ -349,7 +349,7 @@ bash bench/no-tun.sh
 
 The workspace currently has 292 `beam-core` unit tests, two TLS adapter
 integration tests, two stock-ClientHello fixture tests, and 26 `beam-sys` tests
-(322 total). The full-TUN harness passes all eight
+(323 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
 gVisor TUN on both beam and stock Xray. The final-binary no-TUN server-capacity smoke is
