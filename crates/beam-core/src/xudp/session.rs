@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
@@ -214,6 +214,35 @@ pub struct XudpSessionLimiter {
     reply_budget: Arc<Semaphore>,
     /// Process-wide counters for XUDP decisions.
     metrics: Arc<Metrics>,
+    /// Highest number of global permits observed in use.
+    high_water: Arc<AtomicUsize>,
+    /// Number of live mux handlers holding this limiter.
+    live_handlers: Arc<AtomicUsize>,
+    /// Last time a pressure snapshot was emitted.
+    pressure_log: Arc<Mutex<Option<Instant>>>,
+}
+
+/// A point-in-time XUDP capacity snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XudpStats {
+    /// Configured global cap.
+    pub max: usize,
+    /// Available global permits.
+    pub available: usize,
+    /// Used global permits (`max - available`).
+    pub used: usize,
+    /// Highest observed used permits.
+    pub high_water: usize,
+    /// Sessions in active tables.
+    pub active: usize,
+    /// Sockets retained in active tables.
+    pub retained: usize,
+    /// Number of live mux tables with this limiter.
+    pub live_tables: usize,
+    /// Number of live mux handlers.
+    pub live_handlers: usize,
+    /// Used permits not represented by active or retained table entries.
+    pub unattributed: usize,
 }
 
 impl fmt::Debug for XudpSessionLimiter {
@@ -236,6 +265,9 @@ impl XudpSessionLimiter {
             retained_tables: Arc::new(Mutex::new(Vec::new())),
             reply_budget: Arc::new(Semaphore::new(DEFAULT_REPLY_QUEUE_BUDGET)),
             metrics: Arc::new(Metrics::default()),
+            high_water: Arc::new(AtomicUsize::new(0)),
+            live_handlers: Arc::new(AtomicUsize::new(0)),
+            pressure_log: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -271,10 +303,64 @@ impl XudpSessionLimiter {
         tables.push(Arc::downgrade(table));
     }
 
+    /// Registers one live mux handler for the lifetime of `handle_mux_stream`.
+    pub(crate) fn handler_guard(&self) -> LiveHandlerGuard {
+        self.live_handlers.fetch_add(1, Ordering::Relaxed);
+        LiveHandlerGuard {
+            live_handlers: Arc::clone(&self.live_handlers),
+        }
+    }
+
+    /// Returns a point-in-time capacity snapshot.
+    pub fn stats(&self) -> XudpStats {
+        let tables: Vec<Arc<Mutex<SessionTable>>> = {
+            let mut registry = lock(&self.retained_tables);
+            registry.retain(|table| table.strong_count() > 0);
+            registry.iter().filter_map(Weak::upgrade).collect()
+        };
+        let (active, retained) = tables.iter().fold((0usize, 0usize), |(a, r), table| {
+            let table = lock(table);
+            (a + table.active_len(), r + table.retained_len())
+        });
+        let available = self.permits.available_permits();
+        let used = self.max.saturating_sub(available);
+        XudpStats {
+            max: self.max,
+            available,
+            used,
+            high_water: self.high_water.load(Ordering::Relaxed),
+            active,
+            retained,
+            live_tables: tables.len(),
+            live_handlers: self.live_handlers.load(Ordering::Relaxed),
+            unattributed: used.saturating_sub(active.saturating_add(retained)),
+        }
+    }
+
+    /// Returns true at most once per 30 seconds for pressure diagnostics.
+    pub(crate) fn pressure_log_due(&self) -> bool {
+        let now = Instant::now();
+        let mut last = lock(&self.pressure_log);
+        if last.is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(30)) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
+    fn note_permit_used(&self) {
+        let used = self.max.saturating_sub(self.permits.available_permits());
+        self.high_water.fetch_max(used, Ordering::Relaxed);
+    }
+
     /// Tries to reserve one global session slot without waiting.
     #[cfg(test)]
     pub(crate) fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
-        Arc::clone(&self.permits).try_acquire_owned().ok()
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok();
+        if permit.is_some() {
+            self.note_permit_used();
+        }
+        permit
     }
 
     /// Reserves a slot, evicting optional retained sockets when the limit is
@@ -287,6 +373,7 @@ impl XudpSessionLimiter {
     pub(crate) fn try_acquire_or_evict(&self) -> Option<OwnedSemaphorePermit> {
         loop {
             if let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() {
+                self.note_permit_used();
                 return Some(permit);
             }
             if !self.evict_one_retained() {
@@ -350,6 +437,17 @@ impl XudpSessionLimiter {
 impl Default for XudpSessionLimiter {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_GLOBAL_SESSIONS)
+    }
+}
+
+/// Decrements the live-handler gauge when a mux handler returns.
+pub(crate) struct LiveHandlerGuard {
+    live_handlers: Arc<AtomicUsize>,
+}
+
+impl Drop for LiveHandlerGuard {
+    fn drop(&mut self) {
+        self.live_handlers.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -621,6 +719,11 @@ impl SessionTable {
     /// Returns active plus retained sessions.
     pub(crate) fn total(&self) -> usize {
         self.active.len() + self.expiring.len()
+    }
+
+    /// Returns retained sessions.
+    pub(crate) fn retained_len(&self) -> usize {
+        self.expiring.len()
     }
 
     /// Returns the number of active sessions.
@@ -933,6 +1036,7 @@ async fn reply_loop(
     }
 
     if failed && session.mark_closed() {
+        metrics.record_xudp_closed_error();
         // Remove ourselves so the next Keep for this id gets an End.
         let removed = lock(&table).take_if_same(session.id, &session);
         drop(removed);
@@ -1351,6 +1455,47 @@ mod tests {
         assert_eq!(table.total(), 2);
         assert!(table.take_expiring([7; 8]).is_some());
         assert_eq!(table.total(), 1);
+    }
+
+    #[tokio::test]
+    async fn stats_track_active_retained_tables_and_handlers() {
+        let limiter = XudpSessionLimiter::new(2);
+        let table = Arc::new(std::sync::Mutex::new(SessionTable::default()));
+        limiter.register_table(&table);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let address = socket.local_addr().expect("test address");
+        let active = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            limiter.try_acquire(),
+        ));
+        table.lock().expect("table").insert(super::ActiveSession {
+            session: active,
+            reply_task: None,
+        });
+        table.lock().expect("table").insert_expiring(
+            [9; 8],
+            ExpiringSession {
+                socket,
+                family: SocketFamily::V4,
+                expires_at: Instant::now() + Duration::from_secs(10),
+                permit: limiter.try_acquire(),
+            },
+        );
+        let stats = limiter.stats();
+        assert_eq!(stats.max, 2);
+        assert_eq!(stats.available, 0);
+        assert_eq!(stats.used, 2);
+        assert_eq!(stats.active, 1);
+        assert_eq!(stats.retained, 1);
+        assert_eq!(stats.live_tables, 1);
+        let guard = limiter.handler_guard();
+        assert_eq!(limiter.stats().live_handlers, 1);
+        drop(guard);
+        assert_eq!(limiter.stats().live_handlers, 0);
     }
 
     #[tokio::test]

@@ -44,4 +44,6 @@ pub use frame::{
     parse_frame,
 };
 pub use server::{MuxError, handle_mux_stream};
-pub use session::{DEFAULT_MAX_GLOBAL_SESSIONS, XudpConfig, XudpConfigError, XudpSessionLimiter};
+pub use session::{
+    DEFAULT_MAX_GLOBAL_SESSIONS, XudpConfig, XudpConfigError, XudpSessionLimiter, XudpStats,
+};

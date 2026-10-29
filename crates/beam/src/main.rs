@@ -97,6 +97,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     );
     let listener = bind_listener(config.server.listen, config.limits.listen_backlog)?;
     let metrics = tls_config.metrics();
+    let xudp_limiter = tls_config.xudp_limiter();
 
     tracing::info!(
         listen = %config.server.listen,
@@ -120,6 +121,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
             max_pending_handshakes.saturating_sub(preauth_gauge.available_permits());
         let mut last_authenticated_active =
             max_connections.saturating_sub(authenticated_gauge.available_permits());
+        let mut last_xudp = xudp_limiter.stats();
         loop {
             ticker.tick().await;
             let current = metrics_task.snapshot();
@@ -127,9 +129,11 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                 max_pending_handshakes.saturating_sub(preauth_gauge.available_permits());
             let authenticated_active =
                 max_connections.saturating_sub(authenticated_gauge.available_permits());
+            let xudp = xudp_limiter.stats();
             if current != last
                 || preauth_active != last_preauth_active
                 || authenticated_active != last_authenticated_active
+                || xudp != last_xudp
             {
                 tracing::info!(
                     preauth_rejected = current.preauth_rejected,
@@ -143,6 +147,27 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                     xudp_end_dropped = current.xudp_end_dropped,
                     legacy_udp_limited = current.legacy_udp_limited,
                     splice_fallback = current.splice_fallback,
+                    xudp_new_frames = current.xudp_new_frames,
+                    xudp_new_global_id = current.xudp_new_global_id,
+                    xudp_end_frames = current.xudp_end_frames,
+                    xudp_admitted_fresh = current.xudp_admitted_fresh,
+                    xudp_admitted_reattach = current.xudp_admitted_reattach,
+                    xudp_closed_end = current.xudp_closed_end,
+                    xudp_closed_idle = current.xudp_closed_idle,
+                    xudp_closed_error = current.xudp_closed_error,
+                    xudp_closed_mux = current.xudp_closed_mux,
+                    xudp_retained_inserted = current.xudp_retained_inserted,
+                    xudp_retained_reattached = current.xudp_retained_reattached,
+                    xudp_retained_expired = current.xudp_retained_expired,
+                    xudp_retained_discarded = current.xudp_retained_discarded,
+                    xudp_active = xudp.active,
+                    xudp_retained = xudp.retained,
+                    xudp_live_tables = xudp.live_tables,
+                    xudp_live_handlers = xudp.live_handlers,
+                    xudp_used = xudp.used,
+                    xudp_available = xudp.available,
+                    xudp_high_water = xudp.high_water,
+                    xudp_unattributed = xudp.unattributed,
                     preauth_active,
                     authenticated_active,
                     "runtime counters"
@@ -150,6 +175,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                 last = current;
                 last_preauth_active = preauth_active;
                 last_authenticated_active = authenticated_active;
+                last_xudp = xudp;
             }
         }
     });

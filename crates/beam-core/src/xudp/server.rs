@@ -165,6 +165,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     config.validate()?;
+    let metrics = limiter.metrics();
+    let _live = limiter.handler_guard();
 
     let (mut reader, writer) = tokio::io::split(stream);
     let (outbound, inbound) = mpsc::channel(config.max_queued_replies);
@@ -193,6 +195,7 @@ where
     // shutdown budget by the session limit.
     let active = lock_table(&table).drain_active();
     for entry in &active {
+        metrics.record_xudp_closed_mux();
         // A spawned reply task may not have been polled yet. Marking the
         // session closed makes its initial check fail even if the watch
         // notification is missed; `send_replace` also stores the stop value
@@ -436,6 +439,9 @@ impl MuxState {
     /// Handles `New`: create or reattach a UDP session.
     async fn handle_new(&self, parsed: &Frame<'_>) -> Result<(), MuxError> {
         let id = parsed.session_id;
+        self.limiter
+            .metrics()
+            .record_xudp_new(parsed.global_id.is_some());
 
         if parsed.network != Some(TargetNetwork::Udp) {
             tracing::debug!(session_id = id, "XUDP New is not a UDP target; rejecting");
@@ -513,12 +519,16 @@ impl MuxState {
         // when this New names the same identifier within the stream.
         let retained =
             global_id.and_then(|global_id| lock_table(&self.table).take_expiring(global_id));
+        let reattached = matches!(&retained, Some(entry) if entry.family == family);
         let (socket, permit) = match retained {
             Some(retained) if retained.family == family => (retained.socket, retained.permit),
             retained => {
                 // A family change cannot reuse the retained socket; it was
                 // removed from the table and is dropped here. Release its
                 // permit before asking the global limiter for a fresh slot.
+                if retained.is_some() {
+                    self.limiter.metrics().record_xudp_retained_discarded();
+                }
                 drop(retained);
                 if !self.reserve_session_slot() {
                     self.limiter.metrics().record_xudp_rejected_per_stream();
@@ -527,6 +537,28 @@ impl MuxState {
                 }
                 let Some(permit) = self.limiter.try_acquire_or_evict() else {
                     self.limiter.metrics().record_xudp_rejected_global();
+                    if self.limiter.pressure_log_due() {
+                        let (active, retained) = {
+                            let table = lock_table(&self.table);
+                            (table.active_len(), table.retained_len())
+                        };
+                        let stats = self.limiter.stats();
+                        tracing::info!(
+                            session_id = id,
+                            global_limit = self.limiter.max(),
+                            stream_active = active,
+                            stream_retained = retained,
+                            xudp_active = stats.active,
+                            xudp_retained = stats.retained,
+                            xudp_used = stats.used,
+                            xudp_available = stats.available,
+                            xudp_high_water = stats.high_water,
+                            xudp_live_tables = stats.live_tables,
+                            xudp_live_handlers = stats.live_handlers,
+                            xudp_unattributed = stats.unattributed,
+                            "XUDP global session limit pressure"
+                        );
+                    }
                     tracing::debug!(
                         session_id = id,
                         global_limit = self.limiter.max(),
@@ -606,6 +638,12 @@ impl MuxState {
             session,
             reply_task: Some(reply_task),
         });
+        if reattached {
+            self.limiter.metrics().record_xudp_admitted_reattach();
+            self.limiter.metrics().record_xudp_retained_reattached();
+        } else {
+            self.limiter.metrics().record_xudp_admitted_fresh();
+        }
         if let Some(replaced) = replaced {
             // No other path can leave an entry with this id, but never leak a
             // task or socket if the invariant is broken.
@@ -689,8 +727,10 @@ impl MuxState {
 
     /// Handles `End`: close a session. Unknown ids are ignored, like stock.
     async fn handle_end(&self, id: u16) -> Result<(), MuxError> {
+        self.limiter.metrics().record_xudp_end();
         let taken = { lock_table(&self.table).take(id) };
         if let Some(active) = taken {
+            self.limiter.metrics().record_xudp_closed_end();
             self.close_active(active, CloseReason::ClientEnd).await
         } else {
             Ok(())
@@ -737,7 +777,11 @@ impl MuxState {
         if table.total() < self.config.max_sessions {
             return true;
         }
-        table.evict_oldest_expiring()
+        let evicted = table.evict_oldest_expiring();
+        if evicted {
+            self.limiter.metrics().record_xudp_retained_evicted();
+        }
+        evicted
     }
 
     /// Closes a session and sends `End`.
@@ -770,6 +814,11 @@ impl MuxState {
         // close claimed the session; report it as an error even when the
         // close itself was clean.
         let error = reason.is_error() || session.failed();
+        match reason {
+            CloseReason::Idle => self.limiter.metrics().record_xudp_closed_idle(),
+            CloseReason::RelayError => self.limiter.metrics().record_xudp_closed_error(),
+            CloseReason::ClientEnd => {}
+        }
         self.send_end(session.id, error).await?;
 
         let permit = session.take_permit();
@@ -788,6 +837,7 @@ impl MuxState {
                 permit,
             };
             let replaced = lock_table(&self.table).insert_expiring(global_id, retained);
+            self.limiter.metrics().record_xudp_retained_inserted();
             drop(replaced);
         }
 
@@ -846,6 +896,9 @@ impl MuxState {
             let idle = table.take_idle(now, self.config.session_idle_timeout);
             let retained = table.expire_retained(now);
             if retained > 0 {
+                self.limiter
+                    .metrics()
+                    .record_xudp_retained_expired(retained);
                 tracing::trace!(count = retained, "XUDP retained sockets expired");
             }
             idle

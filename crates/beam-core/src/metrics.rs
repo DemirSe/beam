@@ -19,6 +19,19 @@ pub struct Metrics {
     xudp_end_dropped: AtomicU64,
     legacy_udp_limited: AtomicU64,
     splice_fallback: AtomicU64,
+    xudp_new_frames: AtomicU64,
+    xudp_new_global_id: AtomicU64,
+    xudp_end_frames: AtomicU64,
+    xudp_admitted_fresh: AtomicU64,
+    xudp_admitted_reattach: AtomicU64,
+    xudp_closed_end: AtomicU64,
+    xudp_closed_idle: AtomicU64,
+    xudp_closed_error: AtomicU64,
+    xudp_closed_mux: AtomicU64,
+    xudp_retained_inserted: AtomicU64,
+    xudp_retained_reattached: AtomicU64,
+    xudp_retained_expired: AtomicU64,
+    xudp_retained_discarded: AtomicU64,
 }
 
 /// A point-in-time copy of the counters.
@@ -46,6 +59,32 @@ pub struct MetricsSnapshot {
     pub legacy_udp_limited: u64,
     /// Vision relays that used the async copy path because splice was full.
     pub splice_fallback: u64,
+    /// XUDP `New` frames observed.
+    pub xudp_new_frames: u64,
+    /// XUDP `New` frames carrying a nonzero GlobalID.
+    pub xudp_new_global_id: u64,
+    /// XUDP `End` frames observed.
+    pub xudp_end_frames: u64,
+    /// Fresh XUDP sessions inserted into an active table.
+    pub xudp_admitted_fresh: u64,
+    /// Retained XUDP sockets successfully reattached and inserted.
+    pub xudp_admitted_reattach: u64,
+    /// Active sessions closed after an `End` frame.
+    pub xudp_closed_end: u64,
+    /// Active sessions selected for idle expiry.
+    pub xudp_closed_idle: u64,
+    /// Active sessions closed after a relay/socket error.
+    pub xudp_closed_error: u64,
+    /// Active sessions drained when the mux stream ended.
+    pub xudp_closed_mux: u64,
+    /// Retained sockets inserted after a clean GlobalID close.
+    pub xudp_retained_inserted: u64,
+    /// Retained sockets successfully reattached.
+    pub xudp_retained_reattached: u64,
+    /// Retained sockets removed by expiry.
+    pub xudp_retained_expired: u64,
+    /// Retained sockets discarded because the requested family changed.
+    pub xudp_retained_discarded: u64,
 }
 
 impl Metrics {
@@ -105,6 +144,71 @@ impl Metrics {
         self.splice_fallback.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts one XUDP `New` frame and whether it carried a GlobalID.
+    pub fn record_xudp_new(&self, global_id: bool) {
+        self.xudp_new_frames.fetch_add(1, Ordering::Relaxed);
+        if global_id {
+            self.xudp_new_global_id.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts one XUDP `End` frame.
+    pub fn record_xudp_end(&self) {
+        self.xudp_end_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one successfully inserted fresh XUDP session.
+    pub fn record_xudp_admitted_fresh(&self) {
+        self.xudp_admitted_fresh.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one successfully inserted retained XUDP reattachment.
+    pub fn record_xudp_admitted_reattach(&self) {
+        self.xudp_admitted_reattach.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a session closure for the given reason.
+    pub fn record_xudp_closed_end(&self) {
+        self.xudp_closed_end.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one idle-selected session.
+    pub fn record_xudp_closed_idle(&self) {
+        self.xudp_closed_idle.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one relay/socket error closure.
+    pub fn record_xudp_closed_error(&self) {
+        self.xudp_closed_error.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one mux-teardown closure.
+    pub fn record_xudp_closed_mux(&self) {
+        self.xudp_closed_mux.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one retained socket insertion.
+    pub fn record_xudp_retained_inserted(&self) {
+        self.xudp_retained_inserted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one successful retained socket reattachment.
+    pub fn record_xudp_retained_reattached(&self) {
+        self.xudp_retained_reattached
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts retained sockets removed by expiry.
+    pub fn record_xudp_retained_expired(&self, count: usize) {
+        self.xudp_retained_expired
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    /// Counts retained sockets discarded on a family change.
+    pub fn record_xudp_retained_discarded(&self) {
+        self.xudp_retained_discarded.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Returns a snapshot of all counters.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -120,6 +224,19 @@ impl Metrics {
             xudp_end_dropped: self.xudp_end_dropped.load(Ordering::Relaxed),
             legacy_udp_limited: self.legacy_udp_limited.load(Ordering::Relaxed),
             splice_fallback: self.splice_fallback.load(Ordering::Relaxed),
+            xudp_new_frames: self.xudp_new_frames.load(Ordering::Relaxed),
+            xudp_new_global_id: self.xudp_new_global_id.load(Ordering::Relaxed),
+            xudp_end_frames: self.xudp_end_frames.load(Ordering::Relaxed),
+            xudp_admitted_fresh: self.xudp_admitted_fresh.load(Ordering::Relaxed),
+            xudp_admitted_reattach: self.xudp_admitted_reattach.load(Ordering::Relaxed),
+            xudp_closed_end: self.xudp_closed_end.load(Ordering::Relaxed),
+            xudp_closed_idle: self.xudp_closed_idle.load(Ordering::Relaxed),
+            xudp_closed_error: self.xudp_closed_error.load(Ordering::Relaxed),
+            xudp_closed_mux: self.xudp_closed_mux.load(Ordering::Relaxed),
+            xudp_retained_inserted: self.xudp_retained_inserted.load(Ordering::Relaxed),
+            xudp_retained_reattached: self.xudp_retained_reattached.load(Ordering::Relaxed),
+            xudp_retained_expired: self.xudp_retained_expired.load(Ordering::Relaxed),
+            xudp_retained_discarded: self.xudp_retained_discarded.load(Ordering::Relaxed),
         }
     }
 }
@@ -144,6 +261,18 @@ mod tests {
         metrics.record_xudp_end_dropped();
         metrics.record_legacy_udp_limit();
         metrics.record_splice_fallback();
+        metrics.record_xudp_new(true);
+        metrics.record_xudp_end();
+        metrics.record_xudp_admitted_fresh();
+        metrics.record_xudp_admitted_reattach();
+        metrics.record_xudp_closed_end();
+        metrics.record_xudp_closed_idle();
+        metrics.record_xudp_closed_error();
+        metrics.record_xudp_closed_mux();
+        metrics.record_xudp_retained_inserted();
+        metrics.record_xudp_retained_reattached();
+        metrics.record_xudp_retained_expired(2);
+        metrics.record_xudp_retained_discarded();
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.preauth_rejected, 2);
         assert_eq!(snapshot.cover_limited, 1);
@@ -156,5 +285,18 @@ mod tests {
         assert_eq!(snapshot.xudp_end_dropped, 1);
         assert_eq!(snapshot.legacy_udp_limited, 1);
         assert_eq!(snapshot.splice_fallback, 1);
+        assert_eq!(snapshot.xudp_new_frames, 1);
+        assert_eq!(snapshot.xudp_new_global_id, 1);
+        assert_eq!(snapshot.xudp_end_frames, 1);
+        assert_eq!(snapshot.xudp_admitted_fresh, 1);
+        assert_eq!(snapshot.xudp_admitted_reattach, 1);
+        assert_eq!(snapshot.xudp_closed_end, 1);
+        assert_eq!(snapshot.xudp_closed_idle, 1);
+        assert_eq!(snapshot.xudp_closed_error, 1);
+        assert_eq!(snapshot.xudp_closed_mux, 1);
+        assert_eq!(snapshot.xudp_retained_inserted, 1);
+        assert_eq!(snapshot.xudp_retained_reattached, 1);
+        assert_eq!(snapshot.xudp_retained_expired, 2);
+        assert_eq!(snapshot.xudp_retained_discarded, 1);
     }
 }

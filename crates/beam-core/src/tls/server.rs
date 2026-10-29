@@ -384,6 +384,12 @@ impl TlsServerConfig {
         Arc::clone(&self.metrics)
     }
 
+    /// Returns the process-wide XUDP limiter for diagnostics.
+    #[must_use]
+    pub fn xudp_limiter(&self) -> XudpSessionLimiter {
+        self.xudp_limiter.clone()
+    }
+
     /// Overrides the authenticated connection limiter.
     ///
     /// The accept loop holds a separate, smaller pre-auth permit until the
