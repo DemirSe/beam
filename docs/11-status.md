@@ -235,6 +235,16 @@ control frames, and adds XUDP/legacy/splice pressure counters plus active
 gauges to the 60 s log. The live config was preserved; `NRestarts=0`, backlog
 1024, HTTPS IPv4/IPv6, cover certificate, and the local TUN path were verified.
 
+On 2026-10-29 13:34 UTC the remaining-hardening binary was deployed with
+`BEAM_KEEP_CONFIG=1`: SHA-256
+`91d95cb1ac5b61023a3172a313ac1a43274265f79eb9b5d805e7d592b3c52652`.
+It caps cover dial/write at 5 s, rejects a zero per-IP library limit before
+consuming a global permit, and adds the slow-reader/multi-record test coverage.
+The live config was preserved; `NRestarts=0`, backlog 1024, HTTPS IPv4/IPv6,
+cover certificate, and the local TUN path were verified. The first TUN request
+immediately after restart hit a transient connection-refused window; retries
+returned 200 as sing-box reconnected.
+
 ## In progress
 
 - A low-rate live observation ran for about four hours on 2026-10-24
@@ -325,9 +335,9 @@ bash tests/tun/run.sh --udp-mode legacy
 bash bench/no-tun.sh
 ```
 
-The workspace currently has 285 `beam-core` unit tests, two TLS adapter
-integration tests, one stock-ClientHello fixture, and 26 `beam-sys` tests
-(314 total). The full-TUN harness passes all eight
+The workspace currently has 288 `beam-core` unit tests, two TLS adapter
+integration tests, two stock-ClientHello fixture tests, and 26 `beam-sys` tests
+(318 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
 gVisor TUN on both beam and stock Xray. The final-binary no-TUN server-capacity smoke is
