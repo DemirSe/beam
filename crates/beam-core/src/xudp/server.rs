@@ -1166,6 +1166,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_queue_end_does_not_starve_a_live_session() {
+        let echo = spawn_ipv4_echo().await;
+        let config = Arc::new(XudpConfig {
+            max_queued_replies: 4,
+            io_timeout: Duration::from_secs(10),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::new(2);
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let (outbound, mut inbound) = mpsc::channel(config.max_queued_replies);
+
+        // Victim session: closed while the writer queue is full.
+        let victim_socket = Arc::new(
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("victim socket"),
+        );
+        let victim_permit = limiter.try_acquire().expect("victim permit");
+        let victim = Arc::new(Session::new(
+            1,
+            None,
+            victim_socket,
+            SocketFamily::V4,
+            echo.address,
+            Some(victim_permit),
+        ));
+        assert!(
+            table
+                .lock()
+                .expect("table")
+                .insert(ActiveSession {
+                    session: victim,
+                    reply_task: None,
+                })
+                .is_none()
+        );
+
+        // Live session: its reply task must keep working after the victim's
+        // bounded End and the queue drain.
+        let live_socket = Arc::new(
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("live socket"),
+        );
+        let live_permit = limiter.try_acquire().expect("live permit");
+        let live = Arc::new(Session::new(
+            2,
+            None,
+            Arc::clone(&live_socket),
+            SocketFamily::V4,
+            echo.address,
+            Some(live_permit),
+        ));
+        let live_task = spawn_reply_task(
+            Arc::clone(&live),
+            outbound.clone(),
+            Arc::clone(&table),
+            Arc::clone(&config),
+            limiter.clone(),
+        );
+        assert!(
+            table
+                .lock()
+                .expect("table")
+                .insert(ActiveSession {
+                    session: live,
+                    reply_task: Some(live_task),
+                })
+                .is_none()
+        );
+
+        // Fill the writer queue, then close the victim. Both sessions hold
+        // permits; the victim's End must time out and its permit must return.
+        for byte in 0..4u8 {
+            outbound
+                .send(QueuedFrame::new(vec![byte], None))
+                .await
+                .expect("queue slot");
+        }
+        let state = MuxState {
+            config: Arc::clone(&config),
+            table: Arc::clone(&table),
+            outbound: outbound.clone(),
+            limiter: limiter.clone(),
+        };
+        let active = table
+            .lock()
+            .expect("table")
+            .take(1)
+            .expect("victim session");
+        let started = Instant::now();
+        state
+            .close_active(active, super::CloseReason::ClientEnd)
+            .await
+            .expect("victim close");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "close waited for the full io_timeout"
+        );
+        assert_eq!(limiter.metrics().snapshot().xudp_end_dropped, 1);
+        drop(
+            limiter
+                .try_acquire()
+                .expect("victim permit must be reusable"),
+        );
+
+        // Drain the queue, then prove the live session can still echo.
+        while inbound.try_recv().is_ok() {}
+        live_socket
+            .send_to(b"live", echo.address)
+            .await
+            .expect("live send");
+        let queued = timeout(TEST_TIMEOUT, inbound.recv())
+            .await
+            .expect("live reply timed out")
+            .expect("live reply channel closed");
+        let (frame, used) = parse_frame(&queued.bytes)
+            .expect("live reply parse")
+            .expect("complete live reply");
+        assert_eq!(used, queued.bytes.len());
+        let reply = OwnedFrame::from_borrowed(&frame);
+        assert_eq!(reply.session_id, 2);
+        assert_eq!(reply.status, SessionStatus::Keep);
+        assert_eq!(reply.payload, b"live");
+    }
+
+    #[tokio::test]
     async fn empty_stream_closes_after_the_idle_timeout() {
         let config = Arc::new(XudpConfig {
             session_idle_timeout: Duration::from_millis(200),
