@@ -37,10 +37,9 @@ fn parses_stock_xray_client_hello() {
 
 #[test]
 fn a_client_hello_split_across_records_is_rejected_as_truncated() {
-    // TLS permits a ClientHello to span multiple records. beam currently
-    // reads exactly one record, so this test pins the deterministic fallback:
-    // the first record is parsed, found incomplete, and is never mistaken for
-    // an authenticated ClientHello.
+    // This fixture is one TLS record. The parser still rejects a truncated
+    // record deterministically; the server-level assembler is covered by
+    // `reassembles_a_client_hello_split_across_records` in tls/server.rs.
     let record_body = &STOCK_CLIENT_HELLO[5..];
     let split = 64;
     assert!(split > 4 && split < record_body.len());

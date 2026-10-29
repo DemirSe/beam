@@ -74,8 +74,9 @@ outbound: freedom
 - Unauthenticated connections are capped separately (256 pre-auth slots on the
   production config, 5 s ClientHello deadline) and authenticated connections
   use the configured `max_connections` budget. Legacy VLESS UDP/packetaddr has
-  a separate 64-stream cap; XUDP has a process-wide 256-session cap and a 60 s
-  idle expiry.
+  a separate 64-stream cap; XUDP has a process-wide 256-session cap, a
+  per-mux active cap of half the global slots (128 default), and a 60 s idle
+  expiry.
 - A bare TCP FIN without `close_notify` is treated as a half-close by the
   relay; the opposite direction may still finish.
 - No statistics API or hot reload in the first release.
