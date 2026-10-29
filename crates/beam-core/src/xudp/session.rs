@@ -77,6 +77,15 @@ pub const DEFAULT_CLOSE_EXPIRY: Duration = Duration::from_secs(60);
 /// Default number of reply frames that may wait for the stream writer.
 pub const DEFAULT_MAX_QUEUED_REPLIES: usize = 64;
 
+/// Default per-session UDP receive buffer request.
+pub const DEFAULT_UDP_RECV_BUFFER: usize = 128 * 1024;
+
+/// Smallest accepted UDP receive buffer request.
+pub const MIN_UDP_RECV_BUFFER: usize = 16 * 1024;
+
+/// Largest accepted UDP receive buffer request.
+pub const MAX_UDP_RECV_BUFFER: usize = 4 * 1024 * 1024;
+
 /// Process-wide budget for reply bytes waiting in mux queues.
 ///
 /// The per-stream frame count alone lets 256 streams accumulate roughly a
@@ -116,6 +125,8 @@ pub struct XudpConfig {
     pub max_queued_replies: usize,
     /// Timeout for a single UDP send/receive or stream write.
     pub io_timeout: Duration,
+    /// Best-effort per-session UDP receive buffer request.
+    pub udp_recv_buffer: usize,
 }
 
 impl Default for XudpConfig {
@@ -134,6 +145,7 @@ impl XudpConfig {
             close_expiry: DEFAULT_CLOSE_EXPIRY,
             max_queued_replies: DEFAULT_MAX_QUEUED_REPLIES,
             io_timeout: DEFAULT_IO_TIMEOUT,
+            udp_recv_buffer: DEFAULT_UDP_RECV_BUFFER,
         }
     }
 
@@ -156,6 +168,9 @@ impl XudpConfig {
         }
         if self.io_timeout.is_zero() {
             return Err(XudpConfigError::IoTimeout);
+        }
+        if !(MIN_UDP_RECV_BUFFER..=MAX_UDP_RECV_BUFFER).contains(&self.udp_recv_buffer) {
+            return Err(XudpConfigError::UdpRecvBuffer);
         }
         Ok(())
     }
@@ -194,6 +209,9 @@ pub enum XudpConfigError {
     /// `io_timeout` was zero.
     #[error("XUDP io_timeout must be non-zero")]
     IoTimeout,
+    /// `udp_recv_buffer` was outside the accepted range.
+    #[error("XUDP udp_recv_buffer must be between {MIN_UDP_RECV_BUFFER} and {MAX_UDP_RECV_BUFFER}")]
+    UdpRecvBuffer,
 }
 
 /// Process-wide XUDP session limiter.
@@ -1156,6 +1174,7 @@ mod tests {
         assert_eq!(config.session_idle_timeout, Duration::from_secs(300));
         assert_eq!(config.close_expiry, Duration::from_secs(60));
         assert!(config.max_queued_replies > 0);
+        assert_eq!(config.udp_recv_buffer, 128 * 1024);
         config.validate().expect("defaults must be valid");
     }
 
@@ -1217,6 +1236,20 @@ mod tests {
                     ..XudpConfig::default()
                 },
                 XudpConfigError::IoTimeout,
+            ),
+            (
+                XudpConfig {
+                    udp_recv_buffer: 0,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::UdpRecvBuffer,
+            ),
+            (
+                XudpConfig {
+                    udp_recv_buffer: 4 * 1024 * 1024 + 1,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::UdpRecvBuffer,
             ),
         ];
 

@@ -328,6 +328,9 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         // the outer TCP stream drains. Keep a larger bounded reply queue so a
         // short client-side pause does not turn into QUIC packet loss.
         max_queued_replies: 512,
+        udp_recv_buffer: usize::try_from(config.limits.xudp_recv_buffer_bytes)
+            .unwrap_or(usize::MAX)
+            .clamp(16 * 1024, 4 * 1024 * 1024),
         ..XudpConfig::default()
     };
     xudp.validate().context("invalid XUDP limits")?;

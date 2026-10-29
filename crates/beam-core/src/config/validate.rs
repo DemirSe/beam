@@ -102,6 +102,16 @@ pub enum ValidationError {
         /// Largest supported value.
         max: u32,
     },
+    /// A limit is below its supported minimum.
+    #[error("limits.{name} must be between {min} and {max}")]
+    LimitOutOfRange {
+        /// Name of the invalid field.
+        name: &'static str,
+        /// Smallest supported value.
+        min: u32,
+        /// Largest supported value.
+        max: u32,
+    },
 }
 
 impl Config {
@@ -355,6 +365,13 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
             max: 65_536,
         });
     }
+    if !(16 * 1024..=4 * 1024 * 1024).contains(&raw.xudp_recv_buffer_bytes) {
+        return Err(ValidationError::LimitOutOfRange {
+            name: "xudp_recv_buffer_bytes",
+            min: 16 * 1024,
+            max: 4 * 1024 * 1024,
+        });
+    }
     if raw.listen_backlog == 0 {
         return Err(ValidationError::ZeroLimit {
             name: "listen_backlog",
@@ -393,6 +410,7 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
         max_udp_destinations: raw.max_udp_destinations,
         max_preauth_per_ip: raw.max_preauth_per_ip,
         max_xudp_sessions: raw.max_xudp_sessions,
+        xudp_recv_buffer_bytes: raw.xudp_recv_buffer_bytes,
         listen_backlog: raw.listen_backlog,
         shutdown_drain_ms: raw.shutdown_drain_ms,
         handshake_timeout_ms: raw.handshake_timeout_ms,

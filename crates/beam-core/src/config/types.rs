@@ -167,6 +167,8 @@ pub struct LimitsConfig {
     pub max_preauth_per_ip: u32,
     /// Maximum process-wide XUDP sessions (active and retained).
     pub max_xudp_sessions: u32,
+    /// Best-effort per-session XUDP UDP receive buffer request.
+    pub xudp_recv_buffer_bytes: u32,
     /// Listener backlog passed to `listen(2)`.
     pub listen_backlog: u32,
     /// Graceful shutdown drain in milliseconds.
@@ -225,6 +227,8 @@ pub(crate) struct RawLimits {
     pub(crate) max_preauth_per_ip: u32,
     #[serde(default = "default_max_xudp_sessions")]
     pub(crate) max_xudp_sessions: u32,
+    #[serde(default = "default_xudp_recv_buffer_bytes")]
+    pub(crate) xudp_recv_buffer_bytes: u32,
     #[serde(default = "default_listen_backlog")]
     pub(crate) listen_backlog: u32,
     #[serde(default = "default_shutdown_drain_ms")]
@@ -239,6 +243,10 @@ fn default_max_preauth_per_ip() -> u32 {
 
 fn default_max_xudp_sessions() -> u32 {
     256
+}
+
+fn default_xudp_recv_buffer_bytes() -> u32 {
+    128 * 1024
 }
 
 fn default_listen_backlog() -> u32 {

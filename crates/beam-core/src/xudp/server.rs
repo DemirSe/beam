@@ -47,10 +47,6 @@ const READ_CHUNK_LEN: usize = 8192;
 /// Hard bound for the reassembly buffer: one full frame plus one read.
 const MAX_BUFFERED_LEN: usize = MAX_FRAME_LEN + READ_CHUNK_LEN;
 
-/// Best-effort receive buffer for a session UDP socket. The kernel clamps this
-/// to `net.core.rmem_max`; the production host raises that limit.
-const UDP_RECV_BUFFER_BYTES: usize = 1024 * 1024;
-
 /// Upper bound on one domain resolution inside the mux read loop.
 ///
 /// The read loop is shared by every flow on the mux. The generic I/O timeout
@@ -573,9 +569,10 @@ impl MuxState {
                 .await
                 {
                     Ok(Ok(socket)) => {
-                        if let Err(error) =
-                            beam_sys::set_udp_recv_buffer(socket.as_raw_fd(), UDP_RECV_BUFFER_BYTES)
-                        {
+                        if let Err(error) = beam_sys::set_udp_recv_buffer(
+                            socket.as_raw_fd(),
+                            self.config.udp_recv_buffer,
+                        ) {
                             tracing::debug!(
                                 session_id = id,
                                 %error,
