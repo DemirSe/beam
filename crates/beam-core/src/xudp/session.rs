@@ -311,34 +311,37 @@ impl XudpSessionLimiter {
 
     /// Evicts the globally oldest retained socket from any registered stream.
     fn evict_one_retained(&self) -> bool {
-        let tables: Vec<Arc<Mutex<SessionTable>>> = {
-            let mut tables = lock(&self.retained_tables);
-            tables.retain(|table| table.strong_count() > 0);
-            tables.iter().filter_map(Weak::upgrade).collect()
-        };
+        // Retry a few times if a concurrent reattach removes the inspected
+        // entry. The table locks are not held across the selection scan.
+        for _ in 0..8 {
+            let tables: Vec<Arc<Mutex<SessionTable>>> = {
+                let mut tables = lock(&self.retained_tables);
+                tables.retain(|table| table.strong_count() > 0);
+                tables.iter().filter_map(Weak::upgrade).collect()
+            };
 
-        // Inspect each table under its own lock, then evict from the single
-        // table holding the earliest expiry. Do not hold two table locks.
-        let mut victim: Option<(Instant, Arc<Mutex<SessionTable>>)> = None;
-        for table in tables {
-            let Some(expiry) = lock(&table).oldest_expiring_at() else {
-                continue;
-            };
-            let replace = match &victim {
-                None => true,
-                Some((best, _)) => expiry < *best,
-            };
-            if replace {
-                victim = Some((expiry, table));
+            let mut victim: Option<(Instant, Arc<Mutex<SessionTable>>)> = None;
+            for table in tables {
+                let Some(expiry) = lock(&table).oldest_expiring_at() else {
+                    continue;
+                };
+                let replace = match &victim {
+                    None => true,
+                    Some((best, _)) => expiry < *best,
+                };
+                if replace {
+                    victim = Some((expiry, table));
+                }
             }
-        }
 
-        let Some((_, table)) = victim else {
-            return false;
-        };
-        if lock(&table).evict_oldest_expiring() {
-            self.metrics.record_xudp_retained_evicted();
-            return true;
+            let Some((expiry, table)) = victim else {
+                return false;
+            };
+            if lock(&table).evict_oldest_expiring_at(expiry) {
+                self.metrics.record_xudp_retained_evicted();
+                return true;
+            }
+            // The selected entry was reattached or replaced; rescan.
         }
         false
     }
@@ -698,6 +701,27 @@ impl SessionTable {
     /// Returns the earliest retained expiry in this table.
     pub(crate) fn oldest_expiring_at(&self) -> Option<Instant> {
         self.expiring.values().map(|entry| entry.expires_at).min()
+    }
+
+    /// Evicts the retained entry that expires first.
+    ///
+    /// Retained sockets are optional state; an active session must never be
+    /// rejected while one can be dropped instead.
+    pub(crate) fn evict_oldest_expiring_at(&mut self, expected: Instant) -> bool {
+        let Some((global_id, expiry)) = self
+            .expiring
+            .iter()
+            .map(|(global_id, entry)| (*global_id, entry.expires_at))
+            .min_by_key(|(_, expiry)| *expiry)
+        else {
+            return false;
+        };
+        // A concurrent reattach may have removed the selected entry. Do not
+        // evict a younger entry than the one inspected by the caller.
+        if expiry > expected {
+            return false;
+        }
+        self.expiring.remove(&global_id).is_some()
     }
 
     /// Evicts the retained entry that expires first.

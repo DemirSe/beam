@@ -493,6 +493,22 @@ impl MuxState {
             }
         }
 
+        // Every transition from retained to active must respect the same
+        // per-stream active cap. Check before taking the retained socket so a
+        // rejected reattach leaves it available for a later attempt.
+        let active_limit = self
+            .limiter
+            .stream_active_limit()
+            .min(self.config.max_sessions);
+        if lock_table(&self.table).active_len() >= active_limit {
+            self.limiter.metrics().record_xudp_rejected_per_stream();
+            tracing::debug!(
+                session_id = id,
+                "XUDP per-stream active limit reached; rejecting New"
+            );
+            return self.send_end(id, true).await;
+        }
+
         // A clean close with a nonzero GlobalID retains its socket. Reattach
         // when this New names the same identifier within the stream.
         let retained =
@@ -1412,24 +1428,35 @@ mod tests {
     async fn global_session_limit_rejects_new() {
         let echo = spawn_ipv4_echo().await;
         let destination = net_location(echo.address);
-        let (mut client, task) = start_mux_with_limiter(test_config(), XudpSessionLimiter::new(1));
+        let limiter = XudpSessionLimiter::new(2);
+        let (mut first, first_task) = start_mux_with_limiter(test_config(), limiter.clone());
+        let (mut second, second_task) = start_mux_with_limiter(test_config(), limiter.clone());
+        let (mut third, third_task) = start_mux_with_limiter(test_config(), limiter);
         let mut buffer = Vec::new();
 
-        write_frame(&mut client, new_spec(1, &destination, b"first", None)).await;
-        let reply = read_frame(&mut client, &mut buffer)
+        write_frame(&mut first, new_spec(1, &destination, b"first", None)).await;
+        let reply = read_frame(&mut first, &mut buffer)
             .await
             .expect("the first session must be admitted");
         assert_eq!(reply.payload, b"first");
 
-        write_frame(&mut client, new_spec(2, &destination, b"second", None)).await;
-        let end = read_frame(&mut client, &mut buffer)
+        write_frame(&mut second, new_spec(2, &destination, b"second", None)).await;
+        let reply = read_frame(&mut second, &mut buffer)
             .await
-            .expect("the rejected New must receive End");
-        assert_eq!(end.session_id, 2);
+            .expect("the second stream must be admitted");
+        assert_eq!(reply.payload, b"second");
+
+        write_frame(&mut third, new_spec(3, &destination, b"third", None)).await;
+        let end = read_frame(&mut third, &mut buffer)
+            .await
+            .expect("the globally rejected New must receive End");
+        assert_eq!(end.session_id, 3);
         assert_eq!(end.status, SessionStatus::End);
         assert!(end.option.has_error());
 
-        finish(client, task).await;
+        finish(first, first_task).await;
+        finish(second, second_task).await;
+        finish(third, third_task).await;
     }
 
     #[tokio::test]
