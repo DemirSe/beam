@@ -255,8 +255,10 @@ gauges to the 60 s log. The live config was preserved; `NRestarts=0`, backlog
 - The early upload splice depends on the client sending Direct before the
   body; fully framed uploads stay on the async path.
 - A 24-hour soak and privileged syscall/wakeup gates remain.
-- No per-IP connection cap; the global 1024-connection cap, 10 s pre-auth
-  timeout, 30 s cover timeout and provider firewall are the current mitigation.
+- No authenticated per-IP connection cap; pre-auth is bounded globally (256)
+  and per source (128), the ClientHello intake deadline is 5 s, cover idle is
+  30 s, the global authenticated cap is 1024, and the provider firewall is the
+  current mitigation.
 - `max_connections=1024` is admission headroom, not bulk capacity: the 160
   blocking-thread pool is about 60 fully spliced Vision Direct pairs (120
   splice permits; excess directions use async copy); the listener backlog is
