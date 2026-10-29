@@ -44,6 +44,9 @@ impl IpLimiter {
 
     /// Reserves one global and one per-IP permit.
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Result<IpPermit, IpLimitReject> {
+        if self.max_per_ip == 0 {
+            return Err(IpLimitReject::PerIp);
+        }
         let global = self
             .global
             .clone()
@@ -140,6 +143,21 @@ mod tests {
         drop(first);
         assert!(limiter.try_acquire(ip(1)).is_ok());
         drop(second);
+    }
+
+    #[test]
+    fn zero_per_ip_limit_rejects_every_source_without_consuming_global() {
+        let limiter = Arc::new(IpLimiter::new(2, 0));
+        assert_eq!(
+            limiter.try_acquire(ip(1)).expect_err("zero per-IP limit"),
+            IpLimitReject::PerIp
+        );
+        assert_eq!(
+            limiter.try_acquire(ip(2)).expect_err("zero per-IP limit"),
+            IpLimitReject::PerIp
+        );
+        assert_eq!(limiter.available_permits(), 2);
+        assert_eq!(limiter.tracked_ips(), 0);
     }
 
     #[test]
