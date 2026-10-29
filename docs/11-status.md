@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-10-28.
+Updated: 2026-10-29.
 
 ## Decisions
 
@@ -227,6 +227,14 @@ configurable 256-session XUDP cap, and a configurable 2 s shutdown drain.
 Post-deploy `NRestarts=0`, listener backlog 1024, HTTPS IPv4/IPv6, the cover
 certificate, and the local full-TUN client path were verified.
 
+On 2026-10-29 11:52 UTC the XUDP control-path binary was deployed with
+`BEAM_KEEP_CONFIG=1`: SHA-256
+`1c0d00e4d0eba1c41b8acd190e18f3b3852f563a9c4e6091ea6ad9e57d832f4d`.
+It caps both `End` enqueue paths at 250 ms, reserves up to 8 FIFO slots for
+control frames, and adds XUDP/legacy/splice pressure counters plus active
+gauges to the 60 s log. The live config was preserved; `NRestarts=0`, backlog
+1024, HTTPS IPv4/IPv6, cover certificate, and the local TUN path were verified.
+
 ## In progress
 
 - A low-rate live observation ran for about four hours on 2026-10-24
@@ -314,9 +322,9 @@ bash tests/tun/run.sh --udp-mode legacy
 bash bench/no-tun.sh
 ```
 
-The workspace currently has 284 `beam-core` unit tests, two TLS adapter
+The workspace currently has 285 `beam-core` unit tests, two TLS adapter
 integration tests, one stock-ClientHello fixture, and 26 `beam-sys` tests
-(313 total). The full-TUN harness passes all eight
+(314 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
 gVisor TUN on both beam and stock Xray. The final-binary no-TUN server-capacity smoke is
