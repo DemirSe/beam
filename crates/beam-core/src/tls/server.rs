@@ -42,8 +42,8 @@ use crate::reality::{Auth, RealityAuthConfig, authenticate};
 use crate::relay::{RelayActivity, RelayConfig, copy_bidirectional, copy_one_way};
 use crate::tls::stream::{TlsStream, TlsStreamError};
 use crate::tls::{
-    ClientHello, MAX_CLIENT_HELLO_RECORDS, MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN,
-    client_hello_message_len,
+    ClientHello, MAX_CLIENT_HELLO_RECORDS, MAX_RECORD_LEN, TLS_HANDSHAKE_HEADER_LEN,
+    TLS_RECORD_HEADER_LEN, client_hello_message_len,
 };
 use crate::udp::{LegacyUdpConfig, UdpError, handle_udp_stream};
 use crate::vision::VisionStream;
@@ -743,6 +743,82 @@ fn is_plausible_tls_record_header(header: &[u8; TLS_RECORD_HEADER_LEN]) -> bool 
 /// prober sees the cover respond instead of beam waiting for a body that will
 /// never arrive. If the peer stalls or closes mid-record, the bytes already
 /// received are forwarded to the cover too.
+enum NextRecordRead {
+    Complete(Vec<u8>),
+    Partial(Vec<u8>),
+}
+
+/// Reads one complete TLS record under the shared pre-auth deadline.
+///
+/// A timeout, EOF, invalid header, or over-limit record returns the bytes read
+/// so far as `Partial`; the caller forwards them to the cover.
+async fn read_next_record<R>(
+    stream: &mut R,
+    deadline: Instant,
+    max_total: usize,
+) -> Result<NextRecordRead, TlsServerError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0u8; TLS_RECORD_HEADER_LEN];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(NextRecordRead::Partial(header[..filled].to_vec()));
+        }
+        let read = match timeout(remaining, stream.read(&mut header[filled..])).await {
+            Err(_) => return Ok(NextRecordRead::Partial(header[..filled].to_vec())),
+            Ok(read) => read,
+        };
+        match read {
+            Ok(0) => return Ok(NextRecordRead::Partial(header[..filled].to_vec())),
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+    }
+
+    let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+    let total = TLS_RECORD_HEADER_LEN.saturating_add(record_len);
+    if !is_plausible_tls_record_header(&header) || record_len > MAX_RECORD_LEN || total > max_total
+    {
+        return Ok(NextRecordRead::Partial(header.to_vec()));
+    }
+
+    let mut record = Vec::new();
+    record
+        .try_reserve_exact(total)
+        .map_err(|_| TlsServerError::Allocation)?;
+    record.extend_from_slice(&header);
+    record.resize(total, 0);
+    let mut filled = TLS_RECORD_HEADER_LEN;
+    while filled < total {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            record.truncate(filled);
+            return Ok(NextRecordRead::Partial(record));
+        }
+        let read = match timeout(remaining, stream.read(&mut record[filled..])).await {
+            Err(_) => {
+                record.truncate(filled);
+                return Ok(NextRecordRead::Partial(record));
+            }
+            Ok(read) => read,
+        };
+        match read {
+            Ok(0) => {
+                record.truncate(filled);
+                return Ok(NextRecordRead::Partial(record));
+            }
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+    }
+    Ok(NextRecordRead::Complete(record))
+}
+
 async fn read_client_hello_record<R>(
     stream: &mut R,
     config: &TlsServerConfig,
@@ -815,128 +891,78 @@ where
         }
     }
 
-    // A TLS ClientHello is normally one record, but TLS permits it to span
-    // several handshake records. Assemble the handshake message under the same
-    // absolute deadline, with separate bounds for the handshake bytes and the
-    // original wire bytes. A peer that stalls mid-assembly is forwarded, with
-    // every byte read so far, exactly like a stalled single record.
-    let Ok(message_len) = client_hello_message_len(&record[TLS_RECORD_HEADER_LEN..]) else {
-        return Ok(ClientHelloRead::Complete {
-            record: record.clone(),
-            wire: record,
-        });
-    };
     let first_body_len = record.len() - TLS_RECORD_HEADER_LEN;
-    if first_body_len >= message_len {
+    // Fast path: the common one-record ClientHello needs no assembly.
+    if first_body_len >= TLS_HANDSHAKE_HEADER_LEN
+        && let Ok(message_len) = client_hello_message_len(&record[TLS_RECORD_HEADER_LEN..])
+        && first_body_len >= message_len
+    {
         return Ok(ClientHelloRead::Complete {
             record: record.clone(),
             wire: record,
         });
     }
 
+    // A ClientHello may span several TLS records, and even its four-byte
+    // handshake header may be split. Assemble under the same absolute
+    // deadline, with independent logical-message and wire bounds.
     let wire_limit = config
         .max_client_hello_bytes
         .saturating_add(MAX_CLIENT_HELLO_RECORDS.saturating_sub(1) * TLS_RECORD_HEADER_LEN);
     let mut wire = record;
-    let mut handshake = Vec::new();
-    handshake
-        .try_reserve_exact(message_len)
-        .map_err(|_| TlsServerError::Allocation)?;
-    handshake.extend_from_slice(&wire[TLS_RECORD_HEADER_LEN..]);
+    let mut handshake = wire[TLS_RECORD_HEADER_LEN..].to_vec();
     let mut records_seen = 1usize;
+    let mut target_len = TLS_HANDSHAKE_HEADER_LEN;
 
-    while handshake.len() < message_len {
-        if records_seen >= MAX_CLIENT_HELLO_RECORDS {
-            return Ok(ClientHelloRead::Forward(wire));
-        }
-
-        let mut next_header = [0u8; TLS_RECORD_HEADER_LEN];
-        let mut next_filled = 0usize;
-        while next_filled < next_header.len() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                wire.extend_from_slice(&next_header[..next_filled]);
+    loop {
+        while handshake.len() < target_len {
+            if records_seen >= MAX_CLIENT_HELLO_RECORDS {
                 return Ok(ClientHelloRead::Forward(wire));
             }
-            let read = match timeout(remaining, stream.read(&mut next_header[next_filled..])).await
-            {
-                Err(_) => {
-                    wire.extend_from_slice(&next_header[..next_filled]);
+            let max_total = wire_limit.saturating_sub(wire.len());
+            match read_next_record(stream, deadline, max_total).await? {
+                NextRecordRead::Complete(next) => {
+                    handshake.extend_from_slice(&next[TLS_RECORD_HEADER_LEN..]);
+                    wire.extend_from_slice(&next);
+                    records_seen += 1;
+                }
+                NextRecordRead::Partial(partial) => {
+                    wire.extend_from_slice(&partial);
                     return Ok(ClientHelloRead::Forward(wire));
                 }
-                Ok(read) => read,
-            };
-            match read {
-                Ok(0) => {
-                    wire.extend_from_slice(&next_header[..next_filled]);
-                    return Ok(ClientHelloRead::Forward(wire));
-                }
-                Ok(count) => next_filled += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(TlsServerError::Io(error)),
             }
         }
 
-        let next_len = usize::from(u16::from_be_bytes([next_header[3], next_header[4]]));
-        let next_total = TLS_RECORD_HEADER_LEN.saturating_add(next_len);
-        if !is_plausible_tls_record_header(&next_header)
-            || next_len > MAX_RECORD_LEN
-            || wire.len().saturating_add(next_total) > wire_limit
-        {
-            wire.extend_from_slice(&next_header);
-            return Ok(ClientHelloRead::Forward(wire));
-        }
-
-        let start = wire.len();
-        wire.try_reserve_exact(next_total)
-            .map_err(|_| TlsServerError::Allocation)?;
-        wire.resize(start + next_total, 0);
-        wire[start..start + TLS_RECORD_HEADER_LEN].copy_from_slice(&next_header);
-        let mut next_filled = TLS_RECORD_HEADER_LEN;
-        while next_filled < next_total {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                wire.truncate(start + next_filled);
+        if target_len == TLS_HANDSHAKE_HEADER_LEN {
+            let Ok(message_len) = client_hello_message_len(&handshake) else {
+                return Ok(ClientHelloRead::Complete {
+                    record: wire.clone(),
+                    wire,
+                });
+            };
+            // The normalized record must fit the configured logical bound.
+            if TLS_RECORD_HEADER_LEN.saturating_add(message_len) > config.max_client_hello_bytes {
                 return Ok(ClientHelloRead::Forward(wire));
             }
-            let read = match timeout(remaining, stream.read(&mut wire[start + next_filled..])).await
-            {
-                Err(_) => {
-                    wire.truncate(start + next_filled);
-                    return Ok(ClientHelloRead::Forward(wire));
-                }
-                Ok(read) => read,
-            };
-            match read {
-                Ok(0) => {
-                    wire.truncate(start + next_filled);
-                    return Ok(ClientHelloRead::Forward(wire));
-                }
-                Ok(count) => next_filled += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(TlsServerError::Io(error)),
-            }
+            target_len = message_len;
         }
-        handshake.extend_from_slice(&wire[start + TLS_RECORD_HEADER_LEN..start + next_total]);
-        records_seen += 1;
+
+        if handshake.len() > target_len {
+            // Extra bytes after the ClientHello are not silently discarded.
+            return Ok(ClientHelloRead::Forward(wire));
+        }
+        if handshake.len() == target_len {
+            break;
+        }
     }
 
-    if handshake.len() != message_len {
-        // Extra bytes after the ClientHello are not silently discarded.
-        return Ok(ClientHelloRead::Forward(wire));
-    }
-
-    // Normalize the wire records into one record containing exactly the
-    // reassembled handshake message. TLS authenticates the handshake bytes,
-    // not the record segmentation, so rustls and the REALITY AAD see the same
-    // message a single-record client would have sent.
     let mut normalized = Vec::new();
     normalized
-        .try_reserve_exact(TLS_RECORD_HEADER_LEN.saturating_add(message_len))
+        .try_reserve_exact(TLS_RECORD_HEADER_LEN.saturating_add(target_len))
         .map_err(|_| TlsServerError::Allocation)?;
     normalized.extend_from_slice(&wire[..3]);
-    normalized.extend_from_slice(&(message_len as u16).to_be_bytes());
-    normalized.extend_from_slice(&handshake[..message_len]);
+    normalized.extend_from_slice(&(target_len as u16).to_be_bytes());
+    normalized.extend_from_slice(&handshake[..target_len]);
 
     Ok(ClientHelloRead::Complete {
         record: normalized,
@@ -1946,6 +1972,44 @@ mod tests {
         );
         let hello = ClientHello::parse(&record).expect("reassembled ClientHello must parse");
         assert_eq!(hello.server_name, Some("whatsapp.net"));
+    }
+
+    #[tokio::test]
+    async fn reassembles_a_client_hello_split_inside_the_handshake_header() {
+        const HELLO: &[u8] = include_bytes!("../../tests/fixtures/stock-client-hello.bin");
+        let body = &HELLO[TLS_RECORD_HEADER_LEN..];
+        let split = 2;
+        assert!(split < 4 && split < body.len());
+
+        let mut first = Vec::new();
+        first.extend_from_slice(&HELLO[..3]);
+        first.extend_from_slice(&(split as u16).to_be_bytes());
+        first.extend_from_slice(&body[..split]);
+
+        let rest = &body[split..];
+        let mut second = Vec::new();
+        second.extend_from_slice(&HELLO[..3]);
+        second.extend_from_slice(&(rest.len() as u16).to_be_bytes());
+        second.extend_from_slice(rest);
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let write = async move {
+            writer.write_all(&first).await.expect("first record");
+            writer.write_all(&second).await.expect("second record");
+            writer.shutdown().await.expect("shutdown");
+        };
+        let read = async {
+            read_client_hello_record(&mut reader, &test_config())
+                .await
+                .expect("header-split ClientHello read")
+        };
+        let (_, read) = tokio::join!(write, read);
+        let ClientHelloRead::Complete { record, wire } = read else {
+            panic!("header-split ClientHello must be reassembled");
+        };
+        assert_eq!(record, HELLO);
+        assert_eq!(wire.len(), HELLO.len() + TLS_RECORD_HEADER_LEN);
+        ClientHello::parse(&record).expect("reassembled header must parse");
     }
 
     #[tokio::test]
