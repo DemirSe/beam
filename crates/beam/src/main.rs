@@ -34,10 +34,11 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     // Each Vision Direct relay can occupy up to two blocking splice tasks.
-    // The default covers about 80 active relay pairs; max_connections is an
-    // admission cap, not a promise of 1024 concurrent bulk relays. Operators
-    // can raise the pool for a burst-heavy host without changing the
-    // admission limit.
+    // The default covers about 60 fully spliced relay pairs (120 splice
+    // permits); max_connections is an admission cap, not a promise of 1024
+    // concurrent bulk relays. Directions above the splice cap use the async
+    // copy path. Operators can raise the pool for a burst-heavy host without
+    // changing the admission limit.
     let max_blocking_threads = std::env::var("BEAM_MAX_BLOCKING_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())

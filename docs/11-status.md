@@ -258,11 +258,12 @@ gauges to the 60 s log. The live config was preserved; `NRestarts=0`, backlog
 - No per-IP connection cap; the global 1024-connection cap, 10 s pre-auth
   timeout, 30 s cover timeout and provider firewall are the current mitigation.
 - `max_connections=1024` is admission headroom, not bulk capacity: the 160
-  blocking-thread pool is about 80 active Vision Direct pairs; the listener
-  backlog is 128 and historical `ListenOverflows=102`. The 512/1024×1 MB load
-  logs show 49.7 s median and 937 timeouts respectively. Current normal load is
-  tens of connections. The global XUDP cap (256) and cover cap (32) reduce the
-  burst memory/thread exposure and are deployed on the live host.
+  blocking-thread pool is about 60 fully spliced Vision Direct pairs (120
+  splice permits; excess directions use async copy); the listener backlog is
+  1024 and historical `ListenOverflows=102`. The 512/1024×1 MB load logs show
+  49.7 s median and 937 timeouts respectively. Current normal load is tens of
+  connections. The global XUDP cap (256) and cover cap (32) reduce the burst
+  memory/thread exposure and are deployed on the live host.
 - The provider L4 firewall/rate limit was not independently verified; the host
   nftables rules are.
 - The local `sing-box` service is not enabled at boot.
