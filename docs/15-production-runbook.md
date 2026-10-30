@@ -22,7 +22,7 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
 | Unit / backups | `/etc/systemd/system/beam.service` 0644; `*.bak-<UTC stamp>` beside each installed file |
-| Hardening | Deployed 2026-10-30 02:26 UTC: binary `e0843cc3…` (daily lifecycle/TLS/ops hardening; 1024 global sessions, 128 KiB receive buffer); previous `cf8425fe…` at 01:10 UTC; config backup `20261030T011011Z` |
+| Hardening | Deployed 2026-10-30 12:03 UTC: binary `1007354…` (short-ID predecode, dial/retained hardening, pressure visibility; 1024 global sessions, 128 KiB receive buffer); previous `e0843cc3…` at 02:26 UTC, `cf8425fe…` at 01:10 UTC; config backup `20261030T011011Z` |
 | Earlier hardening | 2026-10-29 18:20 UTC binary `9e26cb55…`; 2026-10-24 binary `f33f07fe…`; 2026-10-22/23 binaries preserved in backups |
 | Conntrack | `/etc/sysctl.d/99-beam-conntrack.conf`: max 65536, established 3600 s, TIME_WAIT 30 s |
 | Local client | sing-box, `/etc/sing-box/config.json` 0600, active but disabled at boot |

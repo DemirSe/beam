@@ -277,6 +277,20 @@ certificate, and the local TUN path were verified. The lab passed 11/11,
 10k churn, DNS/HTTP/UDP/H3, and a 5-rep A/B against `cf8425fe` with no
 regression signal; workspace tests are **336**.
 
+On 2026-10-30 12:03 UTC the final audit candidate was deployed with
+`BEAM_KEEP_CONFIG=1`: SHA-256
+`f76691f161c12120e46f59dec05873ce11ba424041e0bd8f28c851bec94281c1`
+(`beam --version` = `0.1.0 (1007354938ff)`). It predecodes/validates REALITY
+short IDs once at startup, adds a direct failure-End/id-reuse regression,
+warns on invalid `BEAM_MAX_BLOCKING_THREADS`, continues dial failover after a
+socket-family creation failure, reports an exhausted dial budget as a timeout,
+counts retained sockets dropped on failed reattachment, and includes all XUDP
+drop counters in the warn-level pressure delta. Sol final review:
+**APPROVE WITH NONBLOCKING CAVEATS**; the follow-up delta review:
+**APPROVE**. Live config remains cap 1024 / 128 KiB. `NRestarts=0`, HTTPS
+IPv4/IPv6, cover certificate, and local TUN were verified. The 24 h soak,
+privileged gates, cgroup OOM sampling, and final fuzz remain open.
+
 ## In progress
 
 - A low-rate live observation ran for about four hours on 2026-10-24
