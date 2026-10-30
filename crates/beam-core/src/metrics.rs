@@ -83,7 +83,8 @@ pub struct MetricsSnapshot {
     pub xudp_retained_reattached: u64,
     /// Retained sockets removed by expiry.
     pub xudp_retained_expired: u64,
-    /// Retained sockets discarded because the requested family changed.
+    /// Retained sockets discarded because the family changed or reattachment
+    /// failed before the first datagram was sent.
     pub xudp_retained_discarded: u64,
 }
 
@@ -204,7 +205,8 @@ impl Metrics {
             .fetch_add(count as u64, Ordering::Relaxed);
     }
 
-    /// Counts retained sockets discarded on a family change.
+    /// Counts retained sockets discarded on a family change or failed
+    /// reattachment.
     pub fn record_xudp_retained_discarded(&self) {
         self.xudp_retained_discarded.fetch_add(1, Ordering::Relaxed);
     }
