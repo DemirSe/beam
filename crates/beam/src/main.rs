@@ -174,6 +174,8 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                     xudp_rejected_per_stream = pressure.3.saturating_sub(last_pressure.3),
                     xudp_rejected_global = pressure.4.saturating_sub(last_pressure.4),
                     xudp_end_dropped = pressure.5.saturating_sub(last_pressure.5),
+                    xudp_replies_dropped = pressure.6.saturating_sub(last_pressure.6),
+                    legacy_udp_limited = pressure.7.saturating_sub(last_pressure.7),
                     xudp_high_water = xudp.high_water,
                     preauth_active,
                     authenticated_active,
@@ -357,7 +359,7 @@ fn warn_if_config_permissions_are_loose(path: &std::path::Path) {
 /// Counters that indicate dropped or rejected traffic, in log order.
 fn pressure_counters(
     snapshot: &beam_core::metrics::MetricsSnapshot,
-) -> (u64, u64, u64, u64, u64, u64) {
+) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
     (
         snapshot.preauth_rejected,
         snapshot.cover_limited,
@@ -365,6 +367,8 @@ fn pressure_counters(
         snapshot.xudp_rejected_per_stream,
         snapshot.xudp_rejected_global,
         snapshot.xudp_end_dropped,
+        snapshot.xudp_replies_dropped,
+        snapshot.legacy_udp_limited,
     )
 }
 

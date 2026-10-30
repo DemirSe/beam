@@ -48,7 +48,7 @@ outbound: freedom
 | Idle connection | Bounded resource use; no leak |
 | Unauthenticated TLS probe | Forwarded to the cover, plausible behavior |
 | Wrong short ID / SNI | Treated as unauthenticated; no crash |
-| Replay / malformed frame | Malformed input is rejected; an exact replay of a completed handshake is diverted to cover. Concurrent duplicates may both reach TLS, stock-like, within the connection cap; no panic or unbounded allocation |
+| Replay / malformed frame | Malformed input is rejected; an exact replay of a completed handshake is diverted to cover while its id remains in the bounded 60 s / 4096-entry cache. Concurrent duplicates may both reach TLS, stock-like, within the connection cap; no panic or unbounded allocation |
 | Concurrent clients | No cross-session data leakage |
 | Full TUN route-all | All client traffic uses the tunnel; DNS, QUIC, and IPv6 work |
 | IPv6 destination | VLESS/XUDP address parsing and freedom dialing work |
@@ -77,8 +77,9 @@ outbound: freedom
   a separate 64-stream cap; XUDP has a configurable process-wide session cap (default 256, live 1024), a
   per-mux active cap of half the global slots (128 default), and a 60 s idle
   expiry. The exact-replay cache is checked at classification but inserted
-  only after the TLS Finished; later replays go to cover, while a concurrent
-  first arrival cannot pre-empt the legitimate client.
+  only after the TLS Finished; later replays go to cover while the id is still
+  cached, while a concurrent first arrival cannot pre-empt the legitimate
+  client. Outside the 60 s / 4096-entry window the cache does not apply.
 - A bare TCP FIN without `close_notify` is treated as a half-close by the
   relay; the opposite direction may still finish.
 - No statistics API or hot reload in the first release.

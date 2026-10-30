@@ -622,10 +622,16 @@ impl MuxState {
                         %error,
                         "XUDP first datagram send failed"
                     );
+                    if reattached {
+                        self.limiter.metrics().record_xudp_retained_discarded();
+                    }
                     return self.send_end(id, true).await;
                 }
                 Err(_) => {
                     tracing::debug!(session_id = id, "XUDP first datagram send timed out");
+                    if reattached {
+                        self.limiter.metrics().record_xudp_retained_discarded();
+                    }
                     return self.send_end(id, true).await;
                 }
             }
