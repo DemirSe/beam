@@ -31,8 +31,8 @@ const HKDF_INFO: &[u8] = b"REALITY";
 pub struct RealityAuthConfig<'a> {
     /// The server's static X25519 private key.
     pub private_key: &'a [u8; 32],
-    /// Configured short ids as hex strings, decoded and zero-padded to 8 bytes.
-    pub short_ids: &'a [String],
+    /// Configured short ids, decoded and zero-padded to 8 bytes.
+    pub short_ids: &'a [[u8; 8]],
     /// Accepted TLS server names.
     pub server_names: &'a [String],
     /// Minimum accepted client version.
@@ -231,8 +231,7 @@ pub fn authenticate(
 
     let mut matched = Choice::from(0u8);
     for configured in config.short_ids {
-        let expected = decode_short_id(configured)?;
-        matched |= expected.ct_eq(&short_id);
+        matched |= configured.ct_eq(&short_id);
     }
     if !bool::from(matched) {
         return Err(AuthError::UnknownShortId);
@@ -346,7 +345,11 @@ fn check_timestamp(timestamp: u32, max_time_diff: Option<Duration>) -> Result<()
     Ok(())
 }
 
-fn decode_short_id(value: &str) -> Result<[u8; 8], AuthError> {
+/// Decodes a configured short id from hex, zero-padding it to 8 bytes.
+///
+/// Accepted values are 2 to 16 hexadecimal characters with an even length.
+/// Configuration is decoded once at startup; authentication never parses hex.
+pub(crate) fn decode_short_id(value: &str) -> Result<[u8; 8], AuthError> {
     let bytes = value.as_bytes();
     if bytes.len() < 2 || bytes.len() > 16 || !bytes.len().is_multiple_of(2) {
         return Err(AuthError::InvalidConfig);
@@ -384,7 +387,7 @@ mod tests {
 
     struct TestConfig {
         private_key: [u8; 32],
-        short_ids: Vec<String>,
+        short_ids: Vec<[u8; 8]>,
         server_names: Vec<String>,
         min_client_version: [u8; 3],
         max_client_version: [u8; 3],
@@ -395,7 +398,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 private_key: test_private_key(),
-                short_ids: vec![TEST_SHORT_ID_HEX.to_string()],
+                short_ids: vec![TEST_SHORT_ID],
                 server_names: vec![TEST_SERVER_NAME.to_string()],
                 min_client_version: [0, 0, 0],
                 max_client_version: [255, 255, 255],
@@ -509,12 +512,82 @@ mod tests {
     fn rejects_unknown_short_id_after_aead() {
         let hello = ClientHello::parse(STOCK_CLIENT_HELLO).expect("fixture must parse");
         let mut config = TestConfig::new();
-        config.short_ids = vec!["deadbeef".to_string()];
+        config.short_ids = vec![[0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0]];
 
         assert!(matches!(
             authenticate(&hello, &config.auth_config()),
             Err(AuthError::UnknownShortId)
         ));
+    }
+
+    #[test]
+    fn decodes_short_ids_with_zero_padding() {
+        assert_eq!(
+            decode_short_id("01").expect("two-character short id"),
+            [0x01, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            decode_short_id("0123").expect("four-character short id"),
+            [0x01, 0x23, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            decode_short_id("AbCdEf").expect("mixed-case short id"),
+            [0xab, 0xcd, 0xef, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            decode_short_id(TEST_SHORT_ID_HEX).expect("full-length short id"),
+            TEST_SHORT_ID
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_short_ids_when_decoding() {
+        for value in ["", "0", "123", "zz", "0g", "0123456789abcdef00"] {
+            assert_eq!(
+                decode_short_id(value),
+                Err(AuthError::InvalidConfig),
+                "short id {value:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticates_zero_padded_short_id() {
+        let server_private = test_private_key();
+        let client_private = [0x44; 32];
+        let client_public = client_public(client_private);
+        let random = test_random();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs() as u32;
+        let short_id = decode_short_id("0123").expect("padded short id");
+        let mut record = build_client_hello(
+            &random,
+            &[0u8; SESSION_ID_LEN],
+            &[(X25519_GROUP, &client_public)],
+            true,
+        );
+        seal_envelope(
+            &mut record,
+            &random,
+            client_private,
+            &server_private,
+            TEST_CLIENT_VERSION,
+            timestamp,
+            short_id,
+        );
+
+        let hello = ClientHello::parse(&record).expect("signed hello must parse");
+        let mut config = TestConfig::new();
+        config.private_key = server_private;
+        config.short_ids = vec![[0xff; 8], short_id];
+        config.min_client_version = TEST_CLIENT_VERSION;
+        config.max_client_version = TEST_CLIENT_VERSION;
+
+        let auth = authenticate(&hello, &config.auth_config())
+            .expect("zero-padded configured short id must authenticate");
+        assert_eq!(auth.short_id, [0x01, 0x23, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]

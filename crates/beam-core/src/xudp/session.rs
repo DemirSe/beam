@@ -880,8 +880,10 @@ impl SessionTable {
     }
 
     /// Drops every retained socket.
-    pub(crate) fn clear_expiring(&mut self) {
+    pub(crate) fn clear_expiring(&mut self) -> usize {
+        let count = self.expiring.len();
         self.expiring.clear();
+        count
     }
 }
 
@@ -1050,24 +1052,36 @@ async fn reply_loop(
     }
 
     if failed && session.mark_closed() {
-        // Remove ourselves and enqueue the error End while the table lock is
-        // held. If the read loop replaces this id first, `take_if_same`
-        // returns None and no stale End may kill the replacement. Holding the
-        // lock until the End is queued also prevents a replacement from being
-        // ordered before the stale End on the shared FIFO.
-        let mut table = lock(&table);
-        let removed = table.take_if_same(session.id, &session);
-        if removed.is_none() {
-            return;
-        }
-        metrics.record_xudp_closed_error();
-        let end = encode_end_frame(session.id, true);
-        if !end.is_empty() && outbound.try_send(QueuedFrame::new(end, None)).is_err() {
-            metrics.record_xudp_end_dropped();
-        }
-        drop(table);
-        drop(removed);
+        queue_failed_session_end(&table, &outbound, &session, &metrics);
     }
+}
+
+/// Removes a failed reply task's session and queues its error `End`.
+///
+/// The removal and enqueue happen under the table lock. If the read loop
+/// already replaced this 16-bit id, `take_if_same` returns `None` and no stale
+/// `End` may kill the replacement. Holding the lock until the `End` is queued
+/// also prevents a replacement from being ordered before the stale `End` on
+/// the shared FIFO.
+fn queue_failed_session_end(
+    table: &Mutex<SessionTable>,
+    outbound: &mpsc::Sender<QueuedFrame>,
+    session: &Arc<Session>,
+    metrics: &Metrics,
+) -> bool {
+    let mut table = lock(table);
+    let removed = table.take_if_same(session.id, session);
+    if removed.is_none() {
+        return false;
+    }
+    metrics.record_xudp_closed_error();
+    let end = encode_end_frame(session.id, true);
+    if !end.is_empty() && outbound.try_send(QueuedFrame::new(end, None)).is_err() {
+        metrics.record_xudp_end_dropped();
+    }
+    drop(table);
+    drop(removed);
+    true
 }
 
 /// Returns the exact encoded size of a UDP reply frame.
@@ -1141,7 +1155,7 @@ mod tests {
     use super::{
         DEFAULT_MAX_GLOBAL_SESSIONS, ExpiringSession, ResolveError, Session, SessionTable,
         SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
-        reply_frame_len, resolve_destination, socket_addr_to_location,
+        queue_failed_session_end, reply_frame_len, resolve_destination, socket_addr_to_location,
     };
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{
@@ -1482,6 +1496,75 @@ mod tests {
         assert_eq!(table.total(), 2);
         assert!(table.take_expiring([7; 8]).is_some());
         assert_eq!(table.total(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_reply_end_is_not_queued_after_id_reuse() {
+        let limiter = XudpSessionLimiter::new(4);
+        let table = Arc::new(std::sync::Mutex::new(SessionTable::default()));
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let address = socket.local_addr().expect("test address");
+        let old = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            limiter.try_acquire(),
+        ));
+        let replacement = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            limiter.try_acquire(),
+        ));
+        table.lock().expect("table").insert(super::ActiveSession {
+            session: Arc::clone(&old),
+            reply_task: None,
+        });
+        let replaced = table
+            .lock()
+            .expect("table")
+            .insert(super::ActiveSession {
+                session: Arc::clone(&replacement),
+                reply_task: None,
+            })
+            .expect("same id must replace");
+        drop(replaced);
+        assert!(old.mark_closed());
+
+        let (outbound, mut inbound) = tokio::sync::mpsc::channel(4);
+        assert!(!queue_failed_session_end(
+            &table,
+            &outbound,
+            &old,
+            &limiter.metrics()
+        ));
+        assert!(
+            inbound.try_recv().is_err(),
+            "a stale failure End must not follow the replacement"
+        );
+        assert_eq!(table.lock().expect("table").total(), 1);
+        assert_eq!(limiter.metrics().snapshot().xudp_closed_error, 0);
+
+        assert!(replacement.mark_closed());
+        assert!(queue_failed_session_end(
+            &table,
+            &outbound,
+            &replacement,
+            &limiter.metrics()
+        ));
+        let queued = inbound.recv().await.expect("current failure End");
+        let (frame, used) = parse_frame(&queued.bytes)
+            .expect("valid End")
+            .expect("complete End");
+        assert_eq!(used, queued.bytes.len());
+        assert_eq!(frame.status, SessionStatus::End);
+        assert_eq!(frame.option, FrameOption::ERROR);
+        assert_eq!(table.lock().expect("table").total(), 0);
+        assert_eq!(limiter.metrics().snapshot().xudp_closed_error, 1);
     }
 
     #[tokio::test]

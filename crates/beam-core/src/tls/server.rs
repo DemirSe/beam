@@ -39,6 +39,7 @@ use crate::address::{Address, NetLocation};
 use crate::admission::{IpLimiter, IpPermit};
 use crate::metrics::Metrics;
 use crate::prepend_stream::PrependStream;
+use crate::reality::auth::decode_short_id;
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
 use crate::relay::{RelayActivity, RelayConfig, copy_bidirectional, copy_one_way};
 use crate::tls::stream::{TlsStream, TlsStreamError};
@@ -262,8 +263,8 @@ pub enum TlsServerError {
 pub struct TlsServerConfig {
     /// REALITY static X25519 private key.
     pub private_key: Zeroizing<[u8; 32]>,
-    /// Configured REALITY short ids as hex strings.
-    pub short_ids: Vec<String>,
+    /// Configured REALITY short ids, decoded and zero-padded to 8 bytes.
+    pub short_ids: Vec<[u8; 8]>,
     /// Accepted REALITY server names.
     pub server_names: Vec<String>,
     /// Minimum accepted client version.
@@ -344,6 +345,16 @@ impl TlsServerConfig {
                 reason: "cover port must be non-zero",
             });
         }
+
+        // Short ids are decoded once here so a malformed entry cannot make
+        // every handshake fail after the process has started.
+        let short_ids = short_ids
+            .iter()
+            .map(|short_id| decode_short_id(short_id.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| TlsServerError::InvalidConfig {
+                reason: "short ids must be 2 to 16 hexadecimal characters",
+            })?;
 
         Ok(Self {
             private_key: Zeroizing::new(private_key),
@@ -1305,15 +1316,25 @@ async fn dial_addresses(
     for (index, address) in addresses.iter().copied().enumerate() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            break;
+            return Err(TlsServerError::Timeout {
+                stage: "destination dial",
+            });
         }
         let last = index + 1 == addresses.len();
         let attempt = dial_attempt_timeout(remaining, last);
         let socket = match address.is_ipv4() {
             true => TcpSocket::new_v4(),
             false => TcpSocket::new_v6(),
-        }
-        .map_err(TlsServerError::Io)?;
+        };
+        let socket = match socket {
+            Ok(socket) => socket,
+            Err(error) => {
+                // A family may be unavailable (for example IPv6 disabled);
+                // that must not prevent trying the other resolved address.
+                last_error = Some(error);
+                continue;
+            }
+        };
         // This must happen before connect: Linux uses TCP_MAXSEG for both the
         // MSS option in the SYN and the local send limit only when it is set
         // while the socket is still unconnected.
@@ -2094,7 +2115,7 @@ mod tests {
             .decode("YLxrYleugiQ4iDDvCtbKHw3SNGAlEHJO6PR-BN6ypH4")
             .expect("test key");
         let key: [u8; 32] = key.try_into().expect("32-byte test key");
-        let short_ids = vec!["0123456789abcdef".to_owned()];
+        let short_ids = [[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]];
         let server_names = vec!["whatsapp.net".to_owned()];
         let config = RealityAuthConfig {
             private_key: &key,
@@ -2410,6 +2431,59 @@ mod tests {
             [0x22; 16],
         );
         assert!(matches!(result, Err(TlsServerError::InvalidConfig { .. })));
+    }
+
+    #[test]
+    fn rejects_malformed_short_id_at_config_time() {
+        for short_id in ["", "0", "123", "zz", "0g", "0123456789abcdef00"] {
+            let result = TlsServerConfig::new(
+                [0x11; 32],
+                vec![short_id.to_string()],
+                vec!["whatsapp.net".to_string()],
+                [0, 0, 0],
+                [255, 255, 255],
+                None,
+                NetLocation {
+                    address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    port: 9,
+                },
+                Duration::from_secs(5),
+                TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+                [0x22; 16],
+            );
+            assert!(
+                matches!(result, Err(TlsServerError::InvalidConfig { .. })),
+                "short id {short_id:?} must be rejected at config time"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_and_zero_pads_short_ids_at_config_time() {
+        let config = TlsServerConfig::new(
+            [0x11; 32],
+            vec!["0123".to_string(), "0123456789abcdef".to_string()],
+            vec!["whatsapp.net".to_string()],
+            [0, 0, 0],
+            [255, 255, 255],
+            None,
+            NetLocation {
+                address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                port: 9,
+            },
+            Duration::from_secs(5),
+            TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            [0x22; 16],
+        )
+        .expect("valid short ids must be accepted");
+
+        assert_eq!(
+            config.short_ids,
+            vec![
+                [0x01, 0x23, 0, 0, 0, 0, 0, 0],
+                [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+            ]
+        );
     }
 
     #[tokio::test]

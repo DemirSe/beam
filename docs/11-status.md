@@ -30,7 +30,7 @@ Updated: 2026-10-30.
 | Vision padding/direct state machine | Done |
 | XUDP frame codec | Done |
 | XUDP session table and UDP relay | Done |
-| Process-wide XUDP session limiter | Done (256 sessions) |
+| Process-wide XUDP session limiter | Done (configurable; live 1024, default 256) |
 | XUDP over VLESS Mux | Done |
 | Legacy VLESS UDP and packetaddr | Done |
 | Linux fd/socket/splice primitives | Done |
@@ -275,7 +275,7 @@ derived validation, and deploy/observability hardening. Live config remains
 cap 1024 / 128 KiB. `NRestarts=0`, backlog 1024, HTTPS IPv4/IPv6, cover
 certificate, and the local TUN path were verified. The lab passed 11/11,
 10k churn, DNS/HTTP/UDP/H3, and a 5-rep A/B against `cf8425fe` with no
-regression signal; workspace tests are **330**.
+regression signal; workspace tests are **336**.
 
 ## In progress
 
@@ -308,7 +308,7 @@ regression signal; workspace tests are **330**.
   splice permits; excess directions use async copy); the listener backlog is
   1024 and historical `ListenOverflows=102`. The 512/1024×1 MB load logs show
   49.7 s median and 937 timeouts respectively. Current normal load is tens of
-  connections. The global XUDP cap (256) and cover cap (32) reduce the burst
+  connections. The global XUDP cap (live 1024; default 256) and cover cap (32) reduce the burst
   memory/thread exposure and are deployed on the live host.
 - The provider L4 firewall/rate limit was not independently verified; the host
   nftables rules are.
@@ -327,7 +327,7 @@ regression signal; workspace tests are **330**.
   H3, IPv6 H3, and 16 MiB upload with zero TUN drops. See
   `docs/14-tun-harness.md`.
 - `XudpSessionLimiter` now evicts a retained GlobalID socket from any mux
-  stream when the 256-slot global limit is full, instead of rejecting a new
+  stream when the 1024-slot global limit is full, instead of rejecting a new
   live session while optional retention state exists. The cross-stream
   regression test is in `crates/beam-core/src/xudp/server.rs`.
 
@@ -369,9 +369,9 @@ bash tests/tun/run.sh --udp-mode legacy
 bash bench/no-tun.sh
 ```
 
-The workspace currently has 292 `beam-core` unit tests, two TLS adapter
+The workspace currently has 306 `beam-core` unit tests, two TLS adapter
 integration tests, two stock-ClientHello fixture tests, and 26 `beam-sys` tests
-(330 total). The full-TUN harness passes all eight
+(336 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
 gVisor TUN on both beam and stock Xray. The final-binary no-TUN server-capacity smoke is

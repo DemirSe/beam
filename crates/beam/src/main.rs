@@ -66,6 +66,19 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         .with_context(|| format!("failed to load `{}`", cli.config.display()))?;
 
     init_logging(config.log.level);
+    if let Ok(raw) = std::env::var("BEAM_MAX_BLOCKING_THREADS") {
+        let valid = raw
+            .parse::<usize>()
+            .ok()
+            .is_some_and(|value| (1..=512).contains(&value));
+        if !valid {
+            tracing::warn!(
+                value = %raw,
+                effective = max_blocking_threads,
+                "invalid BEAM_MAX_BLOCKING_THREADS; using the default"
+            );
+        }
+    }
     warn_if_config_permissions_are_loose(&cli.config);
 
     if cli.check {
@@ -393,7 +406,7 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         max_sessions,
         // Xray/sing-box XUDP clients generally close a flow with the TCP
         // stream, not an `End` frame. Reusing the 300 s TCP idle timeout lets
-        // stale UDP sessions consume the 256-slot global cap. Cap the UDP
+        // stale UDP sessions consume the process-wide global session cap. Cap the UDP
         // session idle clock independently; the TCP relay timeout is unchanged.
         session_idle_timeout: Duration::from_millis(config.limits.idle_timeout_ms)
             .min(Duration::from_secs(60)),

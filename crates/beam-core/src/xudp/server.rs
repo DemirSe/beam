@@ -212,7 +212,10 @@ where
             }
         }
     }
-    lock_table(&table).clear_expiring();
+    let cleared = lock_table(&table).clear_expiring();
+    if cleared > 0 {
+        metrics.record_xudp_retained_expired(cleared);
+    }
 
     drop(state);
     if timeout(SHUTDOWN_TIMEOUT, &mut writer_task).await.is_err() {
@@ -850,6 +853,9 @@ impl MuxState {
             };
             let replaced = lock_table(&self.table).insert_expiring(global_id, retained);
             self.limiter.metrics().record_xudp_retained_inserted();
+            if replaced.is_some() {
+                self.limiter.metrics().record_xudp_retained_expired(1);
+            }
             drop(replaced);
         }
 

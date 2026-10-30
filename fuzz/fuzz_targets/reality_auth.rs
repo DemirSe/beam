@@ -10,7 +10,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let private_key = [0x11_u8; 32];
-    let short_ids = ["0123456789abcdef".to_string()];
+    let short_ids = [[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]];
     let server_names = ["whatsapp.net".to_string()];
     let config = RealityAuthConfig {
         private_key: &private_key,
