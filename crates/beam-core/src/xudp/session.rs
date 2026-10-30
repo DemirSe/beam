@@ -942,9 +942,9 @@ async fn reply_loop(
                     Err(_) => break,
                 }
             }
-            received = timeout(config.io_timeout, session.socket.recv_from(&mut buffer)) => {
+            received = session.socket.recv_from(&mut buffer) => {
                 match received {
-                    Ok(Ok((len, source))) => {
+                    Ok((len, source)) => {
                         session.touch();
                         if len == 0 {
                             // Stock XUDP writers drop zero-length datagrams.
@@ -1034,7 +1034,7 @@ async fn reply_loop(
                         }
                         permit.send(QueuedFrame::new(frame, Some(budget)));
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         tracing::debug!(
                             session_id = session.id,
                             %error,
@@ -1044,35 +1044,29 @@ async fn reply_loop(
                         failed = true;
                         break;
                     }
-                    Err(_) => {
-                        // A receive timeout only wakes the task; the session
-                        // table sweep decides whether the session expired.
-                    }
                 }
             }
         }
     }
 
     if failed && session.mark_closed() {
-        metrics.record_xudp_closed_error();
-        // Remove ourselves so the next Keep for this id gets an End.
-        let removed = lock(&table).take_if_same(session.id, &session);
-        drop(removed);
-
-        let end = encode_end_frame(session.id, true);
-        if !end.is_empty() {
-            // Best effort with a short bound. The queue may be full, but this
-            // is the only place that reports a failed relay.
-            match timeout(
-                config.io_timeout.min(END_ENQUEUE_TIMEOUT),
-                outbound.send(QueuedFrame::new(end, None)),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => metrics.record_xudp_end_dropped(),
-            }
+        // Remove ourselves and enqueue the error End while the table lock is
+        // held. If the read loop replaces this id first, `take_if_same`
+        // returns None and no stale End may kill the replacement. Holding the
+        // lock until the End is queued also prevents a replacement from being
+        // ordered before the stale End on the shared FIFO.
+        let mut table = lock(&table);
+        let removed = table.take_if_same(session.id, &session);
+        if removed.is_none() {
+            return;
         }
+        metrics.record_xudp_closed_error();
+        let end = encode_end_frame(session.id, true);
+        if !end.is_empty() && outbound.try_send(QueuedFrame::new(end, None)).is_err() {
+            metrics.record_xudp_end_dropped();
+        }
+        drop(table);
+        drop(removed);
     }
 }
 

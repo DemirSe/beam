@@ -394,14 +394,30 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
             max: 3_000,
         });
     }
+    // A timeout above one day can only be an operator typo. Reject it here so
+    // `--check` and startup agree, instead of letting a derived UDP
+    // constructor fail later or letting a relay live forever.
+    const MAX_TIMEOUT_MS: u32 = 86_400_000;
     if raw.handshake_timeout_ms == 0 {
         return Err(ValidationError::ZeroLimit {
             name: "handshake_timeout_ms",
         });
     }
+    if raw.handshake_timeout_ms > u64::from(MAX_TIMEOUT_MS) {
+        return Err(ValidationError::LimitTooLarge {
+            name: "handshake_timeout_ms",
+            max: MAX_TIMEOUT_MS,
+        });
+    }
     if raw.idle_timeout_ms == 0 {
         return Err(ValidationError::ZeroLimit {
             name: "idle_timeout_ms",
+        });
+    }
+    if raw.idle_timeout_ms > u64::from(MAX_TIMEOUT_MS) {
+        return Err(ValidationError::LimitTooLarge {
+            name: "idle_timeout_ms",
+            max: MAX_TIMEOUT_MS,
         });
     }
 
@@ -756,6 +772,28 @@ idle_timeout_ms = 300000
                 max: 65535
             })
         ));
+    }
+
+    #[test]
+    fn rejects_timeouts_above_one_day() {
+        for (name, value) in [
+            ("handshake_timeout_ms", "60000"),
+            ("idle_timeout_ms", "300000"),
+        ] {
+            let input = config_toml(&private_key())
+                .replace(&format!("{name} = {value}"), &format!("{name} = 86400001"));
+            let error = Config::from_toml_str(&input).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::Validation(ValidationError::LimitTooLarge {
+                        name: got,
+                        max: 86_400_000
+                    }) if got == name
+                ),
+                "unexpected error for {name}: {error}"
+            );
+        }
     }
 
     #[test]

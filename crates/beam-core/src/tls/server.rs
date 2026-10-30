@@ -13,6 +13,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -128,23 +129,32 @@ impl ReplayCache {
         }
     }
 
-    /// Returns `true` if this id was seen within the TTL; otherwise records it.
-    fn seen_before(&mut self, id: [u8; 32]) -> bool {
-        let now = Instant::now();
+    fn expire(&mut self, now: Instant) {
         while let Some(front) = self.order.front().copied() {
             let expired = self
                 .entries
                 .get(&front)
-                .is_none_or(|seen| now.duration_since(*seen) >= self.ttl);
+                .is_none_or(|seen| now.saturating_duration_since(*seen) >= self.ttl);
             if !expired {
                 break;
             }
             self.order.pop_front();
             self.entries.remove(&front);
         }
+    }
 
+    /// Returns `true` if this id was already recorded within the TTL.
+    fn contains(&mut self, id: [u8; 32]) -> bool {
+        self.expire(Instant::now());
+        self.entries.contains_key(&id)
+    }
+
+    /// Records a completed handshake id and bounds the cache.
+    fn insert(&mut self, id: [u8; 32]) {
+        let now = Instant::now();
+        self.expire(now);
         if self.entries.contains_key(&id) {
-            return true;
+            return;
         }
         if self.entries.len() >= REPLAY_CACHE_CAPACITY
             && let Some(oldest) = self.order.pop_front()
@@ -153,7 +163,6 @@ impl ReplayCache {
         }
         self.entries.insert(id, now);
         self.order.push_back(id);
-        false
     }
 }
 
@@ -206,15 +215,6 @@ pub enum TlsServerError {
     Timeout {
         /// The operation that timed out.
         stage: &'static str,
-    },
-
-    /// The declared ClientHello record exceeds the configured limit.
-    #[error("ClientHello record length {length} exceeds the {max}-byte limit")]
-    ClientHelloTooLarge {
-        /// Total record length including the five-byte header.
-        length: usize,
-        /// Configured maximum.
-        max: usize,
     },
 
     /// An authenticated TCP request had no destination.
@@ -448,10 +448,17 @@ impl TlsServerConfig {
         }
     }
 
-    fn replay_seen(&self, id: [u8; 32]) -> bool {
+    fn replay_contains(&self, id: [u8; 32]) -> bool {
         match self.replay_cache.lock() {
-            Ok(mut cache) => cache.seen_before(id),
-            Err(poisoned) => poisoned.into_inner().seen_before(id),
+            Ok(mut cache) => cache.contains(id),
+            Err(poisoned) => poisoned.into_inner().contains(id),
+        }
+    }
+
+    fn replay_insert(&self, id: [u8; 32]) {
+        match self.replay_cache.lock() {
+            Ok(mut cache) => cache.insert(id),
+            Err(poisoned) => poisoned.into_inner().insert(id),
         }
     }
 
@@ -683,17 +690,11 @@ pub async fn handle_connection_admitted(
     let auth = match ClientHello::parse(&record) {
         Ok(hello) => match authenticate(&hello, &config.reality_config()) {
             Ok(auth) => {
-                let mut session_id = [0u8; 32];
-                if hello.session_id.len() != session_id.len() {
+                if config.replay_contains(auth.session_id) {
+                    tracing::debug!("authenticated ClientHello replay; forwarding to cover");
                     None
                 } else {
-                    session_id.copy_from_slice(hello.session_id);
-                    if config.replay_seen(session_id) {
-                        tracing::debug!("authenticated ClientHello replay; forwarding to cover");
-                        None
-                    } else {
-                        Some(auth)
-                    }
+                    Some(auth)
                 }
             }
             Err(error) => {
@@ -1015,6 +1016,14 @@ async fn handle_authenticated(
         stage: "TLS handshake",
     })??;
 
+    // Record the replay only after the TLS Finished proves the peer holds the
+    // client's keys. Checking at classification but inserting after Finished
+    // keeps stock behavior for concurrent duplicates: an on-path exact replay
+    // cannot pre-empt the legitimate client by winning the classification
+    // race, while a later replay of the completed ClientHello is still
+    // diverted to cover.
+    config.replay_insert(auth.session_id);
+
     let request = timeout(
         config.handshake_timeout,
         read_vless_request(&mut tls, config.handshake_timeout),
@@ -1023,11 +1032,7 @@ async fn handle_authenticated(
     .map_err(|_| TlsServerError::Timeout {
         stage: "VLESS request read",
     })??;
-    if account_id(&request.user_id)
-        .ct_eq(&account_id(&config.user_id))
-        .unwrap_u8()
-        == 0
-    {
+    if !bool::from(account_id(&request.user_id).ct_eq(&account_id(&config.user_id))) {
         return Err(TlsServerError::UnauthorizedUser);
     }
     // Stock rejects an unknown flow instead of silently treating the body as
@@ -1274,8 +1279,36 @@ async fn dial(
         )));
     }
 
+    dial_addresses(&addresses, deadline).await
+}
+
+/// Per-address connect budget when more than one resolved address remains.
+///
+/// A blackholed first address must not consume the whole dial deadline and
+/// prevent trying the other family. The final address gets the remaining
+/// budget so a single-address destination keeps the full timeout.
+const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn dial_attempt_timeout(remaining: Duration, last: bool) -> Duration {
+    if last {
+        remaining
+    } else {
+        remaining.min(DIAL_ATTEMPT_TIMEOUT)
+    }
+}
+
+async fn dial_addresses(
+    addresses: &[SocketAddr],
+    deadline: tokio::time::Instant,
+) -> Result<TcpStream, TlsServerError> {
     let mut last_error = None;
-    for address in addresses {
+    for (index, address) in addresses.iter().copied().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let last = index + 1 == addresses.len();
+        let attempt = dial_attempt_timeout(remaining, last);
         let socket = match address.is_ipv4() {
             true => TcpSocket::new_v4(),
             false => TcpSocket::new_v6(),
@@ -1287,7 +1320,7 @@ async fn dial(
         if let Err(error) = beam_sys::set_tcp_maxseg(socket.as_raw_fd(), TARGET_MSS) {
             tracing::debug!(%error, "could not set TCP_MAXSEG on the destination");
         }
-        match tokio::time::timeout_at(deadline, socket.connect(address)).await {
+        match timeout(attempt, socket.connect(address)).await {
             Ok(Ok(stream)) => {
                 // Small request headers and interactive replies must not wait
                 // for Nagle/delayed-ACK interaction on the outbound socket.
@@ -1306,9 +1339,15 @@ async fn dial(
             }
             Ok(Err(error)) => last_error = Some(error),
             Err(_) => {
-                return Err(TlsServerError::Timeout {
-                    stage: "destination dial",
-                });
+                last_error = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "destination connect attempt timed out",
+                ));
+                if last {
+                    return Err(TlsServerError::Timeout {
+                        stage: "destination dial",
+                    });
+                }
             }
         }
     }
@@ -1902,7 +1941,7 @@ fn is_peer_closed(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     struct UnexpectedEofReader;
 
@@ -2019,6 +2058,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fragmented_client_hello_authenticates_like_a_single_record() {
+        use base64::Engine as _;
+
+        const HELLO: &[u8] = include_bytes!("../../tests/fixtures/stock-client-hello.bin");
+        let body = &HELLO[TLS_RECORD_HEADER_LEN..];
+        let split = 100;
+        let mut first = Vec::new();
+        first.extend_from_slice(&HELLO[..3]);
+        first.extend_from_slice(&(split as u16).to_be_bytes());
+        first.extend_from_slice(&body[..split]);
+        let rest = &body[split..];
+        let mut second = Vec::new();
+        second.extend_from_slice(&HELLO[..3]);
+        second.extend_from_slice(&(rest.len() as u16).to_be_bytes());
+        second.extend_from_slice(rest);
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let write = async move {
+            writer.write_all(&first).await.expect("first record");
+            writer.write_all(&second).await.expect("second record");
+            writer.shutdown().await.expect("shutdown");
+        };
+        let read = async {
+            read_client_hello_record(&mut reader, &test_config())
+                .await
+                .expect("fragmented ClientHello read")
+        };
+        let (_, read) = tokio::join!(write, read);
+        let ClientHelloRead::Complete { record, .. } = read else {
+            panic!("fragmented ClientHello must be reassembled");
+        };
+
+        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode("YLxrYleugiQ4iDDvCtbKHw3SNGAlEHJO6PR-BN6ypH4")
+            .expect("test key");
+        let key: [u8; 32] = key.try_into().expect("32-byte test key");
+        let short_ids = vec!["0123456789abcdef".to_owned()];
+        let server_names = vec!["whatsapp.net".to_owned()];
+        let config = RealityAuthConfig {
+            private_key: &key,
+            short_ids: &short_ids,
+            server_names: &server_names,
+            min_client_version: [0, 0, 0],
+            max_client_version: [255, 255, 255],
+            max_time_diff: None,
+        };
+
+        let single = ClientHello::parse(HELLO).expect("single ClientHello");
+        let fragmented = ClientHello::parse(&record).expect("fragmented ClientHello");
+        let single_auth = authenticate(&single, &config).expect("single authentication");
+        let fragmented_auth =
+            authenticate(&fragmented, &config).expect("fragmented authentication");
+        assert_eq!(single_auth.session_id, fragmented_auth.session_id);
+        assert_eq!(single_auth.short_id, fragmented_auth.short_id);
+        assert_eq!(single_auth.timestamp, fragmented_auth.timestamp);
+        assert_eq!(&single_auth.auth_key[..], &fragmented_auth.auth_key[..]);
+    }
+
+    #[tokio::test]
     async fn dial_limits_target_mss_and_connects() {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2040,6 +2138,48 @@ mod tests {
         assert!(
             mss <= TARGET_MSS,
             "target MSS {mss} exceeded the configured {TARGET_MSS}"
+        );
+        server.await.expect("server task");
+    }
+
+    #[test]
+    fn dial_gives_a_nonfinal_address_only_a_bounded_attempt() {
+        assert_eq!(
+            dial_attempt_timeout(Duration::from_secs(5), false),
+            DIAL_ATTEMPT_TIMEOUT
+        );
+        assert_eq!(
+            dial_attempt_timeout(Duration::from_secs(1), false),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            dial_attempt_timeout(Duration::from_secs(5), true),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_fails_over_to_the_next_address() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        // Port 1 is normally refused immediately; the second address must
+        // still be attempted.
+        let addresses = [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 1)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        ];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let stream = dial_addresses(&addresses, deadline)
+            .await
+            .expect("second address must be attempted");
+        assert_eq!(
+            stream.peer_addr().expect("peer address").ip(),
+            IpAddr::from(Ipv4Addr::LOCALHOST)
         );
         server.await.expect("server task");
     }
@@ -2077,12 +2217,14 @@ mod tests {
     fn replay_cache_rejects_duplicates_and_stays_bounded() {
         let mut cache = ReplayCache::new(Duration::from_secs(60));
         let id = [7u8; 32];
-        assert!(!cache.seen_before(id));
-        assert!(cache.seen_before(id));
+        assert!(!cache.contains(id));
+        assert!(!cache.contains(id));
+        cache.insert(id);
+        assert!(cache.contains(id));
         for index in 0..REPLAY_CACHE_CAPACITY + 32 {
             let mut next = [0u8; 32];
             next[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            let _ = cache.seen_before(next);
+            cache.insert(next);
         }
         assert!(cache.entries.len() <= REPLAY_CACHE_CAPACITY);
         assert!(cache.order.len() <= REPLAY_CACHE_CAPACITY);

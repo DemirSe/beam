@@ -191,12 +191,16 @@ where
     // shutdown budget by the session limit.
     let active = lock_table(&table).drain_active();
     for entry in &active {
-        metrics.record_xudp_closed_mux();
+        // A reply task may have claimed the close just before the drain. Only
+        // the first close owner records a reason, so admitted/closed counters
+        // reconcile instead of double-counting that race.
+        if entry.session.mark_closed() {
+            metrics.record_xudp_closed_mux();
+        }
         // A spawned reply task may not have been polled yet. Marking the
         // session closed makes its initial check fail even if the watch
         // notification is missed; `send_replace` also stores the stop value
         // when no receiver has subscribed.
-        entry.session.mark_closed();
         entry.session.stop();
     }
     let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
@@ -329,11 +333,6 @@ where
                     debug_assert!(used > 0);
                     consumed += used;
                     debug_assert!(consumed <= buffer.len());
-                    empty_since = if state.has_sessions() {
-                        None
-                    } else {
-                        Some(Instant::now())
-                    };
                 }
                 Ok(None) => break,
                 Err(error) => return Err(MuxError::Frame(error)),
@@ -343,6 +342,14 @@ where
         // Compact before the bounds check and the read arm below. Those paths
         // must observe only bytes that are still part of an incomplete frame.
         if consumed > 0 {
+            // One table check per read batch is equivalent to the old
+            // per-frame check for the empty-stream timer: the timer only
+            // needs to know whether the batch left any session behind.
+            empty_since = if state.has_sessions() {
+                None
+            } else {
+                Some(Instant::now())
+            };
             buffer.drain(..consumed);
         }
 
@@ -727,7 +734,6 @@ impl MuxState {
         self.limiter.metrics().record_xudp_end();
         let taken = { lock_table(&self.table).take(id) };
         if let Some(active) = taken {
-            self.limiter.metrics().record_xudp_closed_end();
             self.close_active(active, CloseReason::ClientEnd).await
         } else {
             Ok(())
@@ -814,9 +820,18 @@ impl MuxState {
         match reason {
             CloseReason::Idle => self.limiter.metrics().record_xudp_closed_idle(),
             CloseReason::RelayError => self.limiter.metrics().record_xudp_closed_error(),
-            CloseReason::ClientEnd => {}
+            CloseReason::ClientEnd => self.limiter.metrics().record_xudp_closed_end(),
         }
-        self.send_end(session.id, error).await?;
+        if reason == CloseReason::Idle {
+            // A sweep can expire many sessions at once. Waiting up to
+            // END_ENQUEUE_TIMEOUT for each idle End would block the mux read
+            // loop for seconds when the peer is not reading. Idle End is
+            // best-effort: the client learns the flow is gone on its next
+            // Keep, while a full queue already signals pressure.
+            self.try_send_end(session.id, error);
+        } else {
+            self.send_end(session.id, error).await?;
+        }
 
         let permit = session.take_permit();
         if reason.retains_socket()
@@ -879,6 +894,29 @@ impl MuxState {
                 );
                 Ok(())
             }
+        }
+    }
+
+    /// Queues one `End` if capacity is immediately available.
+    ///
+    /// Used by idle sweeps so one slow reader cannot multiply the bounded
+    /// enqueue delay by the number of expired sessions.
+    fn try_send_end(&self, id: u16, error: bool) {
+        let frame = encode_end_frame(id, error);
+        if frame.is_empty() {
+            self.limiter.metrics().record_xudp_end_dropped();
+            return;
+        }
+        if self
+            .outbound
+            .try_send(QueuedFrame::new(frame, None))
+            .is_err()
+        {
+            self.limiter.metrics().record_xudp_end_dropped();
+            tracing::debug!(
+                session_id = id,
+                "XUDP idle End frame dropped because the write queue is full"
+            );
         }
     }
 
@@ -1510,6 +1548,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn burst_of_short_muxes_releases_every_global_permit() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let limiter = XudpSessionLimiter::new(64);
+
+        for _ in 0..16 {
+            let (mut client, task) = start_mux_with_limiter(test_config(), limiter.clone());
+            let mut buffer = Vec::new();
+            write_frame(&mut client, new_spec(1, &destination, b"q", None)).await;
+            let reply = read_frame(&mut client, &mut buffer)
+                .await
+                .expect("short mux must echo");
+            assert_eq!(reply.payload, b"q");
+            // No End frame: teardown must release the session and its permit.
+            finish(client, task).await;
+        }
+
+        let stats = limiter.stats();
+        assert_eq!(
+            (stats.used, stats.active, stats.retained, stats.unattributed),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(stats.available, 64);
+        let metrics = limiter.metrics().snapshot();
+        assert_eq!(metrics.xudp_admitted_fresh, 16);
+        assert_eq!(metrics.xudp_closed_mux, 16);
+        assert_eq!(metrics.xudp_rejected_global, 0);
+    }
+
+    #[tokio::test]
     async fn one_stream_cannot_take_all_global_sessions() {
         let echo = spawn_ipv4_echo().await;
         let destination = net_location(echo.address);
@@ -1554,7 +1622,8 @@ mod tests {
             io_timeout: Duration::from_secs(2),
             ..XudpConfig::default()
         });
-        let (mut client, task) = start_mux(config);
+        let limiter = XudpSessionLimiter::new(4);
+        let (mut client, task) = start_mux_with_limiter(config, limiter.clone());
         let mut buffer = Vec::new();
         let global_id = Some([0x55; GLOBAL_ID_LEN]);
 
@@ -1575,6 +1644,11 @@ mod tests {
             .expect("new session must echo");
         assert_eq!(reply.session_id, 2);
         assert_eq!(reply.payload, b"second");
+        assert_eq!(
+            limiter.metrics().snapshot().xudp_closed_end,
+            1,
+            "migration must count the replaced client session"
+        );
 
         write_frame(&mut client, keep_spec(1, None, b"stale")).await;
         let stale_end = read_frame(&mut client, &mut buffer)
@@ -1594,6 +1668,7 @@ mod tests {
         let _ = read_frame(&mut client, &mut buffer)
             .await
             .expect("End must be acknowledged");
+        assert_eq!(limiter.metrics().snapshot().xudp_closed_end, 2);
         finish(client, task).await;
     }
 
@@ -1692,6 +1767,68 @@ mod tests {
 
         finish(first, first_task).await;
         finish(second, second_task).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_with_a_full_queue_does_not_stall_the_mux() {
+        let config = Arc::new(XudpConfig {
+            max_sessions: 16,
+            session_idle_timeout: Duration::from_millis(30),
+            close_expiry: Duration::from_secs(1),
+            max_queued_replies: 1,
+            io_timeout: Duration::from_millis(200),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::new(16);
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let (outbound, _inbound) = mpsc::channel(1);
+        let state = MuxState {
+            config: Arc::clone(&config),
+            table: Arc::clone(&table),
+            outbound: outbound.clone(),
+            limiter: limiter.clone(),
+        };
+        outbound
+            .try_send(QueuedFrame::new(vec![0], None))
+            .expect("fill the only queue slot");
+
+        for id in 0..10 {
+            insert_test_session(&state, id).await;
+        }
+        sleep(Duration::from_millis(60)).await;
+
+        let started = Instant::now();
+        state.sweep().await.expect("full queue must not fail sweep");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "ten idle closes must not each wait for the End deadline"
+        );
+        assert_eq!(
+            table.lock().expect("test session table").total(),
+            0,
+            "sweep must remove every expired session"
+        );
+        assert_eq!(
+            limiter.metrics().snapshot().xudp_end_dropped,
+            10,
+            "each idle End should be dropped and counted"
+        );
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                let Some(first) = limiter.try_acquire() else {
+                    sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                if let Some(second) = limiter.try_acquire() {
+                    drop((first, second));
+                    break;
+                }
+                drop(first);
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sweep leaked global session permits");
     }
 
     #[tokio::test]
@@ -1976,7 +2113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_stops_remaining_sessions_when_writer_is_closed() {
+    async fn sweep_releases_sessions_when_writer_is_closed() {
         let config = Arc::new(XudpConfig {
             max_sessions: 2,
             session_idle_timeout: Duration::from_millis(30),
@@ -2000,15 +2137,22 @@ mod tests {
         insert_test_session(&state, 22).await;
         sleep(Duration::from_millis(60)).await;
 
-        let result = state.sweep().await;
-        assert!(
-            matches!(result, Err(MuxError::WriterClosed)),
-            "sweep must report the closed writer: {result:?}"
-        );
+        // Idle End is best-effort: a closed writer must not turn a sweep into
+        // a fatal read-loop error, because the session is already being
+        // removed and its permits must still be released.
+        state
+            .sweep()
+            .await
+            .expect("a closed writer must not fail the idle sweep");
         assert_eq!(
             table.lock().expect("test session table").total(),
             0,
             "sweep must remove every expired session"
+        );
+        assert_eq!(
+            limiter.metrics().snapshot().xudp_end_dropped,
+            2,
+            "both idle End frames should be counted as dropped"
         );
 
         timeout(TEST_TIMEOUT, async {

@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,9 +20,11 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, sleep};
 
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BEAM_GIT_HASH"), ")");
+
 /// High-performance VLESS + REALITY + Vision server.
 #[derive(Debug, Parser)]
-#[command(name = "beam", version, about)]
+#[command(name = "beam", version = VERSION, about)]
 struct Cli {
     /// Path to the TOML configuration file.
     #[arg(short, long, default_value = "/etc/beam/config.toml")]
@@ -63,8 +66,14 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         .with_context(|| format!("failed to load `{}`", cli.config.display()))?;
 
     init_logging(config.log.level);
+    warn_if_config_permissions_are_loose(&cli.config);
 
     if cli.check {
+        // `validate_limits` covers syntax and scalar bounds; constructing the
+        // same runtime configuration catches derived failures (XUDP/legacy
+        // limits, TLS material) before systemd's ExecStartPre says OK and the
+        // real start crash-loops. This performs no bind or network I/O.
+        build_tls_config(&config)?;
         println!("configuration is valid: {}", cli.config.display());
         return Ok(());
     }
@@ -78,6 +87,13 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         .limits
         .max_preauth_per_ip
         .min(max_pending_handshakes as u32);
+    if config.limits.max_preauth_per_ip != max_preauth_per_ip {
+        tracing::warn!(
+            configured = config.limits.max_preauth_per_ip,
+            effective = max_preauth_per_ip,
+            "max_preauth_per_ip clamped to the pre-auth slot count"
+        );
+    }
     let authenticated = Arc::new(Semaphore::new(max_connections));
     let preauth = Arc::new(IpLimiter::new(max_pending_handshakes, max_preauth_per_ip));
     // Leave room in the blocking pool for cover relays, DNS resolution, and
@@ -100,6 +116,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     let xudp_limiter = tls_config.xudp_limiter();
 
     tracing::info!(
+        version = VERSION,
         listen = %config.server.listen,
         max_connections,
         max_pending_handshakes,
@@ -122,6 +139,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         let mut last_authenticated_active =
             max_connections.saturating_sub(authenticated_gauge.available_permits());
         let mut last_xudp = xudp_limiter.stats();
+        let mut last_pressure = pressure_counters(&last);
         loop {
             ticker.tick().await;
             let current = metrics_task.snapshot();
@@ -130,6 +148,26 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
             let authenticated_active =
                 max_connections.saturating_sub(authenticated_gauge.available_permits());
             let xudp = xudp_limiter.stats();
+            let pressure = pressure_counters(&current);
+            if pressure != last_pressure {
+                // Keep a visible trace at the production `warn` level. The
+                // full counter line is info-only, so without this a DNS burst
+                // could reject traffic without any journal entry an operator
+                // sees by default.
+                tracing::warn!(
+                    preauth_rejected = pressure.0.saturating_sub(last_pressure.0),
+                    cover_limited = pressure.1.saturating_sub(last_pressure.1),
+                    connection_limited = pressure.2.saturating_sub(last_pressure.2),
+                    xudp_rejected_per_stream = pressure.3.saturating_sub(last_pressure.3),
+                    xudp_rejected_global = pressure.4.saturating_sub(last_pressure.4),
+                    xudp_end_dropped = pressure.5.saturating_sub(last_pressure.5),
+                    xudp_high_water = xudp.high_water,
+                    preauth_active,
+                    authenticated_active,
+                    "runtime pressure counters increased"
+                );
+                last_pressure = pressure;
+            }
             if current != last
                 || preauth_active != last_preauth_active
                 || authenticated_active != last_authenticated_active
@@ -281,6 +319,42 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Warns when the secrets-bearing config is readable by unrelated users or
+/// writable by a non-owner group. Production uses root:beam 0640.
+fn warn_if_config_permissions_are_loose(path: &std::path::Path) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o007 != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format!("{mode:03o}"),
+            "config file is readable by other users; use root:beam 0640"
+        );
+    } else if mode & 0o020 != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format!("{mode:03o}"),
+            "config file is group-writable; use root:beam 0640"
+        );
+    }
+}
+
+/// Counters that indicate dropped or rejected traffic, in log order.
+fn pressure_counters(
+    snapshot: &beam_core::metrics::MetricsSnapshot,
+) -> (u64, u64, u64, u64, u64, u64) {
+    (
+        snapshot.preauth_rejected,
+        snapshot.cover_limited,
+        snapshot.connection_limited,
+        snapshot.xudp_rejected_per_stream,
+        snapshot.xudp_rejected_global,
+        snapshot.xudp_end_dropped,
+    )
+}
+
 fn bind_listener(address: SocketAddr, backlog: u32) -> anyhow::Result<TcpListener> {
     let socket = match address {
         SocketAddr::V4(_) => TcpSocket::new_v4(),
@@ -375,13 +449,21 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
 
 fn init_logging(level: LogLevel) {
     let env_override = std::env::var_os("RUST_LOG").is_some();
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level.as_str()));
+    let (filter, env_error) = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(filter) => (filter, None),
+        Err(error) if env_override => (
+            tracing_subscriber::EnvFilter::new(level.as_str()),
+            Some(error),
+        ),
+        Err(_) => (tracing_subscriber::EnvFilter::new(level.as_str()), None),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
         .init();
-    if env_override {
+    if let Some(error) = env_error {
+        tracing::warn!(%error, "invalid RUST_LOG; using the configured log level");
+    } else if env_override {
         tracing::warn!("RUST_LOG is set and overrides the configured log level");
     }
     if matches!(level, LogLevel::Debug | LogLevel::Trace) {

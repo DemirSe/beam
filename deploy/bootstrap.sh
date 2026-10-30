@@ -111,22 +111,38 @@ runuser -u beam -- "$INSTALL_BIN" --check -c "$INSTALL_CONFIG"
 
 systemctl daemon-reload
 systemctl enable beam
+# A previous crash-loop can leave the unit failed even after the root cause is
+# fixed. Reset that state so this rollout can start normally.
+systemctl reset-failed beam 2>/dev/null || true
 # Always restart: an already-running process keeps the old binary, config, and
 # unit properties until it is replaced.
 systemctl restart beam
-sleep 2
-systemctl is-active --quiet beam || {
+
+# Poll for beam's own listener instead of trusting a fixed sleep or any process
+# that happens to hold :443. A slow start gets up to 15 s.
+ready=0
+for _ in $(seq 1 15); do
+  if systemctl is-active --quiet beam &&
+     ss -ltnp "sport = :443" 2>/dev/null | grep -q 'beam'; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+if [ "$ready" != 1 ]; then
+  echo "bootstrap: beam did not become active and listening on 443" >&2
   systemctl status --no-pager -l beam || true
   journalctl -u beam -n 50 --no-pager || true
   exit 1
-}
+fi
 
-ss -ltn | grep -q ':443 ' || {
-  echo "bootstrap: beam is active but not listening on 443" >&2
-  systemctl status --no-pager -l beam || true
-  journalctl -u beam -n 50 --no-pager || true
-  exit 1
-}
+# Keep the five most recent backups of each installed file; a long-lived host
+# should not fill its disk with one binary per deploy.
+for base in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK"; do
+  find "$(dirname "$base")" -maxdepth 1 -type f \
+    -name "$(basename "$base").bak-*" -printf '%T@ %p\n' 2>/dev/null |
+    sort -rn | tail -n +6 | cut -d' ' -f2- | xargs -r rm -f
+done
 
-echo "bootstrap: beam is active on 443"
+echo "bootstrap: beam is active on 443 ($("$INSTALL_BIN" --version))"
 systemctl status --no-pager -l beam | sed -n '1,12p'

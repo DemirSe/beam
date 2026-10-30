@@ -22,8 +22,8 @@ Related: `deploy/README.md`, `docs/10-cover-parity.md`,
 | Binary | `/usr/local/bin/beam`, root:root 0755 |
 | Config | `/etc/beam/config.toml`, root:beam 0640, contains secrets |
 | Unit / backups | `/etc/systemd/system/beam.service` 0644; `*.bak-<UTC stamp>` beside each installed file |
-| Hardening | Deployed 2026-10-24 10:05 UTC: binary `f33f07fe…` (pre-auth admission, cover fast fallback, Vision/XUDP fixes); global XUDP 256 + 60 s idle, cover 32, legacy UDP 64, `MemoryHigh=512M`/`MemoryMax=768M`/`MemorySwapMax=512M`; live config preserved; backups `20261024T100534Z` |
-| Earlier hardening | 2026-10-23 18:10 UTC binary `bd17ac26…`; backups `20261023T181052Z` |
+| Hardening | Deployed 2026-10-30 01:10 UTC: binary `cf8425fe…` (XUDP lifecycle/buffer; 1024 global sessions, 128 KiB receive buffer); config backup `20261030T011011Z`; previous hardening `9e26cb55…` |
+| Earlier hardening | 2026-10-29 18:20 UTC binary `9e26cb55…`; 2026-10-24 binary `f33f07fe…`; 2026-10-23 binary `bd17ac26…` |
 | Conntrack | `/etc/sysctl.d/99-beam-conntrack.conf`: max 65536, established 3600 s, TIME_WAIT 30 s |
 | Local client | sing-box, `/etc/sing-box/config.json` 0600, active but disabled at boot |
 | Client identity | `~/.config/beam/client-identity.json`, `client-link.txt` 0600 |
@@ -43,17 +43,20 @@ Old stock Xray is absent; only TCP/443 and SSH 22 are exposed. The unit sets
 
 ## 2. Daily checks
 ```bash
-bssh 'systemctl status --no-pager -l beam'
+bssh 'systemctl status --no-pager -l beam; systemctl is-failed beam; systemctl show beam -p NRestarts --value'
 bssh 'sudo -n ss -ltnp; sudo -n journalctl -u beam --since "24 hours ago" -p warning --no-pager'
 bssh 'pid=$(systemctl show beam -p MainPID --value); ps -o pid,rss,vsz,nlwp,etime,comm -p "$pid"; printf "fds="; sudo -n ls "/proc/$pid/fd" | wc -l'
-bssh 'df -h /; df -i /; free -m; swapon --show; uptime; systemctl show beam -p NRestarts --value'
-bssh 'sudo -n journalctl --disk-usage'
+bssh 'cat /sys/fs/cgroup/system.slice/beam.service/memory.current; cat /sys/fs/cgroup/system.slice/beam.service/memory.peak'
+bssh 'df -h /; df -i /; free -m; swapon --show; uptime; du -sh /usr/local/bin/beam.bak-* 2>/dev/null | tail -3'
+bssh 'sudo -n journalctl --disk-usage; ls /tmp/beam-deploy* 2>/dev/null || true'
 ```
 Expect `active (running)` and `enabled`; `ss` should show `beam` on
 `0.0.0.0:443` and `sshd` on 22, with no unexpected listeners. A healthy
 `warn`-level process is normally quiet. The only documented benign warning is
 `authenticated VLESS command is not implemented yet; closing command=Rvs` for
-the unsupported reverse command; treat anything else as actionable.
+the unsupported reverse command; treat anything else as actionable. A
+`runtime pressure counters increased` warning means traffic was rejected or a
+queue dropped something; inspect its deltas before changing limits.
 `ps` reports RSS/VSZ in KiB and `nlwp` as threads. Local churn baseline: RSS
 7.7 to 8.3 MiB, 2 threads, 10 fds; live idle RSS was about 17 MiB at the last
 audit. The same pass covers disk, inodes, swap, load, and restart count.
@@ -132,10 +135,12 @@ Package and upload:
 BUNDLE=$(bash deploy/package.sh | sed -n 's/^bundle=//p')
 test -f "$BUNDLE"
 scp -i "$SSH_KEY" "$BUNDLE" "$SERVER:/tmp/beam-deploy.tar.gz"
+bssh 'chmod 600 /tmp/beam-deploy.tar.gz'
 ```
 Deploy and load the new binary:
 ```bash
 bssh 'rm -rf /tmp/beam-deploy && mkdir -p /tmp/beam-deploy && tar -xzf /tmp/beam-deploy.tar.gz -C /tmp/beam-deploy && sudo -n bash /tmp/beam-deploy/bootstrap.sh'
+bssh 'rm -rf /tmp/beam-deploy /tmp/beam-deploy.tar.gz'
 ```
 `bootstrap.sh` stops/disables the old Xray units, creates `beam`, backs up and
 installs binary/config/unit, installs the UDP sysctl drop-in, validates the
@@ -147,10 +152,15 @@ example local `max_connections=64`/`log=warn` versus live 1024/`info`), update
 only the binary and unit and preserve `/etc/beam/config.toml`:
 ```bash
 bssh 'rm -rf /tmp/beam-deploy && mkdir -p /tmp/beam-deploy && tar -xzf /tmp/beam-deploy.tar.gz -C /tmp/beam-deploy && sudo -n env BEAM_KEEP_CONFIG=1 bash /tmp/beam-deploy/bootstrap.sh'
+bssh 'rm -rf /tmp/beam-deploy /tmp/beam-deploy.tar.gz'
 ```
 `BEAM_KEEP_CONFIG=1` skips the config install but still requires the live file,
-validates it with the new binary, installs the unit, restarts, and checks 443.
-The bundle's `beam.toml` is ignored in that mode.
+validates it with the new binary (including derived runtime limits), installs
+the unit, restarts, and polls beam's own 443 listener for up to 15 s. The
+bundle's `beam.toml` is ignored in that mode. Uploads are chmod 600 before
+extraction; remove the extracted directory and tarball after success.
+`deploy/package.sh` runs `beam --check` on the local secrets before creating a
+bundle; `bootstrap.sh` prunes each file's backups to the five newest.
 Health checks:
 ```bash
 bssh 'systemctl is-active beam; systemctl is-enabled beam; systemctl show beam -p NRestarts --value'
@@ -161,14 +171,15 @@ sha256sum target/release/beam; bssh 'sha256sum /usr/local/bin/beam'
 The two hashes must match. Then run the client checks in section 3.
 Rollback uses the timestamped backups:
 ```bash
-bssh 'ls -1t /usr/local/bin/beam.bak-* /etc/beam/config.toml.bak-* /etc/systemd/system/beam.service.bak-* /etc/sysctl.d/99-beam.conf.bak-*'
+bssh 'ls -1t /usr/local/bin/beam.bak-* /etc/beam/config.toml.bak-* /etc/systemd/system/beam.service.bak-* /etc/sysctl.d/99-beam.conf.bak-* /etc/sysctl.d/99-beam-conntrack.conf.bak-*'
 STAMP="<stamp>"
 bssh 'sudo -n systemctl stop beam'
 bssh "sudo -n install -m 0755 -o root -g root /usr/local/bin/beam.bak-$STAMP /usr/local/bin/beam"
 bssh "sudo -n install -m 0640 -o root -g beam /etc/beam/config.toml.bak-$STAMP /etc/beam/config.toml"
 bssh "sudo -n install -m 0644 -o root -g root /etc/systemd/system/beam.service.bak-$STAMP /etc/systemd/system/beam.service"
 bssh "sudo -n install -m 0644 -o root -g root /etc/sysctl.d/99-beam.conf.bak-$STAMP /etc/sysctl.d/99-beam.conf"
-bssh 'sudo -n sysctl --system >/dev/null; sudo -n systemctl daemon-reload && sudo -n systemctl start beam'
+bssh "sudo -n install -m 0644 -o root -g root /etc/sysctl.d/99-beam-conntrack.conf.bak-$STAMP /etc/sysctl.d/99-beam-conntrack.conf"
+bssh 'sudo -n runuser -u beam -- /usr/local/bin/beam --check -c /etc/beam/config.toml; sudo -n sysctl --system >/dev/null; sudo -n systemctl daemon-reload && sudo -n systemctl reset-failed beam || true; sudo -n systemctl start beam'
 ```
 Rollback is not atomic; stop first, install all four, then start. There is no
 automatic stock Xray fallback, so keep a known-good bundle or snapshot before cutover.
@@ -237,7 +248,7 @@ tune after a 24-hour soak.
 |---|---|---|---|
 | RSS | < 20 MiB idle | > 128 MiB or monotonic growth | > 256 MiB; restart, lower limits |
 | fds | ~10 idle | > 256 | > 512; check leaks, lower limits |
-| Threads | 27-43 idle | > 128 | > 160; lower `max_connections` |
+| Threads | 2 idle | > 128 | > 160; lower `max_connections` |
 | Swap | 0 used | any sustained use | > 128 MiB; restart, lower limits |
 | Disk | < 70% | > 80% | > 90%; vacuum journal, clean bundles |
 | Load | < 1 | > 2 | > 4; investigate before changing limits |
@@ -253,9 +264,10 @@ loop. Each Vision Direct relay can hold up to two blocking splice tasks and
 512 KiB pipes; a process-wide splice semaphore covers about 60 pairs and turns
 excess directions into the bounded async copy path, so the pool cannot queue a
 handoff forever. The XUDP reply queue is 512 frames and session sockets request
-a 1 MiB receive buffer. XUDP sessions expire after at most **60 s** of
-idleness (the TCP relay idle timeout remains 300 s), under the **process-wide
-256-session cap**; the **32 cover-relay cap** is separate. Check
+a 128 KiB receive buffer (`xudp_recv_buffer_bytes`), live overridable. XUDP
+sessions expire after at most **60 s** of idleness (the TCP relay idle timeout
+remains 300 s), under the **process-wide 1024-session cap**; the **32
+cover-relay cap** is separate. Check
 
 ```bash
 bssh 'systemctl show beam -p MemoryHigh -p MemoryMax -p MemorySwapMax'
@@ -273,8 +285,10 @@ Edit only `[limits]`; keep the file root:beam 0640. The example's 1024 default m
 
 `SIGTERM` closes the listener, drains for at most 2 s, then bounds blocking
 splices with a 3 s runtime shutdown. `SIGHUP` is logged and ignored; use
-`systemctl restart` to reload. Expect a restart to reset active streams, not to
-hang for the 90 s systemd default.
+`systemctl restart` to reload. The unit has no `ExecReload`. Expect a restart
+to reset active streams, not to hang for the 90 s systemd default. `beam --version` includes the build
+commit; startup logs `version` and `beam --check` validates both scalar limits
+and the derived XUDP/TLS configuration before systemd starts the service.
 
 ### Connection admission and relay capacity
 
@@ -297,8 +311,8 @@ bodies, with 162 threads. Do not raise the blocking pool blindly on the 1 GiB
 host; lower `max_connections` or move the relay to an epoll/io_uring design if
 bulk concurrency matters. The current normal load is tens of connections, where
 the pool is not saturated. XUDP sessions are capped by
-`limits.max_xudp_sessions` (**default 256**, process-wide) in addition to the
-per-stream limit, and expire after 60 s of idleness. Graceful shutdown drains
+`limits.max_xudp_sessions` (**default 256**, process-wide; live 1024) in
+addition to the per-stream limit, and expire after 60 s of idleness. Graceful shutdown drains
 for `limits.shutdown_drain_ms` (**default 2000**, max 3000). Admission counters
 (`preauth_rejected`, `cover_limited`, `connection_limited`, `accept_errors`)
 are logged every 60 seconds when they change.

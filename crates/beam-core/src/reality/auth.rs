@@ -69,6 +69,8 @@ pub struct Auth {
     pub timestamp: u32,
     /// Client short id from the envelope, zero-padded to 8 bytes.
     pub short_id: [u8; 8],
+    /// Encrypted 32-byte REALITY session id from the ClientHello.
+    pub session_id: [u8; 32],
 }
 
 impl fmt::Debug for Auth {
@@ -79,6 +81,7 @@ impl fmt::Debug for Auth {
             .field("client_version", &self.client_version)
             .field("timestamp", &self.timestamp)
             .field("short_id", &"<redacted>")
+            .field("session_id", &"<redacted>")
             .finish()
     }
 }
@@ -235,11 +238,15 @@ pub fn authenticate(
         return Err(AuthError::UnknownShortId);
     }
 
+    let mut session_id = [0u8; 32];
+    session_id.copy_from_slice(hello.session_id);
+
     Ok(Auth {
         auth_key,
         client_version,
         timestamp,
         short_id,
+        session_id,
     })
 }
 

@@ -47,6 +47,9 @@ impl IpLimiter {
         if self.max_per_ip == 0 {
             return Err(IpLimitReject::PerIp);
         }
+        // A dual-stack listener can report the same IPv4 source as either
+        // `1.2.3.4` or `::ffff:1.2.3.4`; both must share one per-IP bucket.
+        let ip = ip.to_canonical();
         let global = self
             .global
             .clone()
@@ -158,6 +161,22 @@ mod tests {
         );
         assert_eq!(limiter.available_permits(), 2);
         assert_eq!(limiter.tracked_ips(), 0);
+    }
+
+    #[test]
+    fn ipv4_mapped_and_plain_sources_share_one_bucket() {
+        let limiter = Arc::new(IpLimiter::new(4, 1));
+        let v4 = IpAddr::from([10, 0, 0, 1]);
+        let mapped: IpAddr = "::ffff:10.0.0.1".parse().expect("mapped address");
+        let permit = limiter.try_acquire(v4).expect("IPv4 permit");
+        assert_eq!(
+            limiter
+                .try_acquire(mapped)
+                .expect_err("mapped source must share the IPv4 bucket"),
+            IpLimitReject::PerIp
+        );
+        drop(permit);
+        assert!(limiter.try_acquire(mapped).is_ok());
     }
 
     #[test]

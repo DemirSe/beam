@@ -10,6 +10,8 @@ OUT="${BEAM_BUNDLE_OUT:-/tmp/opencode/beam-deploy-$(date -u +%Y%m%dT%H%M%SZ)}"
 [ -f "$SECRETS" ] || { echo "package: missing secrets file $SECRETS" >&2; exit 1; }
 source "$ROOT/scripts/dev-env.sh"
 cargo build --locked --manifest-path "$ROOT/Cargo.toml" --release -p beam
+# Validate the exact config that will be uploaded before touching the server.
+"$ROOT/target/release/beam" --check -c "$SECRETS"
 
 rm -rf "$OUT"
 install -d -m 0700 "$OUT"

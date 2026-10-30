@@ -123,6 +123,11 @@ installed by `bootstrap.sh`: a mistake there can lock out the host.
 - Binary: `/usr/local/bin/beam.bak-<stamp>`
 - Config: `/etc/beam/config.toml.bak-<stamp>`
 - Unit: `/etc/systemd/system/beam.service.bak-<stamp>`
+- Sysctl: `/etc/sysctl.d/99-beam.conf.bak-<stamp>`
+- Conntrack sysctl: `/etc/sysctl.d/99-beam-conntrack.conf.bak-<stamp>`
+- Remove `/tmp/beam-deploy*` after a successful rollout; it contains a private
+  key. Deploy uploads are chmod 600 before extraction, and bootstrap prunes
+  each backup set to the five newest.
 - To go back to stock Xray, keep the stock binary/config on the host before
   removing it, or reinstall it deliberately. `bootstrap.sh` disables the old
   services so they cannot race for 443.
