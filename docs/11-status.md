@@ -264,6 +264,19 @@ The live config was backed up to
 validation passed. `NRestarts=0`, backlog 1024, HTTPS IPv4/IPv6, cover
 certificate, and the local TUN path were verified.
 
+On 2026-10-30 02:26 UTC the daily-hardening binary was deployed with
+`BEAM_KEEP_CONFIG=1`: SHA-256
+`5107b5c6a4e85638836419d7ad5b8444ce52d46537811c4aad9f676a5e312738`
+(`beam --version` = `0.1.0 (e0843cc35145)`). It adds bounded idle-sweep End
+handling, failure-End/reuse protection, reconciled XUDP lifecycle counters,
+timer-free idle XUDP replies, address failover on dial timeout, post-Finished
+replay insertion, IPv4-mapped admission canonicalisation, full `--check`
+derived validation, and deploy/observability hardening. Live config remains
+cap 1024 / 128 KiB. `NRestarts=0`, backlog 1024, HTTPS IPv4/IPv6, cover
+certificate, and the local TUN path were verified. The lab passed 11/11,
+10k churn, DNS/HTTP/UDP/H3, and a 5-rep A/B against `cf8425fe` with no
+regression signal; workspace tests are **330**.
+
 ## In progress
 
 - A low-rate live observation ran for about four hours on 2026-10-24
@@ -358,7 +371,7 @@ bash bench/no-tun.sh
 
 The workspace currently has 292 `beam-core` unit tests, two TLS adapter
 integration tests, two stock-ClientHello fixture tests, and 26 `beam-sys` tests
-(323 total). The full-TUN harness passes all eight
+(330 total). The full-TUN harness passes all eight
 probes for XUDP, packetaddr, and legacy VLESS UDP. A 1.3 MiB HTTP/3 body also
 passes through the local `system`-stack TUN; the same large body fails with a
 gVisor TUN on both beam and stock Xray. The final-binary no-TUN server-capacity smoke is
