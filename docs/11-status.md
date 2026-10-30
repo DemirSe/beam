@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-10-29.
+Updated: 2026-10-30.
 
 ## Decisions
 
@@ -254,6 +254,15 @@ cap. Live config was preserved; `NRestarts=0`, backlog 1024, HTTPS IPv4/IPv6,
 cover certificate, and the local TUN path were verified. The 24 h soak,
 privileged syscall/wakeup gates, cgroup OOM sampling, and final-candidate fuzz
 remain open release-acceptance items.
+
+On 2026-10-30 01:10 UTC the XUDP lifecycle/buffer binary was deployed with
+`BEAM_KEEP_CONFIG=1`: SHA-256
+`cf8425fe228665eefedb2fa7c6317bd5d4e19d0feca323d365fb3fd7f297b5b5`.
+The live config was backed up to
+`/etc/beam/config.toml.bak-20261030T011011Z` and then updated to
+`max_xudp_sessions = 1024` and `xudp_recv_buffer_bytes = 131072`; config
+validation passed. `NRestarts=0`, backlog 1024, HTTPS IPv4/IPv6, cover
+certificate, and the local TUN path were verified.
 
 ## In progress
 
