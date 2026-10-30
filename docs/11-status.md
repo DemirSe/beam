@@ -291,6 +291,13 @@ drop counters in the warn-level pressure delta. Sol final review:
 IPv4/IPv6, cover certificate, and local TUN were verified. The 24 h soak,
 privileged gates, cgroup OOM sampling, and final fuzz remain open.
 
+At 2026-10-30 21:51 UTC the pushed HEAD `b4d9382` was rebuilt and deployed
+with `BEAM_KEEP_CONFIG=1`: SHA-256
+`a41facef1a3cfad79dfbddfaca1a2cbe1a2a6121216d3aed852fde71d39a6b49`
+(`0.1.0 (b4d93821950e)`). The code is identical to `1007354…`; this rebuild
+only refreshes the embedded commit identity. `NRestarts=0`, HTTPS4/6, cover,
+and TUN verified.
+
 ## In progress
 
 - A low-rate live observation ran for about four hours on 2026-10-24
