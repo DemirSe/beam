@@ -370,6 +370,9 @@ and TUN verified.
   diagnosis and the superseded host-route workaround.
 - `docs/23-target-mss-2026-10-27.md`: final target-socket `TCP_MAXSEG 1400`
   implementation, tests, lab A/B, and production verification.
+- `docs/25-daily-stress-findings-2026-10-31.md`: 2026-10-31 mixed soak,
+  impairment, adversarial checks, and the reproduced XUDP idle-pinning bug.
+  No code changes were made in that round.
 - `docs/16-local-comparison-2026-10-22.md`: detailed local stock-Xray vs beam
   capacity, full-TUN, compatibility, and cover comparison.
 - `bench/README.md`: benchmark and no-TUN smoke usage.
