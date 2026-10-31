@@ -29,10 +29,11 @@
 //!   reached, the oldest retained socket is evicted before an active session.
 //! - **One socket family per session.** A `Keep` whose destination has another
 //!   family is dropped; a session does not silently gain a second socket.
-//! - **Domains are resolved per frame.** A `Keep` that carries a domain is
-//!   looked up again; stock Xray caches a domain's address per outbound. The
-//!   wire behavior is the same, but a per-session cache is a future
-//!   optimization. All lookups are bounded by [`XudpConfig::io_timeout`].
+//! - **Domains are resolved off the mux read loop.** A bounded per-mux
+//!   resolver queues the owning frame and its suffix by session id, caches
+//!   resolved domains for a short TTL, and drains the suffix in order. IP
+//!   frames continue immediately. All lookups are bounded by
+//!   [`XudpConfig::io_timeout`]; the resolver task is aborted on mux teardown.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -92,6 +93,13 @@ pub const MAX_UDP_RECV_BUFFER: usize = 4 * 1024 * 1024;
 /// gigabyte of 8 KiB frames. This budget bounds the aggregate Rust-side queue
 /// while still leaving room for large HTTP/3 bursts on a single stream.
 pub const DEFAULT_REPLY_QUEUE_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Process-wide budget for frames queued while a domain is resolving.
+///
+/// Pending payloads are request data, not reply bytes, so they use a separate
+/// smaller budget. This prevents many muxes from each filling their per-mux
+/// pending queue with large datagrams.
+pub const DEFAULT_RESOLUTION_QUEUE_BUDGET: usize = 4 * 1024 * 1024;
 
 /// Default timeout for one socket send, receive, or stream write.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -230,6 +238,8 @@ pub struct XudpSessionLimiter {
     retained_tables: Arc<Mutex<Vec<Weak<Mutex<SessionTable>>>>>,
     /// Process-wide byte budget for reply frames waiting on stream writers.
     reply_budget: Arc<Semaphore>,
+    /// Process-wide byte budget for frames waiting on domain resolution.
+    resolution_budget: Arc<Semaphore>,
     /// Process-wide counters for XUDP decisions.
     metrics: Arc<Metrics>,
     /// Highest number of global permits observed in use.
@@ -282,6 +292,7 @@ impl XudpSessionLimiter {
             permits: Arc::new(Semaphore::new(max)),
             retained_tables: Arc::new(Mutex::new(Vec::new())),
             reply_budget: Arc::new(Semaphore::new(DEFAULT_REPLY_QUEUE_BUDGET)),
+            resolution_budget: Arc::new(Semaphore::new(DEFAULT_RESOLUTION_QUEUE_BUDGET)),
             metrics: Arc::new(Metrics::default()),
             high_water: Arc::new(AtomicUsize::new(0)),
             live_handlers: Arc::new(AtomicUsize::new(0)),
@@ -412,6 +423,17 @@ impl XudpSessionLimiter {
     #[must_use]
     pub const fn reply_budget_bytes(&self) -> usize {
         DEFAULT_REPLY_QUEUE_BUDGET
+    }
+
+    /// Reserves aggregate bytes for one frame queued behind a DNS lookup.
+    pub(crate) fn try_reserve_resolution(
+        &self,
+        bytes: usize,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes).ok()?;
+        Arc::clone(&self.resolution_budget)
+            .try_acquire_many_owned(bytes)
+            .ok()
     }
 
     /// Evicts the globally oldest retained socket from any registered stream.
@@ -554,6 +576,19 @@ pub(crate) async fn resolve_destination(
             Ok(resolved)
         }
         Address::Domain(domain) => {
+            #[cfg(test)]
+            if domain == "slow.test" {
+                // Deterministic slow-failure fixture for the mux HOL tests.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                return Err(ResolveError::Timeout);
+            }
+            #[cfg(test)]
+            if domain == "slow-ok.test" {
+                // Deterministic slow successful resolution for GlobalID
+                // supersession tests.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                return Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, destination.port)));
+            }
             let addresses = timeout(
                 resolve_timeout,
                 tokio::net::lookup_host((domain.as_str(), destination.port)),
@@ -613,6 +648,9 @@ pub(crate) struct Session {
     pub(crate) family: SocketFamily,
     destination: Mutex<SocketAddr>,
     last_activity: Mutex<Instant>,
+    /// Serializes reply admission with close so an old reply cannot be queued
+    /// after its End.
+    enqueue_gate: Mutex<()>,
     stop: watch::Sender<bool>,
     closed: AtomicBool,
     failed: AtomicBool,
@@ -638,6 +676,7 @@ impl Session {
             family,
             destination: Mutex::new(destination),
             last_activity: Mutex::new(Instant::now()),
+            enqueue_gate: Mutex::new(()),
             stop,
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -653,6 +692,11 @@ impl Session {
     /// Marks request or reply activity.
     pub(crate) fn touch(&self) {
         *lock(&self.last_activity) = Instant::now();
+    }
+
+    /// Serializes a reply enqueue with session close.
+    pub(crate) fn enqueue_guard(&self) -> MutexGuard<'_, ()> {
+        lock(&self.enqueue_gate)
     }
 
     /// Returns how long the session has been idle at `now`.
@@ -1037,6 +1081,10 @@ async fn reply_loop(
                         // counts as session activity. Zero-length, oversize,
                         // queue-pressure, and encoding drops must not keep an
                         // otherwise idle session (and its global permit) alive.
+                        let _gate = session.enqueue_guard();
+                        if session.is_closed() {
+                            break;
+                        }
                         permit.send(QueuedFrame::new(frame, Some(budget)));
                         session.touch();
                     }
@@ -1157,10 +1205,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_GLOBAL_SESSIONS, ExpiringSession, ResolveError, Session, SessionTable,
-        SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
-        queue_failed_session_end, reply_frame_len, reply_loop, resolve_destination,
-        socket_addr_to_location,
+        DEFAULT_MAX_GLOBAL_SESSIONS, DEFAULT_RESOLUTION_QUEUE_BUDGET, ExpiringSession,
+        ResolveError, Session, SessionTable, SocketFamily, XudpConfig, XudpConfigError,
+        XudpSessionLimiter, encode_end_frame, queue_failed_session_end, reply_frame_len,
+        reply_loop, resolve_destination, socket_addr_to_location,
     };
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{
@@ -1418,6 +1466,20 @@ mod tests {
         }
 
         assert!(reply_frame_len(SocketAddr::from(([127, 0, 0, 1], 1)), usize::MAX).is_none());
+    }
+
+    #[test]
+    fn resolution_queue_budget_is_process_wide() {
+        let limiter = XudpSessionLimiter::new(1);
+        let permit = limiter
+            .try_reserve_resolution(DEFAULT_RESOLUTION_QUEUE_BUDGET)
+            .expect("the whole resolution budget must be reservable");
+        assert!(
+            limiter.try_reserve_resolution(1).is_none(),
+            "the resolution budget must reject one more byte"
+        );
+        drop(permit);
+        assert!(limiter.try_reserve_resolution(1).is_some());
     }
 
     #[test]

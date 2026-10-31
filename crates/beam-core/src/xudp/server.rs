@@ -16,7 +16,9 @@
 //! The TLS adapter calls [`handle_mux_stream`] for an authenticated VLESS
 //! `Command::Mux`, after writing the VLESS response header.
 
+use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -27,13 +29,14 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 
 use super::session::{
-    ActiveSession, END_ENQUEUE_TIMEOUT, ExpiringSession, QueuedFrame, Session, SessionTable,
-    SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
-    resolve_destination, spawn_reply_task,
+    ActiveSession, END_ENQUEUE_TIMEOUT, ExpiringSession, QueuedFrame, ResolveError, Session,
+    SessionTable, SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
+    resolve_destination, socket_addr_to_location, spawn_reply_task,
 };
+use crate::address::{Address, NetLocation};
 use crate::xudp::frame::{
-    self, Frame, GLOBAL_ID_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN, METADATA_PREFIX_LEN,
-    SessionStatus, TargetNetwork, XudpError,
+    self, Frame, FrameOption, GLOBAL_ID_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN,
+    METADATA_PREFIX_LEN, SessionStatus, TargetNetwork, XudpError,
 };
 
 /// Largest valid frame: metadata prefix, metadata, payload prefix, payload.
@@ -47,11 +50,11 @@ const READ_CHUNK_LEN: usize = 8192;
 /// Hard bound for the reassembly buffer: one full frame plus one read.
 const MAX_BUFFERED_LEN: usize = MAX_FRAME_LEN + READ_CHUNK_LEN;
 
-/// Upper bound on one domain resolution inside the mux read loop.
+/// Upper bound on one domain resolution in the per-mux resolver task.
 ///
-/// The read loop is shared by every flow on the mux. The generic I/O timeout
-/// is 10 s in production, which is long enough for one slow resolver to stall
-/// DNS and QUIC frames for unrelated sessions.
+/// Domain lookups no longer run on the shared read loop. The resolver still
+/// handles one lookup at a time per mux, so this bound limits that queue's
+/// progress without stalling unrelated IP sessions.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Upper bound on mux read inactivity.
@@ -64,6 +67,387 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Bound on waiting for tasks to stop during stream shutdown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Bound on a send that could not be completed immediately.
+const SEND_WAIT: Duration = Duration::from_millis(100);
+
+/// Bound on stopping a reply task before close queues its End.
+const CLOSE_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Bound on concurrently pending DNS resolutions per mux stream.
+const MAX_PENDING_RESOLUTIONS: usize = 64;
+
+/// Bound on queued frames for one destination still being resolved.
+const MAX_PENDING_FRAMES: usize = 64;
+
+/// Bound on the per-mux resolved-destination cache.
+const MAX_RESOLUTION_CACHE: usize = 256;
+
+/// How long a resolved domain can be reused by one mux stream.
+const RESOLUTION_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Owned form of a parsed frame, used only while a domain is resolving.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnedFrame {
+    session_id: u16,
+    status: SessionStatus,
+    option: FrameOption,
+    network: Option<TargetNetwork>,
+    destination: Option<NetLocation>,
+    global_id: Option<[u8; GLOBAL_ID_LEN]>,
+    payload: Vec<u8>,
+}
+
+impl OwnedFrame {
+    fn from_borrowed(frame: &Frame<'_>) -> Self {
+        Self {
+            session_id: frame.session_id,
+            status: frame.status,
+            option: frame.option,
+            network: frame.network,
+            destination: frame.destination.clone(),
+            global_id: frame.global_id,
+            payload: frame.payload.to_vec(),
+        }
+    }
+
+    fn as_borrowed(&self) -> Frame<'_> {
+        Frame {
+            session_id: self.session_id,
+            status: self.status,
+            option: self.option,
+            network: self.network,
+            destination: self.destination.clone(),
+            global_id: self.global_id,
+            payload: &self.payload,
+        }
+    }
+
+    fn rewrite_destination(&mut self, address: SocketAddr) {
+        // Preserve the original network. A TCP New with a domain must still
+        // reach handle_new's network check and be rejected, not silently
+        // become a UDP flow.
+        self.destination = Some(socket_addr_to_location(address));
+    }
+}
+
+struct ResolutionRequest {
+    id: u16,
+    generation: u64,
+    destination: NetLocation,
+    family: Option<SocketFamily>,
+}
+
+struct ResolutionResult {
+    id: u16,
+    generation: u64,
+    destination: NetLocation,
+    result: Result<SocketAddr, ResolveError>,
+}
+
+struct PendingFrame {
+    frame: OwnedFrame,
+    _budget: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl PendingFrame {
+    fn new(frame: OwnedFrame, limiter: &XudpSessionLimiter) -> Option<Self> {
+        let budget = limiter.try_reserve_resolution(frame.payload.len())?;
+        Some(Self {
+            frame,
+            _budget: budget,
+        })
+    }
+}
+
+struct PendingResolution {
+    /// The frame whose destination owns this lookup. It is kept separate so
+    /// cancellation can invalidate the lookup without changing queue order.
+    owner: Option<PendingFrame>,
+    frames: VecDeque<PendingFrame>,
+    generation: u64,
+}
+
+/// Moves domain lookups off the shared mux read loop.
+///
+/// IP destinations never enter this state. Domain frames are queued in arrival
+/// order per session id, while the resolver task performs the bounded lookup.
+/// Once the result arrives the read loop rewrites those frames to the resolved
+/// IP and dispatches them normally. Unrelated IP sessions continue immediately.
+struct ResolutionState {
+    cache: HashMap<(String, u16), (SocketAddr, Instant)>,
+    pending: HashMap<u16, PendingResolution>,
+    requests: mpsc::Sender<ResolutionRequest>,
+    results: mpsc::Receiver<ResolutionResult>,
+    task: tokio::task::JoinHandle<()>,
+    limiter: XudpSessionLimiter,
+    next_generation: u64,
+}
+
+impl ResolutionState {
+    fn new(limiter: XudpSessionLimiter) -> Self {
+        let (requests, mut request_rx) =
+            mpsc::channel::<ResolutionRequest>(MAX_PENDING_RESOLUTIONS);
+        let (result_tx, results) = mpsc::channel(MAX_PENDING_RESOLUTIONS);
+        let task = tokio::spawn(async move {
+            while let Some(request) = request_rx.recv().await {
+                let result =
+                    resolve_destination(&request.destination, request.family, RESOLVE_TIMEOUT)
+                        .await;
+                if result_tx
+                    .send(ResolutionResult {
+                        id: request.id,
+                        generation: request.generation,
+                        destination: request.destination,
+                        result,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            cache: HashMap::new(),
+            pending: HashMap::new(),
+            requests,
+            results,
+            task,
+            limiter,
+            next_generation: 0,
+        }
+    }
+
+    fn cache_key(destination: &NetLocation) -> Option<(String, u16)> {
+        match &destination.address {
+            Address::Domain(domain) => Some((domain.clone(), destination.port)),
+            Address::Ipv4(_) | Address::Ipv6(_) => None,
+        }
+    }
+
+    fn cache_get(
+        &mut self,
+        destination: &NetLocation,
+        family: Option<SocketFamily>,
+    ) -> Option<SocketAddr> {
+        let key = Self::cache_key(destination)?;
+        let (address, inserted) = self.cache.get(&key)?;
+        if inserted.elapsed() > RESOLUTION_CACHE_TTL {
+            self.cache.remove(&key);
+            return None;
+        }
+        if family.is_some_and(|family| !family.matches(*address)) {
+            return None;
+        }
+        Some(*address)
+    }
+
+    fn cache_insert(&mut self, destination: &NetLocation, address: SocketAddr) {
+        let Some(key) = Self::cache_key(destination) else {
+            return;
+        };
+        if self.cache.len() >= MAX_RESOLUTION_CACHE {
+            self.cache.clear();
+        }
+        self.cache.insert(key, (address, Instant::now()));
+    }
+
+    fn has_pending(&self, id: u16) -> bool {
+        self.pending.contains_key(&id)
+    }
+
+    fn push_frame(&mut self, id: u16, frame: OwnedFrame) -> bool {
+        let Some(frame) = PendingFrame::new(frame, &self.limiter) else {
+            return false;
+        };
+        let Some(pending) = self.pending.get_mut(&id) else {
+            return false;
+        };
+        if pending.frames.len() >= MAX_PENDING_FRAMES {
+            return false;
+        }
+        pending.frames.push_back(frame);
+        true
+    }
+
+    fn start(
+        &mut self,
+        id: u16,
+        destination: NetLocation,
+        family: Option<SocketFamily>,
+        frames: VecDeque<PendingFrame>,
+    ) -> bool {
+        if self.pending.len() >= MAX_PENDING_RESOLUTIONS || frames.is_empty() {
+            return false;
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        if self
+            .requests
+            .try_send(ResolutionRequest {
+                id,
+                generation,
+                destination,
+                family,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let mut frames = frames;
+        let Some(owner) = frames.pop_front() else {
+            return false;
+        };
+        self.pending.insert(
+            id,
+            PendingResolution {
+                owner: Some(owner),
+                frames,
+                generation,
+            },
+        );
+        true
+    }
+
+    fn cancel_global(&mut self, global_id: [u8; GLOBAL_ID_LEN]) {
+        let mut remove = Vec::new();
+        for (id, pending) in &mut self.pending {
+            if pending.owner.as_ref().is_some_and(|frame| {
+                frame.frame.status == SessionStatus::New && frame.frame.global_id == Some(global_id)
+            }) {
+                pending.owner = None;
+            }
+            pending.frames.retain(|frame| {
+                !(frame.frame.status == SessionStatus::New
+                    && frame.frame.global_id == Some(global_id))
+            });
+            if pending.owner.is_none() && pending.frames.is_empty() {
+                remove.push(*id);
+            }
+        }
+        for id in remove {
+            self.pending.remove(&id);
+        }
+    }
+
+    fn take(&mut self, id: u16, generation: u64) -> Option<PendingResolution> {
+        if self
+            .pending
+            .get(&id)
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            self.pending.remove(&id)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ResolutionState {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Applies one completed resolution and drains the frames queued behind it.
+///
+/// If a later queued frame names a different uncached domain, it and the rest
+/// of the queue are moved to a new pending entry instead of blocking here.
+async fn apply_resolution(
+    state: &MuxState,
+    resolutions: &mut ResolutionState,
+    result: ResolutionResult,
+) -> Result<(), MuxError> {
+    let Some(pending) = resolutions.take(result.id, result.generation) else {
+        return Ok(());
+    };
+    let PendingResolution {
+        mut owner, frames, ..
+    } = pending;
+    let ResolutionResult {
+        id,
+        destination,
+        result,
+        ..
+    } = result;
+
+    match result {
+        Ok(address) => {
+            resolutions.cache_insert(&destination, address);
+            if let Some(mut frame) = owner.take() {
+                if frame.frame.status == SessionStatus::New
+                    && let Some(global_id) = frame.frame.global_id
+                {
+                    resolutions.cancel_global(global_id);
+                }
+                frame.frame.rewrite_destination(address);
+                state.handle_frame(&frame.frame.as_borrowed()).await?;
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                session_id = id,
+                %error,
+                "XUDP domain resolution failed"
+            );
+            if let Some(frame) = owner.take() {
+                match frame.frame.status {
+                    SessionStatus::New => state.try_send_end(id, true),
+                    SessionStatus::Keep if state.session(id).is_none() => {
+                        // Match handle_keep's clean End for an unknown session.
+                        state.try_send_end(id, false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    process_pending_frames(state, resolutions, frames).await
+}
+
+/// Dispatches queued frames after the lookup owner has been handled.
+///
+/// A suffix may start with another uncached domain; that frame and the rest of
+/// the queue become a new pending operation instead of blocking the read loop.
+async fn process_pending_frames(
+    state: &MuxState,
+    resolutions: &mut ResolutionState,
+    mut frames: VecDeque<PendingFrame>,
+) -> Result<(), MuxError> {
+    while let Some(mut frame) = frames.pop_front() {
+        if let Some(location) = frame.frame.destination.clone()
+            && matches!(location.address, Address::Domain(_))
+        {
+            let family = if frame.frame.status == SessionStatus::New {
+                None
+            } else {
+                state
+                    .session(frame.frame.session_id)
+                    .map(|session| session.family)
+            };
+            if let Some(cached) = resolutions.cache_get(&location, family) {
+                frame.frame.rewrite_destination(cached);
+            } else {
+                frames.push_front(frame);
+                let next_id = frames
+                    .front()
+                    .map(|frame| frame.frame.session_id)
+                    .expect("queue is non-empty");
+                let reject = frames
+                    .front()
+                    .is_some_and(|frame| frame.frame.status == SessionStatus::New);
+                if !resolutions.start(next_id, location, family, frames) {
+                    state.try_send_end(next_id, reject);
+                }
+                return Ok(());
+            }
+        }
+        state.handle_frame(&frame.frame.as_borrowed()).await?;
+    }
+    Ok(())
+}
 
 /// Errors returned by [`handle_mux_stream`].
 #[derive(Debug, thiserror::Error)]
@@ -317,6 +701,7 @@ where
     let mut buffer = Vec::with_capacity(MAX_FRAME_LEN);
     let mut chunk = vec![0u8; READ_CHUNK_LEN];
     let mut empty_since = Some(Instant::now());
+    let mut resolutions = ResolutionState::new(state.limiter.clone());
     let mut sweep = interval(state.config.sweep_interval());
     sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // The first interval tick is immediate; use the first real sweep later.
@@ -332,7 +717,77 @@ where
         loop {
             match frame::parse_frame(&buffer[consumed..]) {
                 Ok(Some((parsed, used))) => {
-                    state.handle_frame(&parsed).await?;
+                    let id = parsed.session_id;
+                    if parsed.status == SessionStatus::New
+                        && let Some(global_id) = parsed.global_id
+                    {
+                        // A newer attachment for the same GlobalID supersedes
+                        // any older pending domain New. Otherwise the delayed
+                        // old lookup could migrate the flow backwards.
+                        resolutions.cancel_global(global_id);
+                    }
+                    if resolutions.has_pending(id) {
+                        if let Some(session) = state.session(id) {
+                            session.touch();
+                        }
+                        if !resolutions.push_frame(id, OwnedFrame::from_borrowed(&parsed)) {
+                            tracing::debug!(
+                                session_id = id,
+                                "XUDP pending-resolution queue is full; dropping frame"
+                            );
+                            if parsed.status == SessionStatus::New {
+                                state.try_send_end(id, true);
+                            }
+                        }
+                        consumed += used;
+                        debug_assert!(consumed <= buffer.len());
+                        continue;
+                    }
+
+                    if matches!(parsed.status, SessionStatus::New | SessionStatus::Keep)
+                        && let Some(destination) = parsed.destination.as_ref()
+                        && matches!(destination.address, Address::Domain(_))
+                    {
+                        let family = if parsed.status == SessionStatus::New {
+                            None
+                        } else {
+                            state.session(id).map(|session| session.family)
+                        };
+                        if let Some(cached) = resolutions.cache_get(destination, family) {
+                            let mut owned = OwnedFrame::from_borrowed(&parsed);
+                            owned.rewrite_destination(cached);
+                            state.handle_frame(&owned.as_borrowed()).await?;
+                        } else {
+                            if parsed.status == SessionStatus::Keep
+                                && let Some(session) = state.session(id)
+                            {
+                                session.touch();
+                            }
+                            let Some(frame) = PendingFrame::new(
+                                OwnedFrame::from_borrowed(&parsed),
+                                &state.limiter,
+                            ) else {
+                                if parsed.status == SessionStatus::New {
+                                    state.try_send_end(id, true);
+                                }
+                                consumed += used;
+                                debug_assert!(consumed <= buffer.len());
+                                continue;
+                            };
+                            let frames = VecDeque::from([frame]);
+                            if !resolutions.start(id, destination.clone(), family, frames) {
+                                tracing::debug!(
+                                    session_id = id,
+                                    "XUDP pending-resolution limit reached; rejecting frame"
+                                );
+                                if parsed.status == SessionStatus::New {
+                                    state.try_send_end(id, true);
+                                }
+                            }
+                        }
+                    } else {
+                        state.handle_frame(&parsed).await?;
+                    }
                     debug_assert!(used > 0);
                     consumed += used;
                     debug_assert!(consumed <= buffer.len());
@@ -366,6 +821,14 @@ where
             changed = writer_failed.changed() => {
                 let _ = changed;
                 return Err(MuxError::WriterClosed);
+            }
+            resolved = resolutions.results.recv() => {
+                let Some(result) = resolved else {
+                    return Err(MuxError::Timeout {
+                        stage: "XUDP resolution task",
+                    });
+                };
+                apply_resolution(state, &mut resolutions, result).await?;
             }
             _ = sweep.tick() => {
                 let had_sessions = state.has_sessions();
@@ -414,6 +877,30 @@ where
                 }
             }
         }
+    }
+}
+
+/// Sends one UDP datagram without waiting for kernel send-buffer space.
+///
+/// A full UDP send buffer is transient congestion: dropping one datagram is
+/// preferable to stalling the shared mux read loop for `io_timeout`. Other
+/// socket errors remain fatal for the session.
+async fn send_datagram(
+    socket: &UdpSocket,
+    payload: &[u8],
+    destination: SocketAddr,
+) -> io::Result<()> {
+    match socket.try_send_to(payload, destination) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            match timeout(SEND_WAIT, socket.send_to(payload, destination)).await {
+                Ok(result) => result.map(|_| ()),
+                // The send buffer stayed full for the short bound. Dropping
+                // this datagram is preferable to stalling the mux read loop.
+                Err(_) => Ok(()),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -608,33 +1095,19 @@ impl MuxState {
             }
         };
 
-        if parsed.option.has_data() && !parsed.payload.is_empty() {
-            match timeout(
-                self.config.io_timeout,
-                socket.send_to(parsed.payload, resolved),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    tracing::debug!(
-                        session_id = id,
-                        %error,
-                        "XUDP first datagram send failed"
-                    );
-                    if reattached {
-                        self.limiter.metrics().record_xudp_retained_discarded();
-                    }
-                    return self.send_end(id, true).await;
-                }
-                Err(_) => {
-                    tracing::debug!(session_id = id, "XUDP first datagram send timed out");
-                    if reattached {
-                        self.limiter.metrics().record_xudp_retained_discarded();
-                    }
-                    return self.send_end(id, true).await;
-                }
+        if parsed.option.has_data()
+            && !parsed.payload.is_empty()
+            && let Err(error) = send_datagram(&socket, parsed.payload, resolved).await
+        {
+            tracing::debug!(
+                session_id = id,
+                %error,
+                "XUDP first datagram send failed"
+            );
+            if reattached {
+                self.limiter.metrics().record_xudp_retained_discarded();
             }
+            return self.send_end(id, true).await;
         }
 
         let session = Arc::new(Session::new(
@@ -712,29 +1185,15 @@ impl MuxState {
             None => session.destination(),
         };
 
-        match timeout(
-            self.config.io_timeout,
-            session.socket.send_to(parsed.payload, destination),
-        )
-        .await
-        {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => {
-                tracing::debug!(session_id = id, %error, "XUDP relay send failed");
-                if session.is_closed() {
-                    Ok(())
-                } else {
-                    self.close_with_error(id).await
-                }
+        if let Err(error) = send_datagram(&session.socket, parsed.payload, destination).await {
+            tracing::debug!(session_id = id, %error, "XUDP relay send failed");
+            if session.is_closed() {
+                Ok(())
+            } else {
+                self.close_with_error(id).await
             }
-            Err(_) => {
-                tracing::debug!(session_id = id, "XUDP relay send timed out");
-                if session.is_closed() {
-                    Ok(())
-                } else {
-                    self.close_with_error(id).await
-                }
-            }
+        } else {
+            Ok(())
         }
     }
 
@@ -798,9 +1257,10 @@ impl MuxState {
 
     /// Closes a session and sends `End`.
     ///
-    /// The reply task is stopped and joined before `End` is queued, so no data
-    /// frame can follow the close. A reply task that already claimed the close
-    /// owns the `End`; this function then only performs cleanup.
+    /// Close marks the session closed, fences the reply-enqueue gate, waits at
+    /// most [`CLOSE_JOIN_TIMEOUT`] for the reply task, and aborts on timeout.
+    /// A socket is retained only when the old reader stopped, so no data can
+    /// follow the End and no second reader can share a retained socket.
     async fn close_active(
         &self,
         active: ActiveSession,
@@ -812,10 +1272,18 @@ impl MuxState {
         } = active;
         let first = session.mark_closed();
         session.stop();
+        // Fence any reply enqueue that was already in flight, then wait only
+        // briefly for the reply task. If it does not stop, abort and do not
+        // retain the socket; a retained socket must never have two readers.
+        {
+            let _gate = session.enqueue_guard();
+        }
+        let mut reply_stopped = true;
         if let Some(mut task) = reply_task
-            && timeout(self.config.io_timeout, &mut task).await.is_err()
+            && timeout(CLOSE_JOIN_TIMEOUT, &mut task).await.is_err()
         {
             task.abort();
+            reply_stopped = false;
         }
 
         if !first {
@@ -844,6 +1312,7 @@ impl MuxState {
 
         let permit = session.take_permit();
         if reason.retains_socket()
+            && reply_stopped
             && !session.failed()
             && drain_retained_socket(&session.socket)
             && let Some(global_id) = session.global_id
@@ -1030,11 +1499,11 @@ fn lock_table(table: &Mutex<SessionTable>) -> MutexGuard<'_, SessionTable> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MuxError, MuxState, handle_mux_stream};
+    use super::{MuxError, MuxState, OwnedFrame, handle_mux_stream};
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{
-        Frame, FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_PAYLOAD_LEN, SessionStatus,
-        TargetNetwork, XudpError, encode_frame, parse_frame,
+        FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_PAYLOAD_LEN, SessionStatus, TargetNetwork,
+        XudpError, encode_frame, parse_frame,
     };
     use crate::xudp::session::{
         ActiveSession, QueuedFrame, Session, SessionTable, SocketFamily, XudpConfig,
@@ -1143,31 +1612,6 @@ mod tests {
                 reply_task: Some(reply_task),
             });
         assert!(replaced.is_none(), "test session id must be unique");
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct OwnedFrame {
-        session_id: u16,
-        status: SessionStatus,
-        option: FrameOption,
-        network: Option<TargetNetwork>,
-        destination: Option<NetLocation>,
-        global_id: Option<[u8; GLOBAL_ID_LEN]>,
-        payload: Vec<u8>,
-    }
-
-    impl OwnedFrame {
-        fn from_borrowed(frame: &Frame<'_>) -> Self {
-            Self {
-                session_id: frame.session_id,
-                status: frame.status,
-                option: frame.option,
-                network: frame.network,
-                destination: frame.destination.clone(),
-                global_id: frame.global_id,
-                payload: frame.payload.to_vec(),
-            }
-        }
     }
 
     async fn read_frame(client: &mut DuplexStream, buffer: &mut Vec<u8>) -> Option<OwnedFrame> {
@@ -1878,6 +2322,385 @@ mod tests {
             .await
             .expect("End must be acknowledged");
         assert_eq!(end.status, SessionStatus::End);
+
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn domain_new_and_keep_are_applied_in_order() {
+        let echo = spawn_ipv4_echo().await;
+        let port = echo.address.port();
+        let destination = NetLocation {
+            address: Address::Domain("localhost".to_owned()),
+            port,
+        };
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(9, &destination, b"first", None)).await;
+        write_frame(&mut client, keep_spec(9, Some(&destination), b"second")).await;
+        let first = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("New must echo after domain resolution");
+        let second = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("Keep must echo after the same resolution");
+        assert_eq!(first.payload, b"first");
+        assert_eq!(second.payload, b"second");
+        assert_eq!(first.session_id, 9);
+        assert_eq!(second.session_id, 9);
+
+        write_frame(&mut client, FrameSpec::new(9, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn slow_domain_does_not_block_an_unrelated_session() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let slow = NetLocation {
+            address: Address::Domain("slow.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &destination, b"seed", None)).await;
+        let seed = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("seed echo");
+        assert_eq!(seed.payload, b"seed");
+
+        let started = Instant::now();
+        write_frame(&mut client, new_spec(2, &slow, b"slow", None)).await;
+        write_frame(&mut client, keep_spec(1, None, b"probe")).await;
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("unrelated Keep must not wait for the slow domain");
+        assert_eq!(reply.session_id, 1);
+        assert_eq!(reply.payload, b"probe");
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "slow domain blocked an unrelated session for {:?}",
+            started.elapsed()
+        );
+
+        write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn failed_domain_keep_does_not_drop_later_frames() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let bad = NetLocation {
+            address: Address::Domain("slow.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &destination, b"seed", None)).await;
+        let seed = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("seed echo");
+        assert_eq!(seed.payload, b"seed");
+
+        write_frame(&mut client, keep_spec(1, Some(&bad), b"bad")).await;
+        write_frame(&mut client, keep_spec(1, None, b"after")).await;
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("later Keep must survive a failed domain lookup");
+        assert_eq!(reply.session_id, 1);
+        assert_eq!(reply.payload, b"after");
+
+        write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn failed_domain_new_does_not_drop_a_replacement_new() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let bad = NetLocation {
+            address: Address::Domain("slow.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &bad, b"bad", None)).await;
+        write_frame(&mut client, new_spec(1, &destination, b"good", None)).await;
+        let first = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("failed New must produce an End");
+        assert_eq!(first.status, SessionStatus::End);
+        assert!(first.option.has_error());
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("replacement New must still be processed");
+        assert_eq!(reply.session_id, 1);
+        assert_eq!(reply.payload, b"good");
+
+        write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn stale_resolution_does_not_consume_same_id_replacement() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let slow = NetLocation {
+            address: Address::Domain("slow.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let local = NetLocation {
+            address: Address::Domain("localhost".to_owned()),
+            port: echo.address.port(),
+        };
+        let global = [9_u8; GLOBAL_ID_LEN];
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &slow, b"old", Some(global))).await;
+        write_frame(&mut client, new_spec(2, &destination, b"new", Some(global))).await;
+        let newer = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("newer attachment echo");
+        assert_eq!(newer.session_id, 2);
+
+        // Reuse id 1 with a different GlobalID while the first lookup is still
+        // in flight. The stale slow.test failure must not consume this queue.
+        write_frame(&mut client, new_spec(1, &local, b"replacement", None)).await;
+        let replacement = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("replacement New must not be consumed by stale result");
+        assert_eq!(replacement.session_id, 1);
+        assert_eq!(replacement.payload, b"replacement");
+
+        sleep(Duration::from_millis(650)).await;
+        write_frame(&mut client, keep_spec(1, None, b"alive")).await;
+        let alive = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("replacement session must survive stale completion");
+        assert_eq!(alive.session_id, 1);
+        assert_eq!(alive.payload, b"alive");
+
+        write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn newer_global_id_attachment_removes_a_queued_older_new() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let slow = NetLocation {
+            address: Address::Domain("slow.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let global = [11_u8; GLOBAL_ID_LEN];
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &destination, b"seed", None)).await;
+        let seed = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("seed echo");
+        assert_eq!(seed.payload, b"seed");
+
+        write_frame(&mut client, keep_spec(1, Some(&slow), b"pending")).await;
+        write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        write_frame(&mut client, new_spec(1, &destination, b"old", Some(global))).await;
+        write_frame(&mut client, new_spec(2, &destination, b"new", Some(global))).await;
+        let mut newer = None;
+        for _ in 0..4 {
+            let frame = read_frame(&mut client, &mut buffer)
+                .await
+                .expect("reply while waiting for the newer attachment");
+            if frame.session_id == 2 && frame.payload == b"new" {
+                newer = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            newer.is_some(),
+            "newer GlobalID attachment did not echo before the old reply drained"
+        );
+
+        sleep(Duration::from_millis(650)).await;
+        write_frame(&mut client, keep_spec(2, None, b"alive")).await;
+        let mut alive = None;
+        for _ in 0..4 {
+            let frame = read_frame(&mut client, &mut buffer)
+                .await
+                .expect("reply while draining old attachment data");
+            if frame.session_id == 2 && frame.payload == b"alive" {
+                alive = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            alive.is_some(),
+            "newer attachment must survive the old queued New"
+        );
+
+        write_frame(&mut client, FrameSpec::new(2, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn canceled_lookup_owner_does_not_reject_the_suffix() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let slow = NetLocation {
+            address: Address::Domain("slow.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let original = [13_u8; GLOBAL_ID_LEN];
+        let replacement = [14_u8; GLOBAL_ID_LEN];
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &slow, b"slow", Some(original))).await;
+        write_frame(
+            &mut client,
+            new_spec(1, &destination, b"suffix", Some(replacement)),
+        )
+        .await;
+        write_frame(
+            &mut client,
+            new_spec(2, &destination, b"newer", Some(original)),
+        )
+        .await;
+
+        // The newer G attachment is accepted immediately.
+        let mut newer = None;
+        for _ in 0..4 {
+            let frame = read_frame(&mut client, &mut buffer)
+                .await
+                .expect("reply while draining the newer attachment");
+            if frame.session_id == 2 && frame.payload == b"newer" {
+                newer = Some(frame);
+                break;
+            }
+        }
+        assert!(newer.is_some(), "newer G attachment must be accepted");
+
+        // After the stale slow lookup fails, the H New suffix must run.
+        sleep(Duration::from_millis(650)).await;
+        write_frame(&mut client, keep_spec(1, None, b"alive")).await;
+        let mut alive = None;
+        for _ in 0..5 {
+            let frame = read_frame(&mut client, &mut buffer)
+                .await
+                .expect("reply while waiting for the suffix New");
+            if frame.session_id == 1 && frame.payload == b"alive" {
+                alive = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            alive.is_some(),
+            "canceled lookup owner must not reject the H New suffix"
+        );
+
+        write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn newer_global_id_attachment_supersedes_pending_domain_new() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let slow = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let global = [7_u8; GLOBAL_ID_LEN];
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &slow, b"old", Some(global))).await;
+        write_frame(&mut client, new_spec(2, &destination, b"new", Some(global))).await;
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("newer GlobalID attachment must echo");
+        assert_eq!(reply.session_id, 2);
+        assert_eq!(reply.payload, b"new");
+
+        sleep(Duration::from_millis(650)).await;
+        write_frame(&mut client, keep_spec(2, None, b"still")).await;
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("newer attachment must remain active");
+        assert_eq!(reply.session_id, 2);
+        assert_eq!(reply.payload, b"still");
+
+        write_frame(&mut client, FrameSpec::new(2, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn domain_tcp_new_is_rejected_without_becoming_udp() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = NetLocation {
+            address: Address::Domain("localhost".to_owned()),
+            port: echo.address.port(),
+        };
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(
+            &mut client,
+            FrameSpec {
+                session_id: 4,
+                status: SessionStatus::New,
+                option: FrameOption::DATA,
+                network: Some(TargetNetwork::Tcp),
+                destination: Some(&destination),
+                global_id: None,
+                payload: b"tcp",
+            },
+        )
+        .await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("TCP domain New must be rejected");
+        assert_eq!(end.session_id, 4);
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(end.option.has_error());
 
         finish(client, task).await;
     }
