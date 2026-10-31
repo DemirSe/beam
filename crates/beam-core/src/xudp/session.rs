@@ -947,7 +947,6 @@ async fn reply_loop(
             received = session.socket.recv_from(&mut buffer) => {
                 match received {
                     Ok((len, source)) => {
-                        session.touch();
                         if len == 0 {
                             // Stock XUDP writers drop zero-length datagrams.
                             metrics.record_xudp_reply_dropped();
@@ -1034,7 +1033,12 @@ async fn reply_loop(
                             metrics.record_xudp_reply_dropped();
                             continue;
                         }
+                        // Only a reply that is actually handed to the writer
+                        // counts as session activity. Zero-length, oversize,
+                        // queue-pressure, and encoding drops must not keep an
+                        // otherwise idle session (and its global permit) alive.
                         permit.send(QueuedFrame::new(frame, Some(budget)));
+                        session.touch();
                     }
                     Err(error) => {
                         tracing::debug!(
@@ -1155,7 +1159,8 @@ mod tests {
     use super::{
         DEFAULT_MAX_GLOBAL_SESSIONS, ExpiringSession, ResolveError, Session, SessionTable,
         SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
-        queue_failed_session_end, reply_frame_len, resolve_destination, socket_addr_to_location,
+        queue_failed_session_end, reply_frame_len, reply_loop, resolve_destination,
+        socket_addr_to_location,
     };
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{
@@ -1165,13 +1170,97 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::UdpSocket;
-    use tokio::time::Instant;
+    use tokio::time::{Instant, timeout};
+
+    async fn wait_for_reply_drops(limiter: &XudpSessionLimiter, expected: u64) {
+        for _ in 0..100 {
+            if limiter.metrics().snapshot().xudp_replies_dropped >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("reply drop counter did not reach {expected}");
+    }
 
     fn ipv4(port: u16) -> NetLocation {
         NetLocation {
             address: Address::Ipv4(Ipv4Addr::LOCALHOST),
             port,
         }
+    }
+
+    #[tokio::test]
+    async fn dropped_replies_do_not_refresh_idle_clock() {
+        let limiter = XudpSessionLimiter::new(4);
+        let table = Arc::new(std::sync::Mutex::new(SessionTable::default()));
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let address = socket.local_addr().expect("test address");
+        let session = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            None,
+        ));
+        *session.last_activity.lock().expect("last activity") = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("old instant");
+
+        let config = Arc::new(XudpConfig {
+            max_datagram_size: 64,
+            max_queued_replies: 4,
+            io_timeout: Duration::from_secs(1),
+            ..XudpConfig::default()
+        });
+        let (outbound, mut inbound) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(reply_loop(
+            Arc::clone(&session),
+            outbound,
+            Arc::clone(&table),
+            Arc::clone(&config),
+            limiter.clone(),
+        ));
+        let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender socket");
+
+        sender
+            .send_to(&[], address)
+            .await
+            .expect("zero-length send");
+        wait_for_reply_drops(&limiter, 1).await;
+        assert!(
+            session.idle_for(Instant::now()) >= Duration::from_secs(4),
+            "zero-length junk refreshed the idle clock"
+        );
+
+        let oversize = [0_u8; 65];
+        sender
+            .send_to(&oversize, address)
+            .await
+            .expect("oversize send");
+        wait_for_reply_drops(&limiter, 2).await;
+        assert!(
+            session.idle_for(Instant::now()) >= Duration::from_secs(4),
+            "oversize junk refreshed the idle clock"
+        );
+
+        sender.send_to(b"ok", address).await.expect("valid send");
+        let queued = timeout(Duration::from_secs(1), inbound.recv())
+            .await
+            .expect("valid reply did not arrive")
+            .expect("reply channel closed");
+        let (frame, used) = parse_frame(&queued.bytes)
+            .expect("valid reply frame")
+            .expect("complete reply frame");
+        assert_eq!(used, queued.bytes.len());
+        assert_eq!(frame.payload, b"ok");
+        assert!(
+            session.idle_for(Instant::now()) < Duration::from_secs(1),
+            "accepted reply must refresh the idle clock"
+        );
+
+        session.stop();
+        let _ = timeout(Duration::from_secs(1), task).await;
     }
 
     #[test]
