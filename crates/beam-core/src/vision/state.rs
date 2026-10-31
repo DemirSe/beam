@@ -8,7 +8,7 @@
 //! One [`TlsDetector`] belongs to a connection, not to a direction. On a server
 //! the downlink writer owns it; inbound plaintext is fed to
 //! [`VisionWriterState::inspect`] so both directions share the eight-buffer
-//! filter budget described in `docs/08-vision-xudp-spec.md` section 2.3.
+//! filter budget described in the Vision section of `README.md`.
 //!
 //! ServerHellos may span inspected buffers: the detector keeps a bounded copy
 //! of the current record and parses it once complete. A malformed or oversized

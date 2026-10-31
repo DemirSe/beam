@@ -13,7 +13,7 @@
 //!
 //! Pass `first = true` only for the first block of a direction, and only after
 //! the caller has verified the raw 16-byte UUID prefix described in
-//! `docs/08-vision-xudp-spec.md` section 2.1. Later blocks never carry a UUID;
+//! the Vision section of `README.md`. Later blocks never carry a UUID;
 //! treating their leading bytes as one would consume content.
 //!
 //! [`frame`] is the stateless codec. [`state`] holds the per-connection TLS

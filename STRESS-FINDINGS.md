@@ -1,9 +1,11 @@
-# Daily-use stress findings — 2026-10-31
+# Open stress findings — 2026-10-31
 
-Status: lab stress round complete; **no code changes** in this round. Production
-was not touched. The lab is stopped and its config was restored after the
-temporary idle-timeout experiment. Binary under test: final `1007354…` code
-(embedded identity `b4d9382`, deployed build `a41facef…`).
+This file is intentionally separate from `README.md` until every finding is
+fixed and re-verified. Then fold the durable invariants into `README.md` and
+delete this file. It records a lab stress round; **no code changes** were made
+in that round. Production was not touched. The lab is stopped and its config was
+restored after the temporary idle-timeout experiment. Binary under test: final
+`1007354…` code (embedded identity `b4d9382`, deployed build `a41facef…`).
 
 This note records the results of three read-only code audits plus the QEMU lab
 run. It distinguishes **lab-reproduced** findings from code-confirmed risks.

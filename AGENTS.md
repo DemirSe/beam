@@ -6,19 +6,15 @@ supervision.
 
 ## Read order
 
-1. `docs/00-scope.md`
-2. `docs/01-compatibility.md`
-3. `docs/02-architecture.md`
-4. `docs/03-test-plan.md`
-5. `docs/04-benchmark.md`
-6. `docs/05-roadmap.md`
-7. The code you are about to change
+1. `README.md`
+2. `STRESS-FINDINGS.md` while it exists
+3. The code you are about to change
 
 ## Golden rules
 
 - Correctness first, then performance, then elegance.
-- Never change wire behavior without updating the compatibility matrix and
-  adding a test.
+- Never change wire behavior without updating the compatibility section of
+  `README.md` and adding a test.
 - Never commit credentials, private keys, UUIDs from real configs, or captures
   of real traffic.
 - No `unsafe` outside `crates/beam-sys`. Every unsafe block needs a `// SAFETY:`
@@ -77,4 +73,4 @@ verification commands above.
 - Use constant-time comparison for authentication material.
 - Prefer `subtle` or an equivalent constant-time primitive over `==`.
 - Do not add a feature that weakens the REALITY cover behavior without an
-  explicit decision in `docs/01-compatibility.md`.
+  explicit decision in the compatibility section of `README.md`.

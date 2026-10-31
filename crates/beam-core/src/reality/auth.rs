@@ -2,7 +2,7 @@
 //!
 //! The envelope is carried in the TLS 1.3 `legacy_session_id` and is opened
 //! with AES-256-GCM after deriving a key from the X25519 shared secret. See
-//! `docs/07-reality-spec.md` for the wire format.
+//! the REALITY section of `README.md` for the wire format.
 
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

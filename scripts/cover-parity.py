@@ -87,7 +87,7 @@ RECORD_TYPE_NAMES = {
     RECORD_APPLICATION_DATA: "application_data",
 }
 
-# Values quoted in docs/10-cover-parity.md for the rustls + aws-lc-pq cover
+# Values quoted in README.md for the rustls + aws-lc-pq cover
 # probe. The artifact is treated as the source of truth when it exists; these
 # are printed as the documented baseline and guard against a stale artifact.
 DOC_SERVER_HELLO_BYTES = 1215
@@ -429,7 +429,7 @@ def analyze(capture_path: Path, cover_path: Path, json_path: Path | None) -> int
           f"beam={beam['encrypted_bytes']} cover={cover['encrypted_bytes']} "
           f"delta={beam['encrypted_bytes'] - cover['encrypted_bytes']:+d} (expected)")
     print()
-    print("documented cover baseline (docs/10-cover-parity.md)")
+    print("documented cover baseline (README.md)")
     print(f"  ServerHello: {DOC_SERVER_HELLO_BYTES} bytes, "
           f"flight: {DOC_FLIGHT_BYTES[0]}-{DOC_FLIGHT_BYTES[1]} bytes, "
           f"{DOC_FLIGHT_RECORD_COUNT} records")
