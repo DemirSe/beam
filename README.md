@@ -22,10 +22,13 @@ on 2026-10-30 21:51 UTC:
 
 The deployed binary is code-identical to build `1007354…`; `b4d9382` only
 refreshes the embedded commit identity. The full-TUN matrix last passed 8/8 in
-`xudp`, `packetaddr`, and `legacy` modes. `STRESS-FINDINGS.md` records one
-lab-reproduced XUDP lifecycle defect and several code-confirmed backpressure
-and timeout risks that are **not yet fixed**. Do not describe the release as
-fully accepted until those findings and the open acceptance gates are resolved.
+`xudp`, `packetaddr`, and `legacy` modes. The lab-reproduced XUDP junk-reply
+idle-pinning defect is **fixed in the repository** (commit `2163c0a`) and
+lab-verified, but is **not yet deployed to production**; deploy it through the
+normal package/bootstrap flow after final review. The remaining code-confirmed
+backpressure and timeout risks in `STRESS-FINDINGS.md` are still unfixed. Do
+not describe the release as fully accepted until those findings and the open
+acceptance gates are resolved.
 
 ## Scope
 
@@ -73,7 +76,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 336 tests: 306 `beam-core`,
+a benchmark comparison. The current workspace has 337 tests: 307 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
 ## Repository layout
@@ -181,10 +184,17 @@ bind.
   oversize datagrams are dropped. Legacy UDP is capped at 8190 bytes.
   packetaddr uses the magic `sp.packet-addr.v2fly.arpa` destination and
   carries an inner address per datagram.
-- Session sockets are currently unconnected and accept any reply source.
-  This is intentional stock compatibility, but it is also the root of the
-  reproduced idle-pinning finding in `STRESS-FINDINGS.md`: only touch a
-  session after accepting a valid reply, or validate/connect the source.
+- Session sockets remain unconnected and accept replies from arbitrary UDP
+  sources. This preserves stock XUDP/full-cone behavior (STUN, WebRTC, P2P).
+  Only a valid, non-empty reply that passes size/frame/queue/byte-budget checks
+  and is handed to the writer refreshes the idle clock. Zero-length, oversize,
+  encoding-drop, queue-drop, and budget-drop datagrams do **not** refresh it;
+  this closes the lab-reproduced junk-reply idle-pinning defect. "Valid" here
+  means size/frame/admission-valid, not application-validated: a sender that
+  can reach the ephemeral port with an admissible datagram can still keep the
+  session active while the mux remains open. The queue and byte budgets bound
+  outstanding memory, not session lifetime; this is inherent to keeping
+  arbitrary-source/full-cone replies.
 - Live XUDP limits are 1024 process-wide sessions and 128 KiB per socket
   receive buffer; a mux holds at most half the global active slots. XUDP idle
   expiry is at most 60 seconds even when the TCP relay idle timeout is 300
@@ -366,6 +376,23 @@ cargo +nightly fuzz run config -- -max_total_time=60 -timeout=10
 The GitHub fuzz workflow is manual-only. Parser changes require a local run.
 The multi-record ClientHello assembler still needs final fuzz coverage.
 
+### XUDP idle-pinning fix verification
+
+Commit `2163c0a` moves the idle touch after reply admission. The regression
+test is
+`xudp::session::tests::dropped_replies_do_not_refresh_idle_clock`. In the lab,
+the unpatched binary kept a zero-length-fed session alive (`xudp_active=1`,
+**8 socket descriptors** at t27) while the patched binary returned to the
+socket-descriptor baseline by t17. A
+5-rep unpatched→patched A/B measured clean up/down 0.997x/0.994x, HTTP RPS
+1.015x, DNS QPS 0.951x (focused 10-pair 0.9995x), loss1 1.021x, and RTT50
+1.016x. Download CPU was **1.079x** (all five pairs higher); upload CPU was
+1.002x. The CPU signal is not attributed to this one-line ordering change and
+is not claimed as parity. DNS p95 was 1.071x in the focused 10-pair run
+(6/10 pairs), so latency equivalence is not established. No consistent
+throughput regression was established in these short lab comparisons.
+Bidirectional runs had zero samples in both arms and were excluded.
+
 ### Performance
 
 ```bash
@@ -409,10 +436,11 @@ Cover flight differences are diagnostic only by the SNI-level decision.
 
 ## Known gaps
 
-- `STRESS-FINDINGS.md` contains the unfixed XUDP idle-pinning defect, mux
-  head-of-line blocking, close/reserve races, timeout-validation gap, and
-  lower-risk items. Do not fold it into this note until each item is fixed and
-  re-verified.
+- The XUDP junk-reply idle-pinning defect is fixed and lab-verified; its
+  invariant is documented above. `STRESS-FINDINGS.md` retains the remaining
+  open mux head-of-line, close/reserve, timeout-validation, replay, and
+  lower-risk items. Do not fold the remaining items into this note until they
+  are fixed and re-verified.
 - A clean 24-hour mixed soak, privileged syscall/wakeup/splice gates, cgroup
   socket-memory/OOM sampling, and a final fuzz run of the multi-record
   ClientHello assembler remain open release-acceptance items.

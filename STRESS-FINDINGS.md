@@ -1,11 +1,13 @@
 # Open stress findings — 2026-10-31
 
-This file is intentionally separate from `README.md` until every finding is
-fixed and re-verified. Then fold the durable invariants into `README.md` and
-delete this file. It records a lab stress round; **no code changes** were made
-in that round. Production was not touched. The lab is stopped and its config was
-restored after the temporary idle-timeout experiment. Binary under test: final
-`1007354…` code (embedded identity `b4d9382`, deployed build `a41facef…`).
+This file is intentionally separate from `README.md` for the findings that are
+still open. Finding 1 has been fixed and re-verified; its durable invariant is
+now in `README.md`, while the remaining items below stay here until resolved.
+The initial audit made no code changes; the subsequent fix is commit
+`2163c0a`. Production was not touched. The lab is stopped and its config was
+restored after the temporary idle-timeout experiment. Initial binary under
+test: final `1007354…` code (embedded identity `b4d9382`, deployed build
+`a41facef…`).
 
 This note records the results of three read-only code audits plus the QEMU lab
 run. It distinguishes **lab-reproduced** findings from code-confirmed risks.
@@ -68,14 +70,14 @@ loss/retransmission, not a server failure.
 
 ## Findings
 
-### 1. XUDP idle sessions can be pinned indefinitely by junk replies — HIGH, lab reproduced
+### 1. [RESOLVED] XUDP idle sessions can be pinned by junk replies — HIGH, lab reproduced and fixed
 
-`crates/beam-core/src/xudp/session.rs:947-963`
+`crates/beam-core/src/xudp/session.rs` (fixed in `2163c0a`)
 
-The reply loop calls `session.touch()` before checking zero length, oversize,
-encoding, queue reserve, and byte budget. Those dropped datagrams therefore
-refresh the idle clock. The session socket is unconnected and accepts any
-source.
+The original reply loop called `session.touch()` before checking zero length,
+oversize, encoding, queue reserve, and byte budget. Those dropped datagrams
+therefore refreshed the idle clock. The session socket is unconnected and
+accepts any source.
 
 Lab reproduction with a temporary `idle_timeout_ms=10000`:
 
@@ -89,8 +91,44 @@ Impact: a destination or any host that learns the ephemeral source port can
 keep sockets and global permits alive, eventually rejecting legitimate XUDP
 traffic. The idle-timeout invariant is broken.
 
-Fix direction: touch only after a datagram is accepted; use a connected UDP
-socket or validate the source; keep junk-drop accounting separate.
+**Resolution:** `session.touch()` now runs only after a valid reply passes all
+size/frame/queue/byte-budget checks and is handed to the writer. Zero-length,
+oversize, encoding-drop, queue-drop, and budget-drop datagrams do not refresh
+the idle clock. The regression test
+`xudp::session::tests::dropped_replies_do_not_refresh_idle_clock` verifies both
+dropped paths and a valid reply. The socket remains unconnected to preserve
+stock full-cone UDP behavior; source validation was rejected because it would
+break STUN/WebRTC/P2P.
+
+Lab verification (temporary `idle_timeout_ms=10000`):
+
+| Arm | Control (echo) | Junk (zero-length every 1 s) |
+|---|---|---|
+| Unpatched | 6→8 socket fds at t3, 6 at t17 | 8 socket fds at t3/t17/t27; `xudp_active=1` |
+| Patched | 6→8 socket fds at t3, 6 at t17 | 8 socket fds at t3, **6 at t17/t27** |
+
+These counts are `/proc/<pid>/fd` entries matching `socket`, not total process
+descriptors.
+
+The unpatched run reproduced the bug; the patched run closed the junk-fed
+session at the idle deadline while legitimate echo/control behavior was
+unchanged.
+
+Performance regression check, 5-rep unpatched→patched A/B (paired medians):
+clean up **0.997x**, clean down **0.994x**, HTTP RPS **1.015x**, HTTP p95
+**0.939x**, DNS QPS **0.951x**, DNS p95 **1.059x**, loss1 **1.021x**, RTT50
+**1.016x**. Download CPU was **1.079x** (higher in all five pairs); upload CPU
+was **1.002x**. The CPU difference is not attributed to this one-line
+ordering change, but CPU parity is not claimed. A focused 10-pair DNS A/B
+measured QPS **0.9995x** and p95 **1.071x**, with **0 errors** in both arms;
+latency equivalence is not established. The bidir harness had zero samples in
+both arms; its valid pairs were excluded. A 337-test workspace pass,
+lib/clippy/fmt, lab 11/11, and the quick suite completed.
+
+Final Sol review: **APPROVE WITH NONBLOCKING CAVEATS**. The code fix and
+full-cone compatibility were approved; the only requested changes were to stop
+claiming CPU parity/equivalence, distinguish repository-fixed from deployed,
+and label fd counts as socket descriptors. All were applied.
 
 ### 2. XUDP mux read loop has head-of-line blocking — HIGH, code-confirmed
 
@@ -229,16 +267,19 @@ accounting risk.
   capacity behavior, not beam defects. They explain the high-load resets.
 - Half-close remains the previously documented shared client/TUN limitation;
   this round did not establish a beam-only regression.
+- The patched junk test closed the idle session and restored the socket-fd
+  baseline; the unpatched binary kept it open. Legitimate echo control expired
+  normally on both.
 
 ## Next actions
 
-1. Fix finding 1 first: junk replies must not refresh idle state.
+1. ~~Fix finding 1: junk replies must not refresh idle state.~~ Done in
+   `2163c0a`; deploy after final review.
 2. Remove the XUDP read-loop stalls (finding 2) before tuning any XUDP limits.
 3. Make all close paths nonblocking and the control reserve atomic (3–4).
 4. Add a minimum timeout bound and an absolute authenticated-handshake
    deadline (6–7).
-5. Re-run the 10.5 min mixed soak, the junk-idle control, and impairment with
-   the fixes; then resume the 24 h/privileged/fuzz release gates.
+5. Resume the 24 h/privileged/fuzz release gates after the remaining findings.
 
 ## Reproduction notes
 
