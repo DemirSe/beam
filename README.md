@@ -8,13 +8,13 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-10-31 15:19 UTC:
+on 2026-10-31 15:48 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `ed939b9db7cd0c1c603c21577f6c45a1907d42d0904e91df80e3dacd3b557018` |
-| Version | `0.1.0 (e0ca0bcb7876)` |
+| SHA-256 | `ff371eaba27e591d1b00c29a524672e9601e01d36913c0936869b42f7ca8c629` |
+| Version | `0.1.0 (43ebf0c5310c)` |
 | Service | `beam.service`, active, `NRestarts=0` |
 | Listener | `0.0.0.0:443` |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake |
