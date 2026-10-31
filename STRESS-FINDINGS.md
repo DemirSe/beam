@@ -1,13 +1,13 @@
 # Open stress findings — 2026-10-31
 
 This file is intentionally separate from `README.md` for the findings that are
-still open. Finding 1 has been fixed and re-verified; its durable invariant is
-now in `README.md`, while the remaining items below stay here until resolved.
-The initial audit made no code changes; the subsequent fix is commit
-`2163c0a`. Production was not touched. The lab is stopped and its config was
-restored after the temporary idle-timeout experiment. Initial binary under
-test: final `1007354…` code (embedded identity `b4d9382`, deployed build
-`a41facef…`).
+still open. Findings 1 and 2 have been fixed, re-verified, and deployed; their
+durable invariants are now in `README.md`, while the remaining items below stay
+here until resolved. The initial audit made no code changes; the fixes are
+commits `2163c0a` and `e0ca0bc`. Production was updated after each fix. The lab
+is stopped and its config was restored after the temporary idle-timeout
+experiment. Initial binary under test: final `1007354…` code (embedded identity
+`b4d9382`, deployed build `a41facef…`).
 
 This note records the results of three read-only code audits plus the QEMU lab
 run. It distinguishes **lab-reproduced** findings from code-confirmed risks.
@@ -130,24 +130,44 @@ full-cone compatibility were approved; the only requested changes were to stop
 claiming CPU parity/equivalence, distinguish repository-fixed from deployed,
 and label fd counts as socket descriptors. All were applied.
 
-### 2. XUDP mux read loop has head-of-line blocking — HIGH, code-confirmed
+### 2. [RESOLVED] XUDP mux read loop had head-of-line blocking — HIGH
 
-`crates/beam-core/src/xudp/server.rs:335`, `462-466`, `611-616`, `687-719`,
-`815-818`
+`crates/beam-core/src/xudp/server.rs` (fixed in `e0ca0bc`)
 
-One task processes frames sequentially. Inline operations include:
+The original read loop sequentially awaited domain DNS (2 s), UDP `send_to`
+(full `io_timeout`), and reply-task join (full `io_timeout`), stalling every
+session on that mux. The fix:
 
-- destination DNS resolution, up to 2 s per frame;
-- `UdpSocket::bind` and `send_to`, with the full `io_timeout` (10 s live);
-- reply-task join on close, up to the full `io_timeout`.
+- domain `New`/`Keep` frames are queued per session id and resolved by a
+  bounded per-mux resolver task; IP frames continue immediately;
+- lookup owner and suffix are separate, results carry an immutable generation,
+  and stale completions are ignored;
+- newer GlobalID attachments cancel older pending/queued New frames;
+- resolved domains are cached for 300 s; pending payload has a process-wide
+  4 MiB budget plus bounded metadata;
+- sends use `try_send_to`, with only a 100 ms `WouldBlock` fallback, and close
+  uses an enqueue gate plus a 100 ms bounded reply-task join. A socket is not
+  retained if the old reader did not stop.
 
-A slow resolver, full UDP send buffer, or wedged close stalls every session on
-the same mux. DNS/QUIC clients see timeouts and retransmits. This was not
-triggered by the normal-IP lab probes because they do not inject a slow domain
-or fill the kernel send buffer; the code path is unambiguous.
+Tests: slow-domain isolation, failed-lookup suffix draining, replacement New
+after failure, stale same-id completion, queued/newer GlobalID ordering,
+canceled-owner suffix, TCP network preservation, and pending budget. The HOL
+test uses a 500 ms resolver fixture and checks an unrelated IP Keep within
+300 ms. Workspace: **347 tests**, fmt/clippy pass.
 
-Fix direction: bound/offload resolution and sending per frame, cache
-resolutions, and keep close joins off the shared read loop.
+Lab candidate: 11/11 checks; DNS 1000@32 **1000/0** at 1063 qps, p95 46 ms;
+UDP 3000×1200 **3000/3000**; HTTP 2000@32 **2000/0** after drain, p95 47 ms.
+A 5-rep A/B before the final owner/generation amendment: clean up/down
+0.996x/0.986x, HTTP RPS 1.017x/p95 1.047x, DNS QPS 1.011x/p95 1.161x, loss1
+0.975x, RTT50 0.987x, CPU up/down 0.991x/1.026x. Focused 10-pair DNS on final
+source: QPS **0.996x**, p95 **1.023x**, zero errors. Bidirectional: four valid
+pairs after excluding a zero-receive fifth new-arm run. Sol: **APPROVE WITH
+NONBLOCKING CAVEATS** (payload-only budget, scheduling-sensitive tests, no
+controlled multithreaded close test; no universal nonblocking claim).
+
+Residual: resolver lookups are serial per mux; a sequence of slow domains,
+congested sends, or close bursts can still delay a mux briefly. The 4 MiB
+budget does not count frame metadata.
 
 ### 3. Burst `End` closes still serialize on 250 ms — MEDIUM-HIGH, code-confirmed
 
@@ -270,12 +290,16 @@ accounting risk.
 - The patched junk test closed the idle session and restored the socket-fd
   baseline; the unpatched binary kept it open. Legitimate echo control expired
   normally on both.
+- Domain resolution isolation is bounded, not a claim that every mux operation
+  is nonblocking; serial resolver, 100 ms send/close bounds, and End enqueue
+  remain.
 
 ## Next actions
 
 1. ~~Fix finding 1: junk replies must not refresh idle state.~~ Done in
-   `2163c0a`; deploy after final review.
-2. Remove the XUDP read-loop stalls (finding 2) before tuning any XUDP limits.
+   `2163c0a`; deployed.
+2. ~~Remove the XUDP read-loop stalls (finding 2).~~ Done in `e0ca0bc`;
+   deployed with documented residual bounds.
 3. Make all close paths nonblocking and the control reserve atomic (3–4).
 4. Add a minimum timeout bound and an absolute authenticated-handshake
    deadline (6–7).

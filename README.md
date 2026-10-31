@@ -8,27 +8,24 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-10-30 21:51 UTC:
+on 2026-10-31 15:19 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `a41facef1a3cfad79dfbddfaca1a2cbe1a2a6121216d3aed852fde71d39a6b49` |
-| Version | `0.1.0 (b4d93821950e)` |
+| SHA-256 | `ed939b9db7cd0c1c603c21577f6c45a1907d42d0904e91df80e3dacd3b557018` |
+| Version | `0.1.0 (e0ca0bcb7876)` |
 | Service | `beam.service`, active, `NRestarts=0` |
 | Listener | `0.0.0.0:443` |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake |
 | Verification | HTTPS IPv4/IPv6 200, cover certificate valid, local TUN path 200 |
 
-The deployed binary is code-identical to build `1007354…`; `b4d9382` only
-refreshes the embedded commit identity. The full-TUN matrix last passed 8/8 in
-`xudp`, `packetaddr`, and `legacy` modes. The lab-reproduced XUDP junk-reply
-idle-pinning defect is **fixed in the repository** (commit `2163c0a`) and
-lab-verified, but is **not yet deployed to production**; deploy it through the
-normal package/bootstrap flow after final review. The remaining code-confirmed
-backpressure and timeout risks in `STRESS-FINDINGS.md` are still unfixed. Do
-not describe the release as fully accepted until those findings and the open
-acceptance gates are resolved.
+The deployed binary includes the XUDP junk-reply idle-pinning fix (`2163c0a`)
+and the mux-wide resolution/send-stall fix (`e0ca0bc`). The full-TUN matrix
+last passed 8/8 in `xudp`, `packetaddr`, and `legacy` modes. The remaining
+code-confirmed backpressure and timeout risks in `STRESS-FINDINGS.md` are still
+unfixed; the full release gates remain the 24 h soak, privileged
+syscall/wakeup/splice measurements, cgroup OOM sampling, and final fuzzing.
 
 ## Scope
 
@@ -76,7 +73,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 337 tests: 307 `beam-core`,
+a benchmark comparison. The current workspace has 347 tests: 317 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
 ## Repository layout
@@ -195,6 +192,15 @@ bind.
   session active while the mux remains open. The queue and byte budgets bound
   outstanding memory, not session lifetime; this is inherent to keeping
   arbitrary-source/full-cone replies.
+- Domain `New`/`Keep` frames are queued per session id while a bounded
+  per-mux resolver performs DNS; the lookup owner and suffix are tracked
+  separately, results carry a generation, and a newer GlobalID cancels older
+  pending New frames. IP frames, queued suffixes, and rejected replies retain
+  their ordering. Resolved domains are cached for 300 seconds. The resolver is
+  serial per mux, pending payload has a process-wide 4 MiB budget plus bounded
+  metadata, and UDP send/close waits are capped at 100 ms. This is not
+  universally nonblocking: a sequence of slow domains, a congested send, or
+  many close operations can still delay a mux briefly.
 - Live XUDP limits are 1024 process-wide sessions and 128 KiB per socket
   receive buffer; a mux holds at most half the global active slots. XUDP idle
   expiry is at most 60 seconds even when the TCP relay idle timeout is 300
@@ -393,6 +399,27 @@ is not claimed as parity. DNS p95 was 1.071x in the focused 10-pair run
 throughput regression was established in these short lab comparisons.
 Bidirectional runs had zero samples in both arms and were excluded.
 
+### XUDP mux HOL fix verification
+
+Commit `e0ca0bc` moves domain resolution off the shared read loop, bounds send
+and close waits, and adds lookup-owner/generation handling plus a process-wide
+4 MiB pending-payload budget. Regression tests cover slow-domain isolation,
+failed-lookup suffix draining, stale completions, queued/newer GlobalID
+ordering, TCP-network preservation, and accepted/dropped reply activity.
+
+Lab candidate: 11/11 checks; DNS 1000@32 **1000/0** at 1063 qps, p95 46 ms;
+UDP 3000×1200 **3000/3000**; HTTP 2000@32 **2000/0** after drain, p95 47 ms.
+A 5-rep A/B before the final owner/generation amendment measured clean up/down
+0.996x/0.986x, HTTP RPS 1.017x/p95 1.047x, DNS QPS 1.011x/p95 1.161x, loss1
+0.975x, RTT50 0.987x, and CPU up/down 0.991x/1.026x. A focused 10-pair DNS
+A/B on the final source measured QPS **0.996x** and p95 **1.023x** with zero
+errors. These are short lab comparisons, not equivalence proof; the full-A/B
+DNS p95 and HTTP p95 adverse signals remain. Bidirectional A/B had four valid
+pairs after excluding a zero-receive fifth new-arm run.
+Final Sol review: **APPROVE WITH NONBLOCKING CAVEATS**. Remaining caveats:
+the 4 MiB budget is payload-only, timing tests are scheduling-dependent, and
+there is no controlled multithreaded close/enqueue test.
+
 ### Performance
 
 ```bash
@@ -436,11 +463,11 @@ Cover flight differences are diagnostic only by the SNI-level decision.
 
 ## Known gaps
 
-- The XUDP junk-reply idle-pinning defect is fixed and lab-verified; its
-  invariant is documented above. `STRESS-FINDINGS.md` retains the remaining
-  open mux head-of-line, close/reserve, timeout-validation, replay, and
-  lower-risk items. Do not fold the remaining items into this note until they
-  are fixed and re-verified.
+- The XUDP junk-reply idle-pinning defect and the mux-wide resolution/send
+  stalls are fixed, deployed, and lab-verified; their invariants are documented
+  above. `STRESS-FINDINGS.md` retains the remaining close/reserve,
+  timeout-validation, replay, and lower-risk items. Do not fold the remaining
+  items into this note until they are fixed and re-verified.
 - A clean 24-hour mixed soak, privileged syscall/wakeup/splice gates, cgroup
   socket-memory/OOM sampling, and a final fuzz run of the multi-record
   ClientHello assembler remain open release-acceptance items.
