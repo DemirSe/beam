@@ -9,3 +9,9 @@ __pycache__/
 *.pyc
 
 /mobile-singbox.json
+
+# Windows tray launcher build artifacts and local runtime files
+/clients/windows-tray/beam-tray.exe
+/clients/windows-tray/app-res.o
+/clients/windows-tray/sing-box.exe
+/clients/windows-tray/config.json

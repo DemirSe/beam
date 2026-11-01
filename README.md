@@ -76,6 +76,37 @@ Parser changes also require the relevant fuzz target. Hot-path changes require
 a benchmark comparison. The current workspace has 347 tests: 317 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
+## Windows tray launcher
+
+`clients/windows-tray` is an optional 33 KiB native Win32 tray launcher for the
+official `sing-box.exe`. It has no settings UI and does not rewrite the
+configuration. TUN, DNS, routing, and QUIC/H3 behavior come only from
+`config.json`; the tray offers Start, Stop, Restart, Open config, Open log, and
+Exit.
+
+Build with a MinGW-w64 toolchain:
+
+```bash
+cd clients/windows-tray
+CC=x86_64-w64-mingw32-clang WINDRES=x86_64-w64-mingw32-windres ./build.sh
+```
+
+Place `beam-tray.exe`, the official `sing-box.exe`, and the profile as
+`config.json` in the same directory. `beam-tray.exe` carries a
+`requireAdministrator` manifest because the TUN inbound needs elevation. It
+starts sing-box automatically on launch, so TUN comes up from the config
+without a GUI toggle.
+
+Create a desktop shortcut on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-shortcut.ps1
+# add -Startup to place it in the login Startup folder instead
+```
+
+The launcher was cross-compiled and its PE manifest/resources were inspected;
+it has not been executed on a Windows host yet.
+
 ## Repository layout
 
 ```text
@@ -86,6 +117,7 @@ tests/tun         full-TUN interoperability harness and target services
 bench             stock-Xray vs beam benchmark harness and no-TUN smoke
 fuzz              separate cargo-fuzz workspace
 deploy            package/bootstrap, systemd, nftables, client rotation
+clients/windows-tray  optional native Windows tray launcher for official sing-box
 scripts           cover-parity and local build helpers
 ```
 
