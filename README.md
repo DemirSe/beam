@@ -78,7 +78,7 @@ a benchmark comparison. The current workspace has 347 tests: 317 `beam-core`,
 
 ## Windows tray launcher
 
-`clients/windows-tray` is an optional 33 KiB native Win32 tray launcher for the
+`clients/windows-tray` is an optional native Win32 tray launcher for the
 official `sing-box.exe`. It has no settings UI and does not rewrite the
 configuration. TUN, DNS, routing, and QUIC/H3 behavior come only from
 `config.json`; the tray offers Start, Stop, Restart, Open config, Open log, and
@@ -91,37 +91,34 @@ cd clients/windows-tray
 CC=x86_64-w64-mingw32-clang WINDRES=x86_64-w64-mingw32-windres ./build.sh
 ```
 
-Place `beam-tray.exe`, the official `sing-box.exe`, and the profile as
-`config.json` in the same directory. `beam-tray.exe` carries a
-`requireAdministrator` manifest because the TUN inbound needs elevation. It
-starts sing-box automatically on launch, so TUN comes up from the config
-without a GUI toggle.
-
-Create a desktop shortcut on Windows:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install-shortcut.ps1
-# add -Startup to place it in the login Startup folder instead
-```
+The supported Windows install is the one-file installer below. Build the tray
+only for development; do not assemble an elevated install by hand in a
+user-writable directory. The tray has a `requireAdministrator` manifest because
+the TUN inbound needs elevation and starts sing-box automatically on launch, so
+TUN comes up from the config without a GUI toggle.
 
 ### One-file installer
 
 `clients/windows-tray/beam-install.ps1` is a locally generated one-file
-installer containing the tray executable and the real profile. It downloads the
-official sing-box 1.14.4 Windows archive, verifies its SHA-256, installs to
-`%LOCALAPPDATA%\beam`, checks the profile, and creates a desktop shortcut.
-It is ignored by Git because it embeds real credentials.
+installer containing the tray executable and the real profile. Run it from an
+elevated Windows PowerShell. It downloads the official sing-box 1.14.4 Windows
+archive, verifies the archive and individual core files, installs to
+`%ProgramFiles%\beam`, stages and checks `config.json`, sets Windows
+`strict_route` to `true`, protects the directory/config/log ACLs, and creates a
+desktop shortcut. The config is restricted to Administrators and SYSTEM. It is
+ignored by Git because it embeds real credentials.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\beam-install.ps1
-# -Startup adds a login shortcut; -NoLaunch installs without starting the tray
+# Start Windows PowerShell with "Run as administrator", then:
+powershell -NoProfile -ExecutionPolicy Bypass -File .\beam-install.ps1
+# -Startup registers an unlimited highest-privilege logon task
+# -NoLaunch installs only
+# -ZipPath uses an already-downloaded official archive
 ```
 
-The generated installer was PowerShell-parsed and its embedded tray/profile
-payloads were byte-verified; it has not been executed on Windows yet.
-
-The launcher was cross-compiled and its PE manifest/resources were inspected;
-it has not been executed on a Windows host yet.
+The one-file installer has been run successfully on Windows. The hardened
+revision, tray menu, Stop/Restart/Exit, Explorer restart, reinstall, and
+scheduled-task paths still need a Windows smoke test.
 
 ## Repository layout
 

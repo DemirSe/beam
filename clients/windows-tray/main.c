@@ -26,7 +26,7 @@
 #define CORE_EXE        L"sing-box.exe"
 #define CONFIG_JSON     L"config.json"
 #define LOG_FILE        L"sing-box.log"
-#define MUTEX_NAME      L"Local\\beam-sing-box-tray"
+#define MUTEX_NAME      L"Global\\beam-sing-box-tray"
 
 #define WM_TRAY_MSG     (WM_APP + 1)
 #define TIMER_POLL      1
@@ -238,9 +238,13 @@ static BOOL start_core(void)
 
     ZeroMemory(&process, sizeof(process));
 
+    startup.dwFlags |= STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+
     if (!CreateProcessW(g_core, command, NULL, NULL, inherit_handles,
-                        CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, g_dir,
-                        &startup, &process)) {
+                        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP |
+                            CREATE_SUSPENDED,
+                        NULL, g_dir, &startup, &process)) {
         DWORD error = GetLastError();
 
         if (log_file != INVALID_HANDLE_VALUE)
@@ -268,7 +272,23 @@ static BOOL start_core(void)
         }
     }
 
-    ResumeThread(process.hThread);
+    if (ResumeThread(process.hThread) == (DWORD)-1) {
+        DWORD error = GetLastError();
+        TerminateProcess(process.hProcess, 0);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        if (g_job) {
+            CloseHandle(g_job);
+            g_job = NULL;
+        }
+        if (log_file != INVALID_HANDLE_VALUE)
+            CloseHandle(log_file);
+        if (nul_file != INVALID_HANDLE_VALUE)
+            CloseHandle(nul_file);
+        SetLastError(error);
+        show_error(L"Could not resume sing-box.exe.");
+        return FALSE;
+    }
     CloseHandle(process.hThread);
 
     if (log_file != INVALID_HANDLE_VALUE)
@@ -284,7 +304,18 @@ static BOOL start_core(void)
 static void stop_core(void)
 {
     if (g_process) {
-        TerminateProcess(g_process, 0);
+        DWORD pid = GetProcessId(g_process);
+        BOOL signalled = FALSE;
+
+        FreeConsole();
+        if (pid != 0 && AttachConsole(pid)) {
+            signalled = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
+            FreeConsole();
+        }
+
+        if (!signalled || WaitForSingleObject(g_process, 5000) != WAIT_OBJECT_0)
+            TerminateProcess(g_process, 0);
+
         WaitForSingleObject(g_process, 5000);
         CloseHandle(g_process);
         g_process = NULL;
@@ -314,8 +345,20 @@ static void poll_core(void)
 
 static void open_text_file(const wchar_t *path)
 {
-    HINSTANCE result = ShellExecuteW(NULL, L"open", L"notepad.exe", path,
-                                     g_dir, SW_SHOWNORMAL);
+    wchar_t system_dir[MAX_PATH];
+    wchar_t notepad[MAX_PATH];
+    UINT length = GetSystemDirectoryW(system_dir, ARRAYSIZE(system_dir));
+    HINSTANCE result;
+
+    if (length == 0 || length >= ARRAYSIZE(system_dir)) {
+        show_error(L"Could not locate the Windows system directory.");
+        return;
+    }
+
+    _snwprintf(notepad, ARRAYSIZE(notepad), L"%s\\notepad.exe", system_dir);
+    notepad[ARRAYSIZE(notepad) - 1] = L'\0';
+
+    result = ShellExecuteW(NULL, L"open", notepad, path, NULL, SW_SHOWNORMAL);
 
     if ((INT_PTR)result <= 32)
         show_error(L"Could not open the file with Notepad.");
@@ -462,6 +505,11 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line,
             CloseHandle(mutex);
         return 1;
     }
+
+    /* Explorer is medium-integrity; allow its callback and TaskbarCreated. */
+    ChangeWindowMessageFilterEx(g_window, WM_TRAY_MSG, MSGFLT_ALLOW, NULL);
+    if (g_taskbar_created)
+        ChangeWindowMessageFilterEx(g_window, g_taskbar_created, MSGFLT_ALLOW, NULL);
 
     tray_add();
     SetTimer(g_window, TIMER_POLL, 1000, NULL);
