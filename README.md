@@ -104,6 +104,22 @@ powershell -ExecutionPolicy Bypass -File .\install-shortcut.ps1
 # add -Startup to place it in the login Startup folder instead
 ```
 
+### One-file installer
+
+`clients/windows-tray/beam-install.ps1` is a locally generated one-file
+installer containing the tray executable and the real profile. It downloads the
+official sing-box 1.14.4 Windows archive, verifies its SHA-256, installs to
+`%LOCALAPPDATA%\beam`, checks the profile, and creates a desktop shortcut.
+It is ignored by Git because it embeds real credentials.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\beam-install.ps1
+# -Startup adds a login shortcut; -NoLaunch installs without starting the tray
+```
+
+The generated installer was PowerShell-parsed and its embedded tray/profile
+payloads were byte-verified; it has not been executed on Windows yet.
+
 The launcher was cross-compiled and its PE manifest/resources were inspected;
 it has not been executed on a Windows host yet.
 
