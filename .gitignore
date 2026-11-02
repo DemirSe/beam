@@ -16,3 +16,7 @@ __pycache__/
 /clients/windows-tray/sing-box.exe
 /clients/windows-tray/config.json
 /clients/windows-tray/beam-install.ps1
+
+# Linux tray build artifacts
+/clients/linux-tray/beam-tray
+/clients/linux-tray/beam-helper

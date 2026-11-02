@@ -120,6 +120,45 @@ The one-file installer has been run successfully on Windows. The hardened
 revision, tray menu, Stop/Restart/Exit, Explorer restart, reinstall, and
 scheduled-task paths still need a Windows smoke test.
 
+## Linux tray and DNS switch
+
+`clients/linux-tray` is a minimal GTK/AppIndicator tray plus a small setuid
+root helper. It has one action: Connect/Disconnect. There is no settings window
+and no autostart entry.
+
+- Disconnected: systemd-resolved uses the existing local ctrld resolver at
+  `127.0.0.1:5300`, which forwards to Control D.
+- Connected: `beam-client.service` starts and its `ExecStartPost` calls the
+  helper's `dns-on`. The helper waits for `sbtun0`, moves the ctrld resolved
+  drop-in aside, writes `99-beam.conf` with `DNS=1.1.1.1`, and restarts
+  systemd-resolved. That DNS traffic enters the TUN and the profile's Control D
+  DoH configuration handles it.
+- `ExecStopPost` calls `dns-off` and restores ctrld. `Restart=no` avoids a
+  restart cycle where the TUN comes back without the matching DNS state.
+- `beam-dns-reset.service` is enabled at boot and only runs when the beam DNS
+  drop-in is present, restoring ctrld after an unclean shutdown.
+
+Build and install:
+
+```bash
+cd clients/linux-tray
+./build.sh
+sudo ./install.sh
+/usr/local/bin/beam-tray
+```
+
+The installer verifies the official Linux core files by SHA-256 before
+installing them. The service is installed but not enabled or started. The
+helper only accepts fixed commands, checks that its real user matches
+`/etc/beam/allowed-user`, clears its environment, redirects stdio, closes
+inherited descriptors, and executes absolute `systemctl` paths. The TUN profile
+excludes the VLESS server and the Control D IPv4 anycast addresses from the TUN
+route.
+
+The helper is local, unsigned, and setuid root; treat the repository and
+installer as trusted input. SELinux relabeling is attempted on Fedora, but the
+service/helper still need a real TUN/DNS smoke test.
+
 ## Repository layout
 
 ```text
@@ -131,6 +170,7 @@ bench             stock-Xray vs beam benchmark harness and no-TUN smoke
 fuzz              separate cargo-fuzz workspace
 deploy            package/bootstrap, systemd, nftables, client rotation
 clients/windows-tray  optional native Windows tray launcher for official sing-box
+clients/linux-tray    minimal Linux tray plus root helper and DNS switch
 scripts           cover-parity and local build helpers
 ```
 
