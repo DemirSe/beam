@@ -176,6 +176,20 @@ The helper is local, unsigned, and setuid root; treat the repository and
 installer as trusted input. SELinux relabeling is attempted on Fedora, but the
 service/helper still need a real TUN/DNS smoke test.
 
+## Mobile profile
+
+The single canonical Android profile is the gitignored, mode-0600
+`mobile-singbox.json` in the repository root. Do not commit it; it contains the
+live UUID, REALITY keys, and Control D DoH path. `~/.config/beam/android-singbox.json`
+is only a symlink to that file.
+
+The profile keeps Android's TUN on `stack: system`, MTU 1500, `auto_route` on,
+and no generic mux. Like the Linux profile, it rejects UDP/443 before sniffing
+with `method: default` and `no_drop: true`, so H3/QUIC fails fast and the client
+falls back to HTTP/2 instead of waiting for the XUDP/TCP retransmission timeout.
+H3 is therefore intentionally unavailable in this recommended profile; the
+TCP/REALITY/WhatsApp SNI path is unchanged.
+
 ## Repository layout
 
 ```text
