@@ -133,6 +133,10 @@ and no autostart entry.
   drop-in aside, writes `99-beam.conf` with `DNS=1.1.1.1`, and restarts
   systemd-resolved. That DNS traffic enters the TUN and the profile's Control D
   DoH configuration handles it.
+- The Linux profile sets `auto_redirect: true` on the TUN. With only
+  `auto_route`, TCP through the TUN timed out while H3/QUIC worked; the nftables
+  redirect path fixes TCP and is required on this host. Requires nftables and a
+  root client service.
 - `ExecStopPost` calls `dns-off` and restores ctrld. `Restart=no` avoids a
   restart cycle where the TUN comes back without the matching DNS state.
 - `beam-dns-reset.service` is enabled at boot and only runs when the beam DNS
@@ -153,7 +157,7 @@ helper only accepts fixed commands, checks that its real user matches
 `/etc/beam/allowed-user`, clears its environment, redirects stdio, closes
 inherited descriptors, and executes absolute `systemctl` paths. The TUN profile
 excludes the VLESS server and the Control D IPv4 anycast addresses from the TUN
-route.
+route, and uses `auto_redirect: true` for TCP.
 
 The helper is local, unsigned, and setuid root; treat the repository and
 installer as trusted input. SELinux relabeling is attempted on Fedora, but the
