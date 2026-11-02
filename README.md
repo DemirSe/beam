@@ -133,10 +133,11 @@ archive, verifies the archive and individual core files, installs to
 `%ProgramFiles%\beam`, stages and checks `config.json`, sets Windows
 `strict_route` to `true`, protects the directory/config/log ACLs, and creates a
 desktop shortcut. The embedded profile contains the same canonical UDP/443
-pre-match reject as Linux and Android, so Windows also falls back to HTTP/2
-without waiting for XUDP/TCP retransmission. The config is restricted to
-Administrators and SYSTEM. It is ignored by Git because it embeds real
-credentials.
+pre-match reject as Linux and Android, and the installer normalizes the decoded
+route rules again before staging, so an older embedded blob cannot silently
+drop the rule. Windows therefore falls back to HTTP/2 without waiting for
+XUDP/TCP retransmission. The config is restricted to Administrators and SYSTEM.
+It is ignored by Git because it embeds real credentials.
 
 ```powershell
 # Start Windows PowerShell with "Run as administrator", then:
@@ -186,10 +187,12 @@ sudo ./install.sh
 ```
 
 The installer no longer assumes a profile in `/tmp`. If `CONFIG_SRC` is unset
-and `/etc/beam/config.json` exists, a reinstall preserves that file. A fresh
+and `/etc/beam/config.json` exists, a reinstall reuses it as input. A fresh
 install must set `CONFIG_SRC=/path/to/config.json`; the sanitized structure is
-in `clients/linux-tray/config.example.json`. The installer validates the
-profile before stopping the running service.
+in `clients/linux-tray/config.example.json`. The installer requires `python3`,
+normalizes the canonical QUIC reject policy, and validates the normalized
+profile before stopping the running service. An older reused profile therefore
+cannot silently keep a missing reject rule.
 
 The installer verifies the official Linux core files by SHA-256 before
 installing them. The service is installed but not enabled or started. DNS

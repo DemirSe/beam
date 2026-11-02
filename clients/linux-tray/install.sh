@@ -23,7 +23,8 @@ if [ -z "$CONFIG_SRC" ]; then
     fi
 fi
 [ -r "$CONFIG_SRC" ] || { echo "missing or unreadable $CONFIG_SRC" >&2; exit 1; }
-CONFIG_SRC_REAL=$(readlink -f "$CONFIG_SRC")
+[ -f "$HERE/config-policy.py" ] || { echo "missing $HERE/config-policy.py" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 is required to normalize the client policy" >&2; exit 1; }
 
 [ -x "$CORE_DIR/sing-box" ] || { echo "missing $CORE_DIR/sing-box" >&2; exit 1; }
 [ -x "$HERE/beam-tray" ] || { echo "build first: $HERE/build.sh" >&2; exit 1; }
@@ -40,18 +41,18 @@ install -d -m 0755 /usr/local/lib/beam /usr/local/libexec /etc/beam
 install -m 0755 "$CORE_DIR/sing-box" /usr/local/lib/beam/sing-box
 install -m 0644 "$CORE_DIR/libcronet.so" /usr/local/lib/beam/libcronet.so
 install -m 0644 "$CORE_DIR/LICENSE" /usr/local/lib/beam/LICENSE
-/usr/local/lib/beam/sing-box check -c "$CONFIG_SRC"
-INSTALLED_CONFIG_REAL=$(readlink -f /etc/beam/config.json 2>/dev/null || true)
-if [ -n "$INSTALLED_CONFIG_REAL" ] && [ "$CONFIG_SRC_REAL" = "$INSTALLED_CONFIG_REAL" ]; then
-    echo "reusing installed /etc/beam/config.json"
-    systemctl stop beam-client 2>/dev/null || true
-else
-    systemctl stop beam-client 2>/dev/null || true
-    if [ -f /etc/beam/config.json ]; then
-        cp -a /etc/beam/config.json "/etc/beam/config.json.bak-$(date -u +%Y%m%dT%H%M%S%NZ)"
-    fi
-    install -m 0600 "$CONFIG_SRC" /etc/beam/config.json
+
+NORMALIZED_CONFIG=$(mktemp)
+trap 'rm -f "$NORMALIZED_CONFIG"' EXIT
+chmod 0600 "$NORMALIZED_CONFIG"
+python3 "$HERE/config-policy.py" "$CONFIG_SRC" "$NORMALIZED_CONFIG"
+/usr/local/lib/beam/sing-box check -c "$NORMALIZED_CONFIG"
+
+systemctl stop beam-client 2>/dev/null || true
+if [ -f /etc/beam/config.json ]; then
+    cp -a /etc/beam/config.json "/etc/beam/config.json.bak-$(date -u +%Y%m%dT%H%M%S%NZ)"
 fi
+install -m 0600 "$NORMALIZED_CONFIG" /etc/beam/config.json
 printf '%s\n' "$INSTALL_USER" > /etc/beam/allowed-user
 chmod 0644 /etc/beam/allowed-user
 
