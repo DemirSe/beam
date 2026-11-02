@@ -39,9 +39,13 @@ The target profile is:
 - Direct (`freedom`) outbound;
 - a full-TUN client such as sing-box, Hiddify, or stock Xray.
 
-TCP, UDP, DNS, QUIC/HTTP/3, IPv4, and IPv6 must work through the tunnel.
-ICMP is not carried, matching stock Xray. The server must remain compatible
-with stock clients using the same UUID, public key, short ID, SNI, and flow.
+The server carries TCP, UDP, DNS, QUIC/HTTP3, IPv4, and IPv6 through the
+tunnel. The recommended stock-client profiles intentionally reject public
+UDP/443 before sniffing so H3/QUIC falls back immediately to HTTP/2; the
+server-side XUDP/legacy paths remain available for profiles that explicitly
+allow H3. ICMP is not carried, matching stock Xray. The server must remain
+compatible with stock clients using the same UUID, public key, short ID, SNI,
+and flow.
 
 Out of scope for v1: client/TUN implementation, multi-user/panels/accounting,
 VMess/Trojan/Shadowsocks/SOCKS/HTTP, WebSocket/gRPC/H2/QUIC transports, H2MUX,
@@ -76,6 +80,29 @@ Parser changes also require the relevant fuzz target. Hot-path changes require
 a benchmark comparison. The current workspace has 347 tests: 317 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
+### Default stock-client QUIC policy
+
+All recommended profiles use this pre-match rule and ordering:
+
+```json
+[
+  {"ip_is_private": true, "outbound": "direct"},
+  {"action": "reject", "network": "udp", "port": [443],
+   "method": "default", "no_drop": true},
+  {"action": "sniff", "sniffer": ["http", "tls", "quic", "dns"],
+   "timeout": "300ms"},
+  {"protocol": "dns", "action": "hijack-dns"}
+]
+```
+
+The private rule comes first so LAN destinations remain direct. The public
+UDP/443 reject is before sniff so sing-box synthesizes ICMP port unreachable
+instead of silently dropping; `no_drop` prevents burst protection from
+degrading later requests to timeouts. Public HTTP/3 therefore fails fast and
+the application uses HTTP/2 over the TCP/REALITY path. This is the default for
+Linux, Android, and the embedded Windows profile. A profile that needs H3 must
+explicitly opt in and accepts the XUDP/TCP head-of-line risk.
+
 ## Windows tray launcher
 
 `clients/windows-tray` is an optional native Win32 tray launcher for the
@@ -105,8 +132,11 @@ elevated Windows PowerShell. It downloads the official sing-box 1.14.4 Windows
 archive, verifies the archive and individual core files, installs to
 `%ProgramFiles%\beam`, stages and checks `config.json`, sets Windows
 `strict_route` to `true`, protects the directory/config/log ACLs, and creates a
-desktop shortcut. The config is restricted to Administrators and SYSTEM. It is
-ignored by Git because it embeds real credentials.
+desktop shortcut. The embedded profile contains the same canonical UDP/443
+pre-match reject as Linux and Android, so Windows also falls back to HTTP/2
+without waiting for XUDP/TCP retransmission. The config is restricted to
+Administrators and SYSTEM. It is ignored by Git because it embeds real
+credentials.
 
 ```powershell
 # Start Windows PowerShell with "Run as administrator", then:

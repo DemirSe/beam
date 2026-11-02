@@ -12,7 +12,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 IDENTITY = Path("/home/demir/.config/beam/client-identity.json")
-CONFIG = Path("/etc/sing-box/config.json")
+CONFIG = Path("/etc/beam/config.json")
+SERVICE = "beam-client"
+
+
+def ensure_quic_policy(config: dict) -> None:
+    """Keep the stock-client H2 fallback policy canonical."""
+    route = config.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+    private = next((r for r in rules if r.get("ip_is_private") is True), None)
+    sniff = next((r for r in rules if r.get("action") == "sniff"), None)
+    dns = next((r for r in rules if r.get("protocol") == "dns"), None)
+    reject = {
+        "action": "reject",
+        "network": "udp",
+        "port": [443],
+        "method": "default",
+        "no_drop": True,
+    }
+
+    def is_udp443_reject(rule: dict) -> bool:
+        port = rule.get("port", [])
+        if isinstance(port, int):
+            port = [port]
+        return (
+            rule.get("action") == "reject"
+            and rule.get("network") == "udp"
+            and 443 in port
+        )
+
+    route["rules"] = [
+        r
+        for r in (private, reject, sniff, dns)
+        if r is not None
+    ]
+    route["rules"].extend(r for r in rules if not is_udp443_reject(r) and r not in route["rules"])
 
 
 def main() -> int:
@@ -63,6 +97,7 @@ def main() -> int:
     reality["enabled"] = True
     reality["public_key"] = identity["public_key"]
     reality["short_id"] = identity["short_id"]
+    ensure_quic_policy(config)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup = CONFIG.with_name(f"config.json.bak-{stamp}")
@@ -72,21 +107,21 @@ def main() -> int:
     CONFIG.write_text(json.dumps(config, indent=2) + "\n")
     os.chmod(CONFIG, 0o600)
 
-    result = subprocess.run(["systemctl", "restart", "sing-box"], capture_output=True, text=True)
-    active = subprocess.run(["systemctl", "is-active", "--quiet", "sing-box"])
+    result = subprocess.run(["systemctl", "restart", SERVICE], capture_output=True, text=True)
+    active = subprocess.run(["systemctl", "is-active", "--quiet", SERVICE])
     if result.returncode != 0 or active.returncode != 0:
         shutil.copy2(backup, CONFIG)
-        subprocess.run(["systemctl", "restart", "sing-box"], check=False)
+        subprocess.run(["systemctl", "restart", SERVICE], check=False)
         print("update-client: restart failed; previous config restored", file=sys.stderr)
         print(result.stderr.strip(), file=sys.stderr)
         return 1
 
     enabled = subprocess.run(
-        ["systemctl", "enable", "sing-box"], capture_output=True, text=True
+        ["systemctl", "enable", SERVICE], capture_output=True, text=True
     )
     if enabled.returncode != 0:
         print(
-            "update-client: warning: could not enable sing-box at boot",
+            "update-client: warning: could not enable beam-client at boot",
             file=sys.stderr,
         )
         print(enabled.stderr.strip(), file=sys.stderr)

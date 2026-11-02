@@ -100,6 +100,10 @@
     "default_domain_resolver": "local-dns",
     "rules": [
       {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
         "action": "reject",
         "network": "udp",
         "port": [
@@ -121,10 +125,6 @@
       {
         "protocol": "dns",
         "action": "hijack-dns"
-      },
-      {
-        "ip_is_private": true,
-        "outbound": "direct"
       }
     ],
     "final": "proxy"
