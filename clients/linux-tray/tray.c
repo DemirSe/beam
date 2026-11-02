@@ -17,6 +17,7 @@
 #include <sys/file.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define HELPER "/usr/local/libexec/beam-helper"
@@ -74,6 +75,7 @@ static GtkWidget *g_status_item;
 static GtkWidget *g_action_item;
 static int g_busy;
 static int g_helper_failed;
+static time_t g_cooldown_until;
 
 static int tunnel_present(void)
 {
@@ -83,6 +85,7 @@ static int tunnel_present(void)
 static void update_ui(void)
 {
     int connected = tunnel_present();
+    int cooling = time(NULL) < g_cooldown_until;
 
     if (g_busy) {
         gtk_menu_item_set_label(g_status_item, "Beam: working...");
@@ -97,7 +100,7 @@ static void update_ui(void)
                                 connected ? "Beam: connected" : "Beam: disconnected");
     gtk_menu_item_set_label(g_action_item,
                             connected ? "Disconnect" : "Connect");
-    gtk_widget_set_sensitive(g_action_item, 1);
+    gtk_widget_set_sensitive(g_action_item, !cooling);
     app_indicator_set_icon_full(g_indicator,
         connected ? "network-vpn-symbolic" : "network-vpn-disconnected-symbolic",
         connected ? "Connected" : "Disconnected");
@@ -116,6 +119,7 @@ static void helper_done(pid_t pid, gint status, gpointer data)
     (void)data;
     g_busy = 0;
     g_helper_failed = !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    g_cooldown_until = time(NULL) + 3;
     update_ui();
 }
 
@@ -135,7 +139,7 @@ static void on_toggle(GtkWidget *item, gpointer data)
     (void)item;
     (void)data;
 
-    if (g_busy)
+    if (g_busy || time(NULL) < g_cooldown_until)
         return;
 
     command = tunnel_present() ? "down" : "up";

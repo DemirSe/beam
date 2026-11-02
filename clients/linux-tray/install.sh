@@ -7,15 +7,25 @@ fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CORE_DIR="${CORE_DIR:-/tmp/beam-core}"
-CONFIG_SRC="${CONFIG_SRC:-/tmp/beam-linux-config.json}"
+CONFIG_SRC="${CONFIG_SRC:-}"
 INSTALL_USER="${INSTALL_USER:-${SUDO_USER:-}}"
 if [ -z "$INSTALL_USER" ] || [ "$INSTALL_USER" = root ]; then
     echo "run via sudo from the desktop user, or set INSTALL_USER=<name>" >&2
     exit 1
 fi
 
+if [ -z "$CONFIG_SRC" ]; then
+    if [ -f /etc/beam/config.json ]; then
+        CONFIG_SRC=/etc/beam/config.json
+    else
+        echo "set CONFIG_SRC to the client profile; refusing to guess /tmp" >&2
+        exit 1
+    fi
+fi
+[ -r "$CONFIG_SRC" ] || { echo "missing or unreadable $CONFIG_SRC" >&2; exit 1; }
+CONFIG_SRC_REAL=$(readlink -f "$CONFIG_SRC")
+
 [ -x "$CORE_DIR/sing-box" ] || { echo "missing $CORE_DIR/sing-box" >&2; exit 1; }
-[ -f "$CONFIG_SRC" ] || { echo "missing $CONFIG_SRC" >&2; exit 1; }
 [ -x "$HERE/beam-tray" ] || { echo "build first: $HERE/build.sh" >&2; exit 1; }
 [ -x "$HERE/beam-helper" ] || { echo "build first: $HERE/build.sh" >&2; exit 1; }
 
@@ -26,16 +36,22 @@ actual_lib=$(sha256sum "$CORE_DIR/libcronet.so" | awk '{print $1}')
 [ "$actual_sing" = "$CORE_SING_SHA" ] || { echo "core sing-box hash mismatch" >&2; exit 1; }
 [ "$actual_lib" = "$CORE_LIB_SHA" ] || { echo "core libcronet hash mismatch" >&2; exit 1; }
 
-systemctl stop beam-client 2>/dev/null || true
 install -d -m 0755 /usr/local/lib/beam /usr/local/libexec /etc/beam
 install -m 0755 "$CORE_DIR/sing-box" /usr/local/lib/beam/sing-box
 install -m 0644 "$CORE_DIR/libcronet.so" /usr/local/lib/beam/libcronet.so
 install -m 0644 "$CORE_DIR/LICENSE" /usr/local/lib/beam/LICENSE
 /usr/local/lib/beam/sing-box check -c "$CONFIG_SRC"
-if [ -f /etc/beam/config.json ]; then
-    cp -a /etc/beam/config.json "/etc/beam/config.json.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+INSTALLED_CONFIG_REAL=$(readlink -f /etc/beam/config.json 2>/dev/null || true)
+if [ -n "$INSTALLED_CONFIG_REAL" ] && [ "$CONFIG_SRC_REAL" = "$INSTALLED_CONFIG_REAL" ]; then
+    echo "reusing installed /etc/beam/config.json"
+    systemctl stop beam-client 2>/dev/null || true
+else
+    systemctl stop beam-client 2>/dev/null || true
+    if [ -f /etc/beam/config.json ]; then
+        cp -a /etc/beam/config.json "/etc/beam/config.json.bak-$(date -u +%Y%m%dT%H%M%S%NZ)"
+    fi
+    install -m 0600 "$CONFIG_SRC" /etc/beam/config.json
 fi
-install -m 0600 "$CONFIG_SRC" /etc/beam/config.json
 printf '%s\n' "$INSTALL_USER" > /etc/beam/allowed-user
 chmod 0644 /etc/beam/allowed-user
 
@@ -49,6 +65,8 @@ cat > /etc/systemd/system/beam-client.service <<'EOF'
 Description=beam client (sing-box VLESS/REALITY TUN)
 After=network-online.target nss-lookup.target
 Wants=network-online.target
+# The tray may toggle quickly; do not make a transient stop/start permanent.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

@@ -197,11 +197,11 @@ static int switch_dns_on(void)
     return 0;
 }
 
-static int restart_resolved(void)
+static int reload_resolved(void)
 {
     char *const argv[] = {
         SYSTEMCTL, "--no-pager", "--no-ask-password", "--quiet",
-        "restart", "systemd-resolved", NULL
+        "reload", "systemd-resolved", NULL
     };
     return run(argv);
 }
@@ -225,13 +225,13 @@ static int dns_on(void)
     if (lock < 0)
         return 1;
     if (wait_tun(10) == 0 && switch_dns_on() == 0 &&
-        restart_resolved() == 0 &&
+        reload_resolved() == 0 &&
         access(CTRL_DROPIN, F_OK) != 0 &&
         access(BEAM_DROPIN, F_OK) == 0) {
         rc = 0;
     } else {
         (void)restore_ctrld_dropin();
-        (void)restart_resolved();
+        (void)reload_resolved();
     }
     close(lock);
     return rc == 0 ? 0 : 1;
@@ -245,7 +245,7 @@ static int dns_off(void)
     if (lock < 0)
         return 1;
     rc = restore_ctrld_dropin();
-    if (restart_resolved() != 0)
+    if (reload_resolved() != 0)
         rc = -1;
     if (access(CTRL_DROPIN, F_OK) != 0 || access(BEAM_DROPIN, F_OK) == 0)
         rc = -1;

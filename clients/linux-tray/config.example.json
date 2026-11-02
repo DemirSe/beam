@@ -1,0 +1,123 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-hosts",
+        "type": "hosts",
+        "predefined": {
+          "dns.controld.com": [
+            "76.76.2.22",
+            "76.76.10.22",
+            "2606:1a40::22",
+            "2606:1a40:1::22"
+          ]
+        }
+      },
+      {
+        "tag": "remote-doh",
+        "type": "https",
+        "server": "dns.controld.com",
+        "server_port": 443,
+        "path": "/REPLACE_CONTROLD_PATH",
+        "detour": "proxy",
+        "domain_resolver": "dns-hosts"
+      },
+      {
+        "tag": "local-dns",
+        "type": "local",
+        "detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          ".lan",
+          ".local",
+          ".home.arpa"
+        ],
+        "server": "local-dns"
+      }
+    ],
+    "final": "remote-doh",
+    "strategy": "prefer_ipv4",
+    "cache_capacity": 4096
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
+      "mtu": 1500,
+      "auto_route": true,
+      "strict_route": false,
+      "stack": "system",
+      "interface_name": "sbtun0",
+      "route_exclude_address": [
+        "203.0.113.10/32",
+        "76.76.2.22/32",
+        "76.76.10.22/32"
+      ],
+      "auto_redirect": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "203.0.113.10",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "flow": "xtls-rprx-vision",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "short_id": "0000000000000000"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "local-dns",
+    "rules": [
+      {
+        "action": "sniff",
+        "sniffer": [
+          "http",
+          "tls",
+          "quic",
+          "dns"
+        ],
+        "timeout": "300ms"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      }
+    ],
+    "final": "proxy"
+  }
+}

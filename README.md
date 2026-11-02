@@ -151,13 +151,22 @@ sudo ./install.sh
 /usr/local/bin/beam-tray
 ```
 
+The installer no longer assumes a profile in `/tmp`. If `CONFIG_SRC` is unset
+and `/etc/beam/config.json` exists, a reinstall preserves that file. A fresh
+install must set `CONFIG_SRC=/path/to/config.json`; the sanitized structure is
+in `clients/linux-tray/config.example.json`. The installer validates the
+profile before stopping the running service.
+
 The installer verifies the official Linux core files by SHA-256 before
-installing them. The service is installed but not enabled or started. The
-helper only accepts fixed commands, checks that its real user matches
-`/etc/beam/allowed-user`, clears its environment, redirects stdio, closes
-inherited descriptors, and executes absolute `systemctl` paths. The TUN profile
-excludes the VLESS server and the Control D IPv4 anycast addresses from the TUN
-route, and uses `auto_redirect: true` for TCP.
+installing them. The service is installed but not enabled or started. DNS
+changes use `systemctl reload systemd-resolved`, so rapid tray toggles do not
+restart the resolver or hit its start limit. The tray also applies a three
+second cooldown after each helper action. The helper only accepts fixed
+commands, checks that its real user matches `/etc/beam/allowed-user`, clears its
+environment, redirects stdio, closes inherited descriptors, and executes
+absolute `systemctl` paths. The TUN profile excludes the VLESS server and the
+Control D IPv4 anycast addresses from the TUN route, and uses
+`auto_redirect: true` for TCP.
 
 The helper is local, unsigned, and setuid root; treat the repository and
 installer as trusted input. SELinux relabeling is attempted on Fedora, but the
