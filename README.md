@@ -130,13 +130,17 @@ and no autostart entry.
   `127.0.0.1:5300`, which forwards to Control D.
 - Connected: `beam-client.service` starts and its `ExecStartPost` calls the
   helper's `dns-on`. The helper waits for `sbtun0`, moves the ctrld resolved
-  drop-in aside, writes `99-beam.conf` with `DNS=1.1.1.1`, and restarts
+  drop-in aside, writes `99-beam.conf` with `DNS=1.1.1.1`, and reloads
   systemd-resolved. That DNS traffic enters the TUN and the profile's Control D
   DoH configuration handles it.
 - The Linux profile sets `auto_redirect: true` on the TUN. With only
-  `auto_route`, TCP through the TUN timed out while H3/QUIC worked; the nftables
-  redirect path fixes TCP and is required on this host. Requires nftables and a
-  root client service.
+  `auto_route`, TCP through the TUN timed out; the nftables redirect path fixes
+  TCP and is required on this host. Requires nftables and a root client service.
+- The Linux profile also rejects UDP/443 before sniffing with
+  `action: reject`, `method: default`, and `no_drop: true`. sing-box emits ICMP
+  port unreachable immediately, so browsers and curl fall back to HTTP/2
+  without waiting for the XUDP/TCP retransmission timeout. H3 is intentionally
+  unavailable on this stock-client profile; the TCP/REALITY cover is unchanged.
 - `ExecStopPost` calls `dns-off` and restores ctrld. `Restart=no` avoids a
   restart cycle where the TUN comes back without the matching DNS state.
 - `beam-dns-reset.service` is enabled at boot and only runs when the beam DNS

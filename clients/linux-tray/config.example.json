@@ -100,6 +100,15 @@
     "default_domain_resolver": "local-dns",
     "rules": [
       {
+        "action": "reject",
+        "network": "udp",
+        "port": [
+          443
+        ],
+        "method": "default",
+        "no_drop": true
+      },
+      {
         "action": "sniff",
         "sniffer": [
           "http",
