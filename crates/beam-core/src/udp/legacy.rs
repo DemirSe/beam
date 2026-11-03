@@ -320,7 +320,6 @@ where
                     Ok(value) => value,
                     Err(error) => break Err(UdpError::Io(error)),
                 };
-                idle.as_mut().reset(next_deadline(config.idle_timeout));
                 if length == 0 || length > payload_limit {
                     tracing::trace!(
                         length,
@@ -339,6 +338,7 @@ where
                 {
                     break Err(error);
                 }
+                idle.as_mut().reset(next_deadline(config.idle_timeout));
             }
         }
     };
@@ -383,7 +383,6 @@ where
                     "packetaddr destination table is full; dropping the datagram"
                 );
                 decoder.consume(frame.end);
-                idle.as_mut().reset(next_deadline(config.idle_timeout));
                 continue;
             }
 
@@ -397,7 +396,6 @@ where
                     "packetaddr destination family has no socket; dropping the datagram"
                 );
                 decoder.consume(frame.end);
-                idle.as_mut().reset(next_deadline(config.idle_timeout));
                 continue;
             };
 
@@ -446,7 +444,6 @@ where
                     Ok(value) => value,
                     Err(error) => break Err(UdpError::Io(error)),
                 };
-                idle.as_mut().reset(next_deadline(config.idle_timeout));
                 if length == 0 || length > payload_limit {
                     tracing::trace!(
                         length,
@@ -455,7 +452,7 @@ where
                     );
                     continue;
                 }
-                if let Err(error) = write_packetaddr_reply(
+                match write_packetaddr_reply(
                     &mut writer,
                     source,
                     &v4_incoming[..length],
@@ -464,7 +461,9 @@ where
                 )
                 .await
                 {
-                    break Err(error);
+                    Ok(true) => idle.as_mut().reset(next_deadline(config.idle_timeout)),
+                    Ok(false) => {}
+                    Err(error) => break Err(error),
                 }
             }
             received = recv_optional(v6.as_ref(), &mut v6_incoming) => {
@@ -472,7 +471,6 @@ where
                     Ok(value) => value,
                     Err(error) => break Err(UdpError::Io(error)),
                 };
-                idle.as_mut().reset(next_deadline(config.idle_timeout));
                 if length == 0 || length > payload_limit {
                     tracing::trace!(
                         length,
@@ -481,7 +479,7 @@ where
                     );
                     continue;
                 }
-                if let Err(error) = write_packetaddr_reply(
+                match write_packetaddr_reply(
                     &mut writer,
                     source,
                     &v6_incoming[..length],
@@ -490,7 +488,9 @@ where
                 )
                 .await
                 {
-                    break Err(error);
+                    Ok(true) => idle.as_mut().reset(next_deadline(config.idle_timeout)),
+                    Ok(false) => {}
+                    Err(error) => break Err(error),
                 }
             }
         }
@@ -642,15 +642,17 @@ async fn write_packetaddr_reply<W>(
     payload: &[u8],
     reply: &mut Vec<u8>,
     io_timeout: Duration,
-) -> Result<(), UdpError>
+) -> Result<bool, UdpError>
 where
     W: AsyncWrite + Unpin,
 {
     if !encode_packetaddr_reply(source, payload, reply) {
-        return Ok(());
+        // The payload passed the per-socket limit but cannot fit after the
+        // packetaddr source header. This is a dropped reply, not activity.
+        return Ok(false);
     }
     match timeout(io_timeout, writer.write_all(reply)).await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => Ok(true),
         Ok(Err(error)) => Err(UdpError::Io(error)),
         Err(_) => Err(UdpError::Timeout {
             stage: "stream write",
@@ -834,6 +836,7 @@ impl DestinationTable {
 /// Bounded reassembly of `length(2 BE) | payload` frames.
 struct FrameDecoder {
     buffer: Vec<u8>,
+    offset: usize,
     max_payload: usize,
 }
 
@@ -841,22 +844,31 @@ impl FrameDecoder {
     fn new(max_payload: usize) -> Self {
         Self {
             buffer: Vec::with_capacity(LENGTH_PREFIX_LEN + max_payload),
+            offset: 0,
             max_payload,
         }
     }
 
     fn buffered(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len().saturating_sub(self.offset)
     }
 
     /// Appends stream bytes while keeping the reassembly bound.
+    ///
+    /// Compaction happens once per read batch, not once per parsed frame. A
+    /// batch of thousands of tiny frames therefore costs one tail move, not
+    /// one memmove per frame.
     fn push(&mut self, bytes: &[u8]) -> Result<(), UdpError> {
         let bound = READ_CHUNK_LEN
             .saturating_add(LENGTH_PREFIX_LEN)
             .saturating_add(self.max_payload);
-        let buffered = self.buffer.len().saturating_add(bytes.len());
+        let buffered = self.buffered().saturating_add(bytes.len());
         if buffered > bound {
             return Err(UdpError::BufferOverflow { buffered });
+        }
+        if self.offset > 0 {
+            self.buffer.drain(..self.offset);
+            self.offset = 0;
         }
         self.buffer.extend_from_slice(bytes);
         Ok(())
@@ -869,12 +881,16 @@ impl FrameDecoder {
     /// being buffered.
     fn next_frame(&mut self) -> Result<Option<Range<usize>>, UdpError> {
         loop {
-            let Some(header) = self.buffer.get(..LENGTH_PREFIX_LEN) else {
+            let start = self.offset;
+            let Some(header) = self
+                .buffer
+                .get(start..start.saturating_add(LENGTH_PREFIX_LEN))
+            else {
                 return Ok(None);
             };
             let length = usize::from(u16::from_be_bytes([header[0], header[1]]));
             if length == 0 {
-                self.consume(LENGTH_PREFIX_LEN);
+                self.offset = start.saturating_add(LENGTH_PREFIX_LEN);
                 continue;
             }
             if length > self.max_payload {
@@ -883,7 +899,10 @@ impl FrameDecoder {
                     max: self.max_payload,
                 });
             }
-            let Some(end) = LENGTH_PREFIX_LEN.checked_add(length) else {
+            let Some(end) = start
+                .checked_add(LENGTH_PREFIX_LEN)
+                .and_then(|start| start.checked_add(length))
+            else {
                 return Err(UdpError::DatagramTooLarge {
                     length,
                     max: self.max_payload,
@@ -892,16 +911,17 @@ impl FrameDecoder {
             if self.buffer.len() < end {
                 return Ok(None);
             }
-            return Ok(Some(LENGTH_PREFIX_LEN..end));
+            return Ok(Some((start + LENGTH_PREFIX_LEN)..end));
         }
     }
 
-    /// Drops the consumed frame bytes.
+    /// Advances the cursor without moving the unread tail.
     fn consume(&mut self, end: usize) {
         if end >= self.buffer.len() {
             self.buffer.clear();
+            self.offset = 0;
         } else {
-            self.buffer.drain(..end);
+            self.offset = end;
         }
     }
 }
@@ -1140,6 +1160,106 @@ mod tests {
             address: Address::Domain(PACKETADDR_MAGIC_DOMAIN.to_uppercase()),
             port: 0,
         }));
+    }
+
+    #[test]
+    fn frame_decoder_consumes_zero_length_and_coalesced_frames() {
+        let mut decoder = FrameDecoder::new(16);
+        decoder
+            .push(&[0, 0, 0, 1, b'a', 0, 0, 0, 0])
+            .expect("buffer fits");
+        let frame = decoder.next_frame().expect("frame parse").expect("frame");
+        assert_eq!(&decoder.buffer[frame.clone()], b"a");
+        decoder.consume(frame.end);
+        assert_eq!(decoder.next_frame().expect("tail parse"), None);
+        assert_eq!(decoder.buffered(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_legacy_replies_do_not_refresh_idle_clock() {
+        let responder = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("responder socket");
+        let address = responder.local_addr().expect("responder address");
+        let mut config = test_config(MAX_DATAGRAM_SIZE);
+        config.idle_timeout = Duration::from_millis(300);
+
+        let responder_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 64];
+            let (_, peer) = responder
+                .recv_from(&mut buffer)
+                .await
+                .expect("initial datagram");
+            loop {
+                let _ = responder.send_to(&[], peer).await;
+                let _ = responder
+                    .send_to(&vec![0xaa; MAX_DATAGRAM_SIZE + 100], peer)
+                    .await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let (mut client, task) = start(net_location(address), config);
+        write_frame(&mut client, b"start").await;
+        let result = timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("legacy idle timeout did not fire")
+            .expect("legacy handler panicked");
+        assert!(
+            matches!(
+                result,
+                Err(UdpError::Timeout {
+                    stage: "stream idle"
+                })
+            ),
+            "dropped replies refreshed the idle clock: {result:?}"
+        );
+        drop(client);
+        responder_task.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_packetaddr_replies_do_not_refresh_idle_clock() {
+        let responder = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("responder socket");
+        let address = responder.local_addr().expect("responder address");
+        let mut config = test_config(MAX_DATAGRAM_SIZE);
+        config.idle_timeout = Duration::from_millis(300);
+
+        let responder_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 64];
+            let (_, peer) = responder
+                .recv_from(&mut buffer)
+                .await
+                .expect("initial datagram");
+            let oversize = vec![0xaa; MAX_DATAGRAM_SIZE - 8];
+            loop {
+                // The packetaddr source header pushes this reply over the
+                // 8192-byte output bound even though the raw payload passes
+                // the socket receive limit.
+                let _ = responder.send_to(&oversize, peer).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let (mut client, task) = start(packetaddr_destination(), config);
+        write_frame(&mut client, &packetaddr_datagram(address, b"start")).await;
+        let result = timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("packetaddr idle timeout did not fire")
+            .expect("packetaddr handler panicked");
+        assert!(
+            matches!(
+                result,
+                Err(UdpError::Timeout {
+                    stage: "stream idle"
+                })
+            ),
+            "dropped packetaddr replies refreshed the idle clock: {result:?}"
+        );
+        drop(client);
+        responder_task.abort();
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use zeroize::Zeroizing;
 
 use crate::address::{Address, NetLocation};
@@ -1015,17 +1015,19 @@ async fn handle_authenticated(
     config: &TlsServerConfig,
     _connection_permit: OwnedSemaphorePermit,
 ) -> Result<ConnectionOutcome, TlsServerError> {
+    // One absolute deadline covers TLS, VLESS request parsing, response
+    // writes, the initial body write, and the destination dial. Per-stage
+    // timeouts let a slow client hold a connection permit for several times
+    // the configured handshake budget.
+    let deadline = tokio::time::Instant::now() + config.handshake_timeout;
     let server_config = Arc::new(config.build_server_config(&auth.auth_key[..])?);
     let connection =
         rustls::ServerConnection::new(server_config).map_err(TlsServerError::Rustls)?;
-    let mut tls = timeout(
-        config.handshake_timeout,
-        TlsStream::accept(stream, connection, record),
-    )
-    .await
-    .map_err(|_| TlsServerError::Timeout {
-        stage: "TLS handshake",
-    })??;
+    let mut tls = timeout_at(deadline, TlsStream::accept(stream, connection, record))
+        .await
+        .map_err(|_| TlsServerError::Timeout {
+            stage: "TLS handshake",
+        })??;
 
     // Record the replay only after the TLS Finished proves the peer holds the
     // client's keys. Checking at classification but inserting after Finished
@@ -1035,8 +1037,8 @@ async fn handle_authenticated(
     // diverted to cover.
     config.replay_insert(auth.session_id);
 
-    let request = timeout(
-        config.handshake_timeout,
+    let request = timeout_at(
+        deadline,
         read_vless_request(&mut tls, config.handshake_timeout),
     )
     .await
@@ -1057,16 +1059,16 @@ async fn handle_authenticated(
             let destination = request
                 .destination
                 .ok_or(TlsServerError::MissingDestination)?;
-            let target = dial(&destination, config.handshake_timeout.min(MAX_DIAL_TIMEOUT)).await?;
+            let dial_budget = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(MAX_DIAL_TIMEOUT);
+            let target = dial(&destination, dial_budget).await?;
 
-            timeout(
-                config.handshake_timeout,
-                tls.write_all(&ResponseHeader::new().to_bytes()),
-            )
-            .await
-            .map_err(|_| TlsServerError::Timeout {
-                stage: "VLESS response write",
-            })??;
+            timeout_at(deadline, tls.write_all(&ResponseHeader::new().to_bytes()))
+                .await
+                .map_err(|_| TlsServerError::Timeout {
+                    stage: "VLESS response write",
+                })??;
 
             if request.vision {
                 let rng = SmallRng::seed_from_u64(vision_seed());
@@ -1082,7 +1084,7 @@ async fn handle_authenticated(
             } else {
                 let mut target = target;
                 if !request.body.is_empty() {
-                    timeout(config.handshake_timeout, target.write_all(&request.body))
+                    timeout_at(deadline, target.write_all(&request.body))
                         .await
                         .map_err(|_| TlsServerError::Timeout {
                             stage: "initial VLESS body write",
@@ -1115,14 +1117,11 @@ async fn handle_authenticated(
                 .destination
                 .ok_or(TlsServerError::MissingDestination)?;
 
-            timeout(
-                config.handshake_timeout,
-                tls.write_all(&ResponseHeader::new().to_bytes()),
-            )
-            .await
-            .map_err(|_| TlsServerError::Timeout {
-                stage: "VLESS response write",
-            })??;
+            timeout_at(deadline, tls.write_all(&ResponseHeader::new().to_bytes()))
+                .await
+                .map_err(|_| TlsServerError::Timeout {
+                    stage: "VLESS response write",
+                })??;
 
             let stream = PrependStream::new(tls, request.body);
             handle_udp_stream(stream, destination, &config.udp).await?;
@@ -1131,14 +1130,11 @@ async fn handle_authenticated(
             })
         }
         Command::Mux => {
-            timeout(
-                config.handshake_timeout,
-                tls.write_all(&ResponseHeader::new().to_bytes()),
-            )
-            .await
-            .map_err(|_| TlsServerError::Timeout {
-                stage: "VLESS response write",
-            })??;
+            timeout_at(deadline, tls.write_all(&ResponseHeader::new().to_bytes()))
+                .await
+                .map_err(|_| TlsServerError::Timeout {
+                    stage: "VLESS response write",
+                })??;
 
             let xudp = Arc::new(config.xudp.clone());
             if request.vision {

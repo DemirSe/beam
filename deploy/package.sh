@@ -6,6 +6,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SECRETS="${BEAM_SECRETS:-$HOME/.config/beam/beam.toml}"
 OUT="${BEAM_BUNDLE_OUT:-/tmp/opencode/beam-deploy-$(date -u +%Y%m%dT%H%M%SZ)}"
+OUT="$(realpath -m -- "$OUT")"
+case "$OUT" in
+  /tmp/?*)
+    ;;
+  *)
+    echo "package: refusing output path outside /tmp: '$OUT'" >&2
+    exit 1
+    ;;
+esac
 
 [ -f "$SECRETS" ] || { echo "package: missing secrets file $SECRETS" >&2; exit 1; }
 source "$ROOT/scripts/dev-env.sh"

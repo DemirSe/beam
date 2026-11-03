@@ -15,7 +15,9 @@ Restart=on-failure
 RestartSec=3s
 TimeoutStartSec=15s
 TimeoutStopSec=20s
-TasksMax=512
+# 1024 authenticated connections + up to 1024 XUDP reply tasks/threads + the
+# blocking pool can exceed 512; memory and fd limits still bound damage.
+TasksMax=4096
 OOMPolicy=stop
 RestrictRealtime=yes
 LimitNOFILE=65536

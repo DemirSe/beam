@@ -398,9 +398,21 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
     // `--check` and startup agree, instead of letting a derived UDP
     // constructor fail later or letting a relay live forever.
     const MAX_TIMEOUT_MS: u32 = 86_400_000;
+    // A sub-100 ms handshake or sub-second idle value is always an operator
+    // mistake on a real network; accepting it makes --check report a healthy
+    // configuration that fails every useful connection at runtime.
+    const MIN_HANDSHAKE_TIMEOUT_MS: u64 = 100;
+    const MIN_IDLE_TIMEOUT_MS: u64 = 1_000;
     if raw.handshake_timeout_ms == 0 {
         return Err(ValidationError::ZeroLimit {
             name: "handshake_timeout_ms",
+        });
+    }
+    if raw.handshake_timeout_ms < MIN_HANDSHAKE_TIMEOUT_MS {
+        return Err(ValidationError::LimitOutOfRange {
+            name: "handshake_timeout_ms",
+            min: MIN_HANDSHAKE_TIMEOUT_MS as u32,
+            max: MAX_TIMEOUT_MS,
         });
     }
     if raw.handshake_timeout_ms > u64::from(MAX_TIMEOUT_MS) {
@@ -412,6 +424,13 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
     if raw.idle_timeout_ms == 0 {
         return Err(ValidationError::ZeroLimit {
             name: "idle_timeout_ms",
+        });
+    }
+    if raw.idle_timeout_ms < MIN_IDLE_TIMEOUT_MS {
+        return Err(ValidationError::LimitOutOfRange {
+            name: "idle_timeout_ms",
+            min: MIN_IDLE_TIMEOUT_MS as u32,
+            max: MAX_TIMEOUT_MS,
         });
     }
     if raw.idle_timeout_ms > u64::from(MAX_TIMEOUT_MS) {
@@ -790,6 +809,29 @@ idle_timeout_ms = 300000
                         name: got,
                         max: 86_400_000
                     }) if got == name
+                ),
+                "unexpected error for {name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_sub_minimum_timeouts() {
+        for (name, value, min) in [
+            ("handshake_timeout_ms", "60000", 100),
+            ("idle_timeout_ms", "300000", 1_000),
+        ] {
+            let input = config_toml(&private_key())
+                .replace(&format!("{name} = {value}"), &format!("{name} = 1"));
+            let error = Config::from_toml_str(&input).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::Validation(ValidationError::LimitOutOfRange {
+                        name: got,
+                        min: got_min,
+                        ..
+                    }) if got == name && got_min == min
                 ),
                 "unexpected error for {name}: {error}"
             );

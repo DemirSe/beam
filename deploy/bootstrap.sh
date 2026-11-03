@@ -15,14 +15,22 @@ INSTALL_SYSCTL=/etc/sysctl.d/99-beam.conf
 INSTALL_CONNTRACK=/etc/sysctl.d/99-beam-conntrack.conf
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
-# Keep a live config when only the binary/unit are being updated. The bundle
-# still contains a config for a fresh install, but a host with a different
-# local max_connections/log level must not be silently overwritten.
-KEEP_CONFIG="${BEAM_KEEP_CONFIG:-0}"
+# Keep a live config when only the binary/unit are being updated. An existing
+# live config defaults to preserve so a plain documented rollout cannot
+# silently replace identity/limits. A fresh host defaults to install; replacing
+# an existing config requires an explicit BEAM_KEEP_CONFIG=0.
+if [ -n "${BEAM_KEEP_CONFIG:-}" ]; then
+  KEEP_CONFIG="$BEAM_KEEP_CONFIG"
+elif [ -e "$INSTALL_CONFIG" ]; then
+  KEEP_CONFIG=1
+else
+  KEEP_CONFIG=0
+fi
 case "$KEEP_CONFIG" in
   0|1) ;;
   *) echo "bootstrap: BEAM_KEEP_CONFIG must be 0 or 1" >&2; exit 1 ;;
 esac
+echo "bootstrap: KEEP_CONFIG=$KEEP_CONFIG (existing configs default to preserve; set BEAM_KEEP_CONFIG=0 explicitly to replace)" >&2
 
 [ "$(id -u)" -eq 0 ] || { echo "bootstrap: must run as root" >&2; exit 1; }
 for file in "$BIN" "$UNIT" "$SYSCTL"; do
@@ -69,23 +77,64 @@ for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$
   fi
 done
 
+# A failed rollout must not leave new files on disk with a stopped service.
+rollback() {
+  trap - ERR
+  echo "bootstrap: rolling back to backups from $STAMP" >&2
+  rm -f "$INSTALL_BIN.new" "$INSTALL_CONFIG.new" "$INSTALL_UNIT.new" \
+    "$INSTALL_SYSCTL.new" "$INSTALL_CONNTRACK.new"
+  for base in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK"; do
+    if [ -e "$base.bak-$STAMP" ]; then
+      cp -a --remove-destination "$base.bak-$STAMP" "$base"
+    fi
+  done
+  sysctl -p "$INSTALL_SYSCTL" >/dev/null 2>&1 || true
+  if [ -f "$INSTALL_CONNTRACK" ]; then
+    sysctl -p "$INSTALL_CONNTRACK" >/dev/null 2>&1 || true
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed beam >/dev/null 2>&1 || true
+  systemctl restart beam >/dev/null 2>&1 || true
+}
+trap 'echo "bootstrap: rollout failed; restoring previous files" >&2; rollback' ERR
+
 # Install beside the destination and validate there before replacing the
 # running binary. `/tmp` may be mounted noexec, and a broken installed binary
-# would turn the next restart or reboot into an outage.
+# would turn the next restart or reboot into an outage. A fresh-install config
+# is staged root:beam 0640 so the unprivileged service user can read exactly
+# the file that is about to become live.
 install -m 0755 -o root -g root "$BIN" "$INSTALL_BIN.new"
 if [ "$KEEP_CONFIG" = "1" ]; then
   CHECK_CONFIG="$INSTALL_CONFIG"
 else
-  CHECK_CONFIG="$CONFIG"
+  install -m 0640 -o root -g beam "$CONFIG" "$INSTALL_CONFIG.new"
+  CHECK_CONFIG="$INSTALL_CONFIG.new"
 fi
 if ! "$INSTALL_BIN.new" --check -c "$CHECK_CONFIG"; then
-  rm -f "$INSTALL_BIN.new"
+  rm -f "$INSTALL_BIN.new" "$INSTALL_CONFIG.new"
   echo "bootstrap: new binary failed --check; live binary unchanged" >&2
   exit 1
 fi
+if ! runuser -u beam -- "$INSTALL_BIN.new" --check -c "$CHECK_CONFIG"; then
+  rm -f "$INSTALL_BIN.new" "$INSTALL_CONFIG.new"
+  echo "bootstrap: new binary failed the beam-user check; live binary unchanged" >&2
+  exit 1
+fi
+
+# Apply required sysctls only after both binary/config preflights pass. BBR/fq
+# and UDP buffer limits are part of the running configuration, not optional
+# tuning, but a rejected binary must not mutate the live kernel.
+sysctl -p "$SYSCTL" >/dev/null
+if [ -f "$CONNTRACK" ]; then
+  # conntrack keys may not exist until nftables first loads the module. A
+  # failure here must not abort the binary/unit rollout; the file applies at
+  # the next boot as well.
+  sysctl -p "$CONNTRACK" >/dev/null 2>&1 || \
+    echo "bootstrap: warning: conntrack sysctl keys are not available yet" >&2
+fi
+
 mv -f "$INSTALL_BIN.new" "$INSTALL_BIN"
 if [ "$KEEP_CONFIG" = "0" ]; then
-  install -m 0640 -o root -g beam "$CONFIG" "$INSTALL_CONFIG.new"
   mv -f "$INSTALL_CONFIG.new" "$INSTALL_CONFIG"
 fi
 install -m 0644 -o root -g root "$UNIT" "$INSTALL_UNIT.new"
@@ -96,18 +145,6 @@ if [ -f "$CONNTRACK" ]; then
   install -m 0644 -o root -g root "$CONNTRACK" "$INSTALL_CONNTRACK.new"
   mv -f "$INSTALL_CONNTRACK.new" "$INSTALL_CONNTRACK"
 fi
-# The primary UDP buffer file is required; a typo or permission failure must
-# fail the rollout rather than silently losing H3 headroom.
-sysctl -p "$INSTALL_SYSCTL" >/dev/null
-if [ -f "$INSTALL_CONNTRACK" ]; then
-  # conntrack keys may not exist until nftables first loads the module. A
-  # failure here must not abort the binary/unit rollout; the file applies at
-  # the next boot as well.
-  sysctl -p "$INSTALL_CONNTRACK" >/dev/null 2>&1 || \
-    echo "bootstrap: warning: conntrack sysctl keys are not available yet" >&2
-fi
-
-runuser -u beam -- "$INSTALL_BIN" --check -c "$INSTALL_CONFIG"
 
 systemctl daemon-reload
 systemctl enable beam
@@ -133,8 +170,10 @@ if [ "$ready" != 1 ]; then
   echo "bootstrap: beam did not become active and listening on 443" >&2
   systemctl status --no-pager -l beam || true
   journalctl -u beam -n 50 --no-pager || true
+  rollback
   exit 1
 fi
+trap - ERR
 
 # Keep the five most recent backups of each installed file; a long-lived host
 # should not fill its disk with one binary per deploy.

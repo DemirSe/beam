@@ -945,9 +945,6 @@ pub(crate) fn spawn_reply_task(
 /// Largest number of reply-queue slots held back for control frames.
 const MAX_CONTROL_QUEUE_RESERVE: usize = 8;
 
-/// Longest an `End` frame may wait for queue space.
-pub(crate) const END_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(250);
-
 /// Slots data replies must leave free for `End` frames.
 pub(crate) fn control_queue_reserve(max_queued_replies: usize) -> usize {
     max_queued_replies

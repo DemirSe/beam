@@ -77,7 +77,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 347 tests: 317 `beam-core`,
+a benchmark comparison. The current workspace has 351 tests: 321 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
 ### Default stock-client QUIC policy
@@ -390,6 +390,11 @@ Secrets stay outside git. The live profile uses:
 | `handshake_timeout_ms` | example 60000 | **10000** |
 | `idle_timeout_ms` | 300000 | 300000 |
 
+`handshake_timeout_ms` must be at least 100 and `idle_timeout_ms` at least
+1000; both cap at 24 h. The authenticated TLS, VLESS, dial, response, and
+non-Vision first-body stages share one absolute handshake deadline; Vision
+passes its initial body into the Vision relay under `idle_timeout_ms`.
+
 Other fixed admission behavior: 256 pre-auth handshake slots process-wide, a
 5-second ClientHello intake deadline, 32 cover relays process-wide with 8 per
 source, and a 30-second cover idle timeout. `max_connections=1024` is admission
@@ -442,11 +447,18 @@ ssh -i "$SSH_KEY" "$SERVER" \
 ssh -i "$SSH_KEY" "$SERVER" 'rm -rf /tmp/beam-deploy /tmp/beam-deploy.tar.gz'
 ```
 
-Use `BEAM_KEEP_CONFIG=1` to preserve the live `/etc/beam/config.toml` while
-installing the new binary/unit. The package script validates local secrets;
-bootstrap validates the installed config, backs up replaced files, prunes each
-backup set to five, and polls beam's own 443 listener. Compare SHA-256 of the
-local binary with `/usr/local/bin/beam`. Then verify:
+For an existing host, use
+`sudo env BEAM_KEEP_CONFIG=1 bash /tmp/beam-deploy/bootstrap.sh` to preserve
+the live `/etc/beam/config.toml` explicitly. If `BEAM_KEEP_CONFIG` is unset,
+bootstrap automatically preserves any existing `/etc/beam/config.toml`;
+replacing it requires the explicit fresh-install/update override
+`sudo env BEAM_KEEP_CONFIG=0 bash /tmp/beam-deploy/bootstrap.sh`. A plain
+`sudo bash ...` cannot inherit an exported `BEAM_KEEP_CONFIG`, so use `env`
+for both modes. The package script validates local secrets; bootstrap applies
+and validates sysctls, validates the new binary as the unprivileged service
+user, backs up replaced files, rolls back on a failed restart/readiness probe,
+prunes each backup set to five, and polls beam's own 443 listener. Compare
+SHA-256 of the local binary with `/usr/local/bin/beam`. Then verify:
 
 ```bash
 curl -4 -sS -o /dev/null -w '%{http_code}\n' https://example.com/
@@ -490,10 +502,11 @@ then destroy the old copies. Never commit or paste secrets.
 
 The live host uses Debian 13 with nftables default-deny (22/443, established,
 ICMP/ICMPv6, loopback), SSH key-only `demir`, root/debian disabled, BBR + fq,
-conntrack 65536, resolver DoT/DNSSEC, and systemd sandboxing with
-`MemoryHigh=512M`, `MemoryMax=768M`, `MemorySwapMax=512M`, `LimitNOFILE=65536`,
-and only `CAP_NET_BIND_SERVICE`. Test nftables before enabling. SSH, firewall,
-and resolver changes are deliberately not applied by `bootstrap.sh`.
+conntrack 65536 with 600 s UDP retention, resolver DoT/DNSSEC, and systemd
+sandboxing with `MemoryHigh=512M`, `MemoryMax=768M`, `MemorySwapMax=512M`,
+`LimitNOFILE=65536`, `TasksMax=4096`, and only `CAP_NET_BIND_SERVICE`. Test
+nftables before enabling. SSH, firewall, and resolver changes are deliberately
+not applied by `bootstrap.sh`; the systemd sysctl files are.
 
 ## Testing and benchmarking
 

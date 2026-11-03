@@ -1,13 +1,12 @@
 # Open stress findings — 2026-10-31
 
 This file is intentionally separate from `README.md` for the findings that are
-still open. Findings 1 and 2 have been fixed, re-verified, and deployed; their
-durable invariants are now in `README.md`, while the remaining items below stay
-here until resolved. The initial audit made no code changes; the fixes are
-commits `2163c0a` and `e0ca0bc`. Production was updated after each fix. The lab
-is stopped and its config was restored after the temporary idle-timeout
-experiment. Initial binary under test: final `1007354…` code (embedded identity
-`b4d9382`, deployed build `a41facef…`).
+still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
+7, and 11 are fixed in the current working tree and await production rollout.
+The remaining items below stay open. Production was updated after each
+previously deployed fix. The lab is stopped after the current verification run.
+Initial binary under test: final `1007354…` code (embedded identity `b4d9382`,
+deployed build `a41facef…`).
 
 This note records the results of three read-only code audits plus the QEMU lab
 run. It distinguishes **lab-reproduced** findings from code-confirmed risks.
@@ -153,7 +152,8 @@ Tests: slow-domain isolation, failed-lookup suffix draining, replacement New
 after failure, stale same-id completion, queued/newer GlobalID ordering,
 canceled-owner suffix, TCP network preservation, and pending budget. The HOL
 test uses a 500 ms resolver fixture and checks an unrelated IP Keep within
-300 ms. Workspace: **347 tests**, fmt/clippy pass.
+300 ms. Workspace tests, fmt/clippy pass; the 2026-11-03 follow-up added
+timeout, legacy-idle, and FrameDecoder regression tests.
 
 Lab candidate: 11/11 checks; DNS 1000@32 **1000/0** at 1063 qps, p95 46 ms;
 UDP 3000×1200 **3000/3000**; HTTP 2000@32 **2000/0** after drain, p95 47 ms.
@@ -167,32 +167,28 @@ controlled multithreaded close test; no universal nonblocking claim).
 
 Residual: resolver lookups are serial per mux; a sequence of slow domains,
 congested sends, or close bursts can still delay a mux briefly. The 4 MiB
-budget does not count frame metadata.
+budget now charges payload, domain bytes, and a `size_of` floor; allocator
+capacity slack above that estimate is not charged.
 
-### 3. Burst `End` closes still serialize on 250 ms — MEDIUM-HIGH, code-confirmed
+### 3. [RESOLVED] Burst `End` closes still serialize on 250 ms — MEDIUM-HIGH, code-confirmed
 
-`crates/beam-core/src/xudp/server.rs:842`, `887-888`;
-`crates/beam-core/src/xudp/session.rs:904-911`
+`crates/beam-core/src/xudp/server.rs:1350-1389`
 
-Only idle sweep uses nonblocking `try_send_end`. `ClientEnd`, `RelayError`, and
-`New` rejection use `send_end().await`, capped at 250 ms per close. A burst of
-50 closes can stall the mux for about 12.5 s when the peer is slow. The earlier
-single-End cap is correct but the burst fix is incomplete.
+All `End` enqueue paths now use nonblocking `try_send`. A full queue drops that
+flow's End and increments `xudp_end_dropped`; it cannot stall the mux read
+loop. The obsolete 250 ms `END_ENQUEUE_TIMEOUT` was removed.
 
-Fix direction: use a nonblocking/control-reserved path for all closes and a
-shared close deadline.
+### 4. Control reserve check remains advisory — LOW, nonblocking residual
 
-### 4. Control reserve check is racy — MEDIUM, code-confirmed
+`crates/beam-core/src/xudp/session.rs:946-953`, `1018`
 
-`crates/beam-core/src/xudp/session.rs:978-990`
+`outbound.capacity()` is still sampled before `try_reserve()`, so concurrent
+reply tasks can consume the eight nominally reserved slots. With finding 3
+fixed this no longer creates a blocking close path: an End that loses the race
+is dropped and counted. A future separate control queue would make the reserve
+strict; it is not required to prevent the read-loop stall.
 
-`outbound.capacity()` is sampled, then `try_reserve()` is called separately.
-Concurrent reply tasks can all pass the check and consume the reserved slots.
-This makes the 8-slot control reserve advisory and feeds the blocking `End`
-path.
-
-Fix direction: reserve control capacity atomically, or use a separate bounded
-control queue.
+Fix direction: separate bounded control queue or an atomic reservation.
 
 ### 5. Process-wide 32 MiB reply budget couples slow and fast mux streams — MEDIUM, code-confirmed
 
@@ -207,31 +203,21 @@ coupling is global and affects unrelated sessions.
 Fix direction: per-mux byte fairness or a per-stream cap within the global
 budget.
 
-### 6. 1 ms timeouts pass `--check` — HIGH operational risk, lab reproduced
+### 6. [RESOLVED] 1 ms timeouts pass `--check` — HIGH operational risk
 
-`crates/beam-core/src/config/validate.rs:400-422`
+`crates/beam-core/src/config/validate.rs:400-441`
 
-Only zero and values above 24 h are rejected. A copied config with
-`handshake_timeout_ms=1` and `idle_timeout_ms=1` printed:
+`handshake_timeout_ms` now requires at least 100 ms and `idle_timeout_ms` at
+least 1 s; both still cap at 24 h. `rejects_sub_minimum_timeouts` is the
+behavioral regression test.
 
-```text
-configuration is valid: /tmp/beam-1ms.toml
-```
+### 7. [RESOLVED] Authenticated handshake stages do not share one absolute deadline — MEDIUM
 
-At runtime these values drive TLS/VLESS/XUDP/legacy timeouts, so ordinary RTT
-causes total handshake/relay failure while the service still appears active.
-Add a realistic minimum (for example 100 ms–1 s, decided explicitly) and a
-regression test.
+`crates/beam-core/src/tls/server.rs:1018-1149`
 
-### 7. Authenticated handshake stages do not share one absolute deadline — MEDIUM, code-confirmed
-
-`crates/beam-core/src/tls/server.rs:1021-1141`; `crates/beam/src/main.rs:440`
-
-TLS handshake, VLESS request, response writes, first body write, and dial each
-consume a separate `handshake_timeout` (plus the dial cap). A slow/lossy client
-or a replay can hold a connection permit for roughly three to four times the
-configured timeout. `max_connections=1024` masks this in normal single-user
-use, but it weakens the timeout bound.
+TLS handshake, VLESS request, dial, response, and initial body write now share
+one absolute `tokio::time::Instant` deadline. A slow client can hold a permit
+for at most the configured handshake budget, not a multiple of it.
 
 ### 8. Replay cache is post-Finished and timestamp checking is disabled — MEDIUM security/DoS
 
@@ -276,6 +262,15 @@ accounting risk.
   locks (`crates/beam-core/src/xudp/session.rs:865-876`); bounded, no lock
   cycle found.
 
+### 11. [RESOLVED] Legacy UDP dropped replies and quadratic decoder — MEDIUM
+
+`crates/beam-core/src/udp/legacy.rs:318-341`, `379-399`, `442-492`, `835-922`
+
+Dropped/oversized legacy and packetaddr replies no longer refresh the idle
+clock, matching the XUDP fix. `FrameDecoder` now keeps a consumed cursor and
+compacts once per read batch instead of `Vec::drain` per frame. Regression
+tests cover dropped-legacy-reply idle expiry and coalesced zero-length frames.
+
 ## Non-findings
 
 - No fd, task, permit, or XUDP session leak appeared in normal load, the 10k
@@ -300,10 +295,11 @@ accounting risk.
    `2163c0a`; deployed.
 2. ~~Remove the XUDP read-loop stalls (finding 2).~~ Done in `e0ca0bc`;
    deployed with documented residual bounds.
-3. Make all close paths nonblocking and the control reserve atomic (3–4).
-4. Add a minimum timeout bound and an absolute authenticated-handshake
-   deadline (6–7).
-5. Resume the 24 h/privileged/fuzz release gates after the remaining findings.
+3. Separate control queue for a strict End reserve (4).
+4. Per-mux reply-budget fairness (5).
+5. Bounded in-flight replay reservation and a timestamp-window decision (8).
+6. Short-GlobalID lifecycle accounting (9).
+7. Resume the 24 h/privileged/fuzz release gates after the remaining findings.
 
 ## Reproduction notes
 

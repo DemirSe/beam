@@ -29,9 +29,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 
 use super::session::{
-    ActiveSession, END_ENQUEUE_TIMEOUT, ExpiringSession, QueuedFrame, ResolveError, Session,
-    SessionTable, SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
-    resolve_destination, socket_addr_to_location, spawn_reply_task,
+    ActiveSession, ExpiringSession, QueuedFrame, ResolveError, Session, SessionTable, SocketFamily,
+    XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame, resolve_destination,
+    socket_addr_to_location, spawn_reply_task,
 };
 use crate::address::{Address, NetLocation};
 use crate::xudp::frame::{
@@ -123,6 +123,26 @@ impl OwnedFrame {
         }
     }
 
+    /// Approximate retained cost of this queued frame.
+    ///
+    /// The payload budget alone lets an authenticated peer queue many
+    /// zero-payload domain frames without charging their metadata, address,
+    /// and allocation overhead. Charge a floor for every frame as well.
+    fn budget_len(&self) -> usize {
+        let domain_len = match &self.destination {
+            Some(location) => match &location.address {
+                Address::Domain(domain) => domain.len(),
+                Address::Ipv4(_) | Address::Ipv6(_) => 0,
+            },
+            None => 0,
+        };
+        self.payload
+            .len()
+            .saturating_add(domain_len)
+            .saturating_add(std::mem::size_of::<Self>())
+            .max(1)
+    }
+
     fn rewrite_destination(&mut self, address: SocketAddr) {
         // Preserve the original network. A TCP New with a domain must still
         // reach handle_new's network check and be rejected, not silently
@@ -152,7 +172,7 @@ struct PendingFrame {
 
 impl PendingFrame {
     fn new(frame: OwnedFrame, limiter: &XudpSessionLimiter) -> Option<Self> {
-        let budget = limiter.try_reserve_resolution(frame.payload.len())?;
+        let budget = limiter.try_reserve_resolution(frame.budget_len())?;
         Some(Self {
             frame,
             _budget: budget,
@@ -1300,11 +1320,10 @@ impl MuxState {
             CloseReason::ClientEnd => self.limiter.metrics().record_xudp_closed_end(),
         }
         if reason == CloseReason::Idle {
-            // A sweep can expire many sessions at once. Waiting up to
-            // END_ENQUEUE_TIMEOUT for each idle End would block the mux read
-            // loop for seconds when the peer is not reading. Idle End is
-            // best-effort: the client learns the flow is gone on its next
-            // Keep, while a full queue already signals pressure.
+            // A sweep can expire many sessions at once. Waiting for each idle
+            // End would block the mux read loop when the peer is not reading.
+            // Idle End is best-effort: the client learns the flow is gone on
+            // its next Keep, while a full queue already signals pressure.
             self.try_send_end(session.id, error);
         } else {
             self.send_end(session.id, error).await?;
@@ -1347,58 +1366,45 @@ impl MuxState {
         }
     }
 
-    /// Queues one `End` frame behind every data frame already accepted.
+    /// Queues one `End` frame without waiting for writer capacity.
+    ///
+    /// A slow client must not turn a close burst into a read-loop stall. End
+    /// is control information for one flow; dropping it under queue pressure
+    /// is preferable to blocking unrelated DNS and QUIC sessions on the same
+    /// mux.
     async fn send_end(&self, id: u16, error: bool) -> Result<(), MuxError> {
+        self.enqueue_end(id, error)
+    }
+
+    fn enqueue_end(&self, id: u16, error: bool) -> Result<(), MuxError> {
         let frame = encode_end_frame(id, error);
         if frame.is_empty() {
+            self.limiter.metrics().record_xudp_end_dropped();
             return Err(MuxError::Encode);
         }
-        match timeout(
-            self.config.io_timeout.min(END_ENQUEUE_TIMEOUT),
-            self.outbound.send(QueuedFrame::new(frame, None)),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => {
-                self.limiter.metrics().record_xudp_end_dropped();
-                Err(MuxError::WriterClosed)
-            }
-            Err(_) => {
-                // The peer is not reading. A missing End only affects this
-                // flow; tearing down the whole mux would kill unrelated DNS
-                // and QUIC sessions.
+        match self.outbound.try_send(QueuedFrame::new(frame, None)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
                 self.limiter.metrics().record_xudp_end_dropped();
                 tracing::debug!(
                     session_id = id,
-                    "XUDP End frame could not be queued before the write deadline"
+                    "XUDP End frame dropped because the write queue is full"
                 );
                 Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.limiter.metrics().record_xudp_end_dropped();
+                Err(MuxError::WriterClosed)
             }
         }
     }
 
     /// Queues one `End` if capacity is immediately available.
     ///
-    /// Used by idle sweeps so one slow reader cannot multiply the bounded
-    /// enqueue delay by the number of expired sessions.
+    /// Used by idle sweeps so one slow reader cannot multiply close-path work
+    /// by the number of expired sessions.
     fn try_send_end(&self, id: u16, error: bool) {
-        let frame = encode_end_frame(id, error);
-        if frame.is_empty() {
-            self.limiter.metrics().record_xudp_end_dropped();
-            return;
-        }
-        if self
-            .outbound
-            .try_send(QueuedFrame::new(frame, None))
-            .is_err()
-        {
-            self.limiter.metrics().record_xudp_end_dropped();
-            tracing::debug!(
-                session_id = id,
-                "XUDP idle End frame dropped because the write queue is full"
-            );
-        }
+        let _ = self.enqueue_end(id, error);
     }
 
     /// Expires idle sessions and retained sockets.
