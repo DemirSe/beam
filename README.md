@@ -8,24 +8,26 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-10-31 15:48 UTC:
+on 2026-11-03 11:45 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `ff371eaba27e591d1b00c29a524672e9601e01d36913c0936869b42f7ca8c629` |
-| Version | `0.1.0 (43ebf0c5310c)` |
+| SHA-256 | `9419b6623c6775b593a7bf2952cf24205692c1d81503044e6ecd26c01c0869fc` |
+| Version | `0.1.0 (fa0c0ca9d5ff)` |
 | Service | `beam.service`, active, `NRestarts=0` |
 | Listener | `0.0.0.0:443` |
-| Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake |
-| Verification | HTTPS IPv4/IPv6 200, cover certificate valid, local TUN path 200 |
+| Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
+| Host network | BBR + fq, conntrack 65536, 600 s UDP retention |
+| Verification | HTTPS through the local TUN 200, cover certificate valid, public QUIC refused, H2 fallback 200 |
 
-The deployed binary includes the XUDP junk-reply idle-pinning fix (`2163c0a`)
-and the mux-wide resolution/send-stall fix (`e0ca0bc`). The full-TUN matrix
-last passed 8/8 in `xudp`, `packetaddr`, and `legacy` modes. The remaining
-code-confirmed backpressure and timeout risks in `STRESS-FINDINGS.md` are still
-unfixed; the full release gates remain the 24 h soak, privileged
-syscall/wakeup/splice measurements, cgroup OOM sampling, and final fuzzing.
+The deployed binary includes the XUDP junk-reply idle-pinning fix (`2163c0a`),
+the mux-wide resolution/send-stall fix (`e0ca0bc`), and the 2026-11-03
+handshake/legacy-UDP/End-enqueue hardening. The full-TUN matrix last passed
+8/8 in `xudp`, `packetaddr`, and `legacy` modes. Remaining code-confirmed
+backpressure and replay risks in `STRESS-FINDINGS.md` are still tracked; the
+full release gates remain the 24 h soak, privileged syscall/wakeup/splice
+measurements, cgroup OOM sampling, and final fuzzing.
 
 ## Scope
 

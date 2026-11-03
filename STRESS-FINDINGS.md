@@ -2,11 +2,10 @@
 
 This file is intentionally separate from `README.md` for the findings that are
 still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
-7, and 11 are fixed in the current working tree and await production rollout.
-The remaining items below stay open. Production was updated after each
-previously deployed fix. The lab is stopped after the current verification run.
-Initial binary under test: final `1007354…` code (embedded identity `b4d9382`,
-deployed build `a41facef…`).
+7, and 11 are fixed in `fa0c0ca` and deployed. The remaining items below stay
+open. Production was updated after each previously deployed fix. The lab is
+stopped after the current verification run. Initial binary under test: final
+`1007354…` code (embedded identity `b4d9382`, deployed build `a41facef…`).
 
 This note records the results of three read-only code audits plus the QEMU lab
 run. It distinguishes **lab-reproduced** findings from code-confirmed risks.
