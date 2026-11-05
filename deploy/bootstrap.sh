@@ -125,6 +125,23 @@ fi
 # and UDP buffer limits are part of the running configuration, not optional
 # tuning, but a rejected binary must not mutate the live kernel.
 sysctl -p "$SYSCTL" >/dev/null
+# net.core.default_qdisc only affects newly created interfaces. Existing
+# cloud NICs keep their old qdisc until reboot, so apply fq to the default
+# route now. Keep this best-effort: a missing tc/ip must not fail a rollout.
+apply_live_qdisc() {
+  local tc ip iface
+  tc="$(command -v tc 2>/dev/null || command -v /usr/sbin/tc 2>/dev/null || true)"
+  ip="$(command -v ip 2>/dev/null || command -v /usr/sbin/ip 2>/dev/null || true)"
+  if [ -z "$tc" ] || [ -z "$ip" ]; then
+    echo "bootstrap: warning: tc/ip unavailable; fq not applied live" >&2
+    return 0
+  fi
+  iface="$("$ip" -o route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' 2>/dev/null || true)"
+  [ -n "$iface" ] || return 0
+  "$tc" qdisc replace dev "$iface" root fq 2>/dev/null || \
+    echo "bootstrap: warning: could not apply fq to $iface" >&2
+}
+apply_live_qdisc
 if [ -f "$CONNTRACK" ]; then
   # conntrack keys may not exist until nftables first loads the module. A
   # failure here must not abort the binary/unit rollout; the file applies at
