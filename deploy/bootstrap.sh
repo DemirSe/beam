@@ -8,11 +8,13 @@ CONFIG="$HERE/beam.toml"
 UNIT="$HERE/beam.service"
 SYSCTL="$HERE/99-beam.conf"
 CONNTRACK="$HERE/99-beam-conntrack.conf"
+MODULES_LOAD="$HERE/99-beam-conntrack.modules"
 INSTALL_BIN=/usr/local/bin/beam
 INSTALL_CONFIG=/etc/beam/config.toml
 INSTALL_UNIT=/etc/systemd/system/beam.service
 INSTALL_SYSCTL=/etc/sysctl.d/99-beam.conf
 INSTALL_CONNTRACK=/etc/sysctl.d/99-beam-conntrack.conf
+INSTALL_MODULES_LOAD=/etc/modules-load.d/99-beam-conntrack.conf
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 # Keep a live config when only the binary/unit are being updated. An existing
@@ -33,7 +35,7 @@ esac
 echo "bootstrap: KEEP_CONFIG=$KEEP_CONFIG (existing configs default to preserve; set BEAM_KEEP_CONFIG=0 explicitly to replace)" >&2
 
 [ "$(id -u)" -eq 0 ] || { echo "bootstrap: must run as root" >&2; exit 1; }
-for file in "$BIN" "$UNIT" "$SYSCTL"; do
+for file in "$BIN" "$UNIT" "$SYSCTL" "$CONNTRACK" "$MODULES_LOAD"; do
   [ -f "$file" ] || { echo "bootstrap: missing $file" >&2; exit 1; }
 done
 if [ "$KEEP_CONFIG" = "0" ]; then
@@ -71,7 +73,7 @@ if ! id beam >/dev/null 2>&1; then
 fi
 
 install -d -m 0750 -o root -g beam /etc/beam
-for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK"; do
+for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK" "$INSTALL_MODULES_LOAD"; do
   if [ -e "$old" ]; then
     cp -a "$old" "$old.bak-$STAMP"
   fi
@@ -82,10 +84,12 @@ rollback() {
   trap - ERR
   echo "bootstrap: rolling back to backups from $STAMP" >&2
   rm -f "$INSTALL_BIN.new" "$INSTALL_CONFIG.new" "$INSTALL_UNIT.new" \
-    "$INSTALL_SYSCTL.new" "$INSTALL_CONNTRACK.new"
-  for base in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK"; do
+    "$INSTALL_SYSCTL.new" "$INSTALL_CONNTRACK.new" "$INSTALL_MODULES_LOAD.new"
+  for base in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK" "$INSTALL_MODULES_LOAD"; do
     if [ -e "$base.bak-$STAMP" ]; then
       cp -a --remove-destination "$base.bak-$STAMP" "$base"
+    elif [ "$base" = "$INSTALL_MODULES_LOAD" ]; then
+      rm -f "$base"
     fi
   done
   sysctl -p "$INSTALL_SYSCTL" >/dev/null 2>&1 || true
@@ -142,12 +146,17 @@ apply_live_qdisc() {
     echo "bootstrap: warning: could not apply fq to $iface" >&2
 }
 apply_live_qdisc
-if [ -f "$CONNTRACK" ]; then
-  # conntrack keys may not exist until nftables first loads the module. A
-  # failure here must not abort the binary/unit rollout; the file applies at
-  # the next boot as well.
-  sysctl -p "$CONNTRACK" >/dev/null 2>&1 || \
-    echo "bootstrap: warning: conntrack sysctl keys are not available yet" >&2
+# systemd-sysctl.service is ordered after systemd-modules-load.service. Install
+# the module-load request before applying the sysctls so a fresh boot has the
+# net.netfilter keys available without relying on nftables' module autoload.
+install -d -m 0755 /etc/modules-load.d
+install -m 0644 -o root -g root "$MODULES_LOAD" "$INSTALL_MODULES_LOAD.new"
+mv -f "$INSTALL_MODULES_LOAD.new" "$INSTALL_MODULES_LOAD"
+if command -v modprobe >/dev/null 2>&1; then
+  modprobe nf_conntrack 2>/dev/null || true
+fi
+if ! sysctl -p "$CONNTRACK" >/dev/null 2>&1; then
+  echo "bootstrap: warning: conntrack sysctl keys are not available yet" >&2
 fi
 
 mv -f "$INSTALL_BIN.new" "$INSTALL_BIN"
@@ -194,7 +203,7 @@ trap - ERR
 
 # Keep the five most recent backups of each installed file; a long-lived host
 # should not fill its disk with one binary per deploy.
-for base in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK"; do
+for base in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK" "$INSTALL_MODULES_LOAD"; do
   find "$(dirname "$base")" -maxdepth 1 -type f \
     -name "$(basename "$base").bak-*" -printf '%T@ %p\n' 2>/dev/null |
     sort -rn | tail -n +6 | cut -d' ' -f2- | xargs -r rm -f
