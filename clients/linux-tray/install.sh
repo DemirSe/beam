@@ -29,6 +29,7 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is required to normalize t
 [ -x "$CORE_DIR/sing-box" ] || { echo "missing $CORE_DIR/sing-box" >&2; exit 1; }
 [ -x "$HERE/beam-tray" ] || { echo "build first: $HERE/build.sh" >&2; exit 1; }
 [ -x "$HERE/beam-helper" ] || { echo "build first: $HERE/build.sh" >&2; exit 1; }
+[ -r "$HERE/99-beam-client-bbr.conf" ] || { echo "missing $HERE/99-beam-client-bbr.conf" >&2; exit 1; }
 
 CORE_SING_SHA=1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a
 CORE_LIB_SHA=23109c55b08829bb1a68682a61a64852b1bbf243753b153cbd8f6e4ea2c05294
@@ -41,6 +42,35 @@ install -d -m 0755 /usr/local/lib/beam /usr/local/libexec /etc/beam
 install -m 0755 "$CORE_DIR/sing-box" /usr/local/lib/beam/sing-box
 install -m 0644 "$CORE_DIR/libcronet.so" /usr/local/lib/beam/libcronet.so
 install -m 0644 "$CORE_DIR/LICENSE" /usr/local/lib/beam/LICENSE
+
+# BBR is sender-side: it helps TCP uploads on lossy/high-RTT links, not
+# downloads. Enable it only when this kernel actually exposes the algorithm.
+# Keep the install usable on old kernels without BBR.
+if command -v modprobe >/dev/null 2>&1; then
+    modprobe tcp_bbr 2>/dev/null || true
+fi
+if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    install -m 0644 "$HERE/99-beam-client-bbr.conf" /etc/sysctl.d/99-beam-client-bbr.conf
+    sysctl -p /etc/sysctl.d/99-beam-client-bbr.conf >/dev/null 2>&1 || true
+    if [ "$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)" = bbr ]; then
+        echo "enabled: bbr congestion control and fq default qdisc"
+    else
+        echo "warning: BBR is available but did not become the live default" >&2
+    fi
+    if command -v modinfo >/dev/null 2>&1 && modinfo tcp_bbr >/dev/null 2>&1; then
+        install -d -m 0755 /etc/modules-load.d
+        {
+            printf 'tcp_bbr\n'
+            if modinfo sch_fq >/dev/null 2>&1; then
+                printf 'sch_fq\n'
+            fi
+        } > /etc/modules-load.d/beam-bbr.conf
+        chmod 0644 /etc/modules-load.d/beam-bbr.conf
+    fi
+else
+    rm -f /etc/sysctl.d/99-beam-client-bbr.conf
+    echo "warning: kernel does not expose tcp_bbr; BBR/fq not enabled" >&2
+fi
 
 NORMALIZED_CONFIG=$(mktemp)
 trap 'rm -f "$NORMALIZED_CONFIG"' EXIT

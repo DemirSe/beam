@@ -188,6 +188,17 @@ sudo ./install.sh
 /usr/local/bin/beam-tray
 ```
 
+On kernels that expose `tcp_bbr`, the installer enables BBR and the `fq`
+default qdisc through `/etc/sysctl.d/99-beam-client-bbr.conf`. This is
+sender-side tuning: it improves TCP uploads on lossy/high-RTT paths, while
+downloads still follow the remote server's congestion control. The setting is
+applied immediately; `default_qdisc` affects interfaces created afterwards,
+and BBR falls back to internal per-socket pacing on an existing non-fq qdisc.
+The installer warns and continues if the kernel has no BBR. No buffer or
+`tcp_notsent_lowat` changes are installed. Remove
+`/etc/sysctl.d/99-beam-client-bbr.conf` and `/etc/modules-load.d/beam-bbr.conf`
+to revert.
+
 The installer no longer assumes a profile in `/tmp`. If `CONFIG_SRC` is unset
 and `/etc/beam/config.json` exists, a reinstall reuses it as input. A fresh
 install must set `CONFIG_SRC=/path/to/config.json`; the sanitized structure is
