@@ -8,12 +8,14 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 IDENTITY = Path("/home/demir/.config/beam/client-identity.json")
 CONFIG = Path("/etc/beam/config.json")
 SERVICE = "beam-client"
+SING_BOX = "/usr/local/lib/beam/sing-box"
 
 
 def ensure_quic_policy(config: dict) -> None:
@@ -47,6 +49,38 @@ def ensure_quic_policy(config: dict) -> None:
         if r is not None
     ]
     route["rules"].extend(r for r in rules if not is_udp443_reject(r) and r not in route["rules"])
+
+
+def stage_config(config: dict, destination: Path) -> Path:
+    """Write a private temp file and return it for validation/rename."""
+    fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=str(destination.parent))
+    staged = Path(name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(config, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+def check_config(path: Path) -> bool:
+    result = subprocess.run(
+        [SING_BOX, "check", "-c", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        print("update-client: config check failed; live config unchanged", file=sys.stderr)
+        if detail:
+            print(detail, file=sys.stderr)
+        return False
+    return True
 
 
 def main() -> int:
@@ -99,18 +133,30 @@ def main() -> int:
     reality["short_id"] = identity["short_id"]
     ensure_quic_policy(config)
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = CONFIG.with_name(f"config.json.bak-{stamp}")
-    shutil.copy2(CONFIG, backup)
-    os.chmod(backup, 0o600)
+    staged = stage_config(config, CONFIG)
+    try:
+        if not check_config(staged):
+            return 1
 
-    CONFIG.write_text(json.dumps(config, indent=2) + "\n")
-    os.chmod(CONFIG, 0o600)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = CONFIG.with_name(f"config.json.bak-{stamp}")
+        shutil.copy2(CONFIG, backup)
+        os.chmod(backup, 0o600)
+
+        os.replace(staged, CONFIG)
+        dir_fd = os.open(CONFIG.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        staged.unlink(missing_ok=True)
 
     result = subprocess.run(["systemctl", "restart", SERVICE], capture_output=True, text=True)
     active = subprocess.run(["systemctl", "is-active", "--quiet", SERVICE])
     if result.returncode != 0 or active.returncode != 0:
         shutil.copy2(backup, CONFIG)
+        os.chmod(CONFIG, 0o600)
         subprocess.run(["systemctl", "restart", SERVICE], check=False)
         print("update-client: restart failed; previous config restored", file=sys.stderr)
         print(result.stderr.strip(), file=sys.stderr)
