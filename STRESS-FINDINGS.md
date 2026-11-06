@@ -238,12 +238,14 @@ for at most the configured handshake budget, not a multiple of it.
 
 The concurrent-copy permit pressure is bounded: `647623b` adds a maximum of
 four in-flight reservations per exact replay id and releases them on handshake
-failure (lab: 905/1024 pre-fix, 12 post-fix). The cache still inserts only
-after TLS Finished, and timestamp checking remains disabled (`None`); a
-captured ClientHello can therefore authenticate once after the 60 s replay
-window. Stock Xray has no cache, so this is a tradeoff rather than an interop
-regression. The timestamp-window decision remains open and needs either strict
-timestamp checking or a documented threat model.
+failure (lab: 905/1024 pre-fix, 12 post-fix). Completion is now first-wins:
+a duplicate that also reaches TLS Finished is rejected rather than served as a
+second authenticated session. The cache still inserts only after TLS Finished,
+and timestamp checking remains disabled (`None`); a captured ClientHello can
+therefore authenticate once after the 60 s replay window. Stock Xray has no
+cache, so this is a tradeoff rather than an interop regression. The
+timestamp-window decision remains open and needs either strict timestamp
+checking or a documented threat model.
 
 ### 9. Short GlobalID flows can pin a mux/connection for about 120 s — MEDIUM, code-confirmed
 

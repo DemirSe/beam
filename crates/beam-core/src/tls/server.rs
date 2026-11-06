@@ -180,13 +180,17 @@ impl ReplayCache {
         }
     }
 
-    /// Records a completed handshake id and bounds the cache.
-    fn insert(&mut self, id: [u8; 32]) {
+    /// Records the first completed handshake for an id.
+    ///
+    /// Returns `false` when another handshake with the same id completed
+    /// first; the caller must reject that duplicate rather than serving two
+    /// authenticated sessions from one ClientHello.
+    fn insert(&mut self, id: [u8; 32]) -> bool {
         self.in_flight.remove(&id);
         let now = Instant::now();
         self.expire(now);
         if self.entries.contains_key(&id) {
-            return;
+            return false;
         }
         if self.entries.len() >= REPLAY_CACHE_CAPACITY
             && let Some(oldest) = self.order.pop_front()
@@ -195,6 +199,7 @@ impl ReplayCache {
         }
         self.entries.insert(id, now);
         self.order.push_back(id);
+        true
     }
 }
 
@@ -280,6 +285,10 @@ pub enum TlsServerError {
     /// The VLESS user id did not match the configured user.
     #[error("VLESS user id is not authorized")]
     UnauthorizedUser,
+
+    /// Another handshake with the same ClientHello completed first.
+    #[error("authenticated ClientHello replay")]
+    ReplayRejected,
 
     /// rustls rejected a configuration or handshake.
     #[error("rustls error: {0}")]
@@ -529,7 +538,8 @@ impl TlsServerConfig {
         })
     }
 
-    fn replay_insert(&self, id: [u8; 32]) {
+    /// Returns `false` when this exact ClientHello already completed.
+    fn replay_insert(&self, id: [u8; 32]) -> bool {
         match self.replay_cache.lock() {
             Ok(mut cache) => cache.insert(id),
             Err(poisoned) => poisoned.into_inner().insert(id),
@@ -1093,13 +1103,13 @@ async fn handle_authenticated(
         })??;
 
     // Record the replay only after the TLS Finished proves the peer holds the
-    // client's keys. Checking at classification but inserting after Finished
-    // keeps stock behavior for concurrent duplicates: an on-path exact replay
-    // cannot pre-empt the legitimate client by winning the classification
-    // race, while a later replay of the completed ClientHello is still
-    // diverted to cover. The in-flight reservation bounds concurrent copies
-    // until this insert is reached.
-    config.replay_insert(auth.session_id);
+    // client's keys. Insertion is first-wins: concurrent copies may pass the
+    // reservation gate, but only the handshake that reaches Finished first is
+    // served. This preserves the legitimate client's race while rejecting a
+    // duplicate that also completed before the cache insert.
+    if !config.replay_insert(auth.session_id) {
+        return Err(TlsServerError::ReplayRejected);
+    }
     reservation.commit();
 
     let request = timeout_at(
@@ -1550,6 +1560,11 @@ async fn relay_vision(
                     copied_up,
                     "Vision splice task limit reached; using async upload copy"
                 );
+                // The fallback does not use the raw socket clones. Release
+                // them now instead of holding two descriptors until the async
+                // relay reaches its idle timeout.
+                drop(client_read);
+                drop(target_write_splice);
                 copy_direction(
                     &mut vision_read,
                     &mut target_write,
@@ -1622,6 +1637,10 @@ async fn relay_vision(
                 copied_down,
                 "Vision splice task limit reached; using async download copy"
             );
+            // The fallback does not use the raw socket clones. Release them
+            // rather than pinning two descriptors for the relay lifetime.
+            drop(target_read_splice);
+            drop(client_write);
             copy_direction(
                 &mut target_read,
                 &mut vision_write,
@@ -2332,7 +2351,7 @@ mod tests {
         assert!(!cache.try_reserve(id));
         cache.release(id);
         assert!(cache.try_reserve(id));
-        cache.insert(id);
+        assert!(cache.insert(id));
         assert!(!cache.try_reserve(id));
     }
 
