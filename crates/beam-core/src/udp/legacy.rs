@@ -310,7 +310,6 @@ where
                         if let Err(error) = decoder.push(&chunk[..count]) {
                             break Err(error);
                         }
-                        idle.as_mut().reset(next_deadline(config.idle_timeout));
                     }
                     Err(error) => break Err(UdpError::Io(error)),
                 }
@@ -434,7 +433,6 @@ where
                         if let Err(error) = decoder.push(&chunk[..count]) {
                             break Err(error);
                         }
-                        idle.as_mut().reset(next_deadline(config.idle_timeout));
                     }
                     Err(error) => break Err(UdpError::Io(error)),
                 }

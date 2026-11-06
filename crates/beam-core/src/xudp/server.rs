@@ -747,7 +747,10 @@ where
                         resolutions.cancel_global(global_id);
                     }
                     if resolutions.has_pending(id) {
-                        if let Some(session) = state.session(id) {
+                        if parsed.option.has_data()
+                            && !parsed.payload.is_empty()
+                            && let Some(session) = state.session(id)
+                        {
                             session.touch();
                         }
                         if !resolutions.push_frame(id, OwnedFrame::from_borrowed(&parsed)) {
@@ -779,6 +782,8 @@ where
                             state.handle_frame(&owned.as_borrowed()).await?;
                         } else {
                             if parsed.status == SessionStatus::Keep
+                                && parsed.option.has_data()
+                                && !parsed.payload.is_empty()
                                 && let Some(session) = state.session(id)
                             {
                                 session.touch();
@@ -940,12 +945,7 @@ impl MuxState {
             SessionStatus::New => self.handle_new(parsed).await,
             SessionStatus::Keep => self.handle_keep(parsed).await,
             SessionStatus::End => self.handle_end(parsed.session_id).await,
-            SessionStatus::KeepAlive => {
-                if let Some(session) = self.session(parsed.session_id) {
-                    session.touch();
-                }
-                Ok(())
-            }
+            SessionStatus::KeepAlive => Ok(()),
         }
     }
 
@@ -1169,8 +1169,6 @@ impl MuxState {
             // Stock replies with a clean End for an unknown session.
             return self.send_end(id, false).await;
         };
-        session.touch();
-
         if !parsed.option.has_data() || parsed.payload.is_empty() {
             return Ok(());
         }
@@ -1213,6 +1211,7 @@ impl MuxState {
                 self.close_with_error(id).await
             }
         } else {
+            session.touch();
             Ok(())
         }
     }
@@ -3064,6 +3063,46 @@ mod tests {
             0,
             "healthy sweep must remove every expired session"
         );
+    }
+
+    #[tokio::test]
+    async fn keepalive_does_not_extend_session_idle() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let config = Arc::new(XudpConfig {
+            session_idle_timeout: Duration::from_millis(300),
+            close_expiry: Duration::from_secs(5),
+            io_timeout: Duration::from_secs(2),
+            ..XudpConfig::default()
+        });
+        let (mut client, task) = start_mux(config);
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(21, &destination, b"before", None)).await;
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("echo reply before expiry");
+        assert_eq!(reply.payload, b"before");
+
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            write_frame(
+                &mut client,
+                FrameSpec {
+                    option: FrameOption::DATA,
+                    ..FrameSpec::new(21, SessionStatus::KeepAlive)
+                },
+            )
+            .await;
+            write_frame(&mut client, FrameSpec::new(21, SessionStatus::Keep)).await;
+        }
+
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("empty keepalives must not refresh idle");
+        assert_eq!(end.session_id, 21);
+        assert_eq!(end.status, SessionStatus::End);
+        finish(client, task).await;
     }
 
     #[tokio::test]
