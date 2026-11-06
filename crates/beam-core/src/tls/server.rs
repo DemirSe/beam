@@ -2361,6 +2361,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cover_falls_back_to_async_relay_when_splice_pool_is_empty() {
+        let cover_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("cover listener");
+        let cover_port = cover_listener.local_addr().expect("cover address").port();
+        let cover_task = tokio::spawn(async move {
+            let (mut cover, _) = cover_listener.accept().await.expect("cover accept");
+            let mut record = [0u8; 5];
+            cover.read_exact(&mut record).await.expect("cover read");
+            assert_eq!(&record, b"hello");
+            cover.write_all(b"world").await.expect("cover write");
+            cover.shutdown().await.expect("cover shutdown");
+        });
+
+        let mut config = test_config();
+        config.cover = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: cover_port,
+        };
+        config.splice_permits = Arc::new(Semaphore::new(0));
+
+        let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("front listener");
+        let front_port = front_listener.local_addr().expect("front address").port();
+        let connect = tokio::spawn(async move {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("client connect")
+        });
+        let (client, _) = front_listener.accept().await.expect("front accept");
+        let proxy = tokio::spawn(async move { forward_to_cover(client, b"hello", &config).await });
+        let mut peer = connect.await.expect("connect task");
+
+        let mut response = [0u8; 5];
+        timeout(Duration::from_secs(2), peer.read_exact(&mut response))
+            .await
+            .expect("fallback relay response")
+            .expect("fallback relay read");
+        assert_eq!(&response, b"world");
+        peer.shutdown().await.expect("peer shutdown");
+
+        let outcome = timeout(Duration::from_secs(2), proxy)
+            .await
+            .expect("fallback relay did not finish")
+            .expect("fallback relay task");
+        assert!(matches!(outcome, Ok(ConnectionOutcome::CoverForwarded)));
+        cover_task.await.expect("cover task");
+    }
+
+    #[tokio::test]
     async fn cover_limit_is_global_and_bounded() {
         let config = test_config();
         let mut permits = Vec::new();

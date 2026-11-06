@@ -40,7 +40,7 @@ and final fuzzing.
 | Protocol behavior and invariants | [Protocol invariants](#protocol-invariants), [Decisions](#decisions) |
 | Configuration | [Configuration and limits](#configuration-and-limits), [`config.example.toml`](config.example.toml) |
 | Client setup | [Windows tray launcher](#windows-tray-launcher), [Linux tray and DNS switch](#linux-tray-and-dns-switch), [Mobile profile](#mobile-profile) |
-| Tests and performance | [Testing and benchmarking](#testing-and-benchmarking), `tests/tun`, `fuzz`, `bench` |
+| Tests and performance | [Testing and benchmarking](#testing-and-benchmarking), [One-command checks](#one-command-checks), `tests/tun`, `fuzz`, `bench` |
 | Open risks | [Known gaps](#known-gaps), [`STRESS-FINDINGS.md`](STRESS-FINDINGS.md) |
 | Agent rules | [`AGENTS.md`](AGENTS.md) |
 
@@ -94,8 +94,25 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 355 tests: 325 `beam-core`,
+a benchmark comparison. The current workspace has 356 tests: 326 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
+
+### One-command checks
+
+```bash
+make verify          # fmt + clippy + test
+make smoke           # release build, example config check, shell syntax
+make lab-check       # external three-VM lab, 11/11, then teardown
+LAB_PROFILE=loss make lab-check   # same, with 30 ms +/- 8 ms and 0.5% loss
+make acceptance      # verify + smoke + lab-check
+```
+
+`lab-check` builds the current source, installs the binary on the lab server,
+restarts it, and reruns the matrix before the optional impaired run; the initial
+boot check uses whatever binary the lab already has. Lab output is written under
+`~/.cache/beam/lab-results/<timestamp>/`. Set `KEEP_LAB=1` to leave the VMs
+running or `LAB_SKIP_BUILD=1` to reuse the installed lab binary. The lab path
+defaults to `/home/demir/pi/beam-lab` and must match the lab scripts.
 
 ### Default stock-client QUIC policy
 
@@ -485,8 +502,16 @@ replacing it requires the explicit fresh-install/update override
 for both modes. The package script validates local secrets; bootstrap applies
 and validates sysctls, validates the new binary as the unprivileged service
 user, backs up replaced files, rolls back on a failed restart/readiness probe,
-prunes each backup set to five, and polls beam's own 443 listener. Compare
-SHA-256 of the local binary with `/usr/local/bin/beam`. Then verify:
+prunes each backup set to five, and polls beam's own 443 listener. Verify the
+deployed state without printing config contents:
+
+```bash
+SSH_KEY="$SSH_KEY" SERVER="$SERVER" deploy/verify-production.sh
+SSH_KEY="$SSH_KEY" SERVER="$SERVER" CHECK_H2=1 deploy/verify-production.sh
+```
+
+Set `EXPECTED_BINARY_SHA` and `EXPECTED_CONFIG_SHA` to make the script fail on a
+hash mismatch. Then verify end to end:
 
 ```bash
 curl -4 -sS -o /dev/null -w '%{http_code}\n' https://example.com/
@@ -569,6 +594,11 @@ cargo +nightly fuzz run legacy_udp -- -max_total_time=60 -timeout=10
 cargo +nightly fuzz run config -- -max_total_time=60 -timeout=10
 ```
 
+`make fuzz-smoke` runs the same short campaigns and keeps the corpus under
+`~/.cache/beam/fuzz-corpus/` so the repository stays free of generated fuzz
+data. Override the location with `BEAM_FUZZ_CACHE` and the duration with
+`BEAM_FUZZ_SECONDS`.
+
 The GitHub fuzz workflow is manual-only. Parser changes require a local run.
 The multi-record ClientHello assembler still needs final fuzz coverage.
 
@@ -619,14 +649,31 @@ bash bench/run.sh --quick --reps 1    # smoke
 bash bench/run.sh --arms beam         # one arm
 bash bench/no-tun.sh                  # server-capacity smoke
 bash bench/churn.sh                   # connection-churn smoke
+make bench-cache                      # results under ~/.cache/beam/bench-results
 ```
 
-Results are written under `bench/results/<timestamp>/`; raw logs/configs and
-large artifacts are gitignored. Full-TUN bulk is client-capped on this host
+Results from `make bench-cache` are written outside the repository; raw logs
+and large artifacts stay out of Git. Full-TUN bulk is client-capped on this host
 (about 0.98-1.00x), so it is not a headline result. The balanced no-TUN
 capacity result is about 1.46x stock; the final smoke was about 1.40x. Treat
 older n=3 claims as provisional and require n>=10 with matched CPU accounting
 for any new headline.
+
+### Baseline ledger
+
+These are decision baselines, not universal performance claims. Re-run the
+specific scenario before using a number in a new release note.
+
+| Date | Build/commit | Environment | Scenario | Result |
+|---|---|---|---|---|
+| 2026-10-31 | lab `1007354…` | lab, 1024 limits | mixed soak, 10 m 37 s | 0 application errors; RSS plateau 93,920 KiB; fds 12–478; `NRestarts=0` |
+| 2026-11 | `fa0c0ca` | lab, 6.12.115, 30 ms ± 8 ms, 0.5% loss | iperf3 reverse, 10 s, 4 streams | CUBIC median 62.4 Mbps; BBR median 909.2 Mbps; ~14.6× |
+| 2026-11-06 | `647623b` | lab | captured ClientHello replay burst | 905/1024 established before fix; 12/1024 after |
+| 2026-11-06 | `2469971` | lab, clean | three-VM functional matrix | 11/11 PASS |
+| 2026-11-06 | `2469971` | production, local TUN | HTTPS through H2 | HTTP 200; 0.096–0.104 s |
+
+The BBR value is from a virtual 1 Gbps lab link, not a 5G guarantee. The soak
+is short; the 24 h soak and privileged syscall/wakeup/splice gates remain open.
 
 The local TUN matrix and cover diagnostic are:
 
