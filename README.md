@@ -402,8 +402,8 @@ bind.
   many close operations can still delay a mux briefly.
 - All DNS paths (target/cover dial, XUDP, legacy UDP) share one process-wide
   bounded resolver: 28 normal slots plus 4 reserved cover slots by default,
-  kept below the blocking-pool reserve. One hostname may hold at most four
-  concurrent lookups, so a single slow domain cannot consume the whole pool.
+  kept below the blocking-pool reserve. There is no lower per-host cap;
+  concurrent lookups for the same host are limited only by the global lane.
   Excess lookups fail immediately. A lookup that times out keeps its blocking
   slot until `getaddrinfo` returns; timeout pressure is logged at most once per
   30 seconds so timed-out work cannot recreate an unbounded queue. Vision

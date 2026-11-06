@@ -12,7 +12,6 @@
 //! cancelled safely, and releasing the slot early would recreate the same
 //! unbounded pool pressure.
 
-use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -27,12 +26,6 @@ use tokio::task::JoinError;
 /// With the default 160-thread blocking pool and 120 splice permits, this
 /// leaves room for the resolver without starving splice handoffs.
 pub const DEFAULT_MAX_CONCURRENT_RESOLVES: usize = 32;
-
-/// Maximum concurrent lookups for one hostname.
-///
-/// A single slow or malicious domain must not consume the whole process-wide
-/// resolver budget.
-pub const DEFAULT_MAX_CONCURRENT_PER_HOST: usize = 4;
 
 /// Slots reserved for cover dials when normal destination lookups saturate.
 const DEFAULT_COVER_RESERVE: usize = 4;
@@ -57,8 +50,6 @@ struct Inner {
     normal: Arc<Semaphore>,
     cover: Arc<Semaphore>,
     max: usize,
-    max_per_host: usize,
-    per_host: Mutex<HashMap<String, usize>>,
     in_flight: AtomicUsize,
     timeouts: AtomicU64,
     last_timeout_log: Mutex<Option<Instant>>,
@@ -103,8 +94,6 @@ impl Resolver {
                 normal: Arc::new(Semaphore::new(normal)),
                 cover: Arc::new(Semaphore::new(cover)),
                 max,
-                max_per_host: DEFAULT_MAX_CONCURRENT_PER_HOST.min(normal),
-                per_host: Mutex::new(HashMap::new()),
                 in_flight: AtomicUsize::new(0),
                 timeouts: AtomicU64::new(0),
                 last_timeout_log: Mutex::new(None),
@@ -116,12 +105,6 @@ impl Resolver {
     #[must_use]
     pub fn max(&self) -> usize {
         self.inner.max
-    }
-
-    /// Returns the configured per-host concurrency limit.
-    #[must_use]
-    pub fn max_per_host(&self) -> usize {
-        self.inner.max_per_host
     }
 
     /// Returns the number of unused resolver slots.
@@ -137,7 +120,6 @@ impl Resolver {
     pub fn stats(&self) -> ResolverStats {
         ResolverStats {
             max: self.inner.max,
-            max_per_host: self.inner.max_per_host,
             normal_available: self.inner.normal.available_permits(),
             cover_available: self.inner.cover.available_permits(),
             in_flight: self.inner.in_flight.load(Ordering::Relaxed),
@@ -173,8 +155,7 @@ impl Resolver {
         priority: ResolverPriority,
     ) -> Result<Vec<SocketAddr>, ResolverError> {
         let host = host.to_owned();
-        let key = normalize_host(&host);
-        self.lookup_with_key(priority, Some(key), timeout, move || {
+        self.lookup_with_priority(priority, timeout, move || {
             (host.as_str(), port)
                 .to_socket_addrs()
                 .map(|addresses| addresses.collect())
@@ -192,16 +173,15 @@ impl Resolver {
     where
         F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
     {
-        self.lookup_with_key(ResolverPriority::Normal, None, timeout, lookup)
+        self.lookup_with_priority(ResolverPriority::Normal, timeout, lookup)
             .await
     }
 
-    /// Runs one blocking lookup while holding the global, host, and activity
-    /// guards until the platform resolver actually returns.
-    async fn lookup_with_key<F>(
+    /// Runs one blocking lookup while holding the global and activity guards
+    /// until the platform resolver actually returns.
+    async fn lookup_with_priority<F>(
         &self,
         priority: ResolverPriority,
-        host: Option<String>,
         timeout: Duration,
         lookup: F,
     ) -> Result<Vec<SocketAddr>, ResolverError>
@@ -209,21 +189,6 @@ impl Resolver {
         F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
     {
         let permit = self.try_acquire(priority).ok_or(ResolverError::Busy)?;
-        let host_guard = match host {
-            Some(host) => {
-                let mut counts = lock(&self.inner.per_host);
-                let count = counts.get(&host).copied().unwrap_or(0);
-                if count >= self.inner.max_per_host {
-                    return Err(ResolverError::Busy);
-                }
-                counts.insert(host.clone(), count + 1);
-                Some(HostGuard {
-                    inner: Arc::clone(&self.inner),
-                    host,
-                })
-            }
-            None => None,
-        };
         let in_flight = InFlightGuard {
             inner: Arc::clone(&self.inner),
         };
@@ -231,7 +196,6 @@ impl Resolver {
 
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let _host_guard = host_guard;
             let _in_flight = in_flight;
             lookup()
         });
@@ -286,8 +250,6 @@ impl Resolver {
 pub struct ResolverStats {
     /// Configured total concurrency limit.
     pub max: usize,
-    /// Configured per-host limit.
-    pub max_per_host: usize,
     /// Available normal slots.
     pub normal_available: usize,
     /// Available cover emergency slots.
@@ -296,25 +258,6 @@ pub struct ResolverStats {
     pub in_flight: usize,
     /// Lookups whose caller deadline expired.
     pub timeouts: u64,
-}
-
-/// Decrements a hostname's in-flight count when the blocking lookup returns.
-struct HostGuard {
-    inner: Arc<Inner>,
-    host: String,
-}
-
-impl Drop for HostGuard {
-    fn drop(&mut self) {
-        let mut counts = lock(&self.inner.per_host);
-        if let Some(count) = counts.get_mut(&self.host) {
-            if *count <= 1 {
-                counts.remove(&self.host);
-            } else {
-                *count -= 1;
-            }
-        }
-    }
 }
 
 /// Decrements the in-flight gauge when the blocking lookup returns.
@@ -328,10 +271,6 @@ impl Drop for InFlightGuard {
     }
 }
 
-fn normalize_host(host: &str) -> String {
-    host.trim_end_matches('.').to_ascii_lowercase()
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -340,7 +279,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MAX_CONCURRENT_PER_HOST, Resolver, ResolverError, ResolverPriority};
+    use super::{Resolver, ResolverError, ResolverPriority};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -453,68 +392,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn per_host_limit_does_not_consume_all_slots() {
+    async fn same_host_lookups_use_more_than_four_slots() {
         let resolver = Resolver::new(8);
-        let (started, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
-        let release = Arc::new(AtomicBool::new(false));
         let mut tasks = Vec::new();
-        for _ in 0..DEFAULT_MAX_CONCURRENT_PER_HOST {
+        for _ in 0..5 {
             let resolver = resolver.clone();
-            let started = started.clone();
-            let release = Arc::clone(&release);
             tasks.push(tokio::spawn(async move {
                 resolver
-                    .lookup_with_key(
+                    .lookup_host_priority(
+                        "localhost",
+                        9,
+                        Duration::from_secs(5),
                         ResolverPriority::Normal,
-                        Some("same.test".to_owned()),
-                        Duration::from_secs(2),
-                        move || {
-                            let _ = started.send(());
-                            while !release.load(Ordering::SeqCst) {
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                            Ok(Vec::new())
-                        },
                     )
                     .await
             }));
         }
-        for _ in 0..DEFAULT_MAX_CONCURRENT_PER_HOST {
-            started_rx.recv().await.expect("host lookup did not start");
-        }
-
-        assert!(matches!(
-            resolver
-                .lookup_with_key(
-                    ResolverPriority::Normal,
-                    Some("same.test".to_owned()),
-                    Duration::from_secs(1),
-                    || Ok(Vec::new()),
-                )
-                .await,
-            Err(ResolverError::Busy)
-        ));
-        assert!(resolver.inner.normal.available_permits() > 0);
-        resolver
-            .lookup_with_key(
-                ResolverPriority::Normal,
-                Some("other.test".to_owned()),
-                Duration::from_secs(1),
-                || Ok(Vec::new()),
-            )
-            .await
-            .expect("a different host must still use global capacity");
-
-        println!(
-            "per-host policy: cap={} fifth_same_host=Busy different_host=ok",
-            DEFAULT_MAX_CONCURRENT_PER_HOST
-        );
-        release.store(true, Ordering::SeqCst);
         for task in tasks {
             task.await
-                .expect("host lookup task")
-                .expect("host lookup result");
+                .expect("same-host lookup task")
+                .expect("same host must not have a four-lookup cap");
         }
+        println!("same-host policy: 5 concurrent lookups accepted");
     }
 
     #[tokio::test]
@@ -532,16 +431,11 @@ mod tests {
         let cover_resolver = resolver.clone();
         let cover = tokio::spawn(async move {
             cover_resolver
-                .lookup_with_key(
-                    ResolverPriority::Cover,
-                    None,
-                    Duration::from_secs(2),
-                    move || {
-                        let _ = started.send(());
-                        let _ = release_rx.recv_timeout(Duration::from_secs(1));
-                        Ok(Vec::new())
-                    },
-                )
+                .lookup_with_priority(ResolverPriority::Cover, Duration::from_secs(2), move || {
+                    let _ = started.send(());
+                    let _ = release_rx.recv_timeout(Duration::from_secs(1));
+                    Ok(Vec::new())
+                })
                 .await
         });
         started_rx.await.expect("cover lookup did not start");
@@ -551,12 +445,9 @@ mod tests {
 
         assert!(matches!(
             resolver
-                .lookup_with_key(
-                    ResolverPriority::Cover,
-                    None,
-                    Duration::from_secs(1),
-                    || Ok(Vec::new()),
-                )
+                .lookup_with_priority(ResolverPriority::Cover, Duration::from_secs(1), || Ok(
+                    Vec::new()
+                ),)
                 .await,
             Err(ResolverError::Busy)
         ));
