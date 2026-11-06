@@ -9,8 +9,6 @@ __pycache__/
 *.pyc
 
 /mobile-singbox.json
-/android-hysteria-singbox.json
-/amneziawg-android.conf
 
 # Windows tray launcher build artifacts and local runtime files
 /clients/windows-tray/beam-tray.exe
@@ -22,4 +20,3 @@ __pycache__/
 # Linux tray build artifacts
 /clients/linux-tray/beam-tray
 /clients/linux-tray/beam-helper
-/amneziawg-android-qr.png
