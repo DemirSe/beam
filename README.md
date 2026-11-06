@@ -8,18 +8,18 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-11-06 15:07 UTC:
+on 2026-11-06 16:59 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `5acb952a09bfec1ebfd5edda3840375661bb7233e25792ec0d86c63a9e50f6b3` |
-| Version | `0.1.0 (7990d7e461f6)` |
+| SHA-256 | `318cf3bd4051f033603e83037bc5bfea4516446d8932dcb2022d1fc454c71ae9` |
+| Version | `0.1.0 (fc3f2517476a)` |
 | Service | `beam.service`, active, `NRestarts=0` |
 | Listener | `0.0.0.0:443` |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
 | Host network | BBR + fq, conntrack 65536, 600 s UDP retention |
-| Verification | Production verifier PASS; lab 11/11; H2 local-TUN check not re-run after the resolver deploy |
+| Verification | Production verifier PASS; client DNS/HTTP 200 through local TUN; lab 11/11; H2 local-TUN check not re-run |
 
 The deployed binary includes the XUDP junk-reply idle-pinning fix (`2163c0a`),
 the mux-wide resolution/send-stall fix (`e0ca0bc`), the 2026-11-03
@@ -28,9 +28,10 @@ reservation (`647623b`), and the 2026-11-06 hardening batch: XUDP socket-budget
 validation, control-frame idle pinning, Vision empty-block rejection, replay
 first-wins with a 300-second timestamp/cache window, cancellable cover relays,
 bounded legacy UDP, parallel resolver lookups, and the descriptor budget check.
-It also includes the process-wide resolver bound (`f9f39f3`) and the per-host
-lookup cap plus four-slot cover reserve (`7990d7e`). The last lab run passed
-11/11 checks. Remaining
+It also includes the process-wide resolver bound (`f9f39f3`) and the four-slot
+cover reserve. The per-host cap from `7990d7e` was removed in `fc3f251`: it
+closed the fifth concurrent connection to the same DoH host, which produced
+client DNS `unexpected EOF` errors. The last lab run passed 11/11 checks. Remaining
 code-confirmed backpressure and lower-risk resource items in
 `STRESS-FINDINGS.md` are still tracked; the full release gates remain the
 24 h soak, privileged syscall/wakeup/splice measurements, cgroup OOM sampling,

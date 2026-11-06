@@ -6,10 +6,11 @@ still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
 the four deployed 2026-11-06 fixes are in `2469971`; first-wins replay,
 timestamp/cache hardening, legacy UDP bounds, cover cancellation, parallel
 resolver lookups, and the descriptor budget are in `2e0a464` and deployed.
-The process-wide resolver bound, per-host cap, cover reserve, and splice
-handoff timeout are in `f9f39f3`/`7990d7e` and deployed. The remaining items
-below stay open. Production runs `7990d7e` (SHA `5acb952…`) with
-`NRestarts=0`; the lab is stopped after the 11/11 checks.
+The process-wide resolver bound, cover reserve, and splice handoff timeout are
+in `f9f39f3`/`7990d7e`; the per-host cap was removed in `fc3f251` after it
+closed concurrent DoH connections. The remaining items below stay open.
+Production runs `fc3f251` (SHA `318cf3b…`) with `NRestarts=0`; the lab is
+stopped after the 11/11 checks.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 
