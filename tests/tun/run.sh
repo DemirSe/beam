@@ -24,7 +24,7 @@
 # Environment:
 #   SING_BOX        sing-box binary (default: sing-box from PATH)
 #   XRAY_BIN        stock Xray binary (default: xray from PATH)
-#   TEST_CONFIG     beam REALITY fixture (default: ~/.cache/beam/beam-test.toml)
+#   TEST_CONFIG     beam REALITY fixture (default: config.example.toml)
 #   TUN_OUT         run directory (default: ~/.cache/beam/tun/<timestamp>)
 #   SKIP_BUILD=1    reuse target/<profile>/beam and the H3 origin binary
 #   H3_ORIGIN_BIN   use a prebuilt h3-origin binary instead of building it
@@ -99,7 +99,7 @@ source "$ROOT/scripts/dev-env.sh"
 PYTHON="${PYTHON:-python3}"
 SING_BOX="${SING_BOX:-sing-box}"
 XRAY_BIN="${XRAY_BIN:-xray}"
-TEST_CONFIG="${TEST_CONFIG:-${XDG_CACHE_HOME:-$HOME/.cache}/beam/beam-test.toml}"
+TEST_CONFIG="${TEST_CONFIG:-$ROOT/config.example.toml}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 UDP_MODE="${UDP_MODE:-xudp}"
 PROFILE="debug"

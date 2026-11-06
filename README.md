@@ -100,6 +100,7 @@ a benchmark comparison. The current workspace has 356 tests: 326 `beam-core`,
 ### One-command checks
 
 ```bash
+make doctor          # required build tools, optional benchmark tools, local paths
 make verify          # fmt + clippy + test
 make smoke           # release build, example config check, shell syntax
 make lab-check       # external three-VM lab, 11/11, then teardown
@@ -655,9 +656,9 @@ make bench-cache                      # results under ~/.cache/beam/bench-result
 Results from `make bench-cache` are written outside the repository; raw logs
 and large artifacts stay out of Git. Tool binaries come from `PATH` by default
 (`sing-box`, `xray`, `iperf3`, `tc`); override them with `SING_BOX`, `XRAY_BIN`,
-`IPERF3`, and `TC`. `TEST_CONFIG` defaults to
-`~/.cache/beam/bench/beam.toml`; point it at a REALITY fixture before running.
-Full-TUN bulk is client-capped on this host
+`IPERF3`, and `TC`. `TEST_CONFIG` defaults to the local
+`config.example.toml`; replace it with a private fixture when measuring a real
+identity. Full-TUN bulk is client-capped on this host
 (about 0.98-1.00x), so it is not a headline result. The balanced no-TUN
 capacity result is about 1.46x stock; the final smoke was about 1.40x. Treat
 older n=3 claims as provisional and require n>=10 with matched CPU accounting

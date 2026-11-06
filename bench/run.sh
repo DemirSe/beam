@@ -29,7 +29,7 @@
 #   XRAY_BIN      stock Xray (default: xray from PATH)
 #   IPERF3        iperf3 binary (default: iperf3 from PATH)
 #   IPERF3_LIB    optional LD_LIBRARY_PATH for iperf3
-#   TEST_CONFIG   REALITY fixture (default: ~/.cache/beam/bench/beam.toml)
+#   TEST_CONFIG   REALITY fixture (default: config.example.toml)
 #   H3_ORIGIN_BIN prebuilt tests/tun/h3-origin binary
 #   SKIP_BUILD=1  reuse target/release/beam and the H3 origin binary
 #
@@ -64,7 +64,7 @@ PYTHON="${PYTHON:-python3}"
 CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/beam"
 SING_BOX="${SING_BOX:-sing-box}"
 XRAY_BIN="${XRAY_BIN:-xray}"
-TEST_CONFIG="${TEST_CONFIG:-$CACHE_ROOT/bench/beam.toml}"
+TEST_CONFIG="${TEST_CONFIG:-$ROOT/config.example.toml}"
 IPERF3="${IPERF3:-iperf3}"
 IPERF3_LIB="${IPERF3_LIB:-}"
 TC="${TC:-tc}"
