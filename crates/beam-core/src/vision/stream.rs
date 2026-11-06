@@ -37,8 +37,9 @@ const MAX_INNER_TLS_BODY: usize = 16_384 + 256;
 /// trigger sees the same record boundary as the stock writer.
 const MAX_WRITE_BATCH: usize = 5 + MAX_INNER_TLS_BODY;
 
-/// Maximum empty Vision blocks processed in one `poll_read` call before
-/// yielding to the executor.
+/// Maximum consecutive empty Vision blocks accepted in one `poll_read` call.
+/// Reaching this with no coalesced content is treated as malformed input; a
+/// self-wake here would busy-spin an authenticated connection.
 const MAX_EMPTY_BLOCKS_PER_POLL: usize = 64;
 
 /// Maximum plaintext coalesced from complete Vision blocks in one poll.
@@ -567,8 +568,10 @@ where
                             coalescing = false;
                             continue;
                         }
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "too many consecutive empty Vision blocks",
+                        )));
                     }
                 }
                 Ok(None) => {
@@ -1273,6 +1276,24 @@ mod tests {
             .expect("empty-block limit withheld buffered content")
             .expect("read buffered content");
         assert_eq!(&buffer[..count], b"a");
+    }
+
+    #[tokio::test]
+    async fn empty_block_limit_without_content_is_rejected() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block_bytes(Some(USER_ID), Command::Continue, b"", 0));
+        for _ in 1..MAX_EMPTY_BLOCKS_PER_POLL {
+            raw.extend_from_slice(&block_bytes(None, Command::Continue, b"", 0));
+        }
+
+        let (_peer, client) = duplex(64 * 1024);
+        let mut vision = VisionStream::new(client, USER_ID, raw, rng(22));
+        let mut buffer = [0u8; 8];
+        let error = timeout(Duration::from_secs(1), vision.read(&mut buffer))
+            .await
+            .expect("empty-block limit busy-spun")
+            .expect_err("empty-only stream must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
