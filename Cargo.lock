@@ -205,7 +205,6 @@ dependencies = [
  "rand",
  "rcgen",
  "rustls",
- "rustls-pki-types",
  "serde",
  "sha2",
  "subtle",
