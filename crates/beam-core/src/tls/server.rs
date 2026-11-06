@@ -1270,7 +1270,15 @@ async fn forward_to_cover(
     .map_err(|_| TlsServerError::Timeout {
         stage: "cover ClientHello write",
     })??;
-    relay_splice(client, cover, COVER_IDLE_TIMEOUT).await?;
+    let splice_permit = Arc::clone(&config.splice_permits).try_acquire_owned().ok();
+    match splice_permit {
+        Some(permit) => relay_splice(client, cover, COVER_IDLE_TIMEOUT, permit).await?,
+        None => {
+            config.metrics.record_splice_fallback();
+            tracing::debug!("cover splice limit reached; using async cover relay");
+            relay_bidirectional(client, cover, COVER_IDLE_TIMEOUT).await?;
+        }
+    }
     Ok(ConnectionOutcome::CoverForwarded)
 }
 
@@ -1873,9 +1881,11 @@ async fn relay_splice(
     left: TcpStream,
     right: TcpStream,
     idle_timeout: Duration,
+    splice_permit: OwnedSemaphorePermit,
 ) -> Result<(), TlsServerError> {
     let config = splice_config(idle_timeout);
     let result = tokio::task::spawn_blocking(move || {
+        let _splice_permit = splice_permit;
         copy_bidirectional(left.as_raw_fd(), right.as_raw_fd(), &config)
     })
     .await
