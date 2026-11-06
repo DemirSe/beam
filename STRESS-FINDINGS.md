@@ -1,11 +1,13 @@
-# Open stress findings — 2026-10-31
+# Open stress findings — updated 2026-11-06
 
 This file is intentionally separate from `README.md` for the findings that are
 still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
-7, and 11 are fixed in `fa0c0ca` and deployed. The remaining items below stay
-open. Production was updated after each previously deployed fix. The lab is
-stopped after the current verification run. Initial binary under test: final
-`1007354…` code (embedded identity `b4d9382`, deployed build `a41facef…`).
+7, and 11 are fixed in `fa0c0ca`; the concurrent-replay bound is in `647623b`;
+the four 2026-11-06 fixes are in `2469971`. All of those are deployed. The
+remaining items below stay open. Production runs `2469971` (SHA
+`61d8b045…`) with `NRestarts=0`; the lab is stopped after the 11/11 checks.
+Initial binary under test was final `1007354…` code (embedded identity
+`b4d9382`, deployed build `a41facef…`).
 
 This note records the results of three read-only code audits plus the QEMU lab
 run. It distinguishes **lab-reproduced** findings from code-confirmed risks.
@@ -218,18 +220,19 @@ TLS handshake, VLESS request, dial, response, and initial body write now share
 one absolute `tokio::time::Instant` deadline. A slow client can hold a permit
 for at most the configured handshake budget, not a multiple of it.
 
-### 8. Replay cache is post-Finished and timestamp checking is disabled — MEDIUM security/DoS
+### 8. [PARTIAL] Replay cache is post-Finished and timestamp checking is disabled — MEDIUM security/DoS
 
 `crates/beam-core/src/tls/server.rs:704-728`, `1036`;
 `crates/beam/src/main.rs:440`
 
-`replay_contains` happens at classification, but insertion happens only after
-TLS Finished. Concurrent copies of a captured ClientHello can acquire
-authenticated permits and stall until the handshake timeout. With timestamp
-checking disabled (`None`), the same capture can be reused. Stock Xray has no
-cache, so this is a tradeoff rather than an interop regression, but the
-authenticated-permit pressure is real and needs either a bounded in-flight
-reservation or a documented threat model.
+The concurrent-copy permit pressure is bounded: `647623b` adds a maximum of
+four in-flight reservations per exact replay id and releases them on handshake
+failure (lab: 905/1024 pre-fix, 12 post-fix). The cache still inserts only
+after TLS Finished, and timestamp checking remains disabled (`None`); a
+captured ClientHello can therefore authenticate once after the 60 s replay
+window. Stock Xray has no cache, so this is a tradeoff rather than an interop
+regression. The timestamp-window decision remains open and needs either strict
+timestamp checking or a documented threat model.
 
 ### 9. Short GlobalID flows can pin a mux/connection for about 120 s — MEDIUM, code-confirmed
 
@@ -250,13 +253,17 @@ accounting risk.
 - Cover relay uses `copy_bidirectional` without a stop/eventfd
   (`crates/beam-core/src/tls/server.rs:1817-1818`); only cancellation,
   shutdown, or panic leaves detached blocking work and fds for the 30 s cover
-  idle limit.
+  idle limit. `2469971` now bounds concurrent cover relays with the splice
+  permit pool and falls back to the async relay, but does not add a stop
+  signal.
 - `handle_mux_stream` cleanup is skipped if the handler future is aborted or
   panics (`crates/beam-core/src/xudp/server.rs:192-221`); no in-process abort
   path was found, so this is a shutdown/panic concern.
-- Vision padding-only input still uses `wake_by_ref` after the empty-block
+- ~~Vision padding-only input still uses `wake_by_ref` after the empty-block
   budget (`crates/beam-core/src/vision/stream.rs:562-572`), so an authenticated
-  hostile client can burn CPU while staying connected.
+  hostile client can burn CPU while staying connected.~~ Fixed in `abdc033`:
+  after 64 consecutive empty blocks with no coalesced content the stream
+  returns `InvalidData`; regression tested.
 - `take_idle` holds the session-table lock while taking up to 2048 session
   locks (`crates/beam-core/src/xudp/session.rs:865-876`); bounded, no lock
   cycle found.
@@ -330,7 +337,8 @@ separate product decision because it changes the visible transport.
    deployed with documented residual bounds.
 3. Separate control queue for a strict End reserve (4).
 4. Per-mux reply-budget fairness (5).
-5. Bounded in-flight replay reservation and a timestamp-window decision (8).
+5. ~~Bound concurrent in-flight replays (8).~~ In-flight bound shipped in
+   `647623b`; decide the timestamp-checking window.
 6. Short-GlobalID lifecycle accounting (9).
 7. Resume the 24 h/privileged/fuzz release gates after the remaining findings.
 8. Test the external BBR Linux gateway path for finding 12 under the same loss

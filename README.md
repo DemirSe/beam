@@ -8,26 +8,29 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-11-03 11:45 UTC:
+on 2026-11-06 10:06 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `9419b6623c6775b593a7bf2952cf24205692c1d81503044e6ecd26c01c0869fc` |
-| Version | `0.1.0 (fa0c0ca9d5ff)` |
+| SHA-256 | `61d8b04572c31e3c6520be0a204cccc4fdf2a56b1d328ea67447ab193f2009d9` |
+| Version | `0.1.0 (2469971ae715)` |
 | Service | `beam.service`, active, `NRestarts=0` |
 | Listener | `0.0.0.0:443` |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
 | Host network | BBR + fq, conntrack 65536, 600 s UDP retention |
-| Verification | HTTPS through the local TUN 200, cover certificate valid, public QUIC refused, H2 fallback 200 |
+| Verification | HTTPS through the local TUN 200, cover certificate valid, public QUIC refused, H2 fallback 200, lab 11/11 |
 
 The deployed binary includes the XUDP junk-reply idle-pinning fix (`2163c0a`),
-the mux-wide resolution/send-stall fix (`e0ca0bc`), and the 2026-11-03
-handshake/legacy-UDP/End-enqueue hardening. The full-TUN matrix last passed
-8/8 in `xudp`, `packetaddr`, and `legacy` modes. Remaining code-confirmed
-backpressure and replay risks in `STRESS-FINDINGS.md` are still tracked; the
-full release gates remain the 24 h soak, privileged syscall/wakeup/splice
-measurements, cgroup OOM sampling, and final fuzzing.
+the mux-wide resolution/send-stall fix (`e0ca0bc`), the 2026-11-03
+handshake/legacy-UDP/End-enqueue hardening, the bounded in-flight replay
+reservation (`647623b`), and four 2026-11-06 fixes: XUDP socket-budget
+validation, control-frame idle pinning, Vision empty-block rejection, and
+cover splice-permit accounting. The last lab run passed 11/11 checks. Remaining
+code-confirmed backpressure and timestamp-window risks in
+`STRESS-FINDINGS.md` are still tracked; the full release gates remain the
+24 h soak, privileged syscall/wakeup/splice measurements, cgroup OOM sampling,
+and final fuzzing.
 
 ## Scope
 
@@ -79,7 +82,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 351 tests: 321 `beam-core`,
+a benchmark comparison. The current workspace has 355 tests: 325 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
 ### Default stock-client QUIC policy
@@ -640,9 +643,12 @@ Cover flight differences are diagnostic only by the SNI-level decision.
 
 - The XUDP junk-reply idle-pinning defect and the mux-wide resolution/send
   stalls are fixed, deployed, and lab-verified; their invariants are documented
-  above. `STRESS-FINDINGS.md` retains the remaining close/reserve,
-  timeout-validation, replay, and lower-risk items. Do not fold the remaining
-  items into this note until they are fixed and re-verified.
+  above. The control-frame idle pinning, Vision empty-block spin, and cover
+  splice-permit bypass are fixed in `2469971`, and concurrent exact replays are
+  bounded in `647623b`. `STRESS-FINDINGS.md` retains the remaining
+  close/reserve, reply-budget, timestamp-window, short-flow lifecycle, and
+  lower-risk items. Do not fold the remaining items into this note until they
+  are fixed and re-verified.
 - A clean 24-hour mixed soak, privileged syscall/wakeup/splice gates, cgroup
   socket-memory/OOM sampling, and a final fuzz run of the multi-record
   ClientHello assembler remain open release-acceptance items.
