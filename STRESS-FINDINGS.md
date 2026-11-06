@@ -5,9 +5,11 @@ still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
 7, and 11 are fixed in `fa0c0ca`; the concurrent-replay bound is in `647623b`;
 the four deployed 2026-11-06 fixes are in `2469971`; first-wins replay,
 timestamp/cache hardening, legacy UDP bounds, cover cancellation, parallel
-resolver lookups, and the descriptor budget are in `2e0a464` and deployed. The
-remaining items below stay open. Production runs `2e0a464` (SHA `80b46fd…`)
-with `NRestarts=0`; the lab is stopped after the 11/11 checks.
+resolver lookups, and the descriptor budget are in `2e0a464` and deployed.
+The process-wide resolver bound, per-host cap, cover reserve, and splice
+handoff timeout are in `f9f39f3`/`7990d7e` and deployed. The remaining items
+below stay open. Production runs `7990d7e` (SHA `5acb952…`) with
+`NRestarts=0`; the lab is stopped after the 11/11 checks.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 
