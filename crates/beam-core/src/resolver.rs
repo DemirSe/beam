@@ -52,7 +52,9 @@ struct Inner {
     max: usize,
     in_flight: AtomicUsize,
     timeouts: AtomicU64,
+    busy: AtomicU64,
     last_timeout_log: Mutex<Option<Instant>>,
+    last_busy_log: Mutex<Option<Instant>>,
 }
 
 /// Failure while resolving a hostname.
@@ -96,7 +98,9 @@ impl Resolver {
                 max,
                 in_flight: AtomicUsize::new(0),
                 timeouts: AtomicU64::new(0),
+                busy: AtomicU64::new(0),
                 last_timeout_log: Mutex::new(None),
+                last_busy_log: Mutex::new(None),
             }),
         }
     }
@@ -124,6 +128,7 @@ impl Resolver {
             cover_available: self.inner.cover.available_permits(),
             in_flight: self.inner.in_flight.load(Ordering::Relaxed),
             timeouts: self.inner.timeouts.load(Ordering::Relaxed),
+            busy: self.inner.busy.load(Ordering::Relaxed),
         }
     }
 
@@ -188,7 +193,10 @@ impl Resolver {
     where
         F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
     {
-        let permit = self.try_acquire(priority).ok_or(ResolverError::Busy)?;
+        let Some(permit) = self.try_acquire(priority) else {
+            self.note_busy(priority);
+            return Err(ResolverError::Busy);
+        };
         let in_flight = InFlightGuard {
             inner: Arc::clone(&self.inner),
         };
@@ -214,10 +222,31 @@ impl Resolver {
     fn try_acquire(&self, priority: ResolverPriority) -> Option<tokio::sync::OwnedSemaphorePermit> {
         match priority {
             ResolverPriority::Normal => Arc::clone(&self.inner.normal).try_acquire_owned().ok(),
-            ResolverPriority::Cover => Arc::clone(&self.inner.cover)
-                .try_acquire_owned()
-                .ok()
-                .or_else(|| Arc::clone(&self.inner.normal).try_acquire_owned().ok()),
+            ResolverPriority::Cover => Arc::clone(&self.inner.cover).try_acquire_owned().ok(),
+        }
+    }
+
+    fn note_busy(&self, priority: ResolverPriority) {
+        let busy = self.inner.busy.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = Instant::now();
+        let due = {
+            let mut last = lock(&self.inner.last_busy_log);
+            if last.is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(30)) {
+                false
+            } else {
+                *last = Some(now);
+                true
+            }
+        };
+        if due {
+            tracing::warn!(
+                ?priority,
+                busy,
+                in_flight = self.inner.in_flight.load(Ordering::Relaxed),
+                normal_available = self.inner.normal.available_permits(),
+                cover_available = self.inner.cover.available_permits(),
+                "resolver concurrency limit reached"
+            );
         }
     }
 
@@ -258,6 +287,8 @@ pub struct ResolverStats {
     pub in_flight: usize,
     /// Lookups whose caller deadline expired.
     pub timeouts: u64,
+    /// Lookups rejected because both applicable lanes were full.
+    pub busy: u64,
 }
 
 /// Decrements the in-flight gauge when the blocking lookup returns.
@@ -414,6 +445,26 @@ mod tests {
                 .expect("same host must not have a four-lookup cap");
         }
         println!("same-host policy: 5 concurrent lookups accepted");
+    }
+
+    #[tokio::test]
+    async fn cover_lookup_does_not_fall_back_to_normal_slots() {
+        let resolver = Resolver::new(8);
+        let _cover = Arc::clone(&resolver.inner.cover)
+            .try_acquire_owned()
+            .expect("cover slot");
+        assert!(resolver.inner.normal.available_permits() > 0);
+
+        assert!(matches!(
+            resolver
+                .lookup_with_priority(ResolverPriority::Cover, Duration::from_secs(1), || Ok(
+                    Vec::new()
+                ),)
+                .await,
+            Err(ResolverError::Busy)
+        ));
+        assert_eq!(resolver.stats().busy, 1);
+        println!("cover isolation: normal_slots_not_borrowed");
     }
 
     #[tokio::test]

@@ -99,7 +99,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 366 tests: 336 `beam-core`,
+a benchmark comparison. The current workspace has 367 tests: 337 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
 ### One-command checks
@@ -402,13 +402,14 @@ bind.
   universally nonblocking: a sequence of slow domains, a congested send, or
   many close operations can still delay a mux briefly.
 - All DNS paths (target/cover dial, XUDP, legacy UDP) share one process-wide
-  bounded resolver: 28 normal slots plus 4 reserved cover slots by default,
+  bounded resolver: 28 normal slots plus 4 isolated cover slots by default,
   kept below the blocking-pool reserve. There is no lower per-host cap;
   concurrent lookups for the same host are limited only by the global lane.
-  Excess lookups fail immediately. A lookup that times out keeps its blocking
-  slot until `getaddrinfo` returns; timeout pressure is logged at most once per
-  30 seconds so timed-out work cannot recreate an unbounded queue. Vision
-  splice handoff is bounded to five seconds.
+  Cover dials cannot borrow normal slots, so an unauthenticated cover flood
+  cannot starve target DNS. Excess lookups fail immediately and log at most
+  once per 30 seconds. A lookup that times out keeps its blocking slot until
+  `getaddrinfo` returns, so timed-out work cannot recreate an unbounded queue.
+  Vision splice handoff is bounded to five seconds.
 - Live XUDP limits are 1024 process-wide sessions and 128 KiB per socket
   receive buffer; a mux holds at most half the global active slots. XUDP idle
   expiry is at most 60 seconds even when the TCP relay idle timeout is 300
