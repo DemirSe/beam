@@ -50,7 +50,6 @@ use tokio::net::UdpSocket;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::address::{Address, NetLocation};
-use crate::resolver::{Resolver, ResolverError};
 
 /// Magic VLESS destination that selects packetaddr framing.
 ///
@@ -247,7 +246,6 @@ pub async fn handle_udp_stream<S>(
     stream: S,
     destination: NetLocation,
     config: &LegacyUdpConfig,
-    resolver: &Resolver,
 ) -> Result<(), UdpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -256,7 +254,7 @@ where
     if is_packetaddr_destination(&destination) {
         handle_packetaddr(stream, config).await
     } else {
-        handle_fixed(stream, &destination, config, resolver).await
+        handle_fixed(stream, &destination, config).await
     }
 }
 
@@ -273,12 +271,11 @@ async fn handle_fixed<S>(
     stream: S,
     destination: &NetLocation,
     config: &LegacyUdpConfig,
-    resolver: &Resolver,
 ) -> Result<(), UdpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let resolved = resolve_fixed(destination, config.io_timeout, resolver).await?;
+    let resolved = resolve_fixed(destination, config.io_timeout).await?;
     let family = Family::of(resolved);
     let socket = timeout(config.io_timeout, UdpSocket::bind(family.bind_address()))
         .await
@@ -577,7 +574,6 @@ impl Family {
 async fn resolve_fixed(
     destination: &NetLocation,
     io_timeout: Duration,
-    resolver: &Resolver,
 ) -> Result<SocketAddr, UdpError> {
     if destination.port == 0 {
         return Err(UdpError::InvalidDestination {
@@ -589,10 +585,14 @@ async fn resolve_fixed(
         Address::Ipv4(address) => Ok(SocketAddr::from((*address, destination.port))),
         Address::Ipv6(address) => Ok(SocketAddr::from((*address, destination.port))),
         Address::Domain(domain) => {
-            let addresses = resolver
-                .lookup_host(domain, destination.port, io_timeout)
-                .await
-                .map_err(map_resolver_error)?;
+            let addresses = timeout(
+                io_timeout,
+                tokio::net::lookup_host((domain.as_str(), destination.port)),
+            )
+            .await
+            .map_err(|_| UdpError::Timeout {
+                stage: "destination resolution",
+            })??;
 
             let mut fallback = None;
             for address in addresses {
@@ -605,16 +605,6 @@ async fn resolve_fixed(
                 reason: "domain has no address",
             })
         }
-    }
-}
-
-fn map_resolver_error(error: ResolverError) -> UdpError {
-    match error {
-        ResolverError::Busy | ResolverError::Timeout => UdpError::Timeout {
-            stage: "destination resolution",
-        },
-        ResolverError::Io(error) => UdpError::Io(error),
-        ResolverError::Join(error) => UdpError::Io(io::Error::other(error)),
     }
 }
 
@@ -1004,7 +994,6 @@ mod tests {
         PACKETADDR_MAGIC_DOMAIN, UdpError, handle_udp_stream, parse_packetaddr,
     };
     use crate::address::{Address, NetLocation};
-    use crate::resolver::Resolver;
     use proptest::prelude::*;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::time::Duration;
@@ -1049,10 +1038,8 @@ mod tests {
         config: LegacyUdpConfig,
     ) -> (DuplexStream, JoinHandle<Result<(), UdpError>>) {
         let (client, server) = tokio::io::duplex(256 * 1024);
-        let resolver = Resolver::default();
-        let task = tokio::spawn(async move {
-            handle_udp_stream(server, destination, &config, &resolver).await
-        });
+        let task =
+            tokio::spawn(async move { handle_udp_stream(server, destination, &config).await });
         (client, task)
     }
 

@@ -9,7 +9,6 @@ pub mod metrics;
 pub mod prepend_stream;
 pub mod reality;
 pub mod relay;
-pub mod resolver;
 pub mod tls;
 pub mod udp;
 pub mod vision;

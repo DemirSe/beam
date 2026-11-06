@@ -8,18 +8,18 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-11-06 17:13 UTC:
+on 2026-11-06 17:29 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `75fa90f5d76f7dd9464b92a4fc0e24d33762bd30dfb17f5a4ee70ef19a12ec97` |
-| Version | `0.1.0 (eabb67f070eb)` |
+| SHA-256 | `80b46fd6b3c4a4770f9e3d0c356ab841a44364f94cf696eb1ecd0c067f5773d1` |
+| Version | `0.1.0 (2e0a4649c7fe)` |
 | Service | `beam.service`, active, `NRestarts=0` |
 | Listener | `0.0.0.0:443` |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
 | Host network | BBR + fq, conntrack 65536, 600 s UDP retention |
-| Verification | Production verifier PASS; client DNS/HTTP 200 under a 40-connection cover flood; lab 11/11; H2 local-TUN check not re-run |
+| Verification | Rolled back to the pre-resolver binary; production verifier run after rollback |
 
 The deployed binary includes the XUDP junk-reply idle-pinning fix (`2163c0a`),
 the mux-wide resolution/send-stall fix (`e0ca0bc`), the 2026-11-03
@@ -28,12 +28,8 @@ reservation (`647623b`), and the 2026-11-06 hardening batch: XUDP socket-budget
 validation, control-frame idle pinning, Vision empty-block rejection, replay
 first-wins with a 300-second timestamp/cache window, cancellable cover relays,
 bounded legacy UDP, parallel resolver lookups, and the descriptor budget check.
-It also includes the process-wide resolver bound (`f9f39f3`) and the four-slot
-cover reserve. The per-host cap from `7990d7e` was removed in `fc3f251`: it
-closed the fifth concurrent connection to the same DoH host, which produced
-client DNS `unexpected EOF` errors. Cover dials are isolated from the normal
-target lane in `eabb67f`, so an unauthenticated cover flood cannot starve
-target DNS. The last lab run passed 11/11 checks. Remaining
+The process-wide resolver changes were reverted after intermittent client DNS
+failures; production is back on the `2e0a464` binary. Remaining
 code-confirmed backpressure and lower-risk resource items in
 `STRESS-FINDINGS.md` are still tracked; the full release gates remain the
 24 h soak, privileged syscall/wakeup/splice measurements, cgroup OOM sampling,
@@ -101,7 +97,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 367 tests: 337 `beam-core`,
+a benchmark comparison. The current workspace has 359 tests: 329 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
 ### One-command checks
@@ -398,20 +394,11 @@ bind.
   per-mux resolver performs DNS; the lookup owner and suffix are tracked
   separately, results carry a generation, and a newer GlobalID cancels older
   pending New frames. IP frames, queued suffixes, and rejected replies retain
-  their ordering. Resolved domains are cached for 300 seconds. Each mux allows
-  four concurrent lookups, pending payload has a process-wide 4 MiB budget plus
-  bounded metadata, and UDP send/close waits are capped at 100 ms. This is not
+  their ordering. Resolved domains are cached for 300 seconds. The resolver is
+  serial per mux, pending payload has a process-wide 4 MiB budget plus bounded
+  metadata, and UDP send/close waits are capped at 100 ms. This is not
   universally nonblocking: a sequence of slow domains, a congested send, or
   many close operations can still delay a mux briefly.
-- All DNS paths (target/cover dial, XUDP, legacy UDP) share one process-wide
-  bounded resolver: 28 normal slots plus 4 isolated cover slots by default,
-  kept below the blocking-pool reserve. There is no lower per-host cap;
-  concurrent lookups for the same host are limited only by the global lane.
-  Cover dials cannot borrow normal slots, so an unauthenticated cover flood
-  cannot starve target DNS. Excess lookups fail immediately and log at most
-  once per 30 seconds. A lookup that times out keeps its blocking slot until
-  `getaddrinfo` returns, so timed-out work cannot recreate an unbounded queue.
-  Vision splice handoff is bounded to five seconds.
 - Live XUDP limits are 1024 process-wide sessions and 128 KiB per socket
   receive buffer; a mux holds at most half the global active slots. XUDP idle
   expiry is at most 60 seconds even when the TCP relay idle timeout is 300
