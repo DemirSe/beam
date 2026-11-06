@@ -22,6 +22,12 @@ use super::types::{
 const MAX_DNS_NAME_LEN: usize = 253;
 const MAX_DNS_LABEL_LEN: usize = 63;
 
+/// Conservative ceiling for the maximum possible XUDP receive buffers. Linux
+/// doubles the requested SO_RCVBUF, so the estimate is sessions × requested ×
+/// 2. Production 1024 × 128 KiB uses 256 MiB; configs that cannot fit this
+/// budget are rejected instead of passing --check and later OOMing.
+const MAX_XUDP_SOCKET_BUDGET: u64 = 512 * 1024 * 1024;
+
 /// Errors produced while loading a configuration file.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -111,6 +117,17 @@ pub enum ValidationError {
         min: u32,
         /// Largest supported value.
         max: u32,
+    },
+    /// The maximum XUDP socket buffers cannot fit the host memory budget.
+    #[error(
+        "limits.max_xudp_sessions * limits.xudp_recv_buffer_bytes needs about {bytes} bytes, above the {max}-byte budget"
+    )]
+    XudpBufferBudget {
+        /// Estimated kernel buffer bytes, including the kernel's SO_RCVBUF
+        /// doubling.
+        bytes: u64,
+        /// Supported budget.
+        max: u64,
     },
 }
 
@@ -370,6 +387,15 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
             name: "xudp_recv_buffer_bytes",
             min: 16 * 1024,
             max: 4 * 1024 * 1024,
+        });
+    }
+    let xudp_socket_budget = u64::from(raw.max_xudp_sessions)
+        .saturating_mul(u64::from(raw.xudp_recv_buffer_bytes))
+        .saturating_mul(2);
+    if xudp_socket_budget > MAX_XUDP_SOCKET_BUDGET {
+        return Err(ValidationError::XudpBufferBudget {
+            bytes: xudp_socket_budget,
+            max: MAX_XUDP_SOCKET_BUDGET,
         });
     }
     if raw.listen_backlog == 0 {
@@ -789,6 +815,22 @@ idle_timeout_ms = 300000
             ConfigError::Validation(ValidationError::LimitTooLarge {
                 name: "listen_backlog",
                 max: 65535
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_xudp_socket_buffer_budget_overflow() {
+        let input = config_toml(&private_key()).replace(
+            "max_xudp_sessions = 256",
+            "max_xudp_sessions = 1024\nxudp_recv_buffer_bytes = 4194304",
+        );
+        let error = Config::from_toml_str(&input).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::Validation(ValidationError::XudpBufferBudget {
+                bytes: 8_589_934_592,
+                max: 536_870_912
             })
         ));
     }
