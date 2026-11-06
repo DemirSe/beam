@@ -3,11 +3,11 @@
 This file is intentionally separate from `README.md` for the findings that are
 still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
 7, and 11 are fixed in `fa0c0ca`; the concurrent-replay bound is in `647623b`;
-the four deployed 2026-11-06 fixes are in `2469971`. First-wins replay,
-timestamp/cache hardening, legacy UDP bounds, cover cancellation, and parallel
-resolver changes are in the worktree but are not production-deployed yet. The
-remaining items below stay open. Production runs `2469971` (SHA
-`61d8b045…`) with `NRestarts=0`; the lab is stopped after the 11/11 checks.
+the four deployed 2026-11-06 fixes are in `2469971`; first-wins replay,
+timestamp/cache hardening, legacy UDP bounds, cover cancellation, parallel
+resolver lookups, and the descriptor budget are in `2e0a464` and deployed. The
+remaining items below stay open. Production runs `2e0a464` (SHA `80b46fd…`)
+with `NRestarts=0`; the lab is stopped after the 11/11 checks.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 

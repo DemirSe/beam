@@ -8,13 +8,13 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-11-06 10:06 UTC:
+on 2026-11-06 13:16 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `61d8b04572c31e3c6520be0a204cccc4fdf2a56b1d328ea67447ab193f2009d9` |
-| Version | `0.1.0 (2469971ae715)` |
+| SHA-256 | `80b46fd6b3c4a4770f9e3d0c356ab841a44364f94cf696eb1ecd0c067f5773d1` |
+| Version | `0.1.0 (2e0a4649c7fe)` |
 | Service | `beam.service`, active, `NRestarts=0` |
 | Listener | `0.0.0.0:443` |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
@@ -24,9 +24,11 @@ on 2026-11-06 10:06 UTC:
 The deployed binary includes the XUDP junk-reply idle-pinning fix (`2163c0a`),
 the mux-wide resolution/send-stall fix (`e0ca0bc`), the 2026-11-03
 handshake/legacy-UDP/End-enqueue hardening, the bounded in-flight replay
-reservation (`647623b`), and four 2026-11-06 fixes: XUDP socket-budget
-validation, control-frame idle pinning, Vision empty-block rejection, and
-cover splice-permit accounting. The last lab run passed 11/11 checks. Remaining
+reservation (`647623b`), and the 2026-11-06 hardening batch: XUDP socket-budget
+validation, control-frame idle pinning, Vision empty-block rejection, replay
+first-wins with a 300-second timestamp/cache window, cancellable cover relays,
+bounded legacy UDP, parallel resolver lookups, and the descriptor budget check.
+The last lab run passed 11/11 checks. Remaining
 code-confirmed backpressure and lower-risk resource items in
 `STRESS-FINDINGS.md` are still tracked; the full release gates remain the
 24 h soak, privileged syscall/wakeup/splice measurements, cgroup OOM sampling,
