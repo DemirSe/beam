@@ -96,7 +96,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 359 tests: 329 `beam-core`,
+a benchmark comparison. The current workspace has 363 tests: 333 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
 ### One-command checks
@@ -393,11 +393,16 @@ bind.
   per-mux resolver performs DNS; the lookup owner and suffix are tracked
   separately, results carry a generation, and a newer GlobalID cancels older
   pending New frames. IP frames, queued suffixes, and rejected replies retain
-  their ordering. Resolved domains are cached for 300 seconds. The resolver is
-  serial per mux, pending payload has a process-wide 4 MiB budget plus bounded
-  metadata, and UDP send/close waits are capped at 100 ms. This is not
+  their ordering. Resolved domains are cached for 300 seconds. Each mux allows
+  four concurrent lookups, pending payload has a process-wide 4 MiB budget plus
+  bounded metadata, and UDP send/close waits are capped at 100 ms. This is not
   universally nonblocking: a sequence of slow domains, a congested send, or
   many close operations can still delay a mux briefly.
+- All DNS paths (target/cover dial, XUDP, legacy UDP) share one process-wide
+  bounded resolver, sized 32 by default and kept below the blocking-pool
+  reserve. Excess lookups fail immediately. A lookup that times out keeps its
+  blocking slot until `getaddrinfo` returns, so timed-out work cannot recreate
+  the unbounded pool queue. Vision splice handoff is bounded to five seconds.
 - Live XUDP limits are 1024 process-wide sessions and 128 KiB per socket
   receive buffer; a mux holds at most half the global active slots. XUDP idle
   expiry is at most 60 seconds even when the TCP relay idle timeout is 300

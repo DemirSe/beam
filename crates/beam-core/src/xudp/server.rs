@@ -211,6 +211,7 @@ impl ResolutionState {
         let (requests, mut request_rx) =
             mpsc::channel::<ResolutionRequest>(MAX_PENDING_RESOLUTIONS);
         let (result_tx, results) = mpsc::channel(MAX_PENDING_RESOLUTIONS);
+        let resolver = limiter.resolver().clone();
         let task = tokio::spawn(async move {
             let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_RESOLUTIONS));
             while let Some(request) = request_rx.recv().await {
@@ -218,10 +219,15 @@ impl ResolutionState {
                     break;
                 };
                 let result_tx = result_tx.clone();
+                let resolver = resolver.clone();
                 tokio::spawn(async move {
-                    let result =
-                        resolve_destination(&request.destination, request.family, RESOLVE_TIMEOUT)
-                            .await;
+                    let result = resolve_destination(
+                        &request.destination,
+                        request.family,
+                        RESOLVE_TIMEOUT,
+                        &resolver,
+                    )
+                    .await;
                     // Release the lookup slot before waiting on a full result
                     // queue; the queue is independently bounded.
                     drop(permit);
@@ -978,6 +984,7 @@ impl MuxState {
             destination,
             None,
             self.config.io_timeout.min(RESOLVE_TIMEOUT),
+            self.limiter.resolver(),
         )
         .await
         {
@@ -1187,6 +1194,7 @@ impl MuxState {
                     location,
                     Some(session.family),
                     self.config.io_timeout.min(RESOLVE_TIMEOUT),
+                    self.limiter.resolver(),
                 )
                 .await
                 {

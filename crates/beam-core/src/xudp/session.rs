@@ -46,10 +46,11 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout};
+use tokio::time::Instant;
 
 use crate::address::{Address, NetLocation};
 use crate::metrics::Metrics;
+use crate::resolver::{Resolver, ResolverError};
 use crate::xudp::frame::{
     self, FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_PAYLOAD_LEN, SessionStatus, TargetNetwork,
 };
@@ -248,6 +249,8 @@ pub struct XudpSessionLimiter {
     live_handlers: Arc<AtomicUsize>,
     /// Last time a pressure snapshot was emitted.
     pressure_log: Arc<Mutex<Option<Instant>>>,
+    /// Process-wide bounded resolver shared by every mux stream.
+    resolver: Resolver,
 }
 
 /// A point-in-time XUDP capacity snapshot.
@@ -297,6 +300,7 @@ impl XudpSessionLimiter {
             high_water: Arc::new(AtomicUsize::new(0)),
             live_handlers: Arc::new(AtomicUsize::new(0)),
             pressure_log: Arc::new(Mutex::new(None)),
+            resolver: Resolver::default(),
         }
     }
 
@@ -311,6 +315,18 @@ impl XudpSessionLimiter {
     #[must_use]
     pub fn metrics(&self) -> Arc<Metrics> {
         Arc::clone(&self.metrics)
+    }
+
+    /// Uses the supplied process-wide bounded resolver.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Resolver) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// Returns the resolver shared by this limiter's mux streams.
+    pub(crate) fn resolver(&self) -> &Resolver {
+        &self.resolver
     }
 
     /// Returns the configured global session limit.
@@ -536,12 +552,24 @@ pub(crate) enum ResolveError {
     /// Domain resolution exceeded the configured I/O timeout.
     #[error("XUDP destination resolution timed out")]
     Timeout,
+    /// The process-wide resolver concurrency limit is full.
+    #[error("XUDP resolver is busy")]
+    Busy,
     /// The platform resolver failed.
     #[error("XUDP destination resolution failed: {0}")]
     Io(#[from] io::Error),
     /// No result matched the session socket family.
     #[error("XUDP destination has no address for this session socket family")]
     FamilyMismatch,
+}
+
+fn map_resolver_error(error: ResolverError) -> ResolveError {
+    match error {
+        ResolverError::Busy => ResolveError::Busy,
+        ResolverError::Timeout => ResolveError::Timeout,
+        ResolverError::Io(error) => ResolveError::Io(error),
+        ResolverError::Join(error) => ResolveError::Io(io::Error::other(error)),
+    }
 }
 
 /// Resolves `destination` to a single socket address.
@@ -555,6 +583,7 @@ pub(crate) async fn resolve_destination(
     destination: &NetLocation,
     family: Option<SocketFamily>,
     resolve_timeout: Duration,
+    resolver: &Resolver,
 ) -> Result<SocketAddr, ResolveError> {
     if destination.port == 0 {
         return Err(ResolveError::Port);
@@ -589,12 +618,10 @@ pub(crate) async fn resolve_destination(
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 return Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, destination.port)));
             }
-            let addresses = timeout(
-                resolve_timeout,
-                tokio::net::lookup_host((domain.as_str(), destination.port)),
-            )
-            .await
-            .map_err(|_| ResolveError::Timeout)??;
+            let addresses = resolver
+                .lookup_host(domain, destination.port, resolve_timeout)
+                .await
+                .map_err(map_resolver_error)?;
 
             let mut chosen = None;
             for address in addresses {
@@ -1208,6 +1235,7 @@ mod tests {
         reply_loop, resolve_destination, socket_addr_to_location,
     };
     use crate::address::{Address, NetLocation};
+    use crate::resolver::Resolver;
     use crate::xudp::frame::{
         FrameOption, FrameSpec, SessionStatus, TargetNetwork, encode_frame, parse_frame,
     };
@@ -1566,18 +1594,24 @@ mod tests {
     #[tokio::test]
     async fn resolves_ip_literals_and_rejects_port_zero() {
         assert_eq!(
-            resolve_destination(&ipv4(53), None, Duration::from_secs(1))
+            resolve_destination(&ipv4(53), None, Duration::from_secs(1), &Resolver::new(1))
                 .await
                 .expect("IPv4 literal"),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 53))
         );
 
         assert!(matches!(
-            resolve_destination(&ipv4(0), None, Duration::from_secs(1)).await,
+            resolve_destination(&ipv4(0), None, Duration::from_secs(1), &Resolver::new(1)).await,
             Err(ResolveError::Port)
         ));
         assert!(matches!(
-            resolve_destination(&ipv4(53), Some(SocketFamily::V6), Duration::from_secs(1)).await,
+            resolve_destination(
+                &ipv4(53),
+                Some(SocketFamily::V6),
+                Duration::from_secs(1),
+                &Resolver::new(1)
+            )
+            .await,
             Err(ResolveError::FamilyMismatch)
         ));
     }
@@ -1591,6 +1625,7 @@ mod tests {
             },
             None,
             Duration::from_secs(5),
+            &Resolver::new(4),
         )
         .await
         .expect("localhost must resolve");
@@ -1605,6 +1640,7 @@ mod tests {
             },
             Some(SocketFamily::V4),
             Duration::from_secs(5),
+            &Resolver::new(4),
         )
         .await;
         if let Ok(address) = v4 {

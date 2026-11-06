@@ -9,6 +9,7 @@ use anyhow::Context;
 use beam_core::address::{Address, NetLocation};
 use beam_core::admission::IpLimiter;
 use beam_core::config::{Config, LogLevel};
+use beam_core::resolver::{DEFAULT_MAX_CONCURRENT_RESOLVES, Resolver};
 use beam_core::tls::{
     MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN, TlsServerConfig, handle_connection_admitted,
 };
@@ -106,7 +107,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         // same runtime configuration catches derived failures (XUDP/legacy
         // limits, TLS material) before systemd's ExecStartPre says OK and the
         // real start crash-loops. This performs no bind or network I/O.
-        build_tls_config(&config)?;
+        build_tls_config(&config, Resolver::default())?;
         println!("configuration is valid: {}", cli.config.display());
         return Ok(());
     }
@@ -133,13 +134,20 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     // destination dials. Vision directions above this cap use the async copy
     // path instead of queueing forever in `spawn_blocking`.
     let max_splice_tasks = max_blocking_threads.saturating_sub(40).max(1);
+    // Keep the resolver's blocking jobs below the reserve left by the splice
+    // cap. The resolver is process-wide, so every mux and every target dial
+    // shares this admission budget.
+    let resolver_limit = max_blocking_threads
+        .saturating_sub(max_splice_tasks)
+        .clamp(1, DEFAULT_MAX_CONCURRENT_RESOLVES);
+    let resolver = Resolver::new(resolver_limit);
     let splice_permits = Arc::new(Semaphore::new(max_splice_tasks));
     // Legacy/packetaddr UDP is compatibility-only; keep its socket count well
     // below the XUDP cap because packetaddr binds two sockets per stream.
     let legacy_udp_permits = Arc::new(Semaphore::new(64));
 
     let tls_config = Arc::new(
-        build_tls_config(&config)?
+        build_tls_config(&config, resolver.clone())?
             .with_connection_limiter(Arc::clone(&authenticated))
             .with_splice_limiter(splice_permits)
             .with_legacy_udp_limiter(legacy_udp_permits),
@@ -155,6 +163,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         max_pending_handshakes,
         max_preauth_per_ip,
         max_xudp_sessions = config.limits.max_xudp_sessions,
+        resolver_limit,
         listen_backlog = config.limits.listen_backlog,
         shutdown_drain_ms = config.limits.shutdown_drain_ms,
         "beam listening"
@@ -412,7 +421,7 @@ fn bind_listener(address: SocketAddr, backlog: u32) -> anyhow::Result<TcpListene
     Ok(listener)
 }
 
-fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
+fn build_tls_config(config: &Config, resolver: Resolver) -> anyhow::Result<TlsServerConfig> {
     let destination = &config.reality.dest;
     let address = match destination.host.parse::<IpAddr>() {
         Ok(IpAddr::V4(address)) => Address::Ipv4(address),
@@ -471,7 +480,8 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
         user_id,
     )
-    .context("failed to build the TLS server configuration")?;
+    .context("failed to build the TLS server configuration")?
+    .with_resolver(resolver.clone());
     let metrics = tls.metrics();
 
     Ok(tls
@@ -480,7 +490,8 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
             XudpSessionLimiter::new(
                 usize::try_from(config.limits.max_xudp_sessions).unwrap_or(usize::MAX),
             )
-            .with_metrics(metrics),
+            .with_metrics(metrics)
+            .with_resolver(resolver),
         )
         .with_udp(udp)
         .with_relay_idle_timeout(Duration::from_millis(config.limits.idle_timeout_ms)))

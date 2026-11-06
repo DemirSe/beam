@@ -30,7 +30,7 @@ use rustls::{SignatureAlgorithm, SignatureScheme};
 use sha2::Sha512;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpSocket, TcpStream, lookup_host};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::{timeout, timeout_at};
 use zeroize::Zeroizing;
@@ -42,6 +42,7 @@ use crate::prepend_stream::PrependStream;
 use crate::reality::auth::decode_short_id;
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
 use crate::relay::{RelayActivity, RelayConfig, copy_one_way};
+use crate::resolver::{Resolver, ResolverError};
 use crate::tls::stream::{TlsStream, TlsStreamError};
 use crate::tls::{
     ClientHello, MAX_CLIENT_HELLO_RECORDS, MAX_RECORD_LEN, TLS_HANDSHAKE_HEADER_LEN,
@@ -56,6 +57,12 @@ use crate::xudp::{
 
 /// Idle timeout for each relay read, write, and shutdown.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Maximum time a raw Vision direction may wait to enter the blocking splice
+/// pool. The resolver cap keeps the pool available; this bound prevents a
+/// queueing bug or an unexpectedly occupied pool from stalling a connection
+/// until its multi-minute relay idle timeout.
+const SPLICE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Idle timeout for unauthenticated cover relays.
 ///
@@ -363,6 +370,8 @@ pub struct TlsServerConfig {
     xudp_limiter: XudpSessionLimiter,
     /// Legacy VLESS UDP and packetaddr limits.
     pub udp: LegacyUdpConfig,
+    /// Process-wide bounded blocking resolver shared by every DNS path.
+    resolver: Resolver,
     provider: Arc<CryptoProvider>,
     certificate: TemporaryCertificate,
     /// Global cap on authenticated connections. The accept loop bounds
@@ -445,6 +454,7 @@ impl TlsServerConfig {
             xudp: XudpConfig::default(),
             xudp_limiter: XudpSessionLimiter::new(DEFAULT_MAX_GLOBAL_SESSIONS),
             udp: LegacyUdpConfig::default(),
+            resolver: Resolver::default(),
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             certificate: TemporaryCertificate::generate()?,
             connection_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
@@ -519,6 +529,13 @@ impl TlsServerConfig {
     #[must_use]
     pub fn with_udp(mut self, udp: LegacyUdpConfig) -> Self {
         self.udp = udp;
+        self
+    }
+
+    /// Uses the supplied process-wide bounded resolver.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Resolver) -> Self {
+        self.resolver = resolver;
         self
     }
 
@@ -1160,7 +1177,7 @@ async fn handle_authenticated(
             let dial_budget = deadline
                 .saturating_duration_since(tokio::time::Instant::now())
                 .min(MAX_DIAL_TIMEOUT);
-            let target = dial(&destination, dial_budget).await?;
+            let target = dial(&destination, dial_budget, &config.resolver).await?;
 
             timeout_at(deadline, tls.write_all(&ResponseHeader::new().to_bytes()))
                 .await
@@ -1222,7 +1239,7 @@ async fn handle_authenticated(
                 })??;
 
             let stream = PrependStream::new(tls, request.body);
-            handle_udp_stream(stream, destination, &config.udp).await?;
+            handle_udp_stream(stream, destination, &config.udp, &config.resolver).await?;
             Ok(ConnectionOutcome::Authenticated {
                 command: Command::Udp,
             })
@@ -1294,7 +1311,12 @@ async fn forward_to_cover(
         }
     };
 
-    let mut cover = dial(&config.cover, cover_timeout(config.handshake_timeout)).await?;
+    let mut cover = dial(
+        &config.cover,
+        cover_timeout(config.handshake_timeout),
+        &config.resolver,
+    )
+    .await?;
     timeout(
         cover_timeout(config.handshake_timeout),
         cover.write_all(record),
@@ -1365,21 +1387,21 @@ where
 async fn dial(
     destination: &NetLocation,
     dial_timeout: Duration,
+    resolver: &Resolver,
 ) -> Result<TcpStream, TlsServerError> {
-    let host = match &destination.address {
-        Address::Ipv4(address) => address.to_string(),
-        Address::Ipv6(address) => address.to_string(),
-        Address::Domain(domain) => domain.clone(),
-    };
     let deadline = tokio::time::Instant::now() + dial_timeout;
-    let addresses =
-        tokio::time::timeout_at(deadline, lookup_host((host.as_str(), destination.port)))
+    let addresses = match &destination.address {
+        Address::Ipv4(address) => vec![SocketAddr::from((*address, destination.port))],
+        Address::Ipv6(address) => vec![SocketAddr::from((*address, destination.port))],
+        Address::Domain(domain) => resolver
+            .lookup_host(
+                domain,
+                destination.port,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
             .await
-            .map_err(|_| TlsServerError::Timeout {
-                stage: "destination dial",
-            })?
-            .map_err(TlsServerError::Io)?
-            .collect::<Vec<_>>();
+            .map_err(map_resolver_error)?,
+    };
     if addresses.is_empty() {
         return Err(TlsServerError::Io(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
@@ -1388,6 +1410,16 @@ async fn dial(
     }
 
     dial_addresses(&addresses, deadline).await
+}
+
+fn map_resolver_error(error: ResolverError) -> TlsServerError {
+    match error {
+        ResolverError::Busy | ResolverError::Timeout => TlsServerError::Timeout {
+            stage: "destination resolution",
+        },
+        ResolverError::Io(error) => TlsServerError::Io(error),
+        ResolverError::Join(error) => TlsServerError::Io(io::Error::other(error)),
+    }
 }
 
 /// Per-address connect budget when more than one resolved address remains.
@@ -1599,16 +1631,22 @@ async fn relay_vision(
             );
             let config = splice_config(idle_timeout);
             let relay_activity = Arc::clone(&up_activity);
-            let result = tokio::task::spawn_blocking(move || {
-                let _splice_permit = splice_permit;
-                copy_one_way(
-                    client_read.as_raw_fd(),
-                    target_write_splice.as_raw_fd(),
-                    &config,
-                    Some(&relay_activity),
-                )
-            })
+            let result = timeout(
+                splice_handoff_timeout(idle_timeout),
+                tokio::task::spawn_blocking(move || {
+                    let _splice_permit = splice_permit;
+                    copy_one_way(
+                        client_read.as_raw_fd(),
+                        target_write_splice.as_raw_fd(),
+                        &config,
+                        Some(&relay_activity),
+                    )
+                }),
+            )
             .await
+            .map_err(|_| TlsServerError::Timeout {
+                stage: "Vision splice handoff",
+            })?
             .map_err(join_error)?;
             match result {
                 Ok(stats) => tracing::debug!(
@@ -1626,7 +1664,9 @@ async fn relay_vision(
             Ok(())
         }
         .await;
-        stop_guard.disarm();
+        if result.is_ok() {
+            stop_guard.disarm();
+        }
         result
     };
 
@@ -1675,16 +1715,22 @@ async fn relay_vision(
         );
         let config = splice_config(idle_timeout);
         let relay_activity = Arc::clone(&down_activity);
-        let result = tokio::task::spawn_blocking(move || {
-            let _splice_permit = splice_permit;
-            copy_one_way(
-                target_read_splice.as_raw_fd(),
-                client_write.as_raw_fd(),
-                &config,
-                Some(&relay_activity),
-            )
-        })
+        let result = timeout(
+            splice_handoff_timeout(idle_timeout),
+            tokio::task::spawn_blocking(move || {
+                let _splice_permit = splice_permit;
+                copy_one_way(
+                    target_read_splice.as_raw_fd(),
+                    client_write.as_raw_fd(),
+                    &config,
+                    Some(&relay_activity),
+                )
+            }),
+        )
         .await
+        .map_err(|_| TlsServerError::Timeout {
+            stage: "Vision splice handoff",
+        })?
         .map_err(join_error)?;
         match result {
             Ok(stats) => tracing::debug!(
@@ -1701,7 +1747,9 @@ async fn relay_vision(
         }
         Ok(())
         }.await;
-        stop_guard.disarm();
+        if result.is_ok() {
+            stop_guard.disarm();
+        }
         result
     };
 
@@ -1911,6 +1959,10 @@ fn try_clone_tcp(stream: &TcpStream) -> Result<TcpStream, TlsServerError> {
     let stream = std::net::TcpStream::from(fd);
     stream.set_nonblocking(true)?;
     TcpStream::from_std(stream).map_err(TlsServerError::Io)
+}
+
+fn splice_handoff_timeout(idle_timeout: Duration) -> Duration {
+    idle_timeout.min(SPLICE_HANDOFF_TIMEOUT)
 }
 
 fn splice_config(idle_timeout: Duration) -> RelayConfig {
@@ -2234,7 +2286,7 @@ mod tests {
             port: address.port(),
         };
 
-        let stream = dial(&destination, Duration::from_secs(2))
+        let stream = dial(&destination, Duration::from_secs(2), &Resolver::new(1))
             .await
             .expect("dial");
         let mss = beam_sys::get_tcp_maxseg(stream.as_raw_fd()).expect("target MSS");
