@@ -52,6 +52,26 @@ pub fn set_pipe_size(fd: RawFd, size: usize) -> io::Result<usize> {
     }
 }
 
+/// Returns the soft `RLIMIT_NOFILE` limit when it is finite.
+#[must_use]
+pub fn open_file_limit() -> Option<u64> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `getrlimit` initializes the provided `rlimit` structure on
+    // success. The pointer is valid for the duration of the call and the
+    // kernel writes at most one structure.
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: `getrlimit` returned success, so it initialized the structure.
+    let limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        None
+    } else {
+        Some(limit.rlim_cur)
+    }
+}
+
 /// Duplicates a descriptor with close-on-exec set.
 pub fn try_clone_fd(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: `F_DUPFD_CLOEXEC` only reads the integer descriptor and returns a

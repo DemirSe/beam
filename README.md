@@ -27,7 +27,7 @@ handshake/legacy-UDP/End-enqueue hardening, the bounded in-flight replay
 reservation (`647623b`), and four 2026-11-06 fixes: XUDP socket-budget
 validation, control-frame idle pinning, Vision empty-block rejection, and
 cover splice-permit accounting. The last lab run passed 11/11 checks. Remaining
-code-confirmed backpressure and timestamp-window risks in
+code-confirmed backpressure and lower-risk resource items in
 `STRESS-FINDINGS.md` are still tracked; the full release gates remain the
 24 h soak, privileged syscall/wakeup/splice measurements, cgroup OOM sampling,
 and final fuzzing.
@@ -94,7 +94,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 356 tests: 326 `beam-core`,
+a benchmark comparison. The current workspace has 359 tests: 329 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
 ### One-command checks
@@ -331,12 +331,12 @@ bind.
   authentication oracle: unauthenticated or failed probes go to the cover.
 - Short IDs are validated and decoded at startup into fixed 8-byte values;
   comparisons are constant-time.
-- Stock has no replay cache. beam checks a bounded replay cache at
-  classification but inserts only after TLS Finished. The cache is
-  approximately 60 seconds / 4096 entries; outside that window, Finished
-  verification still blocks a replay, but a replayed ClientHello can occupy an
-  authenticated slot until handshake timeout. Timestamp checking is currently
-  disabled by policy.
+- Stock has no replay cache. beam reserves in-flight handshakes before TLS and
+  inserts the first Finished handshake into a bounded 300-second replay cache.
+  Capacity scales with `max_connections` (64x, clamped to 4096..65536), and
+  REALITY timestamps older than five minutes are rejected. Concurrent
+  duplicates are first-wins: a second Finished handshake is closed rather than
+  served. This bounds both the in-flight permit race and the post-cache window.
 - Unauthenticated traffic is relayed to the configured cover. Never send a
   TLS alert or a synthetic response on authentication failure.
 
@@ -716,9 +716,9 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   above. The control-frame idle pinning, Vision empty-block spin, and cover
   splice-permit bypass are fixed in `2469971`, and concurrent exact replays are
   bounded in `647623b`. `STRESS-FINDINGS.md` retains the remaining
-  close/reserve, reply-budget, timestamp-window, short-flow lifecycle, and
-  lower-risk items. Do not fold the remaining items into this note until they
-  are fixed and re-verified.
+  close/reserve, reply-budget, short-flow lifecycle, and lower-risk items.
+  Do not fold the remaining items into this note until they are fixed and
+  re-verified.
 - A clean 24-hour mixed soak, privileged syscall/wakeup/splice gates, cgroup
   socket-memory/OOM sampling, and a final fuzz run of the multi-record
   ClientHello assembler remain open release-acceptance items.

@@ -3,7 +3,9 @@
 This file is intentionally separate from `README.md` for the findings that are
 still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
 7, and 11 are fixed in `fa0c0ca`; the concurrent-replay bound is in `647623b`;
-the four 2026-11-06 fixes are in `2469971`. All of those are deployed. The
+the four deployed 2026-11-06 fixes are in `2469971`. First-wins replay,
+timestamp/cache hardening, legacy UDP bounds, cover cancellation, and parallel
+resolver changes are in the worktree but are not production-deployed yet. The
 remaining items below stay open. Production runs `2469971` (SHA
 `61d8b045…`) with `NRestarts=0`; the lab is stopped after the 11/11 checks.
 Initial binary under test was final `1007354…` code (embedded identity
@@ -19,9 +21,8 @@ Do not treat the latter as fixed or as measured production incidents.
 |---:|---|---|---|
 | 4 | open | XUDP close | The reserved control slots are advisory; a racing End is dropped and counted rather than blocking. |
 | 5 | open | XUDP reply budget | The process-wide 32 MiB budget lets a slow reader delay unrelated mux streams. |
-| 8 | partial | TLS replay | Concurrent in-flight copies are bounded; the disabled timestamp window remains a decision. |
 | 9 | open | XUDP lifecycle | Short GlobalID flows can retain a socket and mux permit for about two close timers. |
-| 10 | open | Lower-risk resources | Remaining cover stop-signal, mux-abort cleanup, and session-table lock items; Vision CPU spin is fixed. |
+| 10 | open | Lower-risk resources | Remaining mux-abort cleanup and session-table lock items; cover/Vision cancellation and CPU-spin issues are fixed. |
 | 12 | open | Client platform | Rootless Android cannot enable BBR while preserving the REALITY outer TCP cover. |
 
 ## Lab results
@@ -231,21 +232,20 @@ TLS handshake, VLESS request, dial, response, and initial body write now share
 one absolute `tokio::time::Instant` deadline. A slow client can hold a permit
 for at most the configured handshake budget, not a multiple of it.
 
-### 8. [PARTIAL] Replay cache is post-Finished and timestamp checking is disabled — MEDIUM security/DoS
+### 8. [RESOLVED] Replay cache completion and timestamp window — MEDIUM security/DoS
 
 `crates/beam-core/src/tls/server.rs:704-728`, `1036`;
 `crates/beam/src/main.rs:440`
 
 The concurrent-copy permit pressure is bounded: `647623b` adds a maximum of
 four in-flight reservations per exact replay id and releases them on handshake
-failure (lab: 905/1024 pre-fix, 12 post-fix). Completion is now first-wins:
-a duplicate that also reaches TLS Finished is rejected rather than served as a
-second authenticated session. The cache still inserts only after TLS Finished,
-and timestamp checking remains disabled (`None`); a captured ClientHello can
-therefore authenticate once after the 60 s replay window. Stock Xray has no
-cache, so this is a tradeoff rather than an interop regression. The
-timestamp-window decision remains open and needs either strict timestamp
-checking or a documented threat model.
+failure (lab: 905/1024 pre-fix, 12 post-fix). Completion is first-wins: a
+duplicate that also reaches TLS Finished is rejected rather than served as a
+second authenticated session. The replay cache retains entries for 300 seconds
+and scales with `max_connections` (64x, clamped to 4096..65536). REALITY
+timestamps older than five minutes are rejected, so a captured ClientHello
+cannot become reusable when the cache expires. Stock Xray has no cache, so this
+remains a deliberate security tradeoff rather than an interop feature.
 
 ### 9. Short GlobalID flows can pin a mux/connection for about 120 s — MEDIUM, code-confirmed
 
@@ -263,12 +263,10 @@ accounting risk.
 - Vision eagerly creates about five extra fds per connection
   (`crates/beam-core/src/tls/server.rs:1439-1442`). At 1024 connections this is
   about 6k fds; `LimitNOFILE=65536` kept the lab safe, but churn cost is real.
-- Cover relay uses `copy_bidirectional` without a stop/eventfd
-  (`crates/beam-core/src/tls/server.rs:1817-1818`); only cancellation,
-  shutdown, or panic leaves detached blocking work and fds for the 30 s cover
-  idle limit. `2469971` now bounds concurrent cover relays with the splice
-  permit pool and falls back to the async relay, but does not add a stop
-  signal.
+- ~~Cover relay uses `copy_bidirectional` without a stop/eventfd; cancellation
+  could leave detached blocking work and fds for the 30 s cover idle limit.~~
+  Cover now always uses the async cancellable relay and is counted in shutdown
+  drain; the blocking cover splice path was removed.
 - `handle_mux_stream` cleanup is skipped if the handler future is aborted or
   panics (`crates/beam-core/src/xudp/server.rs:192-221`); no in-process abort
   path was found, so this is a shutdown/panic concern.
@@ -350,8 +348,8 @@ separate product decision because it changes the visible transport.
    deployed with documented residual bounds.
 3. Separate control queue for a strict End reserve (4).
 4. Per-mux reply-budget fairness (5).
-5. ~~Bound concurrent in-flight replays (8).~~ In-flight bound shipped in
-   `647623b`; decide the timestamp-checking window.
+5. ~~Bound concurrent in-flight replays and timestamp window (8).~~ Shipped:
+   first-wins completion, 300 s cache, and five-minute timestamp window.
 6. Short-GlobalID lifecycle accounting (9).
 7. Resume the 24 h/privileged/fuzz release gates after the remaining findings.
 8. Test the external BBR Linux gateway path for finding 12 under the same loss

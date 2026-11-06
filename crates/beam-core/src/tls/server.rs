@@ -41,7 +41,7 @@ use crate::metrics::Metrics;
 use crate::prepend_stream::PrependStream;
 use crate::reality::auth::decode_short_id;
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
-use crate::relay::{RelayActivity, RelayConfig, copy_bidirectional, copy_one_way};
+use crate::relay::{RelayActivity, RelayConfig, copy_one_way};
 use crate::tls::stream::{TlsStream, TlsStreamError};
 use crate::tls::{
     ClientHello, MAX_CLIENT_HELLO_RECORDS, MAX_RECORD_LEN, TLS_HANDSHAKE_HEADER_LEN,
@@ -109,7 +109,10 @@ const TARGET_MSS: u16 = 1400;
 const REPLAY_CACHE_CAPACITY: usize = 4_096;
 
 /// Retention for one replay-cache entry.
-const REPLAY_CACHE_TTL: Duration = Duration::from_secs(60);
+///
+/// This matches the REALITY timestamp window below: a captured ClientHello
+/// cannot remain reusable after its timestamp is rejected.
+const REPLAY_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Maximum concurrent handshakes allowed for one exact replay id. The
 /// completion cache still rejects all later copies; this only prevents one
@@ -126,15 +129,22 @@ struct ReplayCache {
     order: VecDeque<[u8; 32]>,
     in_flight: HashMap<[u8; 32], usize>,
     ttl: Duration,
+    capacity: usize,
 }
 
 impl ReplayCache {
     fn new(ttl: Duration) -> Self {
+        Self::with_capacity(ttl, REPLAY_CACHE_CAPACITY)
+    }
+
+    fn with_capacity(ttl: Duration, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
-            entries: HashMap::with_capacity(REPLAY_CACHE_CAPACITY),
-            order: VecDeque::with_capacity(REPLAY_CACHE_CAPACITY),
+            entries: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
             in_flight: HashMap::new(),
             ttl,
+            capacity,
         }
     }
 
@@ -192,7 +202,7 @@ impl ReplayCache {
         if self.entries.contains_key(&id) {
             return false;
         }
-        if self.entries.len() >= REPLAY_CACHE_CAPACITY
+        if self.entries.len() >= self.capacity
             && let Some(oldest) = self.order.pop_front()
         {
             self.entries.remove(&oldest);
@@ -484,6 +494,13 @@ impl TlsServerConfig {
         self
     }
 
+    /// Overrides the bounded exact-replay cache capacity.
+    #[must_use]
+    pub fn with_replay_capacity(mut self, capacity: usize) -> Self {
+        self.replay_cache = Mutex::new(ReplayCache::with_capacity(REPLAY_CACHE_TTL, capacity));
+        self
+    }
+
     /// Overrides the process-wide legacy UDP stream limit.
     #[must_use]
     pub fn with_legacy_udp_limiter(mut self, permits: Arc<Semaphore>) -> Self {
@@ -521,6 +538,12 @@ impl TlsServerConfig {
             max_client_version: self.max_client_version,
             max_time_diff: self.max_time_diff,
         }
+    }
+
+    /// Returns the number of unauthenticated cover relays still in flight.
+    #[must_use]
+    pub fn cover_inflight(&self) -> usize {
+        COVER_MAX_CONCURRENCY.saturating_sub(self.cover_limiter.available_permits())
     }
 
     fn replay_reserve(&self, id: [u8; 32]) -> Option<ReplayReservation<'_>> {
@@ -1280,15 +1303,10 @@ async fn forward_to_cover(
     .map_err(|_| TlsServerError::Timeout {
         stage: "cover ClientHello write",
     })??;
-    let splice_permit = Arc::clone(&config.splice_permits).try_acquire_owned().ok();
-    match splice_permit {
-        Some(permit) => relay_splice(client, cover, COVER_IDLE_TIMEOUT, permit).await?,
-        None => {
-            config.metrics.record_splice_fallback();
-            tracing::debug!("cover splice limit reached; using async cover relay");
-            relay_bidirectional(client, cover, COVER_IDLE_TIMEOUT).await?;
-        }
-    }
+    // Cover is deliberately async: an unauthenticated probe must not hold a
+    // detached blocking splice task or a splice permit for up to 30 seconds.
+    // Dropping this future on shutdown cancels the relay promptly.
+    relay_bidirectional(client, cover, COVER_IDLE_TIMEOUT).await?;
     Ok(ConnectionOutcome::CoverForwarded)
 }
 
@@ -1895,32 +1913,6 @@ fn try_clone_tcp(stream: &TcpStream) -> Result<TcpStream, TlsServerError> {
     TcpStream::from_std(stream).map_err(TlsServerError::Io)
 }
 
-/// Hands two raw sockets to the blocking splice relay.
-async fn relay_splice(
-    left: TcpStream,
-    right: TcpStream,
-    idle_timeout: Duration,
-    splice_permit: OwnedSemaphorePermit,
-) -> Result<(), TlsServerError> {
-    let config = splice_config(idle_timeout);
-    let result = tokio::task::spawn_blocking(move || {
-        let _splice_permit = splice_permit;
-        copy_bidirectional(left.as_raw_fd(), right.as_raw_fd(), &config)
-    })
-    .await
-    .map_err(join_error)?;
-    match result {
-        Ok(stats) => {
-            tracing::debug!(bytes = stats.total_bytes(), "cover splice relay finished");
-        }
-        Err(error) if is_peer_closed(&error) => {
-            tracing::debug!(%error, "cover splice peer closed");
-        }
-        Err(error) => return Err(TlsServerError::Io(error)),
-    }
-    Ok(())
-}
-
 fn splice_config(idle_timeout: Duration) -> RelayConfig {
     RelayConfig::new()
         .with_idle_timeout(idle_timeout)
@@ -2342,6 +2334,16 @@ mod tests {
     }
 
     #[test]
+    fn replay_cache_uses_the_configured_capacity() {
+        let mut cache = ReplayCache::with_capacity(Duration::from_secs(60), 2);
+        assert!(cache.insert([1; 32]));
+        assert!(cache.insert([2; 32]));
+        assert!(cache.insert([3; 32]));
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.order.len(), 2);
+    }
+
+    #[test]
     fn replay_cache_limits_in_flight_duplicates() {
         let mut cache = ReplayCache::new(Duration::from_secs(60));
         let id = [9u8; 32];
@@ -2380,7 +2382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cover_falls_back_to_async_relay_when_splice_pool_is_empty() {
+    async fn cover_relays_with_async_copy() {
         let cover_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("cover listener");
@@ -2399,8 +2401,6 @@ mod tests {
             address: Address::Ipv4(Ipv4Addr::LOCALHOST),
             port: cover_port,
         };
-        config.splice_permits = Arc::new(Semaphore::new(0));
-
         let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("front listener");

@@ -118,6 +118,18 @@ pub enum ValidationError {
         /// Largest supported value.
         max: u32,
     },
+    /// The configured TCP/UDP limits need more descriptors than the service
+    /// file limit can safely provide.
+    #[error(
+        "configured connection limits need about {estimated} file descriptors, above the safe limit {limit}"
+    )]
+    FdBudget {
+        /// Conservative descriptor estimate.
+        estimated: u64,
+        /// Safe descriptor budget after headroom.
+        limit: u64,
+    },
+
     /// The maximum XUDP socket buffers cannot fit the host memory budget.
     #[error(
         "limits.max_xudp_sessions * limits.xudp_recv_buffer_bytes needs about {bytes} bytes, above the {max}-byte budget"
@@ -132,6 +144,27 @@ pub enum ValidationError {
 }
 
 impl Config {
+    /// Checks derived descriptor demand against the service's soft limit.
+    ///
+    /// The estimate is intentionally conservative: a Vision Direct relay can
+    /// own several duplicated descriptors, and XUDP keeps a socket per active
+    /// session. This catches configurations that pass scalar validation but
+    /// would hit EMFILE under the service's `LimitNOFILE`.
+    pub fn validate_fd_budget(&self, fd_limit: u64) -> Result<(), ValidationError> {
+        let estimated = u64::from(self.limits.max_connections)
+            .saturating_mul(12)
+            .saturating_add(u64::from(self.limits.max_xudp_sessions).saturating_mul(2))
+            .saturating_add(128);
+        let safe = fd_limit.saturating_sub(fd_limit / 4).max(1);
+        if estimated > safe {
+            return Err(ValidationError::FdBudget {
+                estimated,
+                limit: safe,
+            });
+        }
+        Ok(())
+    }
+
     /// Parse and validate a configuration from a TOML string.
     pub fn from_toml_str(input: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(input).map_err(|error| ConfigError::Toml {
@@ -546,6 +579,16 @@ idle_timeout_ms = 300000
         assert_eq!(config.limits.shutdown_drain_ms, 2_000);
         assert_eq!(config.limits.handshake_timeout_ms, 60_000);
         assert_eq!(config.limits.idle_timeout_ms, 300_000);
+    }
+
+    #[test]
+    fn rejects_limits_above_the_file_descriptor_budget() {
+        let config = valid_config();
+        assert!(config.validate_fd_budget(65_536).is_ok());
+        let error = config
+            .validate_fd_budget(1_000)
+            .expect_err("low descriptor limit must fail");
+        assert!(matches!(error, ValidationError::FdBudget { .. }));
     }
 
     #[test]

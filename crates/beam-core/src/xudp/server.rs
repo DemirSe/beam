@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 
 use super::session::{
@@ -52,10 +52,12 @@ const MAX_BUFFERED_LEN: usize = MAX_FRAME_LEN + READ_CHUNK_LEN;
 
 /// Upper bound on one domain resolution in the per-mux resolver task.
 ///
-/// Domain lookups no longer run on the shared read loop. The resolver still
-/// handles one lookup at a time per mux, so this bound limits that queue's
-/// progress without stalling unrelated IP sessions.
+/// Domain lookups no longer run on the shared read loop. A small bounded pool
+/// prevents one slow lookup from blocking unrelated domain sessions.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum concurrent DNS lookups for one mux stream.
+const MAX_CONCURRENT_RESOLUTIONS: usize = 4;
 
 /// Upper bound on mux read inactivity.
 ///
@@ -210,22 +212,28 @@ impl ResolutionState {
             mpsc::channel::<ResolutionRequest>(MAX_PENDING_RESOLUTIONS);
         let (result_tx, results) = mpsc::channel(MAX_PENDING_RESOLUTIONS);
         let task = tokio::spawn(async move {
+            let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_RESOLUTIONS));
             while let Some(request) = request_rx.recv().await {
-                let result =
-                    resolve_destination(&request.destination, request.family, RESOLVE_TIMEOUT)
-                        .await;
-                if result_tx
-                    .send(ResolutionResult {
-                        id: request.id,
-                        generation: request.generation,
-                        destination: request.destination,
-                        result,
-                    })
-                    .await
-                    .is_err()
-                {
+                let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
                     break;
-                }
+                };
+                let result_tx = result_tx.clone();
+                tokio::spawn(async move {
+                    let result =
+                        resolve_destination(&request.destination, request.family, RESOLVE_TIMEOUT)
+                            .await;
+                    // Release the lookup slot before waiting on a full result
+                    // queue; the queue is independently bounded.
+                    drop(permit);
+                    let _ = result_tx
+                        .send(ResolutionResult {
+                            id: request.id,
+                            generation: request.generation,
+                            destination: request.destination,
+                            result,
+                        })
+                        .await;
+                });
             }
         });
         Self {

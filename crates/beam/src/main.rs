@@ -14,6 +14,10 @@ use beam_core::tls::{
 };
 use beam_core::udp::LegacyUdpConfig;
 use beam_core::xudp::{XudpConfig, XudpSessionLimiter};
+
+/// Five minutes tolerates ordinary NTP skew while closing the replay window
+/// left when the cache expires.
+const REALITY_TIMESTAMP_WINDOW: Duration = Duration::from_secs(300);
 use clap::Parser;
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::signal::unix::{SignalKind, signal};
@@ -66,6 +70,22 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         .with_context(|| format!("failed to load `{}`", cli.config.display()))?;
 
     init_logging(config.log.level);
+    // The service unit owns the runtime limit (64K). A user-shell `--check`
+    // or a lab install may inherit a smaller soft limit; validate against the
+    // deployment floor and make the mismatch visible instead of rejecting a
+    // configuration that the service can serve.
+    const DEPLOYMENT_FD_FLOOR: u64 = 65_536;
+    let actual_fd_limit = beam_sys::open_file_limit().unwrap_or(DEPLOYMENT_FD_FLOOR);
+    if actual_fd_limit < DEPLOYMENT_FD_FLOOR {
+        tracing::warn!(
+            actual_fd_limit,
+            deployment_floor = DEPLOYMENT_FD_FLOOR,
+            "process soft fd limit is below the deployment floor; validate the service limit"
+        );
+    }
+    config
+        .validate_fd_budget(actual_fd_limit.max(DEPLOYMENT_FD_FLOOR))
+        .context("file descriptor budget")?;
     if let Ok(raw) = std::env::var("BEAM_MAX_BLOCKING_THREADS") {
         let valid = raw
             .parse::<usize>()
@@ -319,11 +339,13 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_millis(config.limits.shutdown_drain_ms);
     while authenticated.available_permits() < max_connections
         || preauth.available_permits() < max_pending_handshakes
+        || tls_config.cover_inflight() > 0
     {
         if Instant::now() >= deadline {
             tracing::warn!(
                 authenticated_remaining = max_connections - authenticated.available_permits(),
                 preauth_remaining = max_pending_handshakes - preauth.available_permits(),
+                cover_remaining = tls_config.cover_inflight(),
                 "shutdown drain deadline reached; closing remaining connections"
             );
             break;
@@ -443,7 +465,7 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         config.reality.server_names.clone(),
         [0, 0, 0],
         [255, 255, 255],
-        None,
+        Some(REALITY_TIMESTAMP_WINDOW),
         cover,
         Duration::from_millis(config.limits.handshake_timeout_ms),
         TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,

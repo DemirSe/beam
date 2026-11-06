@@ -87,6 +87,22 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Default bound on distinct packetaddr destinations per connection.
 pub const DEFAULT_MAX_PACKETADDR_DESTINATIONS: usize = 1024;
 
+/// A datagram send must not block the read/receive loop for the TCP handshake
+/// timeout. The socket either accepts the datagram quickly or the datagram is
+/// dropped; this matches the bounded XUDP send wait.
+const MAX_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// A stream write is bounded independently from DNS/bind setup. A slow client
+/// must not stop the opposite direction from being polled for seconds.
+const MAX_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Shutdown is best-effort and must not consume the full TCP idle budget.
+const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound one drain batch so the outer select can poll replies, idle expiry,
+/// and stream input even when many datagrams arrive coalesced.
+const MAX_FRAMES_PER_BATCH: usize = 32;
+
 /// Largest value accepted for either timeout.
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -277,9 +293,19 @@ where
     tokio::pin!(idle);
 
     let outcome = 'session: loop {
+        let mut batch = 0;
         while let Some(frame) = decoder.next_frame()? {
+            if batch >= MAX_FRAMES_PER_BATCH {
+                break;
+            }
+            batch += 1;
             let payload = &decoder.buffer[frame.clone()];
-            match timeout(config.io_timeout, socket.send_to(payload, resolved)).await {
+            match timeout(
+                send_timeout(config.io_timeout),
+                socket.send_to(payload, resolved),
+            )
+            .await
+            {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => break 'session Err(UdpError::Io(error)),
                 Err(_) => {
@@ -292,7 +318,11 @@ where
             idle.as_mut().reset(next_deadline(config.idle_timeout));
         }
 
+        let more_frames = decoder.has_complete_frame()?;
         tokio::select! {
+            _ = std::future::ready(()), if more_frames => {
+                continue;
+            }
             _ = &mut idle => {
                 break Err(UdpError::Timeout { stage: "stream idle" });
             }
@@ -331,7 +361,7 @@ where
                     &mut writer,
                     &incoming[..length],
                     &mut reply,
-                    config.io_timeout,
+                    write_timeout(config.io_timeout),
                 )
                 .await
                 {
@@ -343,7 +373,7 @@ where
     };
 
     if outcome.is_ok() {
-        shutdown_writer(&mut writer, config.io_timeout).await?;
+        shutdown_writer(&mut writer, shutdown_timeout(config.io_timeout)).await?;
     }
     outcome
 }
@@ -371,7 +401,12 @@ where
     tokio::pin!(idle);
 
     let outcome = loop {
+        let mut batch = 0;
         while let Some(frame) = decoder.next_frame()? {
+            if batch >= MAX_FRAMES_PER_BATCH {
+                break;
+            }
+            batch += 1;
             let (destination, payload) = parse_packetaddr(&decoder.buffer[frame.clone()])?;
             let destination = normalize_address(destination);
 
@@ -398,7 +433,12 @@ where
                 continue;
             };
 
-            match timeout(config.io_timeout, socket.send_to(payload, destination)).await {
+            let sent = timeout(
+                send_timeout(config.io_timeout),
+                socket.send_to(payload, destination),
+            )
+            .await;
+            match &sent {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
                     // Packetaddr is deliberately multi-destination. One bad
@@ -412,10 +452,16 @@ where
                 }
             }
             decoder.consume(frame.end);
-            idle.as_mut().reset(next_deadline(config.idle_timeout));
+            if matches!(sent, Ok(Ok(_))) {
+                idle.as_mut().reset(next_deadline(config.idle_timeout));
+            }
         }
 
+        let more_frames = decoder.has_complete_frame()?;
         tokio::select! {
+            _ = std::future::ready(()), if more_frames => {
+                continue;
+            }
             _ = &mut idle => {
                 break Err(UdpError::Timeout { stage: "stream idle" });
             }
@@ -455,7 +501,7 @@ where
                     source,
                     &v4_incoming[..length],
                     &mut reply,
-                    config.io_timeout,
+                    write_timeout(config.io_timeout),
                 )
                 .await
                 {
@@ -482,7 +528,7 @@ where
                     source,
                     &v6_incoming[..length],
                     &mut reply,
-                    config.io_timeout,
+                    write_timeout(config.io_timeout),
                 )
                 .await
                 {
@@ -495,7 +541,7 @@ where
     };
 
     if outcome.is_ok() {
-        shutdown_writer(&mut writer, config.io_timeout).await?;
+        shutdown_writer(&mut writer, shutdown_timeout(config.io_timeout)).await?;
     }
     outcome
 }
@@ -758,6 +804,18 @@ fn framed_payload_limit(configured: usize) -> usize {
     configured.min(MAX_FRAMED_DATAGRAM_SIZE)
 }
 
+fn send_timeout(io_timeout: Duration) -> Duration {
+    io_timeout.min(MAX_SEND_TIMEOUT)
+}
+
+fn write_timeout(io_timeout: Duration) -> Duration {
+    io_timeout.min(MAX_WRITE_TIMEOUT)
+}
+
+fn shutdown_timeout(io_timeout: Duration) -> Duration {
+    io_timeout.min(MAX_SHUTDOWN_TIMEOUT)
+}
+
 fn next_deadline(timeout: Duration) -> Instant {
     Instant::now()
         .checked_add(timeout)
@@ -913,6 +971,11 @@ impl FrameDecoder {
         }
     }
 
+    /// Returns true when a complete non-empty frame is available.
+    fn has_complete_frame(&mut self) -> Result<bool, UdpError> {
+        self.next_frame().map(|frame| frame.is_some())
+    }
+
     /// Advances the cursor without moving the unread tail.
     fn consume(&mut self, end: usize) {
         if end >= self.buffer.len() {
@@ -940,6 +1003,26 @@ mod tests {
     use tokio::time::timeout;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn cancellation_timeouts_are_bounded() {
+        assert_eq!(
+            super::send_timeout(Duration::from_secs(30)),
+            super::MAX_SEND_TIMEOUT
+        );
+        assert_eq!(
+            super::write_timeout(Duration::from_secs(30)),
+            super::MAX_WRITE_TIMEOUT
+        );
+        assert_eq!(
+            super::shutdown_timeout(Duration::from_secs(30)),
+            super::MAX_SHUTDOWN_TIMEOUT
+        );
+        assert_eq!(
+            super::send_timeout(Duration::from_millis(10)),
+            Duration::from_millis(10)
+        );
+    }
 
     fn test_config(max_datagram_size: usize) -> LegacyUdpConfig {
         LegacyUdpConfig {
