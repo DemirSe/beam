@@ -1,4 +1,4 @@
-// Allow the local desktop user to manage only the sing-box unit from the tray.
+// Allow the local desktop user to manage only the beam client unit from the tray.
 // Install as /etc/polkit-1/rules.d/50-sing-box-tray.rules with mode 0644.
 polkit.addRule(function(action, subject) {
     if (subject.user !== "demir") {
@@ -9,7 +9,7 @@ polkit.addRule(function(action, subject) {
         return null;
     }
     var unit = action.lookup("unit");
-    if (unit === "sing-box.service" || unit === "sing-box") {
+    if (unit === "beam-client.service" || unit === "beam-client") {
         return polkit.Result.YES;
     }
     return null;

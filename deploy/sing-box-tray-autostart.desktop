@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Xray Tray (sing-box)
+Name=Beam Tray
 GenericName=Tunnel Control
-Comment=Start or stop the sing-box TUN tunnel
-Exec=/home/demir/.local/bin/sing-box-tray
+Comment=Start or stop the beam TUN tunnel
+Exec=/usr/local/bin/beam-tray
 Icon=network-vpn
 Terminal=false
 Categories=Network;

@@ -80,6 +80,17 @@ for old in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$
 done
 
 # A failed rollout must not leave new files on disk with a stopped service.
+# Only restart when a live file or the unit was actually replaced; a rejected
+# preflight or sysctl must not bounce an otherwise healthy service.
+DIRTY=0
+prune_backups() {
+  for base in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK" "$INSTALL_MODULES_LOAD"; do
+    find "$(dirname "$base")" -maxdepth 1 -type f \
+      -name "$(basename "$base").bak-*" -printf '%T@ %p\n' 2>/dev/null |
+      sort -rn | tail -n +6 | cut -d' ' -f2- | xargs -r rm -f || true
+  done
+}
+
 rollback() {
   trap - ERR
   echo "bootstrap: rolling back to backups from $STAMP" >&2
@@ -96,9 +107,12 @@ rollback() {
   if [ -f "$INSTALL_CONNTRACK" ]; then
     sysctl -p "$INSTALL_CONNTRACK" >/dev/null 2>&1 || true
   fi
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl reset-failed beam >/dev/null 2>&1 || true
-  systemctl restart beam >/dev/null 2>&1 || true
+  if [ "$DIRTY" = "1" ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed beam >/dev/null 2>&1 || true
+    systemctl restart beam >/dev/null 2>&1 || true
+  fi
+  prune_backups
 }
 trap 'echo "bootstrap: rollout failed; restoring previous files" >&2; rollback' ERR
 
@@ -152,6 +166,7 @@ apply_live_qdisc
 install -d -m 0755 /etc/modules-load.d
 install -m 0644 -o root -g root "$MODULES_LOAD" "$INSTALL_MODULES_LOAD.new"
 mv -f "$INSTALL_MODULES_LOAD.new" "$INSTALL_MODULES_LOAD"
+DIRTY=1
 if command -v modprobe >/dev/null 2>&1; then
   modprobe nf_conntrack 2>/dev/null || true
 fi
@@ -200,14 +215,7 @@ if [ "$ready" != 1 ]; then
   exit 1
 fi
 trap - ERR
-
-# Keep the five most recent backups of each installed file; a long-lived host
-# should not fill its disk with one binary per deploy.
-for base in "$INSTALL_BIN" "$INSTALL_CONFIG" "$INSTALL_UNIT" "$INSTALL_SYSCTL" "$INSTALL_CONNTRACK" "$INSTALL_MODULES_LOAD"; do
-  find "$(dirname "$base")" -maxdepth 1 -type f \
-    -name "$(basename "$base").bak-*" -printf '%T@ %p\n' 2>/dev/null |
-    sort -rn | tail -n +6 | cut -d' ' -f2- | xargs -r rm -f
-done
+prune_backups
 
 echo "bootstrap: beam is active on 443 ($("$INSTALL_BIN" --version))"
 systemctl status --no-pager -l beam | sed -n '1,12p'

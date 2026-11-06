@@ -472,6 +472,8 @@ ssh -i "$SSH_KEY" "$SERVER" \
   'pid=$(systemctl show beam -p MainPID --value); ps -o pid,rss,vsz,nlwp,etime,comm -p "$pid"; printf "fds="; sudo -n ls "/proc/$pid/fd" | wc -l'
 ssh -i "$SSH_KEY" "$SERVER" \
   'cat /sys/fs/cgroup/system.slice/beam.service/memory.current; cat /sys/fs/cgroup/system.slice/beam.service/memory.peak'
+ssh -i "$SSH_KEY" "$SERVER" \
+  'cat /proc/sys/net/netfilter/nf_conntrack_count /proc/sys/net/netfilter/nf_conntrack_max'
 ```
 
 Expect active/running, enabled, `NRestarts=0`, no unexpected listeners, and a
@@ -508,11 +510,14 @@ deployed state without printing config contents:
 
 ```bash
 SSH_KEY="$SSH_KEY" SERVER="$SERVER" deploy/verify-production.sh
-SSH_KEY="$SSH_KEY" SERVER="$SERVER" CHECK_H2=1 deploy/verify-production.sh
+SSH_KEY="$SSH_KEY" SERVER="$SERVER" CHECK_H2=1 \
+  TUN_IFACE=sbtun0 deploy/verify-production.sh
 ```
 
-Set `EXPECTED_BINARY_SHA` and `EXPECTED_CONFIG_SHA` to make the script fail on a
-hash mismatch. Then verify end to end:
+`CHECK_H2=1` requires the named local tunnel and fails if it is missing; it no
+longer falls back to the host's direct internet path. Set `EXPECTED_BINARY_SHA`
+and `EXPECTED_CONFIG_SHA` to make the script fail on a hash mismatch. Then
+verify end to end:
 
 ```bash
 curl -4 -sS -o /dev/null -w '%{http_code}\n' https://example.com/
@@ -535,6 +540,7 @@ Backups are timestamped beside each installed file:
 /etc/systemd/system/beam.service.bak-<stamp>
 /etc/sysctl.d/99-beam.conf.bak-<stamp>
 /etc/sysctl.d/99-beam-conntrack.conf.bak-<stamp>
+/etc/modules-load.d/99-beam-conntrack.conf.bak-<stamp>
 ```
 
 Stop beam, install all required backups, validate config, run `sysctl
