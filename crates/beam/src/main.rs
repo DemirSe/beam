@@ -164,6 +164,8 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         max_preauth_per_ip,
         max_xudp_sessions = config.limits.max_xudp_sessions,
         resolver_limit,
+        resolver_per_host = resolver.max_per_host(),
+        resolver_cover_reserve = resolver.stats().cover_available,
         listen_backlog = config.limits.listen_backlog,
         shutdown_drain_ms = config.limits.shutdown_drain_ms,
         "beam listening"

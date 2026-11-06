@@ -42,7 +42,7 @@ use crate::prepend_stream::PrependStream;
 use crate::reality::auth::decode_short_id;
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
 use crate::relay::{RelayActivity, RelayConfig, copy_one_way};
-use crate::resolver::{Resolver, ResolverError};
+use crate::resolver::{Resolver, ResolverError, ResolverPriority};
 use crate::tls::stream::{TlsStream, TlsStreamError};
 use crate::tls::{
     ClientHello, MAX_CLIENT_HELLO_RECORDS, MAX_RECORD_LEN, TLS_HANDSHAKE_HEADER_LEN,
@@ -1177,7 +1177,13 @@ async fn handle_authenticated(
             let dial_budget = deadline
                 .saturating_duration_since(tokio::time::Instant::now())
                 .min(MAX_DIAL_TIMEOUT);
-            let target = dial(&destination, dial_budget, &config.resolver).await?;
+            let target = dial(
+                &destination,
+                dial_budget,
+                &config.resolver,
+                ResolverPriority::Normal,
+            )
+            .await?;
 
             timeout_at(deadline, tls.write_all(&ResponseHeader::new().to_bytes()))
                 .await
@@ -1315,6 +1321,7 @@ async fn forward_to_cover(
         &config.cover,
         cover_timeout(config.handshake_timeout),
         &config.resolver,
+        ResolverPriority::Cover,
     )
     .await?;
     timeout(
@@ -1388,16 +1395,18 @@ async fn dial(
     destination: &NetLocation,
     dial_timeout: Duration,
     resolver: &Resolver,
+    priority: ResolverPriority,
 ) -> Result<TcpStream, TlsServerError> {
     let deadline = tokio::time::Instant::now() + dial_timeout;
     let addresses = match &destination.address {
         Address::Ipv4(address) => vec![SocketAddr::from((*address, destination.port))],
         Address::Ipv6(address) => vec![SocketAddr::from((*address, destination.port))],
         Address::Domain(domain) => resolver
-            .lookup_host(
+            .lookup_host_priority(
                 domain,
                 destination.port,
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
+                priority,
             )
             .await
             .map_err(map_resolver_error)?,
@@ -2286,9 +2295,14 @@ mod tests {
             port: address.port(),
         };
 
-        let stream = dial(&destination, Duration::from_secs(2), &Resolver::new(1))
-            .await
-            .expect("dial");
+        let stream = dial(
+            &destination,
+            Duration::from_secs(2),
+            &Resolver::new(1),
+            ResolverPriority::Normal,
+        )
+        .await
+        .expect("dial");
         let mss = beam_sys::get_tcp_maxseg(stream.as_raw_fd()).expect("target MSS");
         assert!(
             mss <= TARGET_MSS,
