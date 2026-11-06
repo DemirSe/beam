@@ -43,20 +43,20 @@ jobs:
     runs-on: [self-hosted, linux, x64, beam-lab]
     timeout-minutes: 360
     env:
-      SING_BOX: /usr/local/bin/sing-box
-      XRAY_BIN: /tmp/opencode/xray-server-compare/xray
-      TEST_CONFIG: /tmp/opencode/beam-test/beam.toml
-      IPERF3: /tmp/opencode/tools/root/usr/bin/iperf3
-      IPERF3_LIB: /tmp/opencode/tools/root/usr/lib64
+      SING_BOX: sing-box
+      XRAY_BIN: xray
+      TEST_CONFIG: ${{ vars.BEAM_TEST_CONFIG }}
+      IPERF3: iperf3
     steps:
       - uses: actions/checkout@v4
       - name: Prepare lab
         run: |
           source scripts/dev-env.sh
           mkdir -p "$RUNNER_TEMP/beam-lab"
-          test -x "$SING_BOX" || { echo "missing SING_BOX: $SING_BOX" >&2; exit 1; }
-          test -f "$TEST_CONFIG" || { echo "missing TEST_CONFIG: $TEST_CONFIG" >&2; exit 1; }
-          test -x "$IPERF3" || { echo "missing IPERF3: $IPERF3" >&2; exit 1; }
+          command -v "$SING_BOX" >/dev/null || { echo "missing SING_BOX: $SING_BOX" >&2; exit 1; }
+          test -n "$TEST_CONFIG" && test -f "$TEST_CONFIG" || { echo "missing TEST_CONFIG repository variable" >&2; exit 1; }
+          command -v "$IPERF3" >/dev/null || { echo "missing IPERF3: $IPERF3" >&2; exit 1; }
+          if [ -n "$XRAY_BIN" ]; then command -v "$XRAY_BIN" >/dev/null || { echo "missing XRAY_BIN: $XRAY_BIN" >&2; exit 1; }; fi
       - name: Full-TUN suite
         if: inputs.suite != 'bench'
         run: |
@@ -71,13 +71,11 @@ jobs:
         if: inputs.suite != 'tun'
         run: |
           source scripts/dev-env.sh
-          test -x "$XRAY_BIN" || { echo "missing XRAY_BIN: $XRAY_BIN" >&2; exit 1; }
           SKIP_BUILD=0 \
             SING_BOX="$SING_BOX" \
             XRAY_BIN="$XRAY_BIN" \
             TEST_CONFIG="$TEST_CONFIG" \
             IPERF3="$IPERF3" \
-            IPERF3_LIB="$IPERF3_LIB" \
             bash bench/run.sh --quick \
               --reps "${{ inputs.reps }}" \
               --rtt-ms "${{ inputs.rtt_ms }}" \

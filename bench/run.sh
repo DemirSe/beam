@@ -25,11 +25,11 @@
 # build, results under bench/results/<UTC timestamp>/.
 #
 # Environment:
-#   SING_BOX      sing-box binary (default /tmp/opencode/bench/bin/sing-box)
-#   XRAY_BIN      stock Xray (default /tmp/opencode/xray-server-compare/xray)
-#   IPERF3        iperf3 binary (default /tmp/opencode/tools/root/usr/bin/iperf3)
-#   IPERF3_LIB    LD_LIBRARY_PATH for iperf3 (default /tmp/opencode/tools/root/usr/lib64)
-#   TEST_CONFIG   REALITY fixture (default /tmp/opencode/beam-test/beam.toml)
+#   SING_BOX      sing-box binary (default: sing-box from PATH)
+#   XRAY_BIN      stock Xray (default: xray from PATH)
+#   IPERF3        iperf3 binary (default: iperf3 from PATH)
+#   IPERF3_LIB    optional LD_LIBRARY_PATH for iperf3
+#   TEST_CONFIG   REALITY fixture (default: ~/.cache/beam/bench/beam.toml)
 #   H3_ORIGIN_BIN prebuilt tests/tun/h3-origin binary
 #   SKIP_BUILD=1  reuse target/release/beam and the H3 origin binary
 #
@@ -61,12 +61,13 @@ RTT_MS="${BENCH_RTT_MS:-0}"
 MAX_LOAD="${BENCH_MAX_LOAD:-0.3}"
 
 PYTHON="${PYTHON:-python3}"
-SING_BOX="${SING_BOX:-/tmp/opencode/bench/bin/sing-box}"
-XRAY_BIN="${XRAY_BIN:-/tmp/opencode/xray-server-compare/xray}"
-TEST_CONFIG="${TEST_CONFIG:-/tmp/opencode/beam-test/beam.toml}"
-IPERF3="${IPERF3:-/tmp/opencode/tools/root/usr/bin/iperf3}"
-IPERF3_LIB="${IPERF3_LIB:-/tmp/opencode/tools/root/usr/lib64}"
-TC="${TC:-/tmp/opencode/tools/root/usr/bin/tc}"
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/beam"
+SING_BOX="${SING_BOX:-sing-box}"
+XRAY_BIN="${XRAY_BIN:-xray}"
+TEST_CONFIG="${TEST_CONFIG:-$CACHE_ROOT/bench/beam.toml}"
+IPERF3="${IPERF3:-iperf3}"
+IPERF3_LIB="${IPERF3_LIB:-}"
+TC="${TC:-tc}"
 H3_ORIGIN_BIN="${H3_ORIGIN_BIN:-${BENCH_H3_BIN:-$HERE/../tests/tun/h3-origin/target/debug/h3-origin}}"
 
 usage() {
@@ -218,9 +219,8 @@ if [ "$INNER" != "1" ]; then
     exit 1
   fi
 
-  BUILD_LOG="/tmp/opencode/bench-build-$$.log"
-  H3_BUILD_LOG="/tmp/opencode/bench-h3-build-$$.log"
-  mkdir -p /tmp/opencode
+  BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/beam-bench-build.XXXXXX.log")"
+  H3_BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/beam-bench-h3-build.XXXXXX.log")"
   # shellcheck source=../scripts/dev-env.sh
   source "$ROOT/scripts/dev-env.sh"
 
@@ -309,18 +309,28 @@ die() {
   exit 1
 }
 
+resolve_bin() {
+  if [ -x "$1" ]; then
+    printf '%s\n' "$1"
+  else
+    command -v "$1" 2>/dev/null
+  fi
+}
+
 for command in "$PYTHON" ip curl taskset timeout sha256sum; do
   command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
 done
-[ -f "$TEST_CONFIG" ] || die "REALITY fixture not found: $TEST_CONFIG"
-[ -x "$SING_BOX" ] || die "sing-box not found: $SING_BOX (set SING_BOX)"
+[ -f "$TEST_CONFIG" ] || die "REALITY fixture not found: $TEST_CONFIG (set TEST_CONFIG)"
+SING_BOX="$(resolve_bin "$SING_BOX")" || die "sing-box not found: $SING_BOX (set SING_BOX)"
 [ -c /dev/net/tun ] || die "/dev/net/tun is unavailable"
-[ -x "$IPERF3" ] || die "iperf3 not found: $IPERF3 (set IPERF3)"
-[ "$RTT_MS" = "0" ] || [ -x "$TC" ] || die "tc not found: $TC (set TC)"
+IPERF3="$(resolve_bin "$IPERF3")" || die "iperf3 not found: $IPERF3 (set IPERF3)"
+if [ "$RTT_MS" != "0" ]; then
+  TC="$(resolve_bin "$TC")" || die "tc not found: $TC (set TC)"
+fi
 export LD_LIBRARY_PATH="$IPERF3_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$IPERF3" --version >/dev/null 2>&1 || die "iperf3 cannot run (check IPERF3_LIB)"
 if [[ " ${ARM_LIST[*]} " == *" stock "* ]]; then
-  [ -x "$XRAY_BIN" ] || die "stock Xray not found: $XRAY_BIN (set XRAY_BIN)"
+  XRAY_BIN="$(resolve_bin "$XRAY_BIN")" || die "stock Xray not found: $XRAY_BIN (set XRAY_BIN)"
 fi
 if ! curl --version 2>/dev/null | grep -qi 'HTTP3'; then
   H3_BLOCKED="${H3_BLOCKED:-the local curl has no HTTP/3 support; cannot send a QUIC Initial}"

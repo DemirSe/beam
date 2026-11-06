@@ -9,10 +9,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-XRAY="${XRAY_BIN:-/tmp/opencode/xray-server-compare/xray}"
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/beam"
+XRAY="${XRAY_BIN:-xray}"
 BEAM="${BEAM_BIN:-$ROOT/target/release/beam}"
 PYTHON="${PYTHON:-python3}"
-RUN_DIR="${CHURN_OUT:-/tmp/opencode/beam-churn-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+RUN_DIR="${CHURN_OUT:-$CACHE_ROOT/churn/$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 TARGET="$RUN_DIR/target"
 LOG="$RUN_DIR/log"
 REQUESTS="${CHURN_REQUESTS:-1000}"
@@ -22,6 +23,14 @@ CLIENT_CPU="${CHURN_CLIENT_CPU:-1}"
 TARGET_CPU="${CHURN_TARGET_CPU:-0}"
 DRIVER_CPU="${CHURN_DRIVER_CPU:-3}"
 BASE_CONFIG="${TEST_CONFIG:-$ROOT/config.example.toml}"
+if [ -x "$XRAY" ]; then
+  :
+elif command -v "$XRAY" >/dev/null 2>&1; then
+  XRAY="$(command -v "$XRAY")"
+else
+  echo "bench: stock Xray not found: $XRAY (set XRAY_BIN)" >&2
+  exit 1
+fi
 
 mkdir -p "$TARGET" "$LOG"
 printf 'beam churn ok\n' > "$TARGET/index.txt"

@@ -653,7 +653,11 @@ make bench-cache                      # results under ~/.cache/beam/bench-result
 ```
 
 Results from `make bench-cache` are written outside the repository; raw logs
-and large artifacts stay out of Git. Full-TUN bulk is client-capped on this host
+and large artifacts stay out of Git. Tool binaries come from `PATH` by default
+(`sing-box`, `xray`, `iperf3`, `tc`); override them with `SING_BOX`, `XRAY_BIN`,
+`IPERF3`, and `TC`. `TEST_CONFIG` defaults to
+`~/.cache/beam/bench/beam.toml`; point it at a REALITY fixture before running.
+Full-TUN bulk is client-capped on this host
 (about 0.98-1.00x), so it is not a headline result. The balanced no-TUN
 capacity result is about 1.46x stock; the final smoke was about 1.40x. Treat
 older n=3 claims as provisional and require n>=10 with matched CPU accounting

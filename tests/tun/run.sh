@@ -22,10 +22,10 @@
 #   bash tests/tun/run.sh [--release] [--control] [--no-build] [--out DIR]
 #
 # Environment:
-#   SING_BOX        sing-box binary (default /tmp/opencode/bench/bin/sing-box)
-#   XRAY_BIN        stock Xray binary (default /tmp/opencode/xray-server-compare/xray)
-#   TEST_CONFIG     beam REALITY fixture (default /tmp/opencode/beam-test/beam.toml)
-#   TUN_OUT         run directory (default /tmp/opencode/beam-tun/<timestamp>)
+#   SING_BOX        sing-box binary (default: sing-box from PATH)
+#   XRAY_BIN        stock Xray binary (default: xray from PATH)
+#   TEST_CONFIG     beam REALITY fixture (default: ~/.cache/beam/beam-test.toml)
+#   TUN_OUT         run directory (default: ~/.cache/beam/tun/<timestamp>)
 #   SKIP_BUILD=1    reuse target/<profile>/beam and the H3 origin binary
 #   H3_ORIGIN_BIN   use a prebuilt h3-origin binary instead of building it
 #   UDP_MODE        sing-box packet_encoding: xudp, packetaddr, or legacy
@@ -68,8 +68,7 @@ if [ "$INNER" != "1" ]; then
   if [ -n "$H3_BIN_OVERRIDE" ]; then
     H3_ORIGIN_BIN="$H3_BIN_OVERRIDE"
   elif [ "$H3_BUILD" = "1" ]; then
-    mkdir -p /tmp/opencode
-    H3_BUILD_LOG="$(mktemp /tmp/opencode/h3-origin-build.XXXXXX.log)"
+    H3_BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/beam-h3-origin-build.XXXXXX.log")"
     # shellcheck source=../../scripts/dev-env.sh
     source "$ROOT/scripts/dev-env.sh"
     if cargo build --locked --manifest-path "$HERE/h3-origin/Cargo.toml" \
@@ -98,9 +97,9 @@ SELF="${TUN_HARNESS_SELF:-$SELF}"
 source "$ROOT/scripts/dev-env.sh"
 
 PYTHON="${PYTHON:-python3}"
-SING_BOX="${SING_BOX:-/tmp/opencode/bench/bin/sing-box}"
-XRAY_BIN="${XRAY_BIN:-/tmp/opencode/xray-server-compare/xray}"
-TEST_CONFIG="${TEST_CONFIG:-/tmp/opencode/beam-test/beam.toml}"
+SING_BOX="${SING_BOX:-sing-box}"
+XRAY_BIN="${XRAY_BIN:-xray}"
+TEST_CONFIG="${TEST_CONFIG:-${XDG_CACHE_HOME:-$HOME/.cache}/beam/beam-test.toml}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 UDP_MODE="${UDP_MODE:-xudp}"
 PROFILE="debug"
@@ -169,9 +168,15 @@ for command in "$PYTHON" ip curl dig cargo; do
     exit 1
   fi
 done
-if [ "$CONTROL" = "1" ] && [ ! -x "$XRAY_BIN" ]; then
-  echo "tun-harness: --control requested but Xray is not executable: $XRAY_BIN" >&2
-  exit 1
+if [ "$CONTROL" = "1" ]; then
+  if [ -x "$XRAY_BIN" ]; then
+    :
+  elif command -v "$XRAY_BIN" >/dev/null 2>&1; then
+    XRAY_BIN="$(command -v "$XRAY_BIN")"
+  else
+    echo "tun-harness: --control requested but Xray was not found: $XRAY_BIN" >&2
+    exit 1
+  fi
 fi
 CURL_HTTP3=0
 if curl --version 2>/dev/null | grep -qi 'HTTP3'; then
@@ -183,7 +188,7 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 if [ -n "$OUT" ]; then
   RUN_DIR="$OUT"
 else
-  RUN_DIR="/tmp/opencode/beam-tun/$STAMP-$$"
+  RUN_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/beam/tun/$STAMP-$$"
 fi
 mkdir -p "$RUN_DIR/logs" "$RUN_DIR/probes" "$RUN_DIR/config"
 chmod 700 "$RUN_DIR"

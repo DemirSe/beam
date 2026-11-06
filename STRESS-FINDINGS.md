@@ -360,10 +360,6 @@ separate product decision because it changes the visible transport.
 
 ## Reproduction notes
 
-- Low soak: `/tmp/opencode/soak-low/{client,server.csv,journal.txt}`
-- High mixed trial: `/tmp/opencode/soak-high/{client,server.csv,journal.txt}`
-- Slow reader: `/tmp/opencode/slow-{http,dns}.json`
-- Impairment: `/tmp/opencode/impaired-{http,dns,udp,h3}.json`
-- Junk-idle probe outputs: `/tmp/beam-soak-*` on the lab VMs (temporary; VMs
-  were stopped after the run).
-- These paths are scratch evidence, not committed test fixtures.
+- Raw soak, impairment, slow-reader, and junk-idle outputs were scratch
+  evidence on the lab hosts, not committed test fixtures. Reproduce them with
+  the lab harness instead of relying on stale paths.

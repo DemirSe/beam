@@ -1,23 +1,13 @@
 #!/usr/bin/env bash
 # Source this file before running cargo on this development host.
-#
-# The host has gcc and perl but no system cmake/ninja. Portable copies live
-# under /tmp/opencode/tools and are used when present. On a normal build host
-# the script falls back to the system toolchain.
-
-if [ -d /tmp/opencode/tools/bin ]; then
-  export PATH="/tmp/opencode/tools/bin:$PATH"
-fi
+# It only prepares the local Rust toolchain and portable build environment;
+# external benchmark/lab tools are selected by the scripts that need them.
 
 export PATH="$HOME/.cargo/bin:$PATH"
-export CC="${CC:-/usr/bin/gcc}"
-# The host has gcc but no `c++` symlink. libfuzzer-sys builds a small C++
-# runtime, so point CXX at the portable wrapper when it is available.
-if [ -x /tmp/opencode/tools/bin/g++-portable ] && [ -z "${CXX:-}" ]; then
-  export CXX=/tmp/opencode/tools/bin/g++-portable
+if [ -z "${CC:-}" ] && command -v gcc >/dev/null 2>&1; then
+    export CC="$(command -v gcc)"
+fi
+if [ -z "${CXX:-}" ] && command -v c++ >/dev/null 2>&1; then
+    export CXX="$(command -v c++)"
 fi
 export CMAKE_GENERATOR="${CMAKE_GENERATOR:-Ninja}"
-
-if [ -d /tmp/opencode/tools/fedora/usr/lib/gcc/x86_64-redhat-linux/16 ]; then
-  export LIBRARY_PATH="/tmp/opencode/tools/fedora/usr/lib/gcc/x86_64-redhat-linux/16${LIBRARY_PATH:+:$LIBRARY_PATH}"
-fi

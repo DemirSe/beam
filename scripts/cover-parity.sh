@@ -16,10 +16,10 @@
 #   bash scripts/cover-parity.sh
 #
 # Environment overrides:
-#   XRAY_BIN              stock Xray binary (default /tmp/opencode/xray-server-compare/xray)
-#   CLIENT_TEMPLATE       no-flow REALITY client JSON (default /tmp/opencode/tls-server-harness/client-no-flow.json)
-#   TEST_CONFIG           beam test config with the test key (default /tmp/opencode/beam-test/beam.toml)
-#   COVER_ARTIFACT        cover server-flight capture (default /tmp/opencode/beam-spike-tls/cover-artifacts/rustls-aws-pq-serverflight.bin)
+#   XRAY_BIN              stock Xray binary (default: xray from PATH)
+#   CLIENT_TEMPLATE       no-flow REALITY client JSON (default: ~/.cache/beam/cover-parity/client-no-flow.json)
+#   TEST_CONFIG           beam test config with the test key (default: ~/.cache/beam/beam-test.toml)
+#   COVER_ARTIFACT        cover server-flight capture (default: ~/.cache/beam/cover-parity/serverflight.bin)
 #   BEAM_PORT             beam listen port (default 18443)
 #   PROXY_PORT            recording proxy port (default 18444)
 #   SOCKS_PORT            Xray SOCKS inbound port (default 11080)
@@ -36,10 +36,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-python3}"
 
-XRAY_BIN="${XRAY_BIN:-/tmp/opencode/xray-server-compare/xray}"
-CLIENT_TEMPLATE="${CLIENT_TEMPLATE:-/tmp/opencode/tls-server-harness/client-no-flow.json}"
-TEST_CONFIG="${TEST_CONFIG:-/tmp/opencode/beam-test/beam.toml}"
-COVER_ARTIFACT="${COVER_ARTIFACT:-/tmp/opencode/beam-spike-tls/cover-artifacts/rustls-aws-pq-serverflight.bin}"
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/beam"
+XRAY_BIN="${XRAY_BIN:-xray}"
+CLIENT_TEMPLATE="${CLIENT_TEMPLATE:-$CACHE_ROOT/cover-parity/client-no-flow.json}"
+TEST_CONFIG="${TEST_CONFIG:-$CACHE_ROOT/beam-test.toml}"
+COVER_ARTIFACT="${COVER_ARTIFACT:-$CACHE_ROOT/cover-parity/serverflight.bin}"
 
 BEAM_PORT="${BEAM_PORT:-18443}"
 PROXY_PORT="${PROXY_PORT:-18444}"
@@ -48,7 +49,7 @@ HTTP_PORT="${HTTP_PORT:-18080}"
 CARGO_PROFILE="${CARGO_PROFILE:-release}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
-WORK_ROOT="${COVER_PARITY_DIR:-/tmp/opencode}"
+WORK_ROOT="${COVER_PARITY_DIR:-$CACHE_ROOT/cover-parity/runs}"
 mkdir -p "$WORK_ROOT"
 RUN_DIR="$(mktemp -d "$WORK_ROOT/beam-cover-parity.XXXXXX")"
 CAPTURE_DIR="$RUN_DIR/capture"
@@ -102,7 +103,13 @@ source "$ROOT/scripts/dev-env.sh"
 command -v "$PYTHON" >/dev/null 2>&1 || fail "python3 is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v cargo >/dev/null 2>&1 || fail "cargo is required"
-[ -x "$XRAY_BIN" ] || fail "stock Xray binary is not executable: $XRAY_BIN (set XRAY_BIN)"
+if [ -x "$XRAY_BIN" ]; then
+  :
+elif command -v "$XRAY_BIN" >/dev/null 2>&1; then
+  XRAY_BIN="$(command -v "$XRAY_BIN")"
+else
+  fail "stock Xray binary was not found: $XRAY_BIN (set XRAY_BIN)"
+fi
 require_file "$CLIENT_TEMPLATE" "no-flow Xray client config"
 require_file "$TEST_CONFIG" "beam test config"
 require_file "$COVER_ARTIFACT" "cover server-flight artifact"
