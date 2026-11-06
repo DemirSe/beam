@@ -10,15 +10,26 @@ fn main() {
         .ok()
         .filter(|value| !value.is_empty())
         .or_else(|| {
-            Command::new("git")
+            let output = Command::new("git")
                 .args(["rev-parse", "--short=12", "HEAD"])
                 .current_dir(env!("CARGO_MANIFEST_DIR"))
                 .output()
                 .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| String::from_utf8(output.stdout).ok())
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
+                .filter(|output| output.status.success())?;
+            let mut value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+            if value.is_empty() {
+                return None;
+            }
+            let dirty = Command::new("git")
+                .args(["diff", "--quiet", "--"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .status()
+                .ok()
+                .is_some_and(|status| !status.success());
+            if dirty {
+                value.push_str("-dirty");
+            }
+            Some(value)
         })
         .unwrap_or_else(|| "unknown".to_owned());
 

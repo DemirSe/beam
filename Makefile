@@ -29,7 +29,7 @@ doctor:
 	  else printf 'MISS %s (bench only)\n' "$$tool"; fi; \
 	done; \
 	printf '%s\n' '=== local paths ==='; \
-	for path in config.example.toml README.md /home/demir/pi/beam-lab/start-lab.sh; do \
+	for path in config.example.toml README.md "$(LAB_DIR)/start-lab.sh"; do \
 	  if [ -e "$$path" ]; then printf 'OK   %s\n' "$$path"; \
 	  else printf 'MISS %s\n' "$$path"; fi; \
 	done; \
@@ -51,7 +51,7 @@ test:
 	cargo test --workspace
 
 build:
-	cargo build --release
+	cargo build --locked --release
 
 smoke: build
 	target/release/beam --check -c config.example.toml
