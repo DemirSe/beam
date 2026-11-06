@@ -111,6 +111,12 @@ const REPLAY_CACHE_CAPACITY: usize = 4_096;
 /// Retention for one replay-cache entry.
 const REPLAY_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// Maximum concurrent handshakes allowed for one exact replay id. The
+/// completion cache still rejects all later copies; this only prevents one
+/// captured ClientHello from occupying the global connection permit pool
+/// before the TLS Finished insert happens.
+const REPLAY_MAX_IN_FLIGHT_PER_ID: usize = 4;
+
 /// Bounded exact-replay filter for authenticated ClientHellos.
 ///
 /// The key is the encrypted 32-byte REALITY session id. It is not a secret and
@@ -118,6 +124,7 @@ const REPLAY_CACHE_TTL: Duration = Duration::from_secs(60);
 struct ReplayCache {
     entries: HashMap<[u8; 32], Instant>,
     order: VecDeque<[u8; 32]>,
+    in_flight: HashMap<[u8; 32], usize>,
     ttl: Duration,
 }
 
@@ -126,6 +133,7 @@ impl ReplayCache {
         Self {
             entries: HashMap::with_capacity(REPLAY_CACHE_CAPACITY),
             order: VecDeque::with_capacity(REPLAY_CACHE_CAPACITY),
+            in_flight: HashMap::new(),
             ttl,
         }
     }
@@ -144,14 +152,37 @@ impl ReplayCache {
         }
     }
 
-    /// Returns `true` if this id was already recorded within the TTL.
-    fn contains(&mut self, id: [u8; 32]) -> bool {
+    /// Reserves one in-flight handshake for an authenticated ClientHello.
+    ///
+    /// Completed handshakes are rejected by `entries`; concurrent copies are
+    /// bounded so a captured ClientHello cannot occupy the global connection
+    /// permits while its TLS handshake is incomplete.
+    fn try_reserve(&mut self, id: [u8; 32]) -> bool {
         self.expire(Instant::now());
-        self.entries.contains_key(&id)
+        if self.entries.contains_key(&id) {
+            return false;
+        }
+        let count = self.in_flight.get(&id).copied().unwrap_or(0);
+        if count >= REPLAY_MAX_IN_FLIGHT_PER_ID {
+            return false;
+        }
+        self.in_flight.insert(id, count + 1);
+        true
+    }
+
+    fn release(&mut self, id: [u8; 32]) {
+        if let Some(count) = self.in_flight.get_mut(&id) {
+            if *count <= 1 {
+                self.in_flight.remove(&id);
+            } else {
+                *count -= 1;
+            }
+        }
     }
 
     /// Records a completed handshake id and bounds the cache.
     fn insert(&mut self, id: [u8; 32]) {
+        self.in_flight.remove(&id);
         let now = Instant::now();
         self.expire(now);
         if self.entries.contains_key(&id) {
@@ -164,6 +195,30 @@ impl ReplayCache {
         }
         self.entries.insert(id, now);
         self.order.push_back(id);
+    }
+}
+
+struct ReplayReservation<'a> {
+    cache: &'a Mutex<ReplayCache>,
+    id: [u8; 32],
+    active: bool,
+}
+
+impl ReplayReservation<'_> {
+    fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ReplayReservation<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        match self.cache.lock() {
+            Ok(mut cache) => cache.release(self.id),
+            Err(poisoned) => poisoned.into_inner().release(self.id),
+        }
     }
 }
 
@@ -459,11 +514,19 @@ impl TlsServerConfig {
         }
     }
 
-    fn replay_contains(&self, id: [u8; 32]) -> bool {
-        match self.replay_cache.lock() {
-            Ok(mut cache) => cache.contains(id),
-            Err(poisoned) => poisoned.into_inner().contains(id),
+    fn replay_reserve(&self, id: [u8; 32]) -> Option<ReplayReservation<'_>> {
+        let mut cache = match self.replay_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !cache.try_reserve(id) {
+            return None;
         }
+        Some(ReplayReservation {
+            cache: &self.replay_cache,
+            id,
+            active: true,
+        })
     }
 
     fn replay_insert(&self, id: [u8; 32]) {
@@ -700,14 +763,13 @@ pub async fn handle_connection_admitted(
     };
     let auth = match ClientHello::parse(&record) {
         Ok(hello) => match authenticate(&hello, &config.reality_config()) {
-            Ok(auth) => {
-                if config.replay_contains(auth.session_id) {
+            Ok(auth) => match config.replay_reserve(auth.session_id) {
+                Some(reservation) => Some((auth, reservation)),
+                None => {
                     tracing::debug!("authenticated ClientHello replay; forwarding to cover");
                     None
-                } else {
-                    Some(auth)
                 }
-            }
+            },
             Err(error) => {
                 tracing::debug!(%error, "REALITY authentication failed; forwarding to cover");
                 None
@@ -720,7 +782,7 @@ pub async fn handle_connection_admitted(
     };
 
     match auth {
-        Some(auth) => {
+        Some((auth, reservation)) => {
             let permit = match Arc::clone(&config.connection_permits).try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -730,7 +792,7 @@ pub async fn handle_connection_admitted(
                 }
             };
             drop(preauth);
-            handle_authenticated(stream, record, auth, &config, permit).await
+            handle_authenticated(stream, record, auth, &config, permit, reservation).await
         }
         None => {
             drop(preauth);
@@ -1014,6 +1076,7 @@ async fn handle_authenticated(
     auth: Auth,
     config: &TlsServerConfig,
     _connection_permit: OwnedSemaphorePermit,
+    reservation: ReplayReservation<'_>,
 ) -> Result<ConnectionOutcome, TlsServerError> {
     // One absolute deadline covers TLS, VLESS request parsing, response
     // writes, the initial body write, and the destination dial. Per-stage
@@ -1034,8 +1097,10 @@ async fn handle_authenticated(
     // keeps stock behavior for concurrent duplicates: an on-path exact replay
     // cannot pre-empt the legitimate client by winning the classification
     // race, while a later replay of the completed ClientHello is still
-    // diverted to cover.
+    // diverted to cover. The in-flight reservation bounds concurrent copies
+    // until this insert is reached.
     config.replay_insert(auth.session_id);
+    reservation.commit();
 
     let request = timeout_at(
         deadline,
@@ -2234,10 +2299,10 @@ mod tests {
     fn replay_cache_rejects_duplicates_and_stays_bounded() {
         let mut cache = ReplayCache::new(Duration::from_secs(60));
         let id = [7u8; 32];
-        assert!(!cache.contains(id));
-        assert!(!cache.contains(id));
+        assert!(!cache.entries.contains_key(&id));
+        assert!(!cache.entries.contains_key(&id));
         cache.insert(id);
-        assert!(cache.contains(id));
+        assert!(cache.entries.contains_key(&id));
         for index in 0..REPLAY_CACHE_CAPACITY + 32 {
             let mut next = [0u8; 32];
             next[..8].copy_from_slice(&(index as u64).to_be_bytes());
@@ -2245,6 +2310,20 @@ mod tests {
         }
         assert!(cache.entries.len() <= REPLAY_CACHE_CAPACITY);
         assert!(cache.order.len() <= REPLAY_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn replay_cache_limits_in_flight_duplicates() {
+        let mut cache = ReplayCache::new(Duration::from_secs(60));
+        let id = [9u8; 32];
+        for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID {
+            assert!(cache.try_reserve(id));
+        }
+        assert!(!cache.try_reserve(id));
+        cache.release(id);
+        assert!(cache.try_reserve(id));
+        cache.insert(id);
+        assert!(!cache.try_reserve(id));
     }
 
     #[tokio::test]
