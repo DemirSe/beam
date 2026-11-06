@@ -32,6 +32,18 @@ code-confirmed backpressure and timestamp-window risks in
 24 h soak, privileged syscall/wakeup/splice measurements, cgroup OOM sampling,
 and final fuzzing.
 
+## Where to look
+
+| Need | Read |
+|---|---|
+| Current production state | [Status](#status), [Operations](#operations) |
+| Protocol behavior and invariants | [Protocol invariants](#protocol-invariants), [Decisions](#decisions) |
+| Configuration | [Configuration and limits](#configuration-and-limits), [`config.example.toml`](config.example.toml) |
+| Client setup | [Windows tray launcher](#windows-tray-launcher), [Linux tray and DNS switch](#linux-tray-and-dns-switch), [Mobile profile](#mobile-profile) |
+| Tests and performance | [Testing and benchmarking](#testing-and-benchmarking), `tests/tun`, `fuzz`, `bench` |
+| Open risks | [Known gaps](#known-gaps), [`STRESS-FINDINGS.md`](STRESS-FINDINGS.md) |
+| Agent rules | [`AGENTS.md`](AGENTS.md) |
+
 ## Scope
 
 The target profile is:

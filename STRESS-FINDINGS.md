@@ -13,6 +13,17 @@ This note records the results of three read-only code audits plus the QEMU lab
 run. It distinguishes **lab-reproduced** findings from code-confirmed risks.
 Do not treat the latter as fixed or as measured production incidents.
 
+## Current open findings
+
+| # | Status | Area | Summary |
+|---:|---|---|---|
+| 4 | open | XUDP close | The reserved control slots are advisory; a racing End is dropped and counted rather than blocking. |
+| 5 | open | XUDP reply budget | The process-wide 32 MiB budget lets a slow reader delay unrelated mux streams. |
+| 8 | partial | TLS replay | Concurrent in-flight copies are bounded; the disabled timestamp window remains a decision. |
+| 9 | open | XUDP lifecycle | Short GlobalID flows can retain a socket and mux permit for about two close timers. |
+| 10 | open | Lower-risk resources | Remaining cover stop-signal, mux-abort cleanup, and session-table lock items; Vision CPU spin is fixed. |
+| 12 | open | Client platform | Rootless Android cannot enable BBR while preserving the REALITY outer TCP cover. |
+
 ## Lab results
 
 Three VMs, fixed 2 GHz benchmark profile, final lab binary, `max_connections =
