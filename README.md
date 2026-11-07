@@ -98,7 +98,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 359 tests: 329 `beam-core`,
+a benchmark comparison. The current workspace has 360 tests: 330 `beam-core`,
 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 
 ### One-command checks
