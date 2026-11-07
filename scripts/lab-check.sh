@@ -60,7 +60,7 @@ if [ "$SKIP_BUILD" != "1" ]; then
         sudo -n systemctl restart beam
         sleep 2
         systemctl is-active beam
-        sudo -n /usr/local/bin/beam --check -c /etc/beam/config.toml
+        sudo -n bash -c 'ulimit -n 65536 2>/dev/null || true; exec /usr/local/bin/beam --check -c /etc/beam/config.toml'
         sudo -n /usr/local/bin/beam --version" 2>&1 | tee "$OUT/current-deploy.txt"
 
     set +e
