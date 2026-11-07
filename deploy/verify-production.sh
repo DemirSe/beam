@@ -79,12 +79,66 @@ if [ "${CHECK_H2:-0}" = "1" ]; then
         echo "verify: CHECK_H2=1 but tunnel interface $iface is missing" >&2
         exit 1
     fi
+
+    # Validate the destination before sending traffic: a malformed value would
+    # otherwise surface as a misleading "not tunnelled" failure.
+    dst="${CHECK_H2_DST:-1.1.1.1:443}"
+    case "$dst" in
+        *:*) ;;
+        *) echo "verify: CHECK_H2_DST must be host:port, got '$dst'" >&2; exit 1 ;;
+    esac
+    dst_addr="${dst%:*}"
+    dst_port="${dst##*:}"
+    case "$dst_port" in
+        ''|*[!0-9]*) echo "verify: CHECK_H2_DST must end in a numeric port, got '$dst'" >&2; exit 1 ;;
+    esac
+    # Accept a bracketed IPv6 literal; bash /dev/tcp and ss both take it bare.
+    dst_addr="${dst_addr#\[}"
+    dst_addr="${dst_addr%\]}"
+    hold="${CHECK_H2_HOLD:-8}"
+    case "$hold" in
+        ''|*[!0-9]*) echo "verify: CHECK_H2_HOLD must be a whole number of seconds" >&2; exit 1 ;;
+    esac
+    [ "$hold" -ge 4 ] || { echo "verify: CHECK_H2_HOLD must be at least 4 seconds" >&2; exit 1; }
+    # Sample at half the hold, so every accepted hold leaves the socket up.
+    delay=$(( hold / 2 ))
+
+    # The shipped Linux profile sets auto_redirect, so locally generated TCP is
+    # redirected into the client and never enters the tun device. Pinning a
+    # probe to the device tests a path the product does not use; probe the path
+    # traffic actually takes instead.
     for attempt in 1 2 3; do
-        code=$(curl -4 --interface "$iface" -sS --max-time 12 -o /dev/null \
+        code=$(curl -4 -sS --max-time 12 -o /dev/null \
             -w '%{http_code}' https://example.com || true)
         echo "h2 attempt=$attempt http=$code"
-        [ "$code" = "200" ] || { echo "verify: tunneled H2 check failed" >&2; exit 1; }
+        [ "$code" = "200" ] || { echo "verify: HTTP through the client path failed" >&2; exit 1; }
         sleep 1
     done
+
+    # A direct uplink also answers those requests, so prove the traffic left
+    # through beam: hold one client connection open and require a new
+    # established socket owned by beam for the same destination on the server.
+    tunnel_sockets() {
+        remote "sudo -n ss -tnpH state established \"dst ${dst_addr}:${dst_port}\" 2>/dev/null | grep -c '\"beam\"' || true" \
+            | tr -d '[:space:]'
+    }
+    before=$(tunnel_sockets || echo 0)
+    ( exec 3<>"/dev/tcp/${dst_addr}/${dst_port}" 2>/dev/null; sleep "$hold"; exec 3<&- 3>&- ) &
+    holder=$!
+    sleep "$delay"
+    during=$(tunnel_sockets || echo 0)
+    wait "$holder" 2>/dev/null || true
+    sleep 1
+    after=$(tunnel_sockets || echo 0)
+    echo "tunnel sockets dst=$dst beam-owned: before=$before during=$during after=$after"
+    if [ "${during:-0}" -le "${before:-0}" ]; then
+        echo "verify: client traffic is not tunnelled (no beam-owned socket to $dst appeared)" >&2
+        echo "verify: last client journal lines:" >&2
+        journalctl -u beam-client -n 20 --no-pager 2>/dev/null >&2 || true
+        exit 1
+    fi
+    if [ "${after:-0}" -gt "${before:-0}" ]; then
+        echo "verify: note: beam-owned sockets to $dst did not return to baseline" >&2
+    fi
 fi
 echo "verify: PASS"

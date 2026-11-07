@@ -524,10 +524,17 @@ SSH_KEY="$SSH_KEY" SERVER="$SERVER" CHECK_H2=1 \
   TUN_IFACE=sbtun0 deploy/verify-production.sh
 ```
 
-`CHECK_H2=1` requires the named local tunnel and fails if it is missing; it no
-longer falls back to the host's direct internet path. Set `EXPECTED_BINARY_SHA`
-and `EXPECTED_CONFIG_SHA` to make the script fail on a hash mismatch. Then
-verify end to end:
+`CHECK_H2=1` requires the named local tunnel and fails if it is missing. It
+verifies the path real traffic takes: three sequential HTTPS requests, then a
+held client connection that must produce a new established socket owned by beam
+on the server for the same destination (`CHECK_H2_DST`, default `1.1.1.1:443`).
+The second half is what distinguishes the tunnel from the host's direct
+uplink, because a direct path also answers the HTTPS requests. Override the hold
+length with `CHECK_H2_HOLD` (default 8 seconds); it must be at least 4 seconds,
+and IPv6 destinations work bare or bracketed. The Linux profile sets
+`auto_redirect`, so never pin probes to the tunnel device: traffic bound to it
+is not proxied. Set `EXPECTED_BINARY_SHA` and `EXPECTED_CONFIG_SHA` to make the
+script fail on a hash mismatch. Then verify end to end:
 
 ```bash
 curl -4 -sS -o /dev/null -w '%{http_code}\n' https://example.com/
@@ -718,6 +725,11 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   required.
 - **One user, one inbound, no hot reload/stats** keeps the attack surface and
   resource model bounded.
+- **Production is pinned at `2e0a4649c7fe`.** Deploys are an explicit operator
+  action, not a consequence of a green tree; source HEAD may be ahead of the
+  host. Move it only with `deploy/package.sh` plus
+  `BEAM_KEEP_CONFIG=1 bootstrap.sh`, then re-run the hash-pinned verifier and
+  update the pin here.
 
 ## Known gaps
 
