@@ -170,12 +170,19 @@ elevated Windows PowerShell. It downloads the official sing-box 1.14.4 Windows
 archive, verifies the archive and individual core files, installs to
 `%ProgramFiles%\beam`, stages and checks `config.json`, sets Windows
 `strict_route` to `true`, protects the directory/config/log ACLs, and creates a
-desktop shortcut. The embedded profile contains the same canonical UDP/443
-pre-match reject as Linux and Android, and the installer normalizes the decoded
-route rules again before staging, so an older embedded blob cannot silently
-drop the rule. Windows therefore falls back to HTTP/2 without waiting for
+desktop shortcut. The embedded profile uses the same route shape as the Linux
+client: private destinations direct, public UDP/443 rejected, port-53 DNS
+hijacked to DoH, and no HTTP/TLS/QUIC sniffing. The installer normalizes the decoded route rules again before
+staging, so an older embedded blob cannot reintroduce full sniffing or drop the
+UDP/443 rule. Windows therefore falls back to HTTP/2 without waiting for
 XUDP/TCP retransmission. The config is restricted to Administrators and SYSTEM.
 It is ignored by Git because it embeds real credentials.
+
+Reinstall is deliberately destructive: it stops the old tray/core, unregisters
+the old logon task, removes the old Program Files and LocalAppData installs,
+config/log/backups, desktop/startup shortcuts, stale staging directories, and
+the downloaded core cache. The replacement install contains only the new
+binary, core files, config, and log; no old credentials or leftovers remain.
 
 ```powershell
 # Start Windows PowerShell with "Run as administrator", then:
