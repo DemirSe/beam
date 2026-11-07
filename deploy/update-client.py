@@ -18,6 +18,26 @@ SERVICE = "beam-client"
 SING_BOX = "/usr/local/lib/beam/sing-box"
 
 
+# sing-box rejects a string port (route rules take Listable[uint16]); accept
+# any shape so an invalid profile fails at `sing-box check`, not here.
+def _matches_udp_443_port(raw: object) -> bool:
+    if isinstance(raw, int):
+        return raw == 443
+    if isinstance(raw, list):
+        return any(_matches_udp_443_port(item) for item in raw)
+    if isinstance(raw, str):
+        return any(part.strip() == "443" for part in raw.split(","))
+    return False
+
+
+def is_udp443_reject(rule: dict) -> bool:
+    return (
+        rule.get("action") == "reject"
+        and rule.get("network") == "udp"
+        and _matches_udp_443_port(rule.get("port"))
+    )
+
+
 def ensure_quic_policy(config: dict) -> None:
     """Keep the stock-client H2 fallback policy canonical."""
     route = config.setdefault("route", {})
@@ -32,16 +52,6 @@ def ensure_quic_policy(config: dict) -> None:
         "method": "default",
         "no_drop": True,
     }
-
-    def is_udp443_reject(rule: dict) -> bool:
-        port = rule.get("port", [])
-        if isinstance(port, int):
-            port = [port]
-        return (
-            rule.get("action") == "reject"
-            and rule.get("network") == "udp"
-            and 443 in port
-        )
 
     route["rules"] = [
         r
