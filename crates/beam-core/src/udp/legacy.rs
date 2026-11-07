@@ -28,7 +28,9 @@
 //!   destinations are remembered in a bounded table so the session cannot be
 //!   used to retain unbounded per-destination state. A datagram for a new
 //!   destination is dropped after the table is full; destinations already in
-//!   the table keep working.
+//!   the table keep working. Only destinations whose address family has a
+//!   bound socket are admitted, so a family that failed to bind cannot consume
+//!   slots or starve the family that did bind.
 //! - Both relay modes use unconnected sockets and forward the actual reply
 //!   source, matching stock Xray. There is no source allowlist.
 //! - Every stream, socket, and shutdown operation is bounded by a timeout. The
@@ -388,7 +390,19 @@ where
     if v4.is_none() && v6.is_none() {
         return Err(UdpError::NoSocket);
     }
+    handle_packetaddr_bound(stream, config, v4, v6).await
+}
 
+/// Relays a packetaddr session over sockets that are already bound.
+async fn handle_packetaddr_bound<S>(
+    stream: S,
+    config: &LegacyUdpConfig,
+    v4: Option<UdpSocket>,
+    v6: Option<UdpSocket>,
+) -> Result<(), UdpError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (mut reader, mut writer) = tokio::io::split(stream);
     let payload_limit = framed_payload_limit(config.max_datagram_size);
     let mut decoder = FrameDecoder::new(payload_limit);
@@ -410,16 +424,6 @@ where
             let (destination, payload) = parse_packetaddr(&decoder.buffer[frame.clone()])?;
             let destination = normalize_address(destination);
 
-            if !table.admit(destination) {
-                tracing::trace!(
-                    %destination,
-                    max = config.max_packetaddr_destinations,
-                    "packetaddr destination table is full; dropping the datagram"
-                );
-                decoder.consume(frame.end);
-                continue;
-            }
-
             let socket = match destination {
                 SocketAddr::V4(_) => v4.as_ref(),
                 SocketAddr::V6(_) => v6.as_ref(),
@@ -432,6 +436,16 @@ where
                 decoder.consume(frame.end);
                 continue;
             };
+
+            if !table.admit(destination) {
+                tracing::trace!(
+                    %destination,
+                    max = config.max_packetaddr_destinations,
+                    "packetaddr destination table is full; dropping the datagram"
+                );
+                decoder.consume(frame.end);
+                continue;
+            }
 
             let sent = timeout(
                 send_timeout(config.io_timeout),
@@ -991,7 +1005,8 @@ impl FrameDecoder {
 mod tests {
     use super::{
         FrameDecoder, LegacyUdpConfig, LegacyUdpConfigError, MAX_DATAGRAM_SIZE,
-        PACKETADDR_MAGIC_DOMAIN, UdpError, handle_udp_stream, parse_packetaddr,
+        PACKETADDR_MAGIC_DOMAIN, UdpError, handle_packetaddr_bound, handle_udp_stream,
+        parse_packetaddr,
     };
     use crate::address::{Address, NetLocation};
     use proptest::prelude::*;
@@ -1651,6 +1666,45 @@ mod tests {
                 max: 32
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn packetaddr_unbound_family_does_not_consume_destination_slots() {
+        let echo = spawn_ipv4_echo().await;
+        let v4 = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .unwrap();
+        let config = LegacyUdpConfig {
+            max_packetaddr_destinations: 2,
+            ..test_config(MAX_DATAGRAM_SIZE)
+        };
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task =
+            tokio::spawn(
+                async move { handle_packetaddr_bound(server, &config, Some(v4), None).await },
+            );
+
+        // Two distinct IPv6 destinations have no bound socket and must not
+        // occupy the two table slots.
+        write_frame(
+            &mut client,
+            &packetaddr_datagram(SocketAddr::from((Ipv6Addr::LOCALHOST, 9)), b"x"),
+        )
+        .await;
+        write_frame(
+            &mut client,
+            &packetaddr_datagram(SocketAddr::from((Ipv6Addr::LOCALHOST, 10)), b"y"),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The IPv4 destination must still be admitted and echoed.
+        write_frame(&mut client, &packetaddr_datagram(echo.address, b"four")).await;
+        let reply = read_frame(&mut client).await;
+        let (_, payload) = parse_packetaddr_reply(&reply);
+        assert_eq!(payload, b"four");
+
+        finish_clean(client, task).await;
     }
 
     #[tokio::test]
