@@ -26,6 +26,7 @@ import struct
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 GIB = 1024.0 * 1024.0 * 1024.0
@@ -279,8 +280,17 @@ def run_https(args: argparse.Namespace) -> tuple[dict, list[str]]:
     samples: list[dict] = []
     warnings: list[str] = []
     failure = None
-    for _ in range(args.count):
-        completed = _curl(command, timeout=args.max_time + 30)
+
+    def run_one(_: int) -> subprocess.CompletedProcess:
+        return _curl(command, timeout=args.max_time + 30)
+
+    if args.https_parallel > 1:
+        with ThreadPoolExecutor(max_workers=args.https_parallel) as pool:
+            completed_results = list(pool.map(run_one, range(args.count)))
+    else:
+        completed_results = [run_one(index) for index in range(args.count)]
+
+    for completed in completed_results:
         if completed.returncode != 0:
             failure = f"curl exited {completed.returncode}: {completed.stderr.strip()[-300:]}"
             break
@@ -676,6 +686,12 @@ def main() -> int:
     parser.add_argument("--duration", type=int, default=10)
     parser.add_argument("--url", default="https://10.10.2.2:4443/")
     parser.add_argument("--count", type=int, default=3)
+    parser.add_argument(
+        "--https-parallel",
+        type=int,
+        default=1,
+        help="concurrent HTTPS requests; use >1 only for the fallback-permit probe",
+    )
     parser.add_argument("--expected-size", type=int, default=0)
     parser.add_argument("--max-time", type=float, default=30.0)
     parser.add_argument("--host", default="10.10.2.2")
@@ -691,6 +707,8 @@ def main() -> int:
     parser.add_argument("--h3-retries", type=int, default=3)
     parser.add_argument("--h3-gap-ms", type=int, default=50)
     args = parser.parse_args()
+    if args.https_parallel < 1:
+        parser.error("--https-parallel must be >= 1")
 
     run: dict = {
         "schema": "beam-bench-run/1",

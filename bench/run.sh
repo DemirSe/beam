@@ -59,6 +59,12 @@ DRIVER_CPU="${BENCH_DRIVER_CPU:-}"
 CLIENT_CPUS="${BENCH_CLIENT_CPUS:-1}"
 RTT_MS="${BENCH_RTT_MS:-0}"
 MAX_LOAD="${BENCH_MAX_LOAD:-0.3}"
+PERF="${BENCH_PERF:-0}"
+PERF_EVENTS="${BENCH_PERF_EVENTS:-task-clock,context-switches,cpu-migrations,page-faults,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_recvfrom,syscalls:sys_enter_sendto,syscalls:sys_enter_splice,sched:sched_wakeup,sched:sched_switch}"
+HTTPS_PARALLEL="${BENCH_HTTPS_PARALLEL:-1}"
+LOG_LEVEL="${BENCH_LOG_LEVEL:-warn}"
+SCENARIOS="${BENCH_SCENARIOS:-all}"
+REPORT="${BENCH_REPORT:-1}"
 
 PYTHON="${PYTHON:-python3}"
 CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/beam"
@@ -168,6 +174,12 @@ case "$RTT_MS" in
 esac
 [ "$REPS" -ge 1 ] || { echo "bench: --reps must be >= 1" >&2; exit 2; }
 [ "$DURATION" -ge 2 ] || { echo "bench: --duration must be >= 2" >&2; exit 2; }
+case "$PERF" in 0|1) ;; *) echo "bench: BENCH_PERF must be 0 or 1" >&2; exit 2 ;; esac
+case "$HTTPS_PARALLEL" in
+  ''|*[!0-9]*) echo "bench: BENCH_HTTPS_PARALLEL must be a positive integer" >&2; exit 2 ;;
+esac
+[ "$HTTPS_PARALLEL" -ge 1 ] || { echo "bench: BENCH_HTTPS_PARALLEL must be >= 1" >&2; exit 2; }
+case "$REPORT" in 0|1) ;; *) echo "bench: BENCH_REPORT must be 0 or 1" >&2; exit 2 ;; esac
 
 # The documented vps-1c model runs the driver on the client core. A caller can
 # still separate it with --driver-cpu (useful for client-bound sensitivity runs).
@@ -260,6 +272,9 @@ if [ "$INNER" != "1" ]; then
     BENCH_REPS="$REPS" BENCH_DURATION="$DURATION" BENCH_ARMS="$ARMS" \
     BENCH_SERVER_CPU="$SERVER_CPU" BENCH_CLIENT_CPU="$CLIENT_CPU" \
     BENCH_TARGET_CPU="$TARGET_CPU" BENCH_DRIVER_CPU="$DRIVER_CPU" BENCH_CLIENT_CPUS="$CLIENT_CPUS" BENCH_RTT_MS="$RTT_MS" BENCH_MAX_LOAD="$MAX_LOAD" \
+    BENCH_PERF="$PERF" BENCH_PERF_EVENTS="$PERF_EVENTS" \
+    BENCH_HTTPS_PARALLEL="$HTTPS_PARALLEL" BENCH_LOG_LEVEL="$LOG_LEVEL" \
+    BENCH_SCENARIOS="$SCENARIOS" BENCH_REPORT="$REPORT" \
     SING_BOX="$SING_BOX" XRAY_BIN="$XRAY_BIN" TEST_CONFIG="$TEST_CONFIG" \
     IPERF3="$IPERF3" IPERF3_LIB="$IPERF3_LIB" TC="$TC" H3_ORIGIN_BIN="$H3_ORIGIN_BIN" \
     bash "$SELF" "${ORIGINAL_ARGS[@]}"
@@ -307,6 +322,18 @@ log() { printf 'bench: %s\n' "$*"; }
 die() {
   printf 'bench: HARNESS FAILURE: %s\n' "$*" >&2
   exit 1
+}
+
+if [ "$PERF" = "1" ] && [ "$(id -u)" -ne 0 ]; then
+  die "BENCH_PERF=1 requires root; run with BENCH_INNER=1"
+fi
+
+scenario_enabled() {
+  [ "$SCENARIOS" = "all" ] && return 0
+  case ",$SCENARIOS," in
+    *",$1,"*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 resolve_bin() {
@@ -539,7 +566,7 @@ fi
   --cover "$COVER" \
   --singbox \
   "${XRAY_FLAG[@]}" \
-  --log-level warn \
+  --log-level "$LOG_LEVEL" \
   || die "could not render the beam/sing-box/Xray configs"
 
 log "generating $HTTPS_MIB MiB HTTPS payload"
@@ -702,6 +729,20 @@ stop_arm() {
 measure() {
   local arm=$1 rep=$2 scenario=$3 kind=$4 out=$5
   shift 5
+  if [[ "$scenario" != warmup-* ]] && ! scenario_enabled "$scenario"; then
+    return 0
+  fi
+  local perf_pid=""
+  local rc=0
+  if [ "$PERF" = "1" ]; then
+    perf stat -x, -e "$PERF_EVENTS" -p "$SERVER_PID" -o "$out.perf.csv" &
+    perf_pid=$!
+    sleep 0.5
+    if ! kill -0 "$perf_pid" 2>/dev/null; then
+      wait "$perf_pid" 2>/dev/null || true
+      die "perf stat failed for $scenario"
+    fi
+  fi
   ip netns exec tun-client taskset -c "$DRIVER_CPU" \
     env LD_LIBRARY_PATH="$IPERF3_LIB" \
     "$PYTHON" "$HERE/measure.py" \
@@ -714,7 +755,12 @@ measure() {
       --target-core "$TARGET_CPU" --driver-core "$DRIVER_CPU" \
       --client-cores "$CLIENT_MASK_SPEC" --all-cores "$NPROC" \
       --iperf3-bin "$IPERF3" \
-      "$@"
+      "$@" || rc=$?
+  if [ -n "$perf_pid" ]; then
+    kill -INT "$perf_pid" 2>/dev/null || true
+    wait "$perf_pid" 2>/dev/null || true
+  fi
+  return "$rc"
 }
 
 run_warmup() {
@@ -764,7 +810,7 @@ run_scenarios() {
     --target-host "$TARGET_HOST" --iperf3-port "$IPERF3_PORT" \
     || die "measure.py failed for tcp-ul-4/$arm"
   measure "$arm" "$rep" https-bulk https "$raw/$arm-https-bulk-r$rep.json" \
-    --url "https://$TARGET_HOST:4443/large.bin" --count 3 \
+    --url "https://$TARGET_HOST:4443/large.bin" --count 3 --https-parallel "$HTTPS_PARALLEL" \
     --expected-size "$HTTPS_BYTES" --max-time 120 \
     || die "measure.py failed for https-bulk/$arm"
   measure "$arm" "$rep" udp-echo udp "$raw/$arm-udp-echo-r$rep.json" \
@@ -851,5 +897,7 @@ META_ARGS+=(--large-file "$CONFIG_DIR/large.bin")
 META_ARGS+=("${WARNINGS[@]}")
 
 "$PYTHON" "$HERE/meta.py" "${META_ARGS[@]}" || die "could not write meta.json"
-"$PYTHON" "$HERE/report.py" --run "$RUN_DIR" || die "could not write the summary"
+if [ "$REPORT" = "1" ]; then
+  "$PYTHON" "$HERE/report.py" --run "$RUN_DIR" || die "could not write the summary"
+fi
 printf '\nbench: run directory: %s\n' "$RUN_DIR"
