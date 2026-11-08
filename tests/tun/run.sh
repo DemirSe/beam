@@ -30,6 +30,9 @@
 #   H3_ORIGIN_BIN   use a prebuilt h3-origin binary instead of building it
 #   UDP_MODE        sing-box packet_encoding: xudp, packetaddr, or legacy
 #                   (default xudp; legacy renders packet_encoding "")
+#   ALLOW_TUN_BLOCKED=1
+#                   accept a run whose matrix contains BLOCKED rows; without it
+#                   a blocked matrix exits 2
 #
 # This is a local lab harness. It never reaches an external network in the
 # measured path; only the one-time dependency/build step runs outside it.
@@ -296,6 +299,9 @@ record() {
   detail="${detail//$'\n'/ }"
   printf '%s\t%s\t%s\n' "$name" "$status" "$detail" >> "$file"
   printf '  %-18s %-8s %s\n' "$name" "$status" "$detail"
+  if [ "$status" = "BLOCKED" ]; then
+    TUN_BLOCKED=1
+  fi
 }
 
 wait_for_log() {
@@ -389,6 +395,11 @@ finish() {
   fi
   if [ "$UNEXPECTED_FAIL" = "1" ]; then
     exit 1
+  fi
+  if [ "${TUN_BLOCKED:-0}" = "1" ] && [ "${ALLOW_TUN_BLOCKED:-0}" != "1" ]; then
+    printf 'tun-harness: matrix contains BLOCKED rows; refusing success\n' >&2
+    printf 'tun-harness: set ALLOW_TUN_BLOCKED=1 to accept a skipped matrix\n' >&2
+    exit 2
   fi
   exit 0
 }
