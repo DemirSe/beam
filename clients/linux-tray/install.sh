@@ -33,15 +33,119 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 is required to normalize t
 
 CORE_SING_SHA=1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a
 CORE_LIB_SHA=23109c55b08829bb1a68682a61a64852b1bbf243753b153cbd8f6e4ea2c05294
-actual_sing=$(sha256sum "$CORE_DIR/sing-box" | awk '{print $1}')
-actual_lib=$(sha256sum "$CORE_DIR/libcronet.so" | awk '{print $1}')
+
+install -d -m 0755 /usr/local/lib /usr/local/libexec /etc/beam
+STAGE_DIR=
+NORMALIZED_CONFIG=
+BACKUP_DIR=
+BACKUP_READY=0
+INSTALL_COMMITTED=0
+SERVICE_WAS_ACTIVE=0
+DNS_RESET_ENABLED=0
+MANAGED_PATHS=(
+    /etc/beam/config.json
+    /etc/beam/allowed-user
+    /usr/local/lib/beam/sing-box
+    /usr/local/lib/beam/libcronet.so
+    /usr/local/lib/beam/LICENSE
+    /usr/local/libexec/beam-helper
+    /usr/local/bin/beam-tray
+    /etc/systemd/system/beam-client.service
+    /etc/systemd/system/beam-dns-reset.service
+    /etc/systemd/system/multi-user.target.wants/beam-dns-reset.service
+    /etc/sysctl.d/99-beam-client-bbr.conf
+    /etc/modules-load.d/beam-bbr.conf
+    /usr/share/applications/beam-tray.desktop
+)
+
+backup_live() {
+    local src dest
+    for src in "${MANAGED_PATHS[@]}"; do
+        if [ -e "$src" ] || [ -L "$src" ]; then
+            dest="$BACKUP_DIR$src"
+            install -d -m 0755 "$(dirname "$dest")"
+            cp -a "$src" "$dest"
+        fi
+    done
+}
+
+rollback_live() {
+    local path failed=0
+    for path in "${MANAGED_PATHS[@]}"; do
+        if [ -e "$BACKUP_DIR$path" ] || [ -L "$BACKUP_DIR$path" ]; then
+            if ! cp -a "$BACKUP_DIR$path" "$path"; then
+                echo "installer: could not restore $path" >&2
+                failed=1
+            fi
+        elif ! rm -f "$path"; then
+            echo "installer: could not remove $path" >&2
+            failed=1
+        fi
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    if [ "$DNS_RESET_ENABLED" = "1" ]; then
+        if ! systemctl enable beam-dns-reset.service >/dev/null 2>&1; then
+            echo "installer: could not restore beam-dns-reset enablement" >&2
+            failed=1
+        fi
+    else
+        systemctl disable beam-dns-reset.service >/dev/null 2>&1 || true
+    fi
+    if [ "$failed" = "0" ] && [ "$SERVICE_WAS_ACTIVE" = "1" ]; then
+        if ! systemctl start beam-client 2>/dev/null; then
+            echo "installer: could not restart beam-client after rollback" >&2
+            failed=1
+        fi
+    fi
+    return "$failed"
+}
+
+cleanup() {
+    local status=$? keep_backup=0
+    if [ "$BACKUP_READY" = "1" ] && [ "$INSTALL_COMMITTED" = "0" ]; then
+        if ! rollback_live; then
+            keep_backup=1
+            status=1
+            printf 'installer: rollback incomplete; backup kept at %s\n' "$BACKUP_DIR" >&2
+        fi
+    fi
+    if [ -n "$STAGE_DIR" ]; then
+        rm -rf "$STAGE_DIR"
+    fi
+    if [ -n "$NORMALIZED_CONFIG" ]; then
+        rm -f "$NORMALIZED_CONFIG"
+    fi
+    if [ "$keep_backup" = "0" ] && [ -n "$BACKUP_DIR" ]; then
+        rm -rf "$BACKUP_DIR"
+    fi
+    return "$status"
+}
+trap cleanup EXIT
+
+STAGE_DIR=$(mktemp -d /usr/local/lib/.beam-stage.XXXXXX)
+NORMALIZED_CONFIG=$(mktemp)
+chmod 0600 "$NORMALIZED_CONFIG"
+
+# Copy into a private staging directory, then hash and validate the copies.
+# The live core and config are touched only after every check passes.
+install -m 0755 "$CORE_DIR/sing-box" "$STAGE_DIR/sing-box"
+install -m 0644 "$CORE_DIR/libcronet.so" "$STAGE_DIR/libcronet.so"
+install -m 0644 "$CORE_DIR/LICENSE" "$STAGE_DIR/LICENSE"
+
+actual_sing=$(sha256sum "$STAGE_DIR/sing-box" | awk '{print $1}')
+actual_lib=$(sha256sum "$STAGE_DIR/libcronet.so" | awk '{print $1}')
 [ "$actual_sing" = "$CORE_SING_SHA" ] || { echo "core sing-box hash mismatch" >&2; exit 1; }
 [ "$actual_lib" = "$CORE_LIB_SHA" ] || { echo "core libcronet hash mismatch" >&2; exit 1; }
 
-install -d -m 0755 /usr/local/lib/beam /usr/local/libexec /etc/beam
-install -m 0755 "$CORE_DIR/sing-box" /usr/local/lib/beam/sing-box
-install -m 0644 "$CORE_DIR/libcronet.so" /usr/local/lib/beam/libcronet.so
-install -m 0644 "$CORE_DIR/LICENSE" /usr/local/lib/beam/LICENSE
+python3 "$HERE/config-policy.py" "$CONFIG_SRC" "$NORMALIZED_CONFIG"
+"$STAGE_DIR/sing-box" check -c "$NORMALIZED_CONFIG"
+
+BACKUP_DIR=$(mktemp -d /usr/local/lib/.beam-backup.XXXXXX)
+backup_live
+BACKUP_READY=1
+if systemctl is-enabled --quiet beam-dns-reset.service 2>/dev/null; then
+    DNS_RESET_ENABLED=1
+fi
 
 # BBR is sender-side: it helps TCP uploads on lossy/high-RTT links, not
 # downloads. Enable it only when this kernel actually exposes the algorithm.
@@ -72,11 +176,9 @@ else
     echo "warning: kernel does not expose tcp_bbr; BBR/fq not enabled" >&2
 fi
 
-NORMALIZED_CONFIG=$(mktemp)
-trap 'rm -f "$NORMALIZED_CONFIG"' EXIT
-chmod 0600 "$NORMALIZED_CONFIG"
-python3 "$HERE/config-policy.py" "$CONFIG_SRC" "$NORMALIZED_CONFIG"
-/usr/local/lib/beam/sing-box check -c "$NORMALIZED_CONFIG"
+if systemctl is-active --quiet beam-client 2>/dev/null; then
+    SERVICE_WAS_ACTIVE=1
+fi
 
 systemctl stop beam-client 2>/dev/null || true
 if [ -f /etc/beam/config.json ]; then
@@ -85,6 +187,13 @@ fi
 install -m 0600 "$NORMALIZED_CONFIG" /etc/beam/config.json
 printf '%s\n' "$INSTALL_USER" > /etc/beam/allowed-user
 chmod 0644 /etc/beam/allowed-user
+
+install -d -m 0755 /usr/local/lib/beam
+mv -f "$STAGE_DIR/sing-box" /usr/local/lib/beam/sing-box
+mv -f "$STAGE_DIR/libcronet.so" /usr/local/lib/beam/libcronet.so
+mv -f "$STAGE_DIR/LICENSE" /usr/local/lib/beam/LICENSE
+rm -rf "$STAGE_DIR"
+STAGE_DIR=
 
 install -m 0755 "$HERE/beam-helper" /usr/local/libexec/beam-helper
 chown root:root /usr/local/libexec/beam-helper
@@ -117,7 +226,7 @@ cat > /etc/systemd/system/beam-dns-reset.service <<'EOF'
 Description=Restore ctrld DNS after a beam client reboot
 After=systemd-resolved.service ctrld.service
 Wants=ctrld.service
-ConditionPathExists=/etc/systemd/resolved.conf.d/99-beam.conf
+ConditionPathExists=/etc/systemd/resolved.conf.d/10-controld.conf.beam-off
 
 [Service]
 Type=oneshot
@@ -150,6 +259,7 @@ Categories=Network;
 StartupNotify=false
 EOF
 chmod 0644 /usr/share/applications/beam-tray.desktop
+INSTALL_COMMITTED=1
 update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
 
 echo "installed; service is not enabled or started"

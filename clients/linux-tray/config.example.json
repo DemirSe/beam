@@ -11,9 +11,7 @@
         "predefined": {
           "dns.controld.com": [
             "76.76.2.22",
-            "76.76.10.22",
-            "2606:1a40::22",
-            "2606:1a40:1::22"
+            "76.76.10.22"
           ]
         }
       },
@@ -43,7 +41,7 @@
       }
     ],
     "final": "remote-doh",
-    "strategy": "prefer_ipv4",
+    "strategy": "ipv4_only",
     "cache_capacity": 4096
   },
   "inbounds": [
@@ -51,8 +49,7 @@
       "type": "tun",
       "tag": "tun-in",
       "address": [
-        "172.19.0.1/30",
-        "fdfe:dcba:9876::1/126"
+        "172.19.0.1/30"
       ],
       "mtu": 1500,
       "auto_route": true,
@@ -99,6 +96,10 @@
     "auto_detect_interface": true,
     "default_domain_resolver": "local-dns",
     "rules": [
+      {
+        "ip_version": 6,
+        "action": "reject"
+      },
       {
         "ip_is_private": true,
         "outbound": "direct"

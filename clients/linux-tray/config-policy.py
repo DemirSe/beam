@@ -11,13 +11,13 @@ import sys
 
 # sing-box rejects a string port (route rules take Listable[uint16]); accept
 # any shape so an invalid profile fails at `sing-box check`, not here.
-def _matches_udp_443_port(raw: object) -> bool:
+def _is_exact_udp_443_port(raw: object) -> bool:
     if isinstance(raw, int):
         return raw == 443
     if isinstance(raw, list):
-        return any(_matches_udp_443_port(item) for item in raw)
+        return len(raw) == 1 and raw[0] == 443
     if isinstance(raw, str):
-        return any(part.strip() == "443" for part in raw.split(","))
+        return raw.strip() == "443"
     return False
 
 
@@ -25,8 +25,54 @@ def is_udp443_reject(rule: dict) -> bool:
     return (
         rule.get("action") == "reject"
         and rule.get("network") == "udp"
-        and _matches_udp_443_port(rule.get("port"))
+        and _is_exact_udp_443_port(rule.get("port"))
     )
+
+
+def _is_ipv6_literal(value: object) -> bool:
+    return isinstance(value, str) and ":" in value
+
+
+def ensure_ipv4_only(config: dict) -> None:
+    dns = config.setdefault("dns", {})
+    dns["strategy"] = "ipv4_only"
+
+    for server in dns.get("servers", []):
+        predefined = server.get("predefined") if isinstance(server, dict) else None
+        if isinstance(predefined, dict):
+            for host, addresses in list(predefined.items()):
+                if isinstance(addresses, str):
+                    predefined[host] = [] if _is_ipv6_literal(addresses) else [addresses]
+                elif isinstance(addresses, list):
+                    predefined[host] = [
+                        address for address in addresses
+                        if not _is_ipv6_literal(address)
+                    ]
+
+    for inbound in config.get("inbounds", []):
+        if not isinstance(inbound, dict) or inbound.get("type") != "tun":
+            continue
+        addresses = inbound.get("address", [])
+        if isinstance(addresses, str):
+            addresses = [addresses]
+        if not isinstance(addresses, list):
+            continue
+        kept = [address for address in addresses if not _is_ipv6_literal(address)]
+        if not kept:
+            raise ValueError("TUN inbound has no IPv4 address")
+        inbound["address"] = kept
+
+    route = config.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+    rules = [
+        rule for rule in rules
+        if not (
+            isinstance(rule, dict)
+            and str(rule.get("ip_version")) == "6"
+            and rule.get("action") == "reject"
+        )
+    ]
+    route["rules"] = [{"ip_version": 6, "action": "reject"}, *rules]
 
 
 def normalize(config: dict) -> None:
@@ -51,6 +97,7 @@ def normalize(config: dict) -> None:
         and not is_udp443_reject(r)
     ]
     route["rules"] = [r for r in (private, reject, sniff, dns) if r is not None] + others
+    ensure_ipv4_only(config)
 
 
 def main() -> int:
