@@ -8,36 +8,58 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-11-08 09:36 UTC:
+on 2026-11-08 17:53 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `b5df22815c0987cc150d7bd0b5f975e24a8eb341b1078b706c13ee84215605da` |
-| Version | `0.1.0 (f4a0c6840b1c)` |
-| Service | `beam.service`, active, `NRestarts=0` |
-| Listener | `0.0.0.0:443` |
+| SHA-256 | `6a9b4ffb25464445767504ce4fc908d330bb790b289d78f1de1c5db76faf243c` |
+| Version | `0.1.0 (1b9113cde356-dirty)` |
+| Source release | `v0.1.0-rc.1` release candidate (annotated tag) |
+| Service | `beam.service`, active, `NRestarts=0`, `RestrictAddressFamilies=AF_INET AF_UNIX` |
+| Listener | `0.0.0.0:443` (no IPv6 listener) |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
-| Host network | BBR + fq, conntrack 65536, 600 s UDP retention |
-| Verification | Hash-pinned verifier PASS twice (plain and tunnel-egress); health check V1-V8 PASS: 120/120 HTTP 200 soak at 4-way concurrency with `NRestarts=0`, threads and RSS plateaued; lab matrix 11/11; TUN matrix 8/8 in xudp, packetaddr and legacy; 20,000-request churn clean; fuzz smoke 7/7 |
+| Host network | IPv6 disabled (`all/default/lo`), BBR + fq, conntrack 65536, 600 s UDP retention |
+| SSH | `AddressFamily inet`, `0.0.0.0:22`; no IPv6 listener |
+| Verification | Hash-pinned verifier PASS for plain and IPv4 HTTP/2 tunnel with `EXPECT_HOST_IPV6_DISABLED=1`; 120/120 HTTP 200 soak at 4-way concurrency; `NRestarts=0`; 44 threads, 17 MiB RSS, 208 fds at the verification snapshot (fds vary with active relays); cover TLS 1.3 `*.whatsapp.net`; lab matrix 11/11; TUN matrix 8/8 in xudp, packetaddr and legacy; `make check` 373 tests (local client stopped; see Verification before commit) and `make smoke` PASS |
 
-The deployed binary includes the XUDP junk-reply idle-pinning fix (`2163c0a`),
-the mux-wide resolution/send-stall fix (`e0ca0bc`), the 2026-11-03
-handshake/legacy-UDP/End-enqueue hardening, the bounded in-flight replay
-reservation (`647623b`), and the 2026-11-06 hardening batch: XUDP socket-budget
-validation, control-frame idle pinning, Vision empty-block rejection, replay
-first-wins with a 300-second timestamp/cache window, cancellable cover relays,
-bounded legacy UDP, parallel resolver lookups, and the descriptor budget check,
-plus the packetaddr unbound-family admission fix (`5a1cc82`), the counted XUDP
-End control reserve (`fb45eda`), and the deploy preflight fd-limit fix
-(`8c64e5c`).
-The process-wide resolver changes were reverted after intermittent client DNS
-failures (`64d9856`); production runs `f4a0c68`, which includes that revert.
-Remaining
-code-confirmed backpressure and lower-risk resource items in
-`STRESS-FINDINGS.md` are still tracked; the full release gates remain the
-24 h soak, privileged syscall/wakeup/splice measurements, cgroup OOM sampling,
-and final fuzzing.
+Production is IPv4-only end to end: the beam drop-in
+`/etc/systemd/system/beam.service.d/99-ipv4-only.conf` resets the base family
+list before setting `RestrictAddressFamilies=AF_INET AF_UNIX`; host IPv6 is
+disabled by `/etc/sysctl.d/99-beam-ipv6-disable.conf`
+(`all/default/lo.disable_ipv6=1`); and
+`/etc/ssh/sshd_config.d/61-ipv4-only.conf` sets `AddressFamily inet`. The host
+has no IPv6 addresses, routes, or listeners, and `sshd` listens on
+`0.0.0.0:22` only. The kernel IPv6 module is not unloaded and no
+`ipv6.disable=1` kernel-cmdline change is made. IPv6 HTTP/2 is intentionally
+not used in production verification.
+
+The release candidate is the annotated tag `v0.1.0-rc.1`. Production still
+runs the pre-release dirty build `0.1.0 (1b9113cde356-dirty)` (binary
+`6a9b4ffb…`, config `d20d16…`, drop-in `f852fce5…`) and is not redeployed by
+this tag. The RC contains the current server fixes plus the IPv4-only client
+and deployment artifacts. It includes the XUDP junk-reply
+idle-pinning fix (`2163c0a`), the mux-wide resolution/send-stall fix
+(`e0ca0bc`), the 2026-11-03 handshake/legacy-UDP/End-enqueue hardening, the
+bounded in-flight replay reservation (`647623b`), and the 2026-11-06 hardening
+batch: XUDP socket-budget validation, control-frame idle pinning, Vision
+empty-block rejection, replay first-wins with a 300-second timestamp window
+and 601-second retention, cancellable cover relays, bounded legacy UDP,
+bounded resolver lookups, and the descriptor budget check, plus the packetaddr
+unbound-family admission fix (`5a1cc82`), the counted XUDP End control reserve
+(`fb45eda`), and the deploy preflight fd-limit fix (`8c64e5c`).
+The 2026-11-08 follow-up adds the coalesced `New+End` empty-mux timer restart,
+KeepAlive/retained-GlobalID idle isolation, the 2 MiB per-mux reply budget
+inside the 32 MiB process-wide budget, transient legacy UDP send-error
+handling, deterministic timestamp-boundary tests, installer rollback
+hardening, and secure deploy staging/HTTP/2 verification.
+The later IPv4-only client-profile and production-drop-in changes are
+client/deployment artifacts; they are not part of the deployed server binary.
+The process-wide resolver changes remain reverted after intermittent client DNS
+failures (`64d9856`); resolution is bounded to four concurrent lookups per mux.
+The RC is cut with these known gaps; the 24 h soak, privileged
+syscall/wakeup/splice measurements, cgroup OOM sampling, and final fuzzing
+are required for stable and were not completed for this tag.
 
 ## Where to look
 
@@ -63,13 +85,18 @@ The target profile is:
 - Direct (`freedom`) outbound;
 - a full-TUN client such as sing-box, Hiddify, or stock Xray.
 
-The server carries TCP, UDP, DNS, QUIC/HTTP3, IPv4, and IPv6 through the
-tunnel. The recommended stock-client profiles intentionally reject public
-UDP/443 before sniffing so H3/QUIC falls back immediately to HTTP/2; the
-server-side XUDP/legacy paths remain available for profiles that explicitly
-allow H3. ICMP is not carried, matching stock Xray. The server must remain
-compatible with stock clients using the same UUID, public key, short ID, SNI,
-and flow.
+The server code carries TCP, UDP, DNS, QUIC/HTTP3, IPv4, and IPv6 through the
+tunnel. Production is IPv4-only end to end: the systemd drop-in narrows the
+service, host IPv6 is disabled, and `sshd` is IPv4-only. The lab and TUN
+harnesses still exercise IPv6 server paths; the local Linux client
+intentionally rejects IPv6 while connected. The recommended stock-client
+profiles are IPv4-only: they reject IPv6 first, use
+`dns.strategy: ipv4_only`, and carry no IPv6 TUN address. The recommended
+profiles intentionally reject public UDP/443 before sniffing so H3/QUIC falls
+back immediately to HTTP/2; the server-side XUDP/legacy paths remain available
+for profiles that explicitly allow H3. ICMP is not carried, matching stock
+Xray. The server must remain compatible with stock clients using the same
+UUID, public key, short ID, SNI, and flow.
 
 Out of scope for v1: client/TUN implementation, multi-user/panels/accounting,
 VMess/Trojan/Shadowsocks/SOCKS/HTTP, WebSocket/gRPC/H2/QUIC transports, H2MUX,
@@ -101,8 +128,14 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 360 tests: 330 `beam-core`,
-2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
+a benchmark comparison. The current workspace has 373 tests: 342 `beam-core`,
+1 `beam` CLI, 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
+When the IPv4-only Linux client is active, run the workspace checks with
+`sudo systemctl stop beam-client` and restart it afterward: sing-box's
+`auto_redirect` rules reject local IPv6 loopback, so the Rust IPv6 loopback
+tests otherwise fail. The server code and lab/TUN IPv6 coverage are unchanged.
+The client normalizers have a focused regression test:
+`python3 tests/test_ipv4_only.py`.
 
 ### One-command checks
 
@@ -122,12 +155,13 @@ boot check uses whatever binary the lab already has. Lab output is written under
 running or `LAB_SKIP_BUILD=1` to reuse the installed lab binary. The lab path
 defaults to `/home/demir/pi/beam-lab` and must match the lab scripts.
 
-### Default stock-client QUIC policy
+### Default stock-client IPv4-only and QUIC policy
 
 All recommended profiles use this pre-match rule and ordering:
 
 ```json
 [
+  {"ip_version": 6, "action": "reject"},
   {"ip_is_private": true, "outbound": "direct"},
   {"action": "reject", "network": "udp", "port": [443],
    "method": "default", "no_drop": true},
@@ -137,13 +171,21 @@ All recommended profiles use this pre-match rule and ordering:
 ]
 ```
 
-The private rule comes first so LAN destinations remain direct. The public
-UDP/443 reject is before sniff so sing-box synthesizes ICMP port unreachable
-instead of silently dropping; `no_drop` prevents burst protection from
-degrading later requests to timeouts. Public HTTP/3 therefore fails fast and
-the application uses HTTP/2 over the TCP/REALITY path. This is the default for
-Linux, Android, and the embedded Windows profile. A profile that needs H3 must
-explicitly opt in and accepts the XUDP/TCP head-of-line risk.
+The IPv6 reject is first so no IPv6 literal or AAAA-derived destination can
+escape the IPv4-only tunnel. The private rule comes next so IPv4 LAN
+destinations remain direct. The public UDP/443 reject is before sniff so
+sing-box synthesizes ICMP port unreachable instead of silently dropping;
+`no_drop` prevents burst protection from degrading later requests to
+timeouts. Public HTTP/3 therefore fails fast and the application uses HTTP/2
+over the TCP/REALITY path. This is the default for Linux, Android, and the
+embedded Windows profile. A profile that needs H3 must explicitly opt in and
+accepts the XUDP/TCP head-of-line risk. Normalization strips IPv6 addresses
+from DNS predefined lists and TUN address arrays, sets `dns.strategy` to
+`ipv4_only`, and re-adds a single first `ip_version: 6` reject. The Python
+normalizers only replace a UDP/443 rule whose port set is exactly `443`; a rule
+that also lists another port (for example `[443, 8443]`) is preserved. The
+Windows installer's pre-existing normalization uses a broader
+`-contains 443` predicate and is unchanged by this IPv4-only work.
 
 ## Windows tray launcher
 
@@ -174,13 +216,16 @@ elevated Windows PowerShell. It downloads the official sing-box 1.14.4 Windows
 archive, verifies the archive and individual core files, installs to
 `%ProgramFiles%\beam`, stages and checks `config.json`, sets Windows
 `strict_route` to `true`, protects the directory/config/log ACLs, and creates a
-desktop shortcut. The embedded profile uses the same route shape as the Linux
-client: private destinations direct, public UDP/443 rejected, port-53 DNS
-hijacked to DoH, and no HTTP/TLS/QUIC sniffing. The installer normalizes the decoded route rules again before
-staging, so an older embedded blob cannot reintroduce full sniffing or drop the
-UDP/443 rule. Windows therefore falls back to HTTP/2 without waiting for
-XUDP/TCP retransmission. The config is restricted to Administrators and SYSTEM.
-It is ignored by Git because it embeds real credentials.
+desktop shortcut. The embedded profile is IPv4-only (`dns.strategy:
+ipv4_only`, no IPv6 TUN address or IPv6 DoH bootstrap) and uses the same route
+shape as the Linux client: IPv6 rejected first, then private destinations
+direct, public UDP/443 rejected, port-53 DNS hijacked to DoH, and no
+HTTP/TLS/QUIC sniffing. The installer normalizes the decoded route rules again
+before staging, so an older embedded blob cannot reintroduce full sniffing,
+drop the UDP/443 rule, or move IPv6 ahead of the reject. Windows therefore
+falls back to HTTP/2 without waiting for XUDP/TCP retransmission. The config is
+restricted to Administrators and SYSTEM. It is ignored by Git because it embeds
+real credentials.
 
 Reinstall is deliberately destructive: it stops the old tray/core, unregisters
 the old logon task, removes the old Program Files and LocalAppData installs,
@@ -216,6 +261,9 @@ and no autostart entry.
 - The Linux profile sets `auto_redirect: true` on the TUN. With only
   `auto_route`, TCP through the TUN timed out; the nftables redirect path fixes
   TCP and is required on this host. Requires nftables and a root client service.
+  The profile has no IPv6 TUN address and uses `dns.strategy: ipv4_only`; with
+  `auto_redirect`, sing-box rejects IPv6 at the host, so IPv6 (including local
+  loopback) is intentionally unavailable while connected.
 - The Linux profile also rejects UDP/443 before sniffing with
   `action: reject`, `method: default`, and `no_drop: true`. sing-box emits ICMP
   port unreachable immediately, so browsers and curl fall back to HTTP/2
@@ -223,8 +271,9 @@ and no autostart entry.
   unavailable on this stock-client profile; the TCP/REALITY cover is unchanged.
 - `ExecStopPost` calls `dns-off` and restores ctrld. `Restart=no` avoids a
   restart cycle where the TUN comes back without the matching DNS state.
-- `beam-dns-reset.service` is enabled at boot and only runs when the beam DNS
-  drop-in is present, restoring ctrld after an unclean shutdown.
+- `beam-dns-reset.service` is enabled at boot and only runs when the saved
+  ctrld drop-in exists, restoring ctrld after an unclean shutdown (including a
+  crash between the rename and the beam drop-in write).
 
 Build and install:
 
@@ -254,8 +303,16 @@ normalizes the canonical QUIC reject policy, and validates the normalized
 profile before stopping the running service. An older reused profile therefore
 cannot silently keep a missing reject rule.
 
-The installer verifies the official Linux core files by SHA-256 before
-installing them. The service is installed but not enabled or started. DNS
+The installer copies the core into a private staging directory under
+`/usr/local/lib`, verifies the staged copies by SHA-256, normalizes the config,
+and runs `sing-box check` with the staged binary before it stops the service or
+touches the live core/config. If replacement of the live files fails, the
+managed config, core, helper, tray, and unit files are restored from the
+pre-install snapshot; an active service is started again with the restored
+configuration. If restoration itself fails, the installer exits nonzero and
+keeps the snapshot under `/usr/local/lib/.beam-backup.*` for recovery. The
+service is installed but not enabled or
+started. DNS
 changes use `systemctl reload systemd-resolved`, so rapid tray toggles do not
 restart the resolver or hit its start limit. The tray also applies a three
 second cooldown after each helper action. The helper only accepts fixed
@@ -276,12 +333,15 @@ The single canonical Android profile is the gitignored, mode-0600
 live UUID, REALITY keys, and Control D DoH path. `~/.config/beam/android-singbox.json`
 is only a symlink to that file.
 
-The profile keeps Android's TUN on `stack: system`, MTU 1500, `auto_route` on,
-and no generic mux. Like the Linux profile, it rejects UDP/443 before sniffing
-with `method: default` and `no_drop: true`, so H3/QUIC fails fast and the client
-falls back to HTTP/2 instead of waiting for the XUDP/TCP retransmission timeout.
-H3 is therefore intentionally unavailable in this recommended profile; the
-TCP/REALITY/WhatsApp SNI path is unchanged.
+The profile is IPv4-only: `dns.strategy` is `ipv4_only`, the TUN has no IPv6
+address, IPv6 DoH bootstrap entries are absent, and the first route rule is
+`{"ip_version": 6, "action": "reject"}`. It keeps Android's TUN on
+`stack: system`, MTU 1500, `auto_route` on, and no generic mux. Like the Linux
+profile, it rejects UDP/443 before sniffing with `method: default` and
+`no_drop: true`, so H3/QUIC fails fast and the client falls back to HTTP/2
+instead of waiting for the XUDP/TCP retransmission timeout. H3 is therefore
+intentionally unavailable in this recommended profile; the TCP/REALITY/WhatsApp
+SNI path is unchanged.
 
 ## Repository layout
 
@@ -346,11 +406,15 @@ bind.
 - Short IDs are validated and decoded at startup into fixed 8-byte values;
   comparisons are constant-time.
 - Stock has no replay cache. beam reserves in-flight handshakes before TLS and
-  inserts the first Finished handshake into a bounded 300-second replay cache.
-  Capacity scales with `max_connections` (64x, clamped to 4096..65536), and
-  REALITY timestamps older than five minutes are rejected. Concurrent
-  duplicates are first-wins: a second Finished handshake is closed rather than
-  served. This bounds both the in-flight permit race and the post-cache window.
+  inserts the first Finished handshake into a bounded exact-replay cache.
+  Capacity scales with `max_connections` (64x, clamped to 4096..65536) and is
+  wired to `limits.max_connections`. Entries are retained for twice the
+  REALITY timestamp window plus one second (601 s by default), because a
+  timestamp up to five minutes in the future is accepted and stays reusable
+  until it too falls outside the window. A full cache rejects the new
+  handshake instead of evicting a live id. Concurrent duplicates are
+  first-wins: a second Finished handshake is closed rather than served. This
+  bounds the in-flight permit race, the post-cache window, and cache pressure.
 - Unauthenticated traffic is relayed to the configured cover. Never send a
   TLS alert or a synthetic response on authentication failure.
 
@@ -386,10 +450,12 @@ bind.
 - Accept zero GlobalID and per-frame destinations from sing-box. A nonzero
   GlobalID may reattach a retained socket only within the same mux and user;
   never use GlobalID as identity or policy.
-- XUDP datagrams are capped at 7526 bytes inside an 8192-byte frame; empty or
-  oversize datagrams are dropped. Legacy UDP is capped at 8190 bytes.
-  packetaddr uses the magic `sp.packet-addr.v2fly.arpa` destination and
-  carries an inner address per datagram.
+- XUDP datagram payloads are capped at 8192 bytes; empty or oversize
+  datagrams are dropped. Legacy UDP is capped at 8190 bytes. packetaddr uses
+  the magic `sp.packet-addr.v2fly.arpa` destination and carries an inner
+  address per datagram. A 100 ms send timeout or a transient send error
+  (`WouldBlock`, `TimedOut`, `Interrupted`) on the fixed-destination legacy
+  path drops only that datagram; other send errors close the association.
 - Session sockets remain unconnected and accept replies from arbitrary UDP
   sources. This preserves stock XUDP/full-cone behavior (STUN, WebRTC, P2P).
   Only a valid, non-empty reply that passes size/frame/queue/byte-budget checks
@@ -405,11 +471,18 @@ bind.
   per-mux resolver performs DNS; the lookup owner and suffix are tracked
   separately, results carry a generation, and a newer GlobalID cancels older
   pending New frames. IP frames, queued suffixes, and rejected replies retain
-  their ordering. Resolved domains are cached for 300 seconds. The resolver is
-  serial per mux, pending payload has a process-wide 4 MiB budget plus bounded
-  metadata, and UDP send/close waits are capped at 100 ms. This is not
-  universally nonblocking: a sequence of slow domains, a congested send, or
-  many close operations can still delay a mux briefly.
+  their ordering. Resolved domains are cached for 300 seconds. A mux runs at
+  most four concurrent lookups; the resolver permit is held until the result
+  is queued, so a full result channel backpressures the request queue instead
+  of spawning unbounded tasks. Pending payload has a process-wide 4 MiB budget
+  plus bounded metadata, and UDP send/close waits are capped at 100 ms. This is
+  not universally nonblocking: a sequence of slow domains, a congested send,
+  or many close operations can still delay a mux briefly.
+- Reply bytes are bounded by a 2 MiB per-mux budget inside the 32 MiB
+  process-wide budget; one slow reader cannot hold the whole global allowance.
+- An empty mux closes after `session_idle_timeout` even while KeepAlive frames
+  arrive or a retained GlobalID socket is waiting for `close_expiry`. Retained
+  sockets do not extend the empty-mux timer.
 - Live XUDP limits are 1024 process-wide sessions and 128 KiB per socket
   receive buffer; a mux holds at most half the global active slots. XUDP idle
   expiry is at most 60 seconds even when the TCP relay idle timeout is 300
@@ -502,48 +575,123 @@ sustained swap.
 ```bash
 source scripts/dev-env.sh
 BUNDLE=$(bash deploy/package.sh | sed -n 's/^bundle=//p')
-scp -i "$SSH_KEY" "$BUNDLE" "$SERVER:/tmp/beam-deploy.tar.gz"
-ssh -i "$SSH_KEY" "$SERVER" 'chmod 600 /tmp/beam-deploy.tar.gz'
-ssh -i "$SSH_KEY" "$SERVER" \
-  'rm -rf /tmp/beam-deploy && mkdir -p /tmp/beam-deploy && tar -xzf /tmp/beam-deploy.tar.gz -C /tmp/beam-deploy && sudo -n bash /tmp/beam-deploy/bootstrap.sh'
-ssh -i "$SSH_KEY" "$SERVER" 'rm -rf /tmp/beam-deploy /tmp/beam-deploy.tar.gz'
+STAGE=$(ssh -4 -i "$SSH_KEY" "$SERVER" 'mktemp -d /tmp/beam-deploy.XXXXXXXX')
+test -n "$STAGE"
+test "$(ssh -4 -i "$SSH_KEY" "$SERVER" "stat -c %a '$STAGE'")" = 700
+trap 'ssh -4 -i "$SSH_KEY" "$SERVER" "rm -rf -- \"$STAGE\""' EXIT
+scp -4 -i "$SSH_KEY" "$BUNDLE" "$SERVER:$STAGE/beam-deploy.tar.gz"
+ssh -4 -i "$SSH_KEY" "$SERVER" "chmod 600 '$STAGE/beam-deploy.tar.gz'"
+ssh -4 -i "$SSH_KEY" "$SERVER" "tar -xzf '$STAGE/beam-deploy.tar.gz' -C '$STAGE'"
+ssh -4 -i "$SSH_KEY" "$SERVER" \
+  "sudo -n env BEAM_KEEP_CONFIG=1 bash '$STAGE/bootstrap.sh'"
+ssh -4 -i "$SSH_KEY" "$SERVER" "rm -rf -- '$STAGE'"
 ```
 
+`mktemp -d` creates an atomically named, mode-0700 staging directory; do not
+use a predictable `/tmp/beam-deploy` directory. Remove the secret-bearing
+stage in every outcome, including a failed rollout, after preserving local
+logs and the timestamped recovery backups.
+
 For an existing host, use
-`sudo env BEAM_KEEP_CONFIG=1 bash /tmp/beam-deploy/bootstrap.sh` to preserve
+`sudo env BEAM_KEEP_CONFIG=1 bash "$STAGE/bootstrap.sh"` to preserve
 the live `/etc/beam/config.toml` explicitly. If `BEAM_KEEP_CONFIG` is unset,
 bootstrap automatically preserves any existing `/etc/beam/config.toml`;
 replacing it requires the explicit fresh-install/update override
-`sudo env BEAM_KEEP_CONFIG=0 bash /tmp/beam-deploy/bootstrap.sh`. A plain
+`sudo env BEAM_KEEP_CONFIG=0 bash "$STAGE/bootstrap.sh"`. A plain
 `sudo bash ...` cannot inherit an exported `BEAM_KEEP_CONFIG`, so use `env`
-for both modes. The package script validates local secrets; bootstrap applies
-and validates sysctls, validates the new binary as the unprivileged service
-user, backs up replaced files, rolls back on a failed restart/readiness probe,
-prunes each backup set to five, and polls beam's own 443 listener. Verify the
+for both modes. The package script validates local secrets and bundles the
+beam IPv4-only drop-in, host IPv6 sysctl, and SSH IPv4-only drop-in. Bootstrap
+applies and validates sysctls, validates the new binary as the unprivileged
+service user, installs the beam drop-in, backs up replaced files, rolls back on
+a failed restart/readiness probe, prunes each backup set to five, and polls
+beam's own 443 listener. After beam is ready it installs the SSH
+`AddressFamily inet` drop-in and applies the host IPv6 sysctl; a failure in
+either step restores the previous SSH/sysctl state before exit. Verify the
 deployed state without printing config contents:
 
 ```bash
-SSH_KEY="$SSH_KEY" SERVER="$SERVER" deploy/verify-production.sh
-SSH_KEY="$SSH_KEY" SERVER="$SERVER" CHECK_H2=1 \
-  TUN_IFACE=sbtun0 deploy/verify-production.sh
+SSH_KEY="$SSH_KEY" SERVER="$SERVER" EXPECT_IPV4_ONLY=1 \
+  EXPECT_HOST_IPV6_DISABLED=1 deploy/verify-production.sh
+SSH_KEY="$SSH_KEY" SERVER="$SERVER" EXPECT_IPV4_ONLY=1 \
+  EXPECT_HOST_IPV6_DISABLED=1 CHECK_H2=1 \
+  TUN_IFACE=sbtun0 CHECK_H2_DST=1.1.1.1:443 CHECK_H2_FAMILY=4 \
+  deploy/verify-production.sh
 ```
 
+`EXPECT_IPV4_ONLY=1` checks that systemd reports
+`RestrictAddressFamilies=AF_INET AF_UNIX` and fails if `AF_INET6` remains.
+`EXPECT_HOST_IPV6_DISABLED=1` requires `all/default/lo.disable_ipv6=1`, zero
+IPv6 addresses, routes, and listeners, and `sshd` reporting
+`addressfamily inet`.
 `CHECK_H2=1` requires the named local tunnel and fails if it is missing. It
-verifies the path real traffic takes: three sequential HTTPS requests, then a
-held client connection that must produce a new established socket owned by beam
-on the server for the same destination (`CHECK_H2_DST`, default `1.1.1.1:443`).
-The second half is what distinguishes the tunnel from the host's direct
-uplink, because a direct path also answers the HTTPS requests. Override the hold
-length with `CHECK_H2_HOLD` (default 8 seconds); it must be at least 4 seconds,
-and IPv6 destinations work bare or bracketed. The Linux profile sets
-`auto_redirect`, so never pin probes to the tunnel device: traffic bound to it
-is not proxied. Set `EXPECTED_BINARY_SHA` and `EXPECTED_CONFIG_SHA` to make the
-script fail on a hash mismatch. Then verify end to end:
+verifies the path real traffic takes: three sequential HTTPS requests to
+`https://<CHECK_H2_DST>/cdn-cgi/trace`, each requiring HTTP 200 and negotiated
+HTTP/2, then a held client connection that must produce a new established
+socket owned by beam on the server for the same destination. The production
+profile uses `CHECK_H2_DST=1.1.1.1:443` and `CHECK_H2_FAMILY=4`; IPv6 probes
+remain available for lab use only via `CHECK_H2_FAMILY=6`. The correlated
+beam-owned socket observation during the held connection is the discriminator;
+HTTPS alone can also succeed through the host's direct uplink. Override the
+hold length with `CHECK_H2_HOLD` (default 8 seconds); it must be at least 4
+seconds. The Linux profile sets `auto_redirect`, so never pin probes to the
+tunnel device: traffic bound to it is not proxied. Set `EXPECTED_BINARY_SHA`
+and `EXPECTED_CONFIG_SHA` to make the script fail on a hash mismatch.
+
+Production uses the production-only drop-in
+`deploy/beam-ipv4-only.conf`; copy it to the host and install it as
+`/etc/systemd/system/beam.service.d/99-ipv4-only.conf`:
+
+```bash
+sudo install -d -m 0755 /etc/systemd/system/beam.service.d
+sudo install -m 0644 deploy/beam-ipv4-only.conf \
+  /etc/systemd/system/beam.service.d/99-ipv4-only.conf
+sudo systemctl daemon-reload
+sudo systemctl restart beam
+```
+
+The empty `RestrictAddressFamilies=` assignment is required: systemd appends
+repeated family assignments, so without the reset the base unit's `AF_INET6`
+remains. To roll back, remove the drop-in, reload, reset the failed state, and
+restart:
+
+```bash
+sudo rm -f /etc/systemd/system/beam.service.d/99-ipv4-only.conf
+sudo systemctl daemon-reload
+sudo systemctl reset-failed beam
+sudo systemctl restart beam
+```
+
+This narrows only the beam service's socket families. Host IPv6 and SSH are
+controlled by separate files: `deploy/99-beam-ipv6-disable.conf` (installed as
+`/etc/sysctl.d/99-beam-ipv6-disable.conf`) and
+`deploy/sshd-61-ipv4-only.conf` (installed as
+`/etc/ssh/sshd_config.d/61-ipv4-only.conf`). The fresh-host bootstrap installs
+the beam drop-in before restart, then the SSH and IPv6 files after beam is
+ready. To roll back host-wide policy, remove the SSH
+and IPv6 files, re-enable IPv6, reconfigure the IPv4-default interface, and
+reload ssh while retaining provider console access:
+
+```bash
+sudo rm -f /etc/ssh/sshd_config.d/61-ipv4-only.conf
+sudo rm -f /etc/sysctl.d/99-beam-ipv6-disable.conf
+sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 \
+  net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+iface=$(ip -o -4 route show default | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+if [ -n "$iface" ]; then
+  sudo networkctl reconfigure "$iface" || sudo systemctl restart systemd-networkd
+fi
+sudo sshd -t && sudo systemctl reload ssh
+```
+
+Then verify end to end on IPv4:
 
 ```bash
 curl -4 -sS -o /dev/null -w '%{http_code}\n' https://example.com/
-curl -6 -sS -o /dev/null -w '%{http_code}\n' https://example.com/
-curl --http3-only -sS -o /dev/null -w '%{http_code}\n' https://cloudflare-quic.com/
+# Expected failure: the default profile rejects public UDP/443.
+if curl --http3-only -sS -o /dev/null --max-time 5 https://cloudflare-quic.com/; then
+  echo 'unexpected H3 success' >&2
+  exit 1
+fi
 dig +short example.com
 ```
 
@@ -559,9 +707,12 @@ Backups are timestamped beside each installed file:
 /usr/local/bin/beam.bak-<stamp>
 /etc/beam/config.toml.bak-<stamp>
 /etc/systemd/system/beam.service.bak-<stamp>
+/etc/systemd/system/beam.service.d/99-ipv4-only.conf.bak-<stamp>
 /etc/sysctl.d/99-beam.conf.bak-<stamp>
 /etc/sysctl.d/99-beam-conntrack.conf.bak-<stamp>
+/etc/sysctl.d/99-beam-ipv6-disable.conf.bak-<stamp>
 /etc/modules-load.d/99-beam-conntrack.conf.bak-<stamp>
+/etc/ssh/sshd_config.d/61-ipv4-only.conf.bak-<stamp>
 ```
 
 Stop beam, install all required backups, validate config, run `sysctl
@@ -586,8 +737,9 @@ ICMP/ICMPv6, loopback), SSH key-only `demir`, root/debian disabled, BBR + fq,
 conntrack 65536 with 600 s UDP retention, resolver DoT/DNSSEC, and systemd
 sandboxing with `MemoryHigh=512M`, `MemoryMax=768M`, `MemorySwapMax=512M`,
 `LimitNOFILE=65536`, `TasksMax=4096`, and only `CAP_NET_BIND_SERVICE`. Test
-nftables before enabling. SSH, firewall, and resolver changes are deliberately
-not applied by `bootstrap.sh`; the systemd sysctl files are.
+nftables before enabling. The 61 address-family drop-in and the host IPv6
+sysctl are applied by `bootstrap.sh` after beam readiness; the existing 60
+authentication hardening, firewall, and resolver remain manual.
 
 ## Testing and benchmarking
 
@@ -602,9 +754,15 @@ bash tests/tun/run.sh --udp-mode legacy
 ```
 
 Each mode must report 8/8 PASS: TCP HTTP v4/v6, UDP echo v4/v6, DNS v4/v6,
-QUIC/H3, and HTTPS through Vision Direct. `BLOCKED` is not pass. If
-`/dev/net/tun` is unavailable, all rows are BLOCKED and the script exits 0.
+QUIC/H3, and HTTPS through Vision Direct. `BLOCKED` is not pass: any blocked
+row makes the harness exit 2. If `/dev/net/tun` is unavailable, all rows are
+BLOCKED and the script also exits 2; set `ALLOW_TUN_BLOCKED=1` only when
+skipping the matrix is intended.
 This harness is local and does not touch production.
+
+The coalesced `New+End` test uses real 500 ms scheduling margins and may be
+scheduler-sensitive; it is retained as a timing test, not deterministic-clock
+proof.
 
 ### Fuzz
 
@@ -665,8 +823,10 @@ errors. These are short lab comparisons, not equivalence proof; the full-A/B
 DNS p95 and HTTP p95 adverse signals remain. Bidirectional A/B had four valid
 pairs after excluding a zero-receive fifth new-arm run.
 Final Sol review: **APPROVE WITH NONBLOCKING CAVEATS**. Remaining caveats:
-the 4 MiB budget is payload-only, timing tests are scheduling-dependent, and
-there is no controlled multithreaded close/enqueue test.
+the 4 MiB resolver budget charges payload plus domain, metadata, and structural
+overhead, but it is still an estimate rather than a byte-exact allocation cap;
+timing tests are scheduling-dependent, and there is no controlled
+multithreaded close/enqueue test.
 
 ### Performance
 
@@ -706,6 +866,11 @@ specific scenario before using a number in a new release note.
 
 The BBR value is from a virtual 1 Gbps lab link, not a 5G guarantee. The soak
 is short; the 24 h soak and privileged syscall/wakeup/splice gates remain open.
+The low-rate UDP A/B is provisional: the current arm ran at 3700.1 MHz versus
+the baseline's 3600 MHz with two repetitions. Its +1.99% throughput /
+-1.10% CPU delta is frequency-confounded and is not regression-freedom
+evidence. TCP 860.6 vs 840.1 MB/s remains inside the existing 5% gate; the
+saturated UDP run was driver-bound.
 
 The local TUN matrix and cover diagnostic are:
 
@@ -729,25 +894,41 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   required.
 - **One user, one inbound, no hot reload/stats** keeps the attack surface and
   resource model bounded.
-- **Production is pinned at `f4a0c6840b1c`.** Deploys are an explicit operator
-  action, not a consequence of a green tree; source HEAD may be ahead of the
-  host. Move it only with `deploy/package.sh` plus
+- **Production is pinned at `1b9113cde356-dirty`; release source is
+  `v0.1.0-rc.1`** — the annotated RC tag contains the current fix set.
+  Production was built from the pre-release dirty tree and is not redeployed
+  by the tag. Move it only with `deploy/package.sh` plus
   `BEAM_KEEP_CONFIG=1 bootstrap.sh`, then re-run the hash-pinned verifier and
-  update the pin here.
+  update the dirty-build pin here when deployed.
+- **Production is IPv4-only at the host boundary** — the beam
+  `99-ipv4-only.conf` drop-in resets the base family list and sets
+  `RestrictAddressFamilies=AF_INET AF_UNIX`; host IPv6 is disabled
+  (`all/default/lo.disable_ipv6=1`) and `sshd` is `AddressFamily inet`. The lab
+  and TUN harness still exercise IPv6 server code; the local Linux client
+  intentionally rejects IPv6 while connected.
 
 ## Known gaps
 
-- The XUDP junk-reply idle-pinning defect and the mux-wide resolution/send
-  stalls are fixed, deployed, and lab-verified; their invariants are documented
-  above. The control-frame idle pinning, Vision empty-block spin, and cover
-  splice-permit bypass are fixed in `2469971`, and concurrent exact replays are
-  bounded in `647623b`. `STRESS-FINDINGS.md` retains the remaining
-  close/reserve, reply-budget, short-flow lifecycle, and lower-risk items.
-  Do not fold the remaining items into this note until they are fixed and
-  re-verified.
+- The XUDP junk-reply idle-pinning defect, mux-wide resolution/send stalls,
+  control-frame idle pinning, Vision empty-block spin, cover splice-permit
+  bypass, concurrent exact replays, and the 2026-11-08 reply-budget,
+  short-flow lifecycle, replay-cache, resolver-task, legacy-send, and installer
+  issues are fixed in the repository. The server deploy carries the
+  `beam-core`/`beam`/server-deploy fixes; the IPv4-only client profiles, beam
+  drop-in, SSH drop-in, and host IPv6 sysctl are deployment artifacts, and
+  client installer/tray changes are not installed by that deploy.
+  `STRESS-FINDINGS.md` retains only the lower-risk resource/CPU items (#10) and
+  the rootless Android platform limitation (#12). Do not fold those remaining
+  items into this note until they are fixed and re-verified.
+- The 11 local client `/etc/beam/config.json.bak-*` backups were removed after
+  live-profile validation; the production host retains five
+  `/etc/beam/config.toml.bak-*` recovery backups. Existing Android/Windows
+  profiles and any stock-Xray configuration are operator-managed outside this
+  repository rollout.
 - A clean 24-hour mixed soak, privileged syscall/wakeup/splice gates, cgroup
   socket-memory/OOM sampling, and a final fuzz run of the multi-record
-  ClientHello assembler remain open release-acceptance items.
+  ClientHello assembler remain required for stable promotion; they were not
+  completed for `v0.1.0-rc.1`.
 - Fully framed HTTPS uploads stay on the async path; early Direct acceleration
   requires the client to send Direct before the body (for example
   `Expect: 100-continue`). This is a performance gap, not a correctness defect.

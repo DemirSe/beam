@@ -8,8 +8,17 @@ timestamp/cache hardening, legacy UDP bounds, cover cancellation, parallel
 resolver lookups, and the descriptor budget are in `2e0a464` and deployed.
 Finding 4 is fixed in `fb45eda` and deployed.
 The process-wide resolver changes were reverted after intermittent client DNS
-failures. The remaining items below stay open. Production runs `f4a0c68`
-(SHA `b5df228…`) with `NRestarts=0`; the lab is stopped after the 11/11 checks.
+failures. Findings 10 and 12 remain open; the 2026-11-08 follow-up closed the
+lifecycle, reply-budget, replay-cache, resolver-task, legacy-send, installer,
+and harness issues listed below. Production runs `1b9113cde356-dirty`
+(SHA `6a9b4ffb…`) with `NRestarts=0`, an IPv4-only beam service drop-in, host
+IPv6 disabled (`all/default/lo.disable_ipv6=1`), zero IPv6
+addresses/routes/listeners, and `sshd` `AddressFamily inet`; the lab is stopped
+after the 11/11 checks.
+The annotated `v0.1.0-rc.1` tag is the current source release candidate.
+Stable promotion remains blocked on the 24 h soak, privileged
+syscall/wakeup/splice measurements, cgroup OOM sampling, and final fuzzing;
+findings 10/12 remain open known gaps.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 
@@ -22,8 +31,8 @@ Do not treat the latter as fixed or as measured production incidents.
 | # | Status | Area | Summary |
 |---:|---|---|---|
 | 4 | fixed `fb45eda` | XUDP close | Counted `SlotGuard` reservations make the End reserve strict; an End is still dropped and counted when all eight reserved slots are held. |
-| 5 | open | XUDP reply budget | The process-wide 32 MiB budget lets a slow reader delay unrelated mux streams. |
-| 9 | open | XUDP lifecycle | Short GlobalID flows can retain a socket and mux permit for about two close timers. |
+| 5 | fixed 2026-11-08 | XUDP reply budget | A 2 MiB per-mux cap inside the 32 MiB process-wide budget prevents one slow reader from starving other mux streams. |
+| 9 | fixed 2026-11-08 | XUDP lifecycle | The empty-mux timer now tracks active sessions only, so retained GlobalID sockets cannot add another close timer. |
 | 10 | open | Lower-risk resources | Remaining mux-abort cleanup and session-table lock items; cover/Vision cancellation and CPU-spin issues are fixed. |
 | 12 | open | Client platform | Rootless Android cannot enable BBR while preserving the REALITY outer TCP cover. |
 
@@ -177,13 +186,14 @@ A 5-rep A/B before the final owner/generation amendment: clean up/down
 0.975x, RTT50 0.987x, CPU up/down 0.991x/1.026x. Focused 10-pair DNS on final
 source: QPS **0.996x**, p95 **1.023x**, zero errors. Bidirectional: four valid
 pairs after excluding a zero-receive fifth new-arm run. Sol: **APPROVE WITH
-NONBLOCKING CAVEATS** (payload-only budget, scheduling-sensitive tests, no
+NONBLOCKING CAVEATS** (the 4 MiB budget is an estimated retained-cost cap,
+not a byte-exact allocation cap, scheduling-sensitive tests, no
 controlled multithreaded close test; no universal nonblocking claim).
 
-Residual: resolver lookups are serial per mux; a sequence of slow domains,
-congested sends, or close bursts can still delay a mux briefly. The 4 MiB
-budget now charges payload, domain bytes, and a `size_of` floor; allocator
-capacity slack above that estimate is not charged.
+Residual: resolver lookups are bounded to four concurrent per mux; a sequence
+of slow domains, congested sends, or close bursts can still delay a mux
+briefly. The 4 MiB budget now charges payload, domain bytes, and a `size_of`
+floor; allocator capacity slack above that estimate is not charged.
 
 ### 3. [RESOLVED] Burst `End` closes still serialize on 250 ms — MEDIUM-HIGH, code-confirmed
 
@@ -213,7 +223,7 @@ with twenty flooded datagrams at a stalled writer: eight are admitted, twelve
 are dropped, and the End still queues. `control_reserve_bounds_concurrent_ends`
 covers the eight-End bound.
 
-### 5. Process-wide 32 MiB reply budget couples slow and fast mux streams — MEDIUM, code-confirmed
+### 5. [RESOLVED] Process-wide 32 MiB reply budget couples slow and fast mux streams — MEDIUM, code-confirmed
 
 `crates/beam-core/src/xudp/session.rs:94`, `404-409`;
 `crates/beam-core/src/xudp/server.rs:258-285`
@@ -223,8 +233,13 @@ queue. Other mux streams then drop replies until the slow writer times out or
 drains. The single slow-reader probe did not exhaust the budget, but the
 coupling is global and affects unrelated sessions.
 
-Fix direction: per-mux byte fairness or a per-stream cap within the global
-budget.
+Fixed 2026-11-08: every mux has a 2 MiB `ReplyQueueBudget` inside the global
+32 MiB budget. A reply reserves the per-stream bytes before the global bytes,
+and the stream permit is held by the queued frame until the writer drains it.
+Ten stalled muxes now leave more than 12 MiB of global budget headroom, so an
+unrelated 8 KiB echo is delivered; with a 32 MiB per-mux cap the same test
+times out because the global budget is exhausted. Unit coverage includes
+reservation, release, and the starvation regression.
 
 ### 6. [RESOLVED] 1 ms timeouts pass `--check` — HIGH operational risk
 
@@ -251,22 +266,26 @@ The concurrent-copy permit pressure is bounded: `647623b` adds a maximum of
 four in-flight reservations per exact replay id and releases them on handshake
 failure (lab: 905/1024 pre-fix, 12 post-fix). Completion is first-wins: a
 duplicate that also reaches TLS Finished is rejected rather than served as a
-second authenticated session. The replay cache retains entries for 300 seconds
-and scales with `max_connections` (64x, clamped to 4096..65536). REALITY
-timestamps older than five minutes are rejected, so a captured ClientHello
-cannot become reusable when the cache expires. Stock Xray has no cache, so this
-remains a deliberate security tradeoff rather than an interop feature.
+second authenticated session. The replay cache retains entries for twice the
+REALITY timestamp window plus one second (601 s by default) and scales with
+`max_connections` (64x, clamped to 4096..65536, wired in `build_tls_config`).
+A full cache rejects a new handshake instead of evicting a live id, so a
+captured ClientHello cannot become reusable because its entry was evicted.
+Stock Xray has no cache, so this remains a deliberate security tradeoff rather
+than an interop feature.
 
-### 9. Short GlobalID flows can pin a mux/connection for about 120 s — MEDIUM, code-confirmed
+### 9. [RESOLVED] Short GlobalID flows can pin a mux/connection for about 120 s — MEDIUM, code-confirmed
 
-`crates/beam-core/src/xudp/server.rs:804-861`, `939-944`
+`crates/beam-core/src/xudp/server.rs` (`has_active_sessions`, `read_loop`)
 
-A clean GlobalID close can retain the socket for `close_expiry` (60 s). Once
-retained state is gone, the empty-stream timer can add another 60 s before the
-mux teardown releases its connection permit. Frequent short UDP flows can
-therefore contribute to authenticated/XUDP pressure after the application is
-finished. This was not reproduced as a leak this round; it is a lifecycle
-accounting risk.
+A clean GlobalID close can retain the socket for `close_expiry` (60 s). The
+old empty-stream timer counted active plus retained sessions, so the mux could
+add another idle timeout before teardown. The timer now checks
+`active_len() > 0` only and uses `get_or_insert` on the batch path, so
+KeepAlive frames and retained sockets cannot reset it. A mux with only retained
+state closes after `session_idle_timeout` and releases the retained permit at
+shutdown. `empty_mux_keepalive_does_not_extend_idle` and
+`short_globalid_flow_does_not_wait_for_retention` cover both cases.
 
 ### 10. Lower-risk resource/CPU items
 
@@ -347,8 +366,8 @@ separate product decision because it changes the visible transport.
   baseline; the unpatched binary kept it open. Legitimate echo control expired
   normally on both.
 - Domain resolution isolation is bounded, not a claim that every mux operation
-  is nonblocking; serial resolver, 100 ms send/close bounds, and End enqueue
-  remain.
+  is nonblocking; bounded resolver concurrency, 100 ms send/close bounds, and
+  End enqueue remain.
 
 ## Next actions
 
@@ -356,17 +375,31 @@ separate product decision because it changes the visible transport.
    `2163c0a`; deployed.
 2. ~~Remove the XUDP read-loop stalls (finding 2).~~ Done in `e0ca0bc`;
    deployed with documented residual bounds.
-3. Separate control queue for a strict End reserve (4).
-4. Per-mux reply-budget fairness (5).
+3. ~~Separate control queue for a strict End reserve (4).~~ Done (`fb45eda`).
+4. ~~Per-mux reply-budget fairness (5).~~ Done 2026-11-08.
 5. ~~Bound concurrent in-flight replays and timestamp window (8).~~ Shipped:
-   first-wins completion, 300 s cache, and five-minute timestamp window.
-6. Short-GlobalID lifecycle accounting (9).
-7. Resume the 24 h/privileged/fuzz release gates after the remaining findings.
+   first-wins completion, five-minute timestamp window, and a 300 s cache at
+   that time; current retention is 601 s.
+6. ~~Short-GlobalID lifecycle accounting (9).~~ Done 2026-11-08.
+7. Complete the post-v0.1.0-rc.1 stable-validation backlog: 24 h soak,
+   privileged syscall/wakeup/splice measurements, cgroup OOM sampling, and
+   final fuzzing.
 8. Test the external BBR Linux gateway path for finding 12 under the same loss
    matrix while keeping TCP/443 + `whatsapp.net` on the WAN side.
 9. If 8 does not hold, quantify custom-client pacing/queue only; treat
    Hysteria2/TUIC or another QUIC transport as a separate cover-changing
    product decision.
+
+## 2026-11-08 follow-up
+
+The lab-verified audit findings were fixed together: B0 (resolver permit held
+until the result is queued), B1 (exact-443 QUIC rule matching), B2 (TUN harness
+exit 2 when blocked), B3/B4 (wired replay capacity, 601 s retention,
+fail-closed insert), B5/K2 (active-only empty-mux timer), B6 (DNS reset
+condition on the saved ctrld drop-in), B7 (stage, hash, and `sing-box check`
+before the live core/config), B8 (transient legacy send errors drop one
+datagram), K1 (2 MiB per-mux reply budget), and K2's two-timer retention
+interaction. README and this file were updated with the measured behavior.
 
 ## Reproduction notes
 
