@@ -20,6 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -29,9 +30,9 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 
 use super::session::{
-    ActiveSession, ExpiringSession, QueuedFrame, ResolveError, Session, SessionTable, SocketFamily,
-    XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame, resolve_destination,
-    socket_addr_to_location, spawn_reply_task,
+    ActiveSession, ExpiringSession, QueuedFrame, ResolveError, Session, SessionTable, SlotGuard,
+    SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
+    resolve_destination, socket_addr_to_location, spawn_reply_task,
 };
 use crate::address::{Address, NetLocation};
 use crate::xudp::frame::{
@@ -550,6 +551,8 @@ struct MuxState {
     config: Arc<XudpConfig>,
     table: Arc<Mutex<SessionTable>>,
     outbound: mpsc::Sender<QueuedFrame>,
+    /// Counted reply-queue reservations shared by data and control frames.
+    queued: Arc<AtomicUsize>,
     limiter: XudpSessionLimiter,
 }
 
@@ -578,6 +581,7 @@ where
 
     let (mut reader, writer) = tokio::io::split(stream);
     let (outbound, inbound) = mpsc::channel(config.max_queued_replies);
+    let queued = Arc::new(AtomicUsize::new(0));
     let (writer_failed, mut writer_failed_rx) = watch::channel(false);
     let mut writer_task = tokio::spawn(write_loop(
         writer,
@@ -592,6 +596,7 @@ where
         config: config.clone(),
         table: Arc::clone(&table),
         outbound,
+        queued,
         limiter,
     };
 
@@ -1144,6 +1149,7 @@ impl MuxState {
         let reply_task = spawn_reply_task(
             Arc::clone(&session),
             self.outbound.clone(),
+            Arc::clone(&self.queued),
             Arc::clone(&self.table),
             Arc::clone(&self.config),
             self.limiter.clone(),
@@ -1389,7 +1395,19 @@ impl MuxState {
             self.limiter.metrics().record_xudp_end_dropped();
             return Err(MuxError::Encode);
         }
-        match self.outbound.try_send(QueuedFrame::new(frame, None)) {
+        let Some(slot) = SlotGuard::try_acquire(&self.queued, self.config.max_queued_replies)
+        else {
+            self.limiter.metrics().record_xudp_end_dropped();
+            tracing::debug!(
+                session_id = id,
+                "XUDP End frame dropped because the control reserve is exhausted"
+            );
+            return Ok(());
+        };
+        match self
+            .outbound
+            .try_send(QueuedFrame::new(frame, None, Some(slot)))
+        {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.limiter.metrics().record_xudp_end_dropped();
@@ -1519,10 +1537,11 @@ mod tests {
         XudpError, encode_frame, parse_frame,
     };
     use crate::xudp::session::{
-        ActiveSession, QueuedFrame, Session, SessionTable, SocketFamily, XudpConfig,
+        ActiveSession, QueuedFrame, Session, SessionTable, SlotGuard, SocketFamily, XudpConfig,
         XudpConfigError, XudpSessionLimiter, spawn_reply_task,
     };
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -1543,17 +1562,18 @@ mod tests {
         let limiter = XudpSessionLimiter::default();
         let (outbound, _inbound) = mpsc::channel(config.max_queued_replies);
         outbound
-            .send(QueuedFrame::new(vec![1], None))
+            .send(QueuedFrame::new(vec![1], None, None))
             .await
             .expect("first slot");
         outbound
-            .send(QueuedFrame::new(vec![2], None))
+            .send(QueuedFrame::new(vec![2], None, None))
             .await
             .expect("second slot");
         let state = MuxState {
             config: Arc::clone(&config),
             table: Arc::new(Mutex::new(SessionTable::default())),
             outbound,
+            queued: Arc::new(AtomicUsize::new(0)),
             limiter: limiter.clone(),
         };
 
@@ -1567,6 +1587,133 @@ mod tests {
             "End waited for the full io_timeout"
         );
         assert_eq!(limiter.metrics().snapshot().xudp_end_dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn data_pressure_cannot_consume_the_control_reserve() {
+        // Drive the real reply task: a sender floods the session socket while
+        // the writer channel is not drained. Data may fill only
+        // `max_queued_replies - reserve`, so the End must still fit.
+        let config = Arc::new(XudpConfig {
+            max_datagram_size: 64,
+            max_queued_replies: 16,
+            io_timeout: Duration::from_secs(1),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::default();
+        let (outbound, mut inbound) = mpsc::channel(config.max_queued_replies);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let state = MuxState {
+            config: Arc::clone(&config),
+            table: Arc::clone(&table),
+            outbound: outbound.clone(),
+            queued: Arc::clone(&queued),
+            limiter: limiter.clone(),
+        };
+
+        let socket = Arc::new(
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("session socket"),
+        );
+        let address = socket.local_addr().expect("session address");
+        let session = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            None,
+        ));
+        let task = spawn_reply_task(
+            Arc::clone(&session),
+            outbound,
+            Arc::clone(&queued),
+            Arc::clone(&table),
+            Arc::clone(&config),
+            limiter.clone(),
+        );
+
+        let sender = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("sender socket");
+        for byte in 0..20u8 {
+            sender.send_to(&[byte], address).await.expect("flood send");
+        }
+        let mut waited = Duration::ZERO;
+        while limiter.metrics().snapshot().xudp_replies_dropped < 12 {
+            assert!(waited < TEST_TIMEOUT, "the flood was not admitted");
+            sleep(Duration::from_millis(5)).await;
+            waited += Duration::from_millis(5);
+        }
+
+        // Eight data replies hold the data class; the End uses the reserve.
+        state.try_send_end(7, false);
+        for _ in 0..8 {
+            let queued_frame = timeout(TEST_TIMEOUT, inbound.recv())
+                .await
+                .expect("data reply timed out")
+                .expect("data frame");
+            let (frame, _) = parse_frame(&queued_frame.bytes)
+                .expect("data parse")
+                .expect("complete data frame");
+            assert_eq!(frame.status, SessionStatus::Keep);
+        }
+        let queued_frame = timeout(TEST_TIMEOUT, inbound.recv())
+            .await
+            .expect("end frame timed out")
+            .expect("end frame");
+        let (frame, _) = parse_frame(&queued_frame.bytes)
+            .expect("end parse")
+            .expect("complete end frame");
+        assert_eq!(frame.session_id, 7);
+        assert_eq!(frame.status, SessionStatus::End);
+        assert_eq!(limiter.metrics().snapshot().xudp_end_dropped, 0);
+
+        session.stop();
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("reply task must stop")
+            .expect("reply task panicked");
+    }
+
+    #[tokio::test]
+    async fn control_reserve_bounds_concurrent_ends() {
+        let config = Arc::new(XudpConfig {
+            max_queued_replies: 16,
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::default();
+        let (outbound, mut inbound) = mpsc::channel(config.max_queued_replies);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let state = MuxState {
+            config: Arc::clone(&config),
+            table: Arc::new(Mutex::new(SessionTable::default())),
+            outbound: outbound.clone(),
+            queued: Arc::clone(&queued),
+            limiter: limiter.clone(),
+        };
+
+        let mut held = Vec::new();
+        for _ in 0..config.max_queued_replies {
+            held.push(
+                SlotGuard::try_acquire(&queued, config.max_queued_replies).expect("control slot"),
+            );
+        }
+        state.try_send_end(7, false);
+        assert_eq!(limiter.metrics().snapshot().xudp_end_dropped, 1);
+        assert!(
+            inbound.try_recv().is_err(),
+            "a dropped End must not reach the queue"
+        );
+
+        drop(held);
+        state.try_send_end(7, false);
+        assert!(
+            inbound.try_recv().is_ok(),
+            "a released slot must admit the next End"
+        );
     }
 
     fn test_config() -> Arc<XudpConfig> {
@@ -1612,6 +1759,7 @@ mod tests {
         let reply_task = spawn_reply_task(
             Arc::clone(&session),
             state.outbound.clone(),
+            Arc::clone(&state.queued),
             Arc::clone(&state.table),
             Arc::clone(&state.config),
             state.limiter.clone(),
@@ -1759,6 +1907,7 @@ mod tests {
         let limiter = XudpSessionLimiter::new(2);
         let table = Arc::new(Mutex::new(SessionTable::default()));
         let (outbound, mut inbound) = mpsc::channel(config.max_queued_replies);
+        let queued = Arc::new(AtomicUsize::new(0));
 
         // Victim session: closed while the writer queue is full.
         let victim_socket = Arc::new(
@@ -1805,6 +1954,7 @@ mod tests {
         let live_task = spawn_reply_task(
             Arc::clone(&live),
             outbound.clone(),
+            Arc::clone(&queued),
             Arc::clone(&table),
             Arc::clone(&config),
             limiter.clone(),
@@ -1824,7 +1974,7 @@ mod tests {
         // permits; the victim's End must time out and its permit must return.
         for byte in 0..4u8 {
             outbound
-                .send(QueuedFrame::new(vec![byte], None))
+                .send(QueuedFrame::new(vec![byte], None, None))
                 .await
                 .expect("queue slot");
         }
@@ -1832,6 +1982,7 @@ mod tests {
             config: Arc::clone(&config),
             table: Arc::clone(&table),
             outbound: outbound.clone(),
+            queued,
             limiter: limiter.clone(),
         };
         let active = table
@@ -2255,10 +2406,11 @@ mod tests {
             config: Arc::clone(&config),
             table: Arc::clone(&table),
             outbound: outbound.clone(),
+            queued: Arc::new(AtomicUsize::new(0)),
             limiter: limiter.clone(),
         };
         outbound
-            .try_send(QueuedFrame::new(vec![0], None))
+            .try_send(QueuedFrame::new(vec![0], None, None))
             .expect("fill the only queue slot");
 
         for id in 0..10 {
@@ -2978,6 +3130,7 @@ mod tests {
             config: Arc::clone(&config),
             table: Arc::clone(&table),
             outbound: outbound.clone(),
+            queued: Arc::new(AtomicUsize::new(0)),
             limiter: limiter.clone(),
         };
 
@@ -3038,6 +3191,7 @@ mod tests {
             config: Arc::clone(&config),
             table: Arc::clone(&table),
             outbound: outbound.clone(),
+            queued: Arc::new(AtomicUsize::new(0)),
             limiter: limiter.clone(),
         };
 

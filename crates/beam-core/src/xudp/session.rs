@@ -618,20 +618,68 @@ pub(crate) async fn resolve_destination(
     }
 }
 
+/// One reserved slot in a mux reply queue.
+///
+/// The slot is counted before the frame enters the channel, so a per-class
+/// limit holds even when several tasks reserve at the same time. The guard
+/// releases the slot when the frame is written or dropped.
+pub(crate) struct SlotGuard {
+    queued: Arc<AtomicUsize>,
+}
+
+impl SlotGuard {
+    /// Reserves one slot while the counter stays below `limit`.
+    pub(crate) fn try_acquire(queued: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let mut current = queued.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match queued.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        queued: Arc::clone(queued),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// One encoded frame waiting for the mux writer.
 ///
 /// `budget` is held until the writer has written (or dropped) the frame, so
 /// aggregate queued bytes stay bounded even when many streams are slow.
+/// `_slot` releases the counted queue reservation when the frame leaves the
+/// queue.
 pub(crate) struct QueuedFrame {
     pub(crate) bytes: Vec<u8>,
     _budget: Option<OwnedSemaphorePermit>,
+    _slot: Option<SlotGuard>,
 }
 
 impl QueuedFrame {
-    pub(crate) fn new(bytes: Vec<u8>, budget: Option<OwnedSemaphorePermit>) -> Self {
+    pub(crate) fn new(
+        bytes: Vec<u8>,
+        budget: Option<OwnedSemaphorePermit>,
+        slot: Option<SlotGuard>,
+    ) -> Self {
         Self {
             bytes,
             _budget: budget,
+            _slot: slot,
         }
     }
 }
@@ -935,11 +983,14 @@ impl SessionTable {
 pub(crate) fn spawn_reply_task(
     session: Arc<Session>,
     outbound: mpsc::Sender<QueuedFrame>,
+    queued: Arc<AtomicUsize>,
     table: Arc<Mutex<SessionTable>>,
     config: Arc<XudpConfig>,
     limiter: XudpSessionLimiter,
 ) -> JoinHandle<()> {
-    tokio::spawn(reply_loop(session, outbound, table, config, limiter))
+    tokio::spawn(reply_loop(
+        session, outbound, queued, table, config, limiter,
+    ))
 }
 
 /// Largest number of reply-queue slots held back for control frames.
@@ -961,6 +1012,7 @@ pub(crate) fn control_queue_reserve(max_queued_replies: usize) -> usize {
 async fn reply_loop(
     session: Arc<Session>,
     outbound: mpsc::Sender<QueuedFrame>,
+    queued: Arc<AtomicUsize>,
     table: Arc<Mutex<SessionTable>>,
     config: Arc<XudpConfig>,
     limiter: XudpSessionLimiter,
@@ -975,6 +1027,11 @@ async fn reply_loop(
     let mut buffer = vec![0u8; config.max_datagram_size.saturating_add(1)];
     let mut failed = false;
     let metrics = limiter.metrics();
+    // Data replies may only raise the queue counter to this limit. The
+    // difference up to `max_queued_replies` is held for End control frames.
+    let data_limit = config
+        .max_queued_replies
+        .saturating_sub(control_queue_reserve(config.max_queued_replies));
 
     loop {
         tokio::select! {
@@ -1012,17 +1069,18 @@ async fn reply_loop(
                             continue;
                         };
 
-                        // Keep a small FIFO reserve for End control frames.
-                        // Data stops before the queue is completely full, so a
-                        // closing session does not wait behind the last burst.
-                        if outbound.capacity() <= control_queue_reserve(config.max_queued_replies) {
+                        // Count the slot before reserving the channel permit.
+                        // Data stops at `data_limit`, so concurrent reply
+                        // tasks can never take the slots kept free for End
+                        // control frames.
+                        let Some(slot) = SlotGuard::try_acquire(&queued, data_limit) else {
                             tracing::trace!(
                                 session_id = session.id,
                                 "XUDP reply queue is reserving control capacity; dropping a datagram"
                             );
                             metrics.record_xudp_reply_dropped();
                             continue;
-                        }
+                        };
 
                         // Reserve the queue slot and the aggregate byte budget
                         // before allocating or encoding. A reply that cannot be
@@ -1082,7 +1140,7 @@ async fn reply_loop(
                         if session.is_closed() {
                             break;
                         }
-                        permit.send(QueuedFrame::new(frame, Some(budget)));
+                        permit.send(QueuedFrame::new(frame, Some(budget), Some(slot)));
                         session.touch();
                     }
                     Err(error) => {
@@ -1101,7 +1159,14 @@ async fn reply_loop(
     }
 
     if failed && session.mark_closed() {
-        queue_failed_session_end(&table, &outbound, &session, &metrics);
+        queue_failed_session_end(
+            &table,
+            &outbound,
+            &queued,
+            config.max_queued_replies,
+            &session,
+            &metrics,
+        );
     }
 }
 
@@ -1115,6 +1180,8 @@ async fn reply_loop(
 fn queue_failed_session_end(
     table: &Mutex<SessionTable>,
     outbound: &mpsc::Sender<QueuedFrame>,
+    queued: &Arc<AtomicUsize>,
+    max_queued: usize,
     session: &Arc<Session>,
     metrics: &Metrics,
 ) -> bool {
@@ -1125,8 +1192,19 @@ fn queue_failed_session_end(
     }
     metrics.record_xudp_closed_error();
     let end = encode_end_frame(session.id, true);
-    if !end.is_empty() && outbound.try_send(QueuedFrame::new(end, None)).is_err() {
-        metrics.record_xudp_end_dropped();
+    if !end.is_empty() {
+        // Control frames may use the whole queue, including the slots data
+        // replies left free. A failure here still releases the session.
+        let Some(slot) = SlotGuard::try_acquire(queued, max_queued) else {
+            metrics.record_xudp_end_dropped();
+            return true;
+        };
+        if outbound
+            .try_send(QueuedFrame::new(end, None, Some(slot)))
+            .is_err()
+        {
+            metrics.record_xudp_end_dropped();
+        }
     }
     drop(table);
     drop(removed);
@@ -1213,6 +1291,7 @@ mod tests {
     };
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::net::UdpSocket;
     use tokio::time::{Instant, timeout};
@@ -1262,6 +1341,7 @@ mod tests {
         let task = tokio::spawn(reply_loop(
             Arc::clone(&session),
             outbound,
+            Arc::new(AtomicUsize::new(0)),
             Arc::clone(&table),
             Arc::clone(&config),
             limiter.clone(),
@@ -1684,9 +1764,12 @@ mod tests {
         assert!(old.mark_closed());
 
         let (outbound, mut inbound) = tokio::sync::mpsc::channel(4);
+        let queued = Arc::new(AtomicUsize::new(0));
         assert!(!queue_failed_session_end(
             &table,
             &outbound,
+            &queued,
+            4,
             &old,
             &limiter.metrics()
         ));
@@ -1701,6 +1784,8 @@ mod tests {
         assert!(queue_failed_session_end(
             &table,
             &outbound,
+            &queued,
+            4,
             &replacement,
             &limiter.metrics()
         ));
