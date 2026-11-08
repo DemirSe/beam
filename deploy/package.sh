@@ -30,10 +30,14 @@ install -m 0644 "$HERE/beam.service" "$OUT/beam.service"
 install -m 0644 "$HERE/99-beam.conf" "$OUT/99-beam.conf"
 install -m 0644 "$HERE/99-beam-conntrack.conf" "$OUT/99-beam-conntrack.conf"
 install -m 0644 "$HERE/99-beam-conntrack.modules" "$OUT/99-beam-conntrack.modules"
+install -m 0644 "$HERE/beam-ipv4-only.conf" "$OUT/beam-ipv4-only.conf"
+install -m 0644 "$HERE/99-beam-ipv6-disable.conf" "$OUT/99-beam-ipv6-disable.conf"
+install -m 0644 "$HERE/sshd-61-ipv4-only.conf" "$OUT/sshd-61-ipv4-only.conf"
 install -m 0755 "$HERE/bootstrap.sh" "$OUT/bootstrap.sh"
 tar -C "$OUT" -czf "$OUT/beam-deploy.tar.gz" \
   beam beam.toml beam.service 99-beam.conf 99-beam-conntrack.conf \
-  99-beam-conntrack.modules bootstrap.sh
+  99-beam-conntrack.modules beam-ipv4-only.conf 99-beam-ipv6-disable.conf \
+  sshd-61-ipv4-only.conf bootstrap.sh
 chmod 0600 "$OUT/beam-deploy.tar.gz"
 sha256sum "$OUT/beam-deploy.tar.gz" > "$OUT/beam-deploy.tar.gz.sha256"
 echo "bundle=$OUT/beam-deploy.tar.gz"
