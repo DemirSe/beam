@@ -7,8 +7,8 @@ the four deployed 2026-11-06 fixes are in `2469971`; first-wins replay,
 timestamp/cache hardening, legacy UDP bounds, cover cancellation, parallel
 resolver lookups, and the descriptor budget are in `2e0a464` and deployed.
 The process-wide resolver changes were reverted after intermittent client DNS
-failures. The remaining items below stay open. Production runs `d273200`
-(SHA `6c0b13d…`) with `NRestarts=0`; the lab is stopped after the 11/11 checks.
+failures. The remaining items below stay open. Production runs `26dcfbb`
+(SHA `b384fce…`) with `NRestarts=0`; the lab is stopped after the 11/11 checks.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 

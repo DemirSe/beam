@@ -8,18 +8,18 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-11-07 22:41 UTC:
+on 2026-11-08 00:00 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `6c0b13df7e9b310e33c920a82ea5d715cb6def879200cf401834a3d2441325af` |
-| Version | `0.1.0 (d273200d578a)` |
+| SHA-256 | `b384fce2cd96541456189474610129372ff1fa03a2f113e7908161604fb27c5f` |
+| Version | `0.1.0 (26dcfbb7bd93)` |
 | Service | `beam.service`, active, `NRestarts=0` |
 | Listener | `0.0.0.0:443` |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
 | Host network | BBR + fq, conntrack 65536, 600 s UDP retention |
-| Verification | Hash-pinned verifier PASS with tunnel-egress proof; 10-minute soak 60/60 HTTP 200 with threads plateaued at 111, RSS 17 MB and `NRestarts=0`; client DNS/HTTP 200; lab 11/11 clean and loss |
+| Verification | Hash-pinned verifier PASS with tunnel-egress proof; 120/120 HTTP 200 soak at 4-way concurrency with `NRestarts=0` and threads/fds plateaued; client DNS and HTTP 200; lab matrix 8/8 in xudp, packetaddr and legacy |
 
 The deployed binary includes the XUDP junk-reply idle-pinning fix (`2163c0a`),
 the mux-wide resolution/send-stall fix (`e0ca0bc`), the 2026-11-03
@@ -27,9 +27,10 @@ handshake/legacy-UDP/End-enqueue hardening, the bounded in-flight replay
 reservation (`647623b`), and the 2026-11-06 hardening batch: XUDP socket-budget
 validation, control-frame idle pinning, Vision empty-block rejection, replay
 first-wins with a 300-second timestamp/cache window, cancellable cover relays,
-bounded legacy UDP, parallel resolver lookups, and the descriptor budget check.
+bounded legacy UDP, parallel resolver lookups, and the descriptor budget check,
+plus the packetaddr unbound-family admission fix (`5a1cc82`).
 The process-wide resolver changes were reverted after intermittent client DNS
-failures (`64d9856`); production runs `d273200`, which includes that revert.
+failures (`64d9856`); production runs `26dcfbb`, which includes that revert.
 Remaining
 code-confirmed backpressure and lower-risk resource items in
 `STRESS-FINDINGS.md` are still tracked; the full release gates remain the
@@ -726,7 +727,7 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   required.
 - **One user, one inbound, no hot reload/stats** keeps the attack surface and
   resource model bounded.
-- **Production is pinned at `d273200d578a`.** Deploys are an explicit operator
+- **Production is pinned at `26dcfbb7bd93`.** Deploys are an explicit operator
   action, not a consequence of a green tree; source HEAD may be ahead of the
   host. Move it only with `deploy/package.sh` plus
   `BEAM_KEEP_CONFIG=1 bootstrap.sh`, then re-run the hash-pinned verifier and
