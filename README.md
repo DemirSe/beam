@@ -8,18 +8,18 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-11-08 01:06 UTC:
+on 2026-11-08 09:36 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `60b786c4321c300af5e0a431c8a64f89ca136572a9229f0b0e76a66a03ae793b` |
-| Version | `0.1.0 (8c64e5c75b60)` |
+| SHA-256 | `b5df22815c0987cc150d7bd0b5f975e24a8eb341b1078b706c13ee84215605da` |
+| Version | `0.1.0 (f4a0c6840b1c)` |
 | Service | `beam.service`, active, `NRestarts=0` |
 | Listener | `0.0.0.0:443` |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
 | Host network | BBR + fq, conntrack 65536, 600 s UDP retention |
-| Verification | Hash-pinned verifier PASS twice (plain and tunnel-egress); 120/120 HTTP 200 soak at 4-way concurrency with `NRestarts=0`, threads and RSS plateaued, fds receding; lab matrix 11/11; TUN matrix 8/8 in xudp, packetaddr and legacy; 20,000-request churn clean; fuzz smoke 7/7 |
+| Verification | Hash-pinned verifier PASS twice (plain and tunnel-egress); health check V1-V8 PASS: 120/120 HTTP 200 soak at 4-way concurrency with `NRestarts=0`, threads and RSS plateaued; lab matrix 11/11; TUN matrix 8/8 in xudp, packetaddr and legacy; 20,000-request churn clean; fuzz smoke 7/7 |
 
 The deployed binary includes the XUDP junk-reply idle-pinning fix (`2163c0a`),
 the mux-wide resolution/send-stall fix (`e0ca0bc`), the 2026-11-03
@@ -32,7 +32,7 @@ plus the packetaddr unbound-family admission fix (`5a1cc82`), the counted XUDP
 End control reserve (`fb45eda`), and the deploy preflight fd-limit fix
 (`8c64e5c`).
 The process-wide resolver changes were reverted after intermittent client DNS
-failures (`64d9856`); production runs `8c64e5c`, which includes that revert.
+failures (`64d9856`); production runs `f4a0c68`, which includes that revert.
 Remaining
 code-confirmed backpressure and lower-risk resource items in
 `STRESS-FINDINGS.md` are still tracked; the full release gates remain the
@@ -729,7 +729,7 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   required.
 - **One user, one inbound, no hot reload/stats** keeps the attack surface and
   resource model bounded.
-- **Production is pinned at `8c64e5c75b60`.** Deploys are an explicit operator
+- **Production is pinned at `f4a0c6840b1c`.** Deploys are an explicit operator
   action, not a consequence of a green tree; source HEAD may be ahead of the
   host. Move it only with `deploy/package.sh` plus
   `BEAM_KEEP_CONFIG=1 bootstrap.sh`, then re-run the hash-pinned verifier and

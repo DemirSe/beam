@@ -8,8 +8,8 @@ timestamp/cache hardening, legacy UDP bounds, cover cancellation, parallel
 resolver lookups, and the descriptor budget are in `2e0a464` and deployed.
 Finding 4 is fixed in `fb45eda` and deployed.
 The process-wide resolver changes were reverted after intermittent client DNS
-failures. The remaining items below stay open. Production runs `8c64e5c`
-(SHA `60b786c…`) with `NRestarts=0`; the lab is stopped after the 11/11 checks.
+failures. The remaining items below stay open. Production runs `f4a0c68`
+(SHA `b5df228…`) with `NRestarts=0`; the lab is stopped after the 11/11 checks.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 
