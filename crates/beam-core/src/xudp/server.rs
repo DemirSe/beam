@@ -30,9 +30,10 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 
 use super::session::{
-    ActiveSession, ExpiringSession, QueuedFrame, ResolveError, Session, SessionTable, SlotGuard,
-    SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
-    resolve_destination, socket_addr_to_location, spawn_reply_task,
+    ActiveSession, DEFAULT_STREAM_REPLY_BUDGET, ExpiringSession, QueuedFrame, ReplyQueueBudget,
+    ResolveError, Session, SessionTable, SlotGuard, SocketFamily, XudpConfig, XudpConfigError,
+    XudpSessionLimiter, encode_end_frame, resolve_destination, socket_addr_to_location,
+    spawn_reply_task,
 };
 use crate::address::{Address, NetLocation};
 use crate::xudp::frame::{
@@ -223,9 +224,10 @@ impl ResolutionState {
                     let result =
                         resolve_destination(&request.destination, request.family, RESOLVE_TIMEOUT)
                             .await;
-                    // Release the lookup slot before waiting on a full result
-                    // queue; the queue is independently bounded.
-                    drop(permit);
+                    // Hold the lookup slot until the result is queued. A full
+                    // result channel must apply backpressure to the request
+                    // queue instead of spawning unbounded tasks that wait to
+                    // send after releasing their permit.
                     let _ = result_tx
                         .send(ResolutionResult {
                             id: request.id,
@@ -234,6 +236,7 @@ impl ResolutionState {
                             result,
                         })
                         .await;
+                    drop(permit);
                 });
             }
         });
@@ -387,9 +390,9 @@ async fn apply_resolution(
     state: &MuxState,
     resolutions: &mut ResolutionState,
     result: ResolutionResult,
-) -> Result<(), MuxError> {
+) -> Result<bool, MuxError> {
     let Some(pending) = resolutions.take(result.id, result.generation) else {
-        return Ok(());
+        return Ok(false);
     };
     let PendingResolution {
         mut owner, frames, ..
@@ -400,6 +403,7 @@ async fn apply_resolution(
         result,
         ..
     } = result;
+    let mut session_activity = false;
 
     match result {
         Ok(address) => {
@@ -411,7 +415,9 @@ async fn apply_resolution(
                     resolutions.cancel_global(global_id);
                 }
                 frame.frame.rewrite_destination(address);
-                state.handle_frame(&frame.frame.as_borrowed()).await?;
+                session_activity |= state
+                    .handle_frame_with_session_transition(&frame.frame.as_borrowed())
+                    .await?;
             }
         }
         Err(error) => {
@@ -433,7 +439,8 @@ async fn apply_resolution(
         }
     }
 
-    process_pending_frames(state, resolutions, frames).await
+    session_activity |= process_pending_frames(state, resolutions, frames).await?;
+    Ok(session_activity)
 }
 
 /// Dispatches queued frames after the lookup owner has been handled.
@@ -444,7 +451,8 @@ async fn process_pending_frames(
     state: &MuxState,
     resolutions: &mut ResolutionState,
     mut frames: VecDeque<PendingFrame>,
-) -> Result<(), MuxError> {
+) -> Result<bool, MuxError> {
+    let mut session_activity = false;
     while let Some(mut frame) = frames.pop_front() {
         if let Some(location) = frame.frame.destination.clone()
             && matches!(location.address, Address::Domain(_))
@@ -470,12 +478,14 @@ async fn process_pending_frames(
                 if !resolutions.start(next_id, location, family, frames) {
                     state.try_send_end(next_id, reject);
                 }
-                return Ok(());
+                return Ok(session_activity);
             }
         }
-        state.handle_frame(&frame.frame.as_borrowed()).await?;
+        session_activity |= state
+            .handle_frame_with_session_transition(&frame.frame.as_borrowed())
+            .await?;
     }
-    Ok(())
+    Ok(session_activity)
 }
 
 /// Errors returned by [`handle_mux_stream`].
@@ -553,6 +563,8 @@ struct MuxState {
     outbound: mpsc::Sender<QueuedFrame>,
     /// Counted reply-queue reservations shared by data and control frames.
     queued: Arc<AtomicUsize>,
+    /// Byte budget shared by every session of this mux.
+    stream_reply_budget: ReplyQueueBudget,
     limiter: XudpSessionLimiter,
 }
 
@@ -597,6 +609,7 @@ where
         table: Arc::clone(&table),
         outbound,
         queued,
+        stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
         limiter,
     };
 
@@ -747,6 +760,7 @@ where
         // repeatedly move the remaining batch, which is quadratic for small
         // coalesced frames.
         let mut consumed = 0;
+        let mut batch_session_activity = false;
         loop {
             match frame::parse_frame(&buffer[consumed..]) {
                 Ok(Some((parsed, used))) => {
@@ -792,7 +806,9 @@ where
                         if let Some(cached) = resolutions.cache_get(destination, family) {
                             let mut owned = OwnedFrame::from_borrowed(&parsed);
                             owned.rewrite_destination(cached);
-                            state.handle_frame(&owned.as_borrowed()).await?;
+                            batch_session_activity |= state
+                                .handle_frame_with_session_transition(&owned.as_borrowed())
+                                .await?;
                         } else {
                             if parsed.status == SessionStatus::Keep
                                 && parsed.option.has_data()
@@ -824,7 +840,8 @@ where
                             }
                         }
                     } else {
-                        state.handle_frame(&parsed).await?;
+                        batch_session_activity |=
+                            state.handle_frame_with_session_transition(&parsed).await?;
                     }
                     debug_assert!(used > 0);
                     consumed += used;
@@ -841,11 +858,17 @@ where
             // One table check per read batch is equivalent to the old
             // per-frame check for the empty-stream timer: the timer only
             // needs to know whether the batch left any session behind.
-            empty_since = if state.has_sessions() {
-                None
+            // A session created and closed inside the same batch must restart
+            // the deadline; otherwise a coalesced New+End near the old
+            // deadline closes the mux early. KeepAlive-only batches leave
+            // this false and cannot extend the timer.
+            if state.has_active_sessions() {
+                empty_since = None;
+            } else if batch_session_activity {
+                empty_since = Some(Instant::now());
             } else {
-                Some(Instant::now())
-            };
+                empty_since.get_or_insert_with(Instant::now);
+            }
             buffer.drain(..consumed);
         }
 
@@ -866,17 +889,23 @@ where
                         stage: "XUDP resolution task",
                     });
                 };
-                apply_resolution(state, &mut resolutions, result).await?;
+                let session_activity =
+                    apply_resolution(state, &mut resolutions, result).await?;
+                if state.has_active_sessions() {
+                    empty_since = None;
+                } else if session_activity {
+                    empty_since = Some(Instant::now());
+                }
             }
             _ = sweep.tick() => {
-                let had_sessions = state.has_sessions();
+                let had_sessions = state.has_active_sessions();
                 state.sweep().await?;
                 // A mux stream that has stayed empty for the session idle
                 // timeout cannot carry a live session. Stock closes such a
                 // worker after 60 s; match the intent without cutting an
                 // active one-way flow. Losing the last session in this sweep
                 // starts the clock now instead of reusing an older one.
-                if state.has_sessions() {
+                if state.has_active_sessions() {
                     empty_since = None;
                 } else if had_sessions {
                     empty_since = Some(Instant::now());
@@ -959,6 +988,32 @@ impl MuxState {
             SessionStatus::Keep => self.handle_keep(parsed).await,
             SessionStatus::End => self.handle_end(parsed.session_id).await,
             SessionStatus::KeepAlive => Ok(()),
+        }
+    }
+
+    /// Dispatches a frame that may create or close an active session.
+    ///
+    /// Data frames are deliberately excluded: the batch-end active check
+    /// already covers a session that stays alive, and adding a table lookup
+    /// to every datagram would put the lock back on the reply hot path.
+    async fn handle_frame_with_session_transition(
+        &self,
+        parsed: &Frame<'_>,
+    ) -> Result<bool, MuxError> {
+        match parsed.status {
+            SessionStatus::New => {
+                self.handle_frame(parsed).await?;
+                Ok(self.session(parsed.session_id).is_some())
+            }
+            SessionStatus::End => {
+                let had_session = self.session(parsed.session_id).is_some();
+                self.handle_frame(parsed).await?;
+                Ok(had_session)
+            }
+            _ => {
+                self.handle_frame(parsed).await?;
+                Ok(false)
+            }
         }
     }
 
@@ -1153,6 +1208,7 @@ impl MuxState {
             Arc::clone(&self.table),
             Arc::clone(&self.config),
             self.limiter.clone(),
+            self.stream_reply_budget.clone(),
         );
         let replaced = lock_table(&self.table).insert(ActiveSession {
             session,
@@ -1248,9 +1304,12 @@ impl MuxState {
             .map(|entry| Arc::clone(&entry.session))
     }
 
-    /// Returns `true` while any active or retained session exists.
-    fn has_sessions(&self) -> bool {
-        lock_table(&self.table).total() > 0
+    /// Returns `true` while any active session exists.
+    ///
+    /// Retained (`expiring`) sockets deliberately do not count: a GlobalID
+    /// kept for reattachment must not keep an otherwise empty mux alive.
+    fn has_active_sessions(&self) -> bool {
+        lock_table(&self.table).active_len() > 0
     }
 
     /// Returns the duplicate-ID classification for a `New`.
@@ -1537,8 +1596,9 @@ mod tests {
         XudpError, encode_frame, parse_frame,
     };
     use crate::xudp::session::{
-        ActiveSession, QueuedFrame, Session, SessionTable, SlotGuard, SocketFamily, XudpConfig,
-        XudpConfigError, XudpSessionLimiter, spawn_reply_task,
+        ActiveSession, DEFAULT_STREAM_REPLY_BUDGET, QueuedFrame, ReplyQueueBudget, Session,
+        SessionTable, SlotGuard, SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter,
+        spawn_reply_task,
     };
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::atomic::AtomicUsize;
@@ -1574,6 +1634,7 @@ mod tests {
             table: Arc::new(Mutex::new(SessionTable::default())),
             outbound,
             queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
         };
 
@@ -1609,6 +1670,7 @@ mod tests {
             table: Arc::clone(&table),
             outbound: outbound.clone(),
             queued: Arc::clone(&queued),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
         };
 
@@ -1633,6 +1695,7 @@ mod tests {
             Arc::clone(&table),
             Arc::clone(&config),
             limiter.clone(),
+            ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
         );
 
         let sender = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -1692,6 +1755,7 @@ mod tests {
             table: Arc::new(Mutex::new(SessionTable::default())),
             outbound: outbound.clone(),
             queued: Arc::clone(&queued),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
         };
 
@@ -1738,6 +1802,52 @@ mod tests {
         (client, task)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolver_churn_stays_bounded() {
+        let config = Arc::new(XudpConfig {
+            io_timeout: Duration::from_millis(200),
+            session_idle_timeout: Duration::from_secs(30),
+            close_expiry: Duration::from_secs(5),
+            ..XudpConfig::default()
+        });
+        let (mut client, task) = start_mux(config);
+        let baseline = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        let sampler = tokio::spawn(async move {
+            let mut peak = baseline;
+            for _ in 0..50 {
+                sleep(Duration::from_millis(20)).await;
+                peak = peak.max(
+                    tokio::runtime::Handle::current()
+                        .metrics()
+                        .num_alive_tasks(),
+                );
+            }
+            peak
+        });
+        for round in 0..150u16 {
+            for lane in 0..64u16 {
+                let destination = NetLocation {
+                    address: Address::Domain("localhost".to_owned()),
+                    port: 20_000 + round * 64 + lane,
+                };
+                write_frame(
+                    &mut client,
+                    new_spec(lane, &destination, b"x", Some([0x55; GLOBAL_ID_LEN])),
+                )
+                .await;
+            }
+        }
+        let peak = sampler.await.expect("sampler panicked");
+        let delta = peak.saturating_sub(baseline);
+        assert!(
+            delta < 100,
+            "resolver churn spawned {delta} extra tasks (peak {peak}, baseline {baseline})"
+        );
+        finish(client, task).await;
+    }
+
     async fn insert_test_session(state: &MuxState, id: u16) {
         let socket = Arc::new(
             UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -1763,6 +1873,7 @@ mod tests {
             Arc::clone(&state.table),
             Arc::clone(&state.config),
             state.limiter.clone(),
+            state.stream_reply_budget.clone(),
         );
         let replaced = state
             .table
@@ -1958,6 +2069,7 @@ mod tests {
             Arc::clone(&table),
             Arc::clone(&config),
             limiter.clone(),
+            ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
         );
         assert!(
             table
@@ -1983,6 +2095,7 @@ mod tests {
             table: Arc::clone(&table),
             outbound: outbound.clone(),
             queued,
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
         };
         let active = table
@@ -2040,6 +2153,235 @@ mod tests {
             .expect("empty stream did not close")
             .expect("mux handler panicked");
         assert!(result.is_ok(), "empty stream close failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn empty_mux_keepalive_does_not_extend_idle() {
+        let config = Arc::new(XudpConfig {
+            session_idle_timeout: Duration::from_millis(300),
+            close_expiry: Duration::from_secs(1),
+            io_timeout: Duration::from_secs(2),
+            ..XudpConfig::default()
+        });
+        let (mut client, task) = start_mux(config);
+        let mut bytes = Vec::new();
+        encode_frame(
+            &mut bytes,
+            FrameSpec {
+                option: FrameOption::DATA,
+                ..FrameSpec::new(1, SessionStatus::KeepAlive)
+            },
+        )
+        .expect("keepalive must encode");
+
+        // Keep transmitting for the whole observation window. If a KeepAlive
+        // resets the empty-stream deadline, this writer prevents closure and
+        // the timeout below fails; the old test stopped writing first and
+        // could not detect that regression.
+        let writer = tokio::spawn(async move {
+            loop {
+                if client.write_all(&bytes).await.is_err() {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        });
+
+        let result = timeout(Duration::from_secs(2), task).await;
+        writer.abort();
+        let result = result
+            .expect("keepalive-only mux stayed open while KeepAlive continued")
+            .expect("mux handler panicked");
+        assert!(result.is_ok(), "keepalive-only mux failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn coalesced_new_end_restarts_the_empty_timer() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let config = Arc::new(XudpConfig {
+            session_idle_timeout: Duration::from_millis(500),
+            close_expiry: Duration::from_secs(2),
+            io_timeout: Duration::from_secs(2),
+            ..XudpConfig::default()
+        });
+        let (mut client, task) = start_mux(config);
+        let global_id = Some([0x44; GLOBAL_ID_LEN]);
+
+        let mut batch = Vec::new();
+        encode_frame(&mut batch, new_spec(1, &destination, b"", global_id))
+            .expect("New must encode");
+        encode_frame(&mut batch, FrameSpec::new(1, SessionStatus::End)).expect("End must encode");
+        sleep(Duration::from_millis(300)).await;
+        timeout(TEST_TIMEOUT, client.write_all(&batch))
+            .await
+            .expect("coalesced New+End write timed out")
+            .expect("coalesced New+End write failed");
+
+        let mut buffer = Vec::new();
+        let end = read_frame(&mut client, &mut buffer).await.expect("End ack");
+        assert_eq!(end.session_id, 1);
+        assert_eq!(end.status, SessionStatus::End);
+
+        // The old deadline was five hundred milliseconds from mux creation.
+        // Reattach after it, but before a full idle interval from the End.
+        sleep(Duration::from_millis(250)).await;
+        write_frame(
+            &mut client,
+            new_spec(2, &destination, b"reattach", global_id),
+        )
+        .await;
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("reattached session must echo");
+        assert_eq!(reply.session_id, 2);
+        assert_eq!(reply.payload, b"reattach");
+
+        write_frame(&mut client, FrameSpec::new(2, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("second End ack");
+        assert_eq!(end.session_id, 2);
+        assert_eq!(end.status, SessionStatus::End);
+
+        let result = timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("mux did not close after the reattached session ended")
+            .expect("mux handler panicked");
+        assert!(result.is_ok(), "mux handler failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn short_globalid_flow_does_not_wait_for_retention() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let config = Arc::new(XudpConfig {
+            session_idle_timeout: Duration::from_millis(300),
+            close_expiry: Duration::from_secs(30),
+            io_timeout: Duration::from_secs(2),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::new(1);
+        let (mut client, task) = start_mux_with_limiter(config, limiter.clone());
+        let mut buffer = Vec::new();
+
+        write_frame(
+            &mut client,
+            new_spec(7, &destination, b"data", Some([0x33; GLOBAL_ID_LEN])),
+        )
+        .await;
+        let reply = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("global-id session must echo");
+        assert_eq!(reply.payload, b"data");
+        write_frame(&mut client, FrameSpec::new(7, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+
+        let started = Instant::now();
+        let result = timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("retained global id kept the empty mux alive")
+            .expect("mux handler panicked");
+        assert!(result.is_ok(), "mux handler failed: {result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "mux waited {:?} for close_expiry",
+            started.elapsed()
+        );
+        assert_eq!(
+            limiter.stats().available,
+            1,
+            "shutdown must release the retained session permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_mux_does_not_starve_an_unrelated_reply() {
+        let echo = spawn_ipv4_echo().await;
+        let limiter = XudpSessionLimiter::default();
+        let config = Arc::new(XudpConfig {
+            max_datagram_size: 8192,
+            max_queued_replies: 512,
+            io_timeout: Duration::from_secs(2),
+            ..XudpConfig::default()
+        });
+        let mut stalled = Vec::new();
+        for id in 0..10u16 {
+            let socket = Arc::new(
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .await
+                    .expect("stalled session socket"),
+            );
+            let address = socket.local_addr().expect("stalled address");
+            let session = Arc::new(Session::new(
+                id,
+                None,
+                Arc::clone(&socket),
+                SocketFamily::V4,
+                address,
+                None,
+            ));
+            let (outbound, inbound) = mpsc::channel(config.max_queued_replies);
+            let task = spawn_reply_task(
+                Arc::clone(&session),
+                outbound,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(Mutex::new(SessionTable::default())),
+                Arc::clone(&config),
+                limiter.clone(),
+                ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
+            );
+            stalled.push((session, task, inbound, address));
+        }
+
+        let sender = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("flood sender");
+        let payload = vec![0x5a; 8192];
+        for (_, _, _, address) in &stalled {
+            for index in 0..1_200 {
+                sender
+                    .send_to(&payload, *address)
+                    .await
+                    .expect("flood send");
+                if index % 32 == 31 {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }
+        sleep(Duration::from_secs(2)).await;
+
+        let (mut client, mux) = start_mux_with_limiter(Arc::clone(&config), limiter.clone());
+        let mut buffer = Vec::new();
+        let probe = vec![0x61; 8192];
+        write_frame(
+            &mut client,
+            new_spec(7, &net_location(echo.address), &probe, None),
+        )
+        .await;
+        let reply = timeout(
+            Duration::from_millis(700),
+            read_frame(&mut client, &mut buffer),
+        )
+        .await
+        .expect("an unrelated mux was starved by the reply budget")
+        .expect("unrelated reply failed");
+        assert_eq!(reply.session_id, 7);
+        assert_eq!(reply.payload, probe);
+        assert!(
+            limiter.metrics().snapshot().xudp_replies_dropped > 0,
+            "the stalled muxes must have hit the per-stream budget"
+        );
+
+        finish(client, mux).await;
+        for (session, task, inbound, _) in stalled {
+            session.stop();
+            let _ = timeout(TEST_TIMEOUT, task).await;
+            drop(inbound);
+        }
     }
 
     #[tokio::test]
@@ -2407,6 +2749,7 @@ mod tests {
             table: Arc::clone(&table),
             outbound: outbound.clone(),
             queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
         };
         outbound
@@ -3131,6 +3474,7 @@ mod tests {
             table: Arc::clone(&table),
             outbound: outbound.clone(),
             queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
         };
 
@@ -3192,6 +3536,7 @@ mod tests {
             table: Arc::clone(&table),
             outbound: outbound.clone(),
             queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
         };
 

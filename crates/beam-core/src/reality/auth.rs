@@ -338,8 +338,12 @@ fn check_timestamp(timestamp: u32, max_time_diff: Option<Duration>) -> Result<()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| AuthError::Clock)?
         .as_secs();
+    check_timestamp_at(timestamp, max_time_diff, now)
+}
+
+fn check_timestamp_at(timestamp: u32, max_time_diff: Duration, now: u64) -> Result<(), AuthError> {
     let difference = now.abs_diff(u64::from(timestamp));
-    if Duration::from_secs(difference) > max_time_diff {
+    if difference > max_time_diff.as_secs() {
         return Err(AuthError::TimestampOutOfRange);
     }
     Ok(())
@@ -435,6 +439,23 @@ mod tests {
 
     fn client_public(client_private: [u8; 32]) -> [u8; 32] {
         PublicKey::from(&StaticSecret::from(client_private)).to_bytes()
+    }
+
+    #[test]
+    fn timestamp_boundary_is_symmetric() {
+        let now: u32 = 1_700_000_000;
+        let window = Duration::from_secs(300);
+        assert!(check_timestamp_at(now + 300, window, u64::from(now)).is_ok());
+        assert!(matches!(
+            check_timestamp_at(now + 301, window, u64::from(now)),
+            Err(AuthError::TimestampOutOfRange)
+        ));
+        assert!(check_timestamp_at(now - 300, window, u64::from(now)).is_ok());
+        assert!(matches!(
+            check_timestamp_at(now - 301, window, u64::from(now)),
+            Err(AuthError::TimestampOutOfRange)
+        ));
+        assert!(check_timestamp(now - 301, None).is_ok());
     }
 
     #[test]

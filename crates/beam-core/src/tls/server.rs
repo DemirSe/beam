@@ -108,11 +108,24 @@ const TARGET_MSS: u16 = 1400;
 /// Bound on remembered authenticated ClientHello session ids.
 const REPLAY_CACHE_CAPACITY: usize = 4_096;
 
-/// Retention for one replay-cache entry.
+/// Retention for one replay-cache entry when no timestamp window is configured.
 ///
-/// This matches the REALITY timestamp window below: a captured ClientHello
-/// cannot remain reusable after its timestamp is rejected.
+/// With a configured window, retention is `2 * window + slack`; see
+/// [`replay_retention`]. A timestamp `now + window` is accepted, so its
+/// ClientHello stays reusable until that future timestamp itself falls outside
+/// the window, which is at most `2 * window` after it is first seen.
 const REPLAY_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Extra retention beyond twice the timestamp window to cover clock granularity.
+const REPLAY_RETENTION_SLACK: Duration = Duration::from_secs(1);
+
+fn replay_retention(max_time_diff: Option<Duration>) -> Duration {
+    max_time_diff.map_or(REPLAY_CACHE_TTL, |window| {
+        window
+            .saturating_mul(2)
+            .saturating_add(REPLAY_RETENTION_SLACK)
+    })
+}
 
 /// Maximum concurrent handshakes allowed for one exact replay id. The
 /// completion cache still rejects all later copies; this only prevents one
@@ -133,6 +146,7 @@ struct ReplayCache {
 }
 
 impl ReplayCache {
+    #[cfg(test)]
     fn new(ttl: Duration) -> Self {
         Self::with_capacity(ttl, REPLAY_CACHE_CAPACITY)
     }
@@ -194,18 +208,15 @@ impl ReplayCache {
     ///
     /// Returns `false` when another handshake with the same id completed
     /// first; the caller must reject that duplicate rather than serving two
-    /// authenticated sessions from one ClientHello.
+    /// authenticated sessions from one ClientHello. A full cache also returns
+    /// `false` instead of evicting a live entry: evicting the oldest id would
+    /// reopen its replay window while its timestamp is still acceptable.
     fn insert(&mut self, id: [u8; 32]) -> bool {
         self.in_flight.remove(&id);
         let now = Instant::now();
         self.expire(now);
-        if self.entries.contains_key(&id) {
+        if self.entries.contains_key(&id) || self.entries.len() >= self.capacity {
             return false;
-        }
-        if self.entries.len() >= self.capacity
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.entries.remove(&oldest);
         }
         self.entries.insert(id, now);
         self.order.push_back(id);
@@ -452,7 +463,10 @@ impl TlsServerConfig {
             legacy_udp_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             cover_limiter: Arc::new(IpLimiter::new(COVER_MAX_CONCURRENCY, COVER_MAX_PER_IP)),
             metrics: Arc::new(Metrics::default()),
-            replay_cache: Mutex::new(ReplayCache::new(REPLAY_CACHE_TTL)),
+            replay_cache: Mutex::new(ReplayCache::with_capacity(
+                replay_retention(max_time_diff),
+                REPLAY_CACHE_CAPACITY,
+            )),
         })
     }
 
@@ -497,7 +511,10 @@ impl TlsServerConfig {
     /// Overrides the bounded exact-replay cache capacity.
     #[must_use]
     pub fn with_replay_capacity(mut self, capacity: usize) -> Self {
-        self.replay_cache = Mutex::new(ReplayCache::with_capacity(REPLAY_CACHE_TTL, capacity));
+        self.replay_cache = Mutex::new(ReplayCache::with_capacity(
+            replay_retention(self.max_time_diff),
+            capacity,
+        ));
         self
     }
 
@@ -2321,16 +2338,27 @@ mod tests {
         let mut cache = ReplayCache::new(Duration::from_secs(60));
         let id = [7u8; 32];
         assert!(!cache.entries.contains_key(&id));
-        assert!(!cache.entries.contains_key(&id));
-        cache.insert(id);
-        assert!(cache.entries.contains_key(&id));
-        for index in 0..REPLAY_CACHE_CAPACITY + 32 {
+        assert!(cache.try_reserve(id));
+        assert!(cache.insert(id));
+        assert!(!cache.try_reserve(id));
+        let mut oldest = [0u8; 32];
+        for index in 0..REPLAY_CACHE_CAPACITY - 1 {
             let mut next = [0u8; 32];
             next[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            cache.insert(next);
+            assert!(cache.insert(next), "entry {index} must fit the cache");
+            if index == 0 {
+                oldest = next;
+            }
         }
-        assert!(cache.entries.len() <= REPLAY_CACHE_CAPACITY);
-        assert!(cache.order.len() <= REPLAY_CACHE_CAPACITY);
+        let mut extra = [0xffu8; 32];
+        extra[..8].copy_from_slice(&(REPLAY_CACHE_CAPACITY as u64).to_be_bytes());
+        assert!(!cache.insert(extra), "a full cache must reject, not evict");
+        assert_eq!(cache.entries.len(), REPLAY_CACHE_CAPACITY);
+        assert_eq!(cache.order.len(), REPLAY_CACHE_CAPACITY);
+        assert!(
+            !cache.try_reserve(oldest),
+            "the oldest live id must not be evicted"
+        );
     }
 
     #[test]
@@ -2338,9 +2366,27 @@ mod tests {
         let mut cache = ReplayCache::with_capacity(Duration::from_secs(60), 2);
         assert!(cache.insert([1; 32]));
         assert!(cache.insert([2; 32]));
-        assert!(cache.insert([3; 32]));
+        assert!(!cache.insert([3; 32]));
         assert_eq!(cache.entries.len(), 2);
         assert_eq!(cache.order.len(), 2);
+    }
+
+    #[test]
+    fn replay_cache_entries_expire_after_retention() {
+        let mut cache = ReplayCache::with_capacity(Duration::ZERO, 2);
+        assert!(cache.insert([4; 32]));
+        cache.expire(Instant::now());
+        assert!(cache.entries.is_empty());
+        assert!(cache.insert([4; 32]));
+    }
+
+    #[test]
+    fn replay_retention_covers_future_timestamps() {
+        assert_eq!(
+            replay_retention(Some(Duration::from_secs(300))),
+            Duration::from_secs(601)
+        );
+        assert_eq!(replay_retention(None), Duration::from_secs(300));
     }
 
     #[test]

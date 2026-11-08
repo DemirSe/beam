@@ -15,16 +15,33 @@ use beam_core::tls::{
 use beam_core::udp::LegacyUdpConfig;
 use beam_core::xudp::{XudpConfig, XudpSessionLimiter};
 
-/// Five minutes tolerates ordinary NTP skew while closing the replay window
-/// left when the cache expires.
-const REALITY_TIMESTAMP_WINDOW: Duration = Duration::from_secs(300);
 use clap::Parser;
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, sleep};
 
+/// Five minutes tolerates ordinary NTP skew while closing the replay window
+/// left when the cache expires.
+const REALITY_TIMESTAMP_WINDOW: Duration = Duration::from_secs(300);
+
+/// Exact-replay entries remembered per configured authenticated connection.
+const REPLAY_CAPACITY_PER_CONNECTION: usize = 64;
+const REPLAY_CAPACITY_MIN: usize = 4_096;
+const REPLAY_CAPACITY_MAX: usize = 65_536;
+
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BEAM_GIT_HASH"), ")");
+
+/// Bounds the exact-replay cache for the configured connection pool.
+///
+/// The README promises `max_connections * 64` bounded to 4096..65536. A full
+/// cache rejects new authenticated handshakes instead of evicting a live id.
+fn replay_capacity(max_connections: u32) -> usize {
+    usize::try_from(max_connections)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(REPLAY_CAPACITY_PER_CONNECTION)
+        .clamp(REPLAY_CAPACITY_MIN, REPLAY_CAPACITY_MAX)
+}
 
 /// High-performance VLESS + REALITY + Vision server.
 #[derive(Debug, Parser)]
@@ -475,6 +492,7 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
     let metrics = tls.metrics();
 
     Ok(tls
+        .with_replay_capacity(replay_capacity(config.limits.max_connections))
         .with_xudp(xudp)
         .with_xudp_limiter(
             XudpSessionLimiter::new(
@@ -509,5 +527,19 @@ fn init_logging(level: LogLevel) {
         tracing::warn!(
             "diagnostic logging is enabled; peer addresses and destinations may be recorded"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_capacity_bounds_the_configured_pool() {
+        assert_eq!(replay_capacity(1), REPLAY_CAPACITY_MIN);
+        assert_eq!(replay_capacity(1024), REPLAY_CAPACITY_MAX);
+        assert_eq!(replay_capacity(2000), REPLAY_CAPACITY_MAX);
+        assert_eq!(replay_capacity(64), 4096);
+        assert_eq!(replay_capacity(100), 6400);
     }
 }

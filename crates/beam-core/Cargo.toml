@@ -36,3 +36,4 @@ zeroize = { version = "1", features = ["derive"] }
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }

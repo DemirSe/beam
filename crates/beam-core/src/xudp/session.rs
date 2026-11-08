@@ -94,6 +94,32 @@ pub const MAX_UDP_RECV_BUFFER: usize = 4 * 1024 * 1024;
 /// while still leaving room for large HTTP/3 bursts on a single stream.
 pub const DEFAULT_REPLY_QUEUE_BUDGET: usize = 32 * 1024 * 1024;
 
+/// Per-mux share of the process-wide reply-byte budget.
+///
+/// A single stalled mux must not be able to hold the whole global budget and
+/// starve every other mux. Two MiB is 1/16 of the global cap and half of a
+/// full 512-slot queue of 8 KiB frames.
+pub(crate) const DEFAULT_STREAM_REPLY_BUDGET: usize = 2 * 1024 * 1024;
+
+/// Byte budget shared by every session of one mux stream.
+#[derive(Clone)]
+pub(crate) struct ReplyQueueBudget {
+    bytes: Arc<Semaphore>,
+}
+
+impl ReplyQueueBudget {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Arc::new(Semaphore::new(max_bytes)),
+        }
+    }
+
+    pub(crate) fn try_reserve(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes).ok()?;
+        Arc::clone(&self.bytes).try_acquire_many_owned(bytes).ok()
+    }
+}
+
 /// Process-wide budget for frames queued while a domain is resolving.
 ///
 /// Pending payloads are request data, not reply bytes, so they use a separate
@@ -667,6 +693,7 @@ impl Drop for SlotGuard {
 pub(crate) struct QueuedFrame {
     pub(crate) bytes: Vec<u8>,
     _budget: Option<OwnedSemaphorePermit>,
+    _stream_budget: Option<OwnedSemaphorePermit>,
     _slot: Option<SlotGuard>,
 }
 
@@ -679,8 +706,17 @@ impl QueuedFrame {
         Self {
             bytes,
             _budget: budget,
+            _stream_budget: None,
             _slot: slot,
         }
+    }
+
+    pub(crate) fn with_stream_budget(
+        mut self,
+        stream_budget: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        self._stream_budget = stream_budget;
+        self
     }
 }
 
@@ -987,9 +1023,16 @@ pub(crate) fn spawn_reply_task(
     table: Arc<Mutex<SessionTable>>,
     config: Arc<XudpConfig>,
     limiter: XudpSessionLimiter,
+    stream_budget: ReplyQueueBudget,
 ) -> JoinHandle<()> {
     tokio::spawn(reply_loop(
-        session, outbound, queued, table, config, limiter,
+        session,
+        outbound,
+        queued,
+        table,
+        config,
+        limiter,
+        stream_budget,
     ))
 }
 
@@ -1016,6 +1059,7 @@ async fn reply_loop(
     table: Arc<Mutex<SessionTable>>,
     config: Arc<XudpConfig>,
     limiter: XudpSessionLimiter,
+    stream_budget: ReplyQueueBudget,
 ) {
     let mut stop = session.stop_receiver();
     if *stop.borrow() || session.is_closed() {
@@ -1099,6 +1143,14 @@ async fn reply_loop(
                             // shutting the mux stream down.
                             Err(mpsc::error::TrySendError::Closed(())) => break,
                         };
+                        let Some(stream_budget) = stream_budget.try_reserve(frame_len) else {
+                            tracing::trace!(
+                                session_id = session.id,
+                                "XUDP per-stream reply budget is full; dropping a datagram"
+                            );
+                            metrics.record_xudp_reply_dropped();
+                            continue;
+                        };
                         let Some(budget) = limiter.try_reserve_reply(frame_len) else {
                             tracing::trace!(
                                 session_id = session.id,
@@ -1140,7 +1192,10 @@ async fn reply_loop(
                         if session.is_closed() {
                             break;
                         }
-                        permit.send(QueuedFrame::new(frame, Some(budget), Some(slot)));
+                        permit.send(
+                            QueuedFrame::new(frame, Some(budget), Some(slot))
+                                .with_stream_budget(Some(stream_budget)),
+                        );
                         session.touch();
                     }
                     Err(error) => {
@@ -1280,10 +1335,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_GLOBAL_SESSIONS, DEFAULT_RESOLUTION_QUEUE_BUDGET, ExpiringSession,
-        ResolveError, Session, SessionTable, SocketFamily, XudpConfig, XudpConfigError,
-        XudpSessionLimiter, encode_end_frame, queue_failed_session_end, reply_frame_len,
-        reply_loop, resolve_destination, socket_addr_to_location,
+        DEFAULT_MAX_GLOBAL_SESSIONS, DEFAULT_RESOLUTION_QUEUE_BUDGET, DEFAULT_STREAM_REPLY_BUDGET,
+        ExpiringSession, ReplyQueueBudget, ResolveError, Session, SessionTable, SocketFamily,
+        XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
+        queue_failed_session_end, reply_frame_len, reply_loop, resolve_destination,
+        socket_addr_to_location,
     };
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{
@@ -1311,6 +1367,15 @@ mod tests {
             address: Address::Ipv4(Ipv4Addr::LOCALHOST),
             port,
         }
+    }
+
+    #[test]
+    fn stream_reply_budget_rejects_before_the_global_budget() {
+        let budget = ReplyQueueBudget::new(100);
+        let first = budget.try_reserve(60).expect("first reservation");
+        assert!(budget.try_reserve(60).is_none());
+        drop(first);
+        assert!(budget.try_reserve(60).is_some());
     }
 
     #[tokio::test]
@@ -1345,6 +1410,7 @@ mod tests {
             Arc::clone(&table),
             Arc::clone(&config),
             limiter.clone(),
+            ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
         ));
         let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender socket");
 

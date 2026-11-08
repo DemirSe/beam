@@ -94,6 +94,18 @@ pub const DEFAULT_MAX_PACKETADDR_DESTINATIONS: usize = 1024;
 /// dropped; this matches the bounded XUDP send wait.
 const MAX_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Send failures that affect one datagram, not the association.
+///
+/// A full socket buffer (`WouldBlock`), the local send deadline, or a signal
+/// interruption must not tear down a fixed-destination legacy session; the
+/// next datagram can still succeed.
+fn is_transient_send_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
 /// A stream write is bounded independently from DNS/bind setup. A slow client
 /// must not stop the opposite direction from being polled for seconds.
 const MAX_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -309,11 +321,16 @@ where
             .await
             {
                 Ok(Ok(_)) => {}
+                Ok(Err(error)) if is_transient_send_error(&error) => {
+                    tracing::debug!(%error, "legacy UDP send failed; dropping datagram");
+                    decoder.consume(frame.end);
+                    continue;
+                }
                 Ok(Err(error)) => break 'session Err(UdpError::Io(error)),
                 Err(_) => {
-                    break 'session Err(UdpError::Timeout {
-                        stage: "datagram send",
-                    });
+                    tracing::debug!("legacy UDP send timed out; dropping datagram");
+                    decoder.consume(frame.end);
+                    continue;
                 }
             }
             decoder.consume(frame.end);
@@ -1018,6 +1035,24 @@ mod tests {
     use tokio::time::timeout;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn transient_udp_send_errors_drop_only_the_datagram() {
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            assert!(super::is_transient_send_error(&std::io::Error::from(kind)));
+        }
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(!super::is_transient_send_error(&std::io::Error::from(kind)));
+        }
+    }
 
     #[test]
     fn cancellation_timeouts_are_bounded() {
