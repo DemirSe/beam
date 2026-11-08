@@ -960,6 +960,17 @@ where
     // body. Per-read timeouts would let a patient peer hold a pre-auth slot for
     // twice the configured handshake budget.
     let deadline = Instant::now() + config.handshake_timeout.min(PREAUTH_HANDSHAKE_TIMEOUT);
+    read_client_hello_record_with_limits(stream, deadline, config.max_client_hello_bytes).await
+}
+
+async fn read_client_hello_record_with_limits<R>(
+    stream: &mut R,
+    deadline: Instant,
+    max_client_hello_bytes: usize,
+) -> Result<ClientHelloRead, TlsServerError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header = [0u8; TLS_RECORD_HEADER_LEN];
     let mut filled = 0usize;
 
@@ -985,7 +996,7 @@ where
     // already have sent more bytes and the splice will carry them.
     let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
     let total = TLS_RECORD_HEADER_LEN.saturating_add(record_len);
-    if !is_plausible_tls_record_header(&header) || total > config.max_client_hello_bytes {
+    if !is_plausible_tls_record_header(&header) || total > max_client_hello_bytes {
         return Ok(ClientHelloRead::Forward(header.to_vec()));
     }
 
@@ -1036,8 +1047,7 @@ where
     // A ClientHello may span several TLS records, and even its four-byte
     // handshake header may be split. Assemble under the same absolute
     // deadline, with independent logical-message and wire bounds.
-    let wire_limit = config
-        .max_client_hello_bytes
+    let wire_limit = max_client_hello_bytes
         .saturating_add(MAX_CLIENT_HELLO_RECORDS.saturating_sub(1) * TLS_RECORD_HEADER_LEN);
     let mut wire = record;
     let mut handshake = wire[TLS_RECORD_HEADER_LEN..].to_vec();
@@ -1071,7 +1081,7 @@ where
                 });
             };
             // The normalized record must fit the configured logical bound.
-            if TLS_RECORD_HEADER_LEN.saturating_add(message_len) > config.max_client_hello_bytes {
+            if TLS_RECORD_HEADER_LEN.saturating_add(message_len) > max_client_hello_bytes {
                 return Ok(ClientHelloRead::Forward(wire));
             }
             target_len = message_len;
@@ -1098,6 +1108,115 @@ where
         record: normalized,
         wire,
     })
+}
+
+/// Slice-backed reader used by the ClientHello assembler fuzz target.
+#[cfg(feature = "fuzz")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FuzzReadMode {
+    Slice,
+    StallHeader,
+    StallBody,
+}
+
+#[cfg(feature = "fuzz")]
+struct FuzzReader<'a> {
+    data: &'a [u8],
+    offset: usize,
+    mode: FuzzReadMode,
+}
+
+#[cfg(feature = "fuzz")]
+impl AsyncRead for FuzzReader<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.mode {
+            FuzzReadMode::StallHeader if this.offset == 0 => Poll::Pending,
+            FuzzReadMode::StallBody if this.offset == TLS_RECORD_HEADER_LEN => Poll::Pending,
+            _ => {
+                let remaining = this.data.len().saturating_sub(this.offset);
+                let count = remaining.min(buf.remaining());
+                buf.put_slice(&this.data[this.offset..this.offset + count]);
+                this.offset += count;
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+/// Test-only entry point for the ClientHello assembler fuzz target.
+///
+/// This is compiled only with the `fuzz` feature and is not part of the
+/// production API. It exercises multi-record assembly, the cover-prefix
+/// invariants, and both header and body read timeouts without opening a
+/// socket.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub fn fuzz_client_hello_assembler(data: &[u8]) {
+    thread_local! {
+        static RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("fuzz runtime");
+    }
+
+    let mode = if data.first() == Some(&0xfe) {
+        FuzzReadMode::StallHeader
+    } else if data.len() >= 6
+        && data[0] == 0x16
+        && data[1] == 0x03
+        && matches!(data[2], 0x01 | 0x03)
+        && u16::from_be_bytes([data[3], data[4]]) > 0
+        && data[5] == 0xfe
+    {
+        FuzzReadMode::StallBody
+    } else {
+        FuzzReadMode::Slice
+    };
+
+    let declared = data.get(..2).map_or(0, |bytes| {
+        usize::from(u16::from_be_bytes([bytes[0], bytes[1]]))
+    });
+    let max_client_hello_bytes = TLS_RECORD_HEADER_LEN + declared % (MAX_RECORD_LEN + 1);
+    let deadline = if mode == FuzzReadMode::Slice {
+        Instant::now() + PREAUTH_HANDSHAKE_TIMEOUT
+    } else {
+        // One millisecond is enough for the tokio timer to fire; the fuzz
+        // target spends this time only for inputs carrying a stall marker.
+        Instant::now() + Duration::from_millis(1)
+    };
+
+    RUNTIME.with(|runtime| {
+        let mut reader = FuzzReader {
+            data,
+            offset: 0,
+            mode,
+        };
+        let result = runtime.block_on(read_client_hello_record_with_limits(
+            &mut reader,
+            deadline,
+            max_client_hello_bytes,
+        ));
+        match result {
+            Ok(ClientHelloRead::Complete { wire, .. }) => {
+                assert!(
+                    data.starts_with(&wire),
+                    "complete wire must be an input prefix"
+                );
+            }
+            Ok(ClientHelloRead::Forward(prefix)) => {
+                assert!(
+                    data.starts_with(&prefix),
+                    "forward prefix must be an input prefix"
+                );
+            }
+            Err(_) => {}
+        }
+    });
 }
 
 /// Returns whether a VLESS flow value is supported.
@@ -2175,6 +2294,78 @@ mod tests {
         assert_eq!(record, HELLO);
         assert_eq!(wire.len(), HELLO.len() + TLS_RECORD_HEADER_LEN);
         ClientHello::parse(&record).expect("reassembled header must parse");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_hello_read_times_out_on_a_stalled_header() {
+        struct Stall;
+        impl AsyncRead for Stall {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        let mut reader = Stall;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let task = tokio::spawn(async move {
+            read_client_hello_record_with_limits(
+                &mut reader,
+                deadline,
+                TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let read = task.await.expect("task").expect("read");
+        assert!(matches!(read, ClientHelloRead::Forward(prefix) if prefix.is_empty()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_hello_read_times_out_on_a_stalled_body() {
+        struct StallAfterHeader {
+            sent: usize,
+        }
+        impl AsyncRead for StallAfterHeader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                if this.sent == 0 {
+                    let header = [0x16, 0x03, 0x01, 0x00, 0x01];
+                    buf.put_slice(&header);
+                    this.sent = header.len();
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        let mut reader = StallAfterHeader { sent: 0 };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let task = tokio::spawn(async move {
+            read_client_hello_record_with_limits(
+                &mut reader,
+                deadline,
+                TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let read = task.await.expect("task").expect("read");
+        assert!(matches!(
+            read,
+            ClientHelloRead::Forward(prefix)
+                if prefix == [0x16, 0x03, 0x01, 0x00, 0x01]
+        ));
     }
 
     #[tokio::test]
