@@ -128,12 +128,14 @@ else
   install -m 0640 -o root -g beam "$CONFIG" "$INSTALL_CONFIG.new"
   CHECK_CONFIG="$INSTALL_CONFIG.new"
 fi
-if ! "$INSTALL_BIN.new" --check -c "$CHECK_CONFIG"; then
+if ! bash -c 'ulimit -n 65536 2>/dev/null || true; exec "$0" --check -c "$1"' \
+    "$INSTALL_BIN.new" "$CHECK_CONFIG"; then
   rm -f "$INSTALL_BIN.new" "$INSTALL_CONFIG.new"
   echo "bootstrap: new binary failed --check; live binary unchanged" >&2
   exit 1
 fi
-if ! runuser -u beam -- "$INSTALL_BIN.new" --check -c "$CHECK_CONFIG"; then
+if ! runuser -u beam -- bash -c 'ulimit -n 65536 2>/dev/null || true; exec "$0" --check -c "$1"' \
+    "$INSTALL_BIN.new" "$CHECK_CONFIG"; then
   rm -f "$INSTALL_BIN.new" "$INSTALL_CONFIG.new"
   echo "bootstrap: new binary failed the beam-user check; live binary unchanged" >&2
   exit 1
