@@ -1,4 +1,4 @@
-# Open stress findings — updated 2026-11-06
+# Open stress findings — updated 2026-11-08
 
 This file is intentionally separate from `README.md` for the findings that are
 still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
@@ -6,9 +6,10 @@ still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
 the four deployed 2026-11-06 fixes are in `2469971`; first-wins replay,
 timestamp/cache hardening, legacy UDP bounds, cover cancellation, parallel
 resolver lookups, and the descriptor budget are in `2e0a464` and deployed.
+Finding 4 is fixed in `fb45eda` and deployed.
 The process-wide resolver changes were reverted after intermittent client DNS
-failures. The remaining items below stay open. Production runs `26dcfbb`
-(SHA `b384fce…`) with `NRestarts=0`; the lab is stopped after the 11/11 checks.
+failures. The remaining items below stay open. Production runs `8c64e5c`
+(SHA `60b786c…`) with `NRestarts=0`; the lab is stopped after the 11/11 checks.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 
@@ -20,7 +21,7 @@ Do not treat the latter as fixed or as measured production incidents.
 
 | # | Status | Area | Summary |
 |---:|---|---|---|
-| 4 | open | XUDP close | The reserved control slots are advisory; a racing End is dropped and counted rather than blocking. |
+| 4 | fixed `fb45eda` | XUDP close | Counted `SlotGuard` reservations make the End reserve strict; an End is still dropped and counted when all eight reserved slots are held. |
 | 5 | open | XUDP reply budget | The process-wide 32 MiB budget lets a slow reader delay unrelated mux streams. |
 | 9 | open | XUDP lifecycle | Short GlobalID flows can retain a socket and mux permit for about two close timers. |
 | 10 | open | Lower-risk resources | Remaining mux-abort cleanup and session-table lock items; cover/Vision cancellation and CPU-spin issues are fixed. |
@@ -192,17 +193,25 @@ All `End` enqueue paths now use nonblocking `try_send`. A full queue drops that
 flow's End and increments `xudp_end_dropped`; it cannot stall the mux read
 loop. The obsolete 250 ms `END_ENQUEUE_TIMEOUT` was removed.
 
-### 4. Control reserve check remains advisory — LOW, nonblocking residual
+### 4. [RESOLVED] Control reserve check remains advisory — LOW, nonblocking residual
 
-`crates/beam-core/src/xudp/session.rs:946-953`, `1018`
+`crates/beam-core/src/xudp/session.rs` (fixed in `fb45eda`)
 
-`outbound.capacity()` is still sampled before `try_reserve()`, so concurrent
-reply tasks can consume the eight nominally reserved slots. With finding 3
-fixed this no longer creates a blocking close path: an End that loses the race
-is dropped and counted. A future separate control queue would make the reserve
-strict; it is not required to prevent the read-loop stall.
+The reply loop sampled `outbound.capacity()` before `try_reserve()`, so
+concurrent reply tasks could consume the eight nominally reserved slots. The
+sample is gone: `SlotGuard` counts reservations in an `Arc<AtomicUsize>` shared
+by every reply task and the End paths. Data may raise the counter only to
+`max_queued_replies - control_queue_reserve(..)` (504 of 512 in production);
+control may raise it to `max_queued_replies`. Because channel occupancy is at
+most the counter, a data reservation can no longer take a reserved slot, and
+`try_reserve` cannot fail while the bound holds. An End that arrives when all
+eight reserved slots are held is still dropped and counted rather than
+blocking, so the read-loop stall fix from finding 3 is preserved.
 
-Fix direction: separate bounded control queue or an atomic reservation.
+`data_pressure_cannot_consume_the_control_reserve` drives the real reply task
+with twenty flooded datagrams at a stalled writer: eight are admitted, twelve
+are dropped, and the End still queues. `control_reserve_bounds_concurrent_ends`
+covers the eight-End bound.
 
 ### 5. Process-wide 32 MiB reply budget couples slow and fast mux streams — MEDIUM, code-confirmed
 
