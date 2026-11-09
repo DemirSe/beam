@@ -31,7 +31,6 @@ jobs:
           df -h / /tmp | tail -3
 
       - name: TUN device (required)
-        continue-on-error: true
         id: tun
         run: |
           test -c /dev/net/tun && echo "/dev/net/tun present"
@@ -50,12 +49,12 @@ jobs:
           PY
 
       - name: Unprivileged user namespaces (informational)
+        if: always()
         id: userns
-        continue-on-error: true
         run: unshare --user --map-root-user --mount true && echo "userns ok"
 
       - name: Private netns with veth and netem (required)
-        continue-on-error: true
+        if: always()
         id: netem
         run: |
           sudo unshare --mount --propagation private --net --fork bash -euo pipefail -c '
@@ -75,7 +74,7 @@ jobs:
           '
 
       - name: Delegated cgroup v2 with memory accounting (required)
-        continue-on-error: true
+        if: always()
         id: cgroup
         run: |
           sudo systemd-run --scope --unit=pf-cgroup -p Delegate=yes \
@@ -101,37 +100,44 @@ jobs:
             '
 
       - name: HTTP/3-capable curl (required)
-        continue-on-error: true
+        if: always()
         id: curl3
         run: |
           curl --version
           if curl --version | grep -qi 'HTTP3'; then
             echo "curl HTTP3 ok"
           else
-            echo "::warning::the runner curl has no HTTP/3; H3 scenarios need a pinned static curl or must be disabled"
             echo "system curl: $(curl --version | head -1)"
-            apt-cache policy curl 2>/dev/null | head -3 || true
+            echo "::error::the runner curl has no HTTP/3; pin a static curl or disable H3 scenarios"
+            exit 1
           fi
 
       - name: tc and sch_netem (informational)
+        if: always()
         id: tcmod
-        continue-on-error: true
         run: |
           tc -V
-          modinfo sch_netem | head -3 || echo "sch_netem module metadata unavailable"
-          grep -c netem /proc/modules || true
+          modinfo sch_netem | head -3
+          echo "netem qdisc was exercised by the netns step above"
 
       - name: perf tracepoints (informational)
+        if: always()
         id: perf
-        continue-on-error: true
         run: |
           cat /proc/sys/kernel/perf_event_paranoid
-          command -v perf || echo "perf binary missing"
-          ls /sys/kernel/tracing/events/syscalls/sys_enter_splice 2>/dev/null \
-            || ls /sys/kernel/debug/tracing/events/syscalls/sys_enter_splice 2>/dev/null \
-            || echo "splice tracepoint missing"
+          command -v perf
+          test -r /proc/kallsyms && echo "kallsyms readable"
+          if ls /sys/kernel/tracing/events/syscalls/sys_enter_splice >/dev/null 2>&1; then
+            echo "splice tracepoint present"
+          elif ls /sys/kernel/debug/tracing/events/syscalls/sys_enter_splice >/dev/null 2>&1; then
+            echo "splice tracepoint present (debugfs)"
+          else
+            echo "::warning::splice tracepoint unavailable"
+            exit 1
+          fi
 
       - name: Capability summary (fails when a required probe failed)
+        if: always()
         env:
           TUN: ${{ steps.tun.outcome }}
           NETEM: ${{ steps.netem.outcome }}
