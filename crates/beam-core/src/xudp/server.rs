@@ -20,7 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -36,6 +36,7 @@ use super::session::{
     spawn_reply_task,
 };
 use crate::address::{Address, NetLocation};
+use crate::metrics::Metrics;
 use crate::xudp::frame::{
     self, Frame, FrameOption, GLOBAL_ID_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN,
     METADATA_PREFIX_LEN, SessionStatus, TargetNetwork, XudpError,
@@ -74,6 +75,17 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Bound on a send that could not be completed immediately.
 const SEND_WAIT: Duration = Duration::from_millis(100);
+
+/// Bound on datagrams waiting for kernel send-buffer space per mux.
+const SEND_QUEUE_CAPACITY: usize = 128;
+
+/// One datagram waiting for a congested session socket.
+struct OutboundDatagram {
+    session_id: u16,
+    socket: Arc<UdpSocket>,
+    destination: SocketAddr,
+    payload: Vec<u8>,
+}
 
 /// Bound on stopping a reply task before close queues its End.
 const CLOSE_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -566,6 +578,10 @@ struct MuxState {
     /// Byte budget shared by every session of this mux.
     stream_reply_budget: ReplyQueueBudget,
     limiter: XudpSessionLimiter,
+    /// Bounded outbound queue for congested session sockets.
+    send_tx: mpsc::Sender<OutboundDatagram>,
+    /// Queued plus in-flight outbound datagrams.
+    send_inflight: Arc<AtomicUsize>,
 }
 
 /// Handles one XUDP mux stream until EOF or a protocol error.
@@ -594,12 +610,21 @@ where
     let (mut reader, writer) = tokio::io::split(stream);
     let (outbound, inbound) = mpsc::channel(config.max_queued_replies);
     let queued = Arc::new(AtomicUsize::new(0));
+    let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+    let send_inflight = Arc::new(AtomicUsize::new(0));
+    let (send_failed, mut send_failed_rx) = mpsc::channel(16);
     let (writer_failed, mut writer_failed_rx) = watch::channel(false);
     let mut writer_task = tokio::spawn(write_loop(
         writer,
         inbound,
         config.io_timeout,
         writer_failed,
+    ));
+    let mut send_task = tokio::spawn(send_loop(
+        send_rx,
+        Arc::clone(&send_inflight),
+        limiter.metrics(),
+        send_failed,
     ));
 
     let table = Arc::new(Mutex::new(SessionTable::default()));
@@ -611,9 +636,17 @@ where
         queued,
         stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
         limiter,
+        send_tx,
+        send_inflight,
     };
 
-    let result = read_loop(&mut reader, &state, &mut writer_failed_rx).await;
+    let result = read_loop(
+        &mut reader,
+        &state,
+        &mut writer_failed_rx,
+        &mut send_failed_rx,
+    )
+    .await;
 
     // The stream is gone or unusable; no End frames can reach the peer. Stop
     // every reply task and release every socket. Signal every task first, then
@@ -650,6 +683,9 @@ where
     drop(state);
     if timeout(SHUTDOWN_TIMEOUT, &mut writer_task).await.is_err() {
         writer_task.abort();
+    }
+    if timeout(SHUTDOWN_TIMEOUT, &mut send_task).await.is_err() {
+        send_task.abort();
     }
 
     result
@@ -740,6 +776,7 @@ async fn read_loop<R>(
     reader: &mut R,
     state: &MuxState,
     writer_failed: &mut watch::Receiver<bool>,
+    send_failed: &mut mpsc::Receiver<u16>,
 ) -> Result<(), MuxError>
 where
     R: AsyncRead + Unpin,
@@ -883,6 +920,13 @@ where
                 let _ = changed;
                 return Err(MuxError::WriterClosed);
             }
+            Some(id) = send_failed.recv() => {
+                if state.session(id).is_some() {
+                    state.close_with_error(id).await?;
+                } else {
+                    state.try_send_end(id, true);
+                }
+            }
             resolved = resolutions.results.recv() => {
                 let Some(result) = resolved else {
                     return Err(MuxError::Timeout {
@@ -947,31 +991,114 @@ where
     }
 }
 
-/// Sends one UDP datagram without waiting for kernel send-buffer space.
-///
-/// A full UDP send buffer is transient congestion: dropping one datagram is
-/// preferable to stalling the shared mux read loop for `io_timeout`. Other
-/// socket errors remain fatal for the session.
-async fn send_datagram(
-    socket: &UdpSocket,
-    payload: &[u8],
-    destination: SocketAddr,
-) -> io::Result<()> {
+/// Sends one UDP datagram without waiting on the shared mux read loop.
+fn try_send_now(socket: &UdpSocket, payload: &[u8], destination: SocketAddr) -> io::Result<bool> {
     match socket.try_send_to(payload, destination) {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            match timeout(SEND_WAIT, socket.send_to(payload, destination)).await {
-                Ok(result) => result.map(|_| ()),
-                // The send buffer stayed full for the short bound. Dropping
-                // this datagram is preferable to stalling the mux read loop.
-                Err(_) => Ok(()),
-            }
-        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
         Err(error) => Err(error),
     }
 }
 
+/// Drains congested datagrams without holding the mux read loop.
+async fn send_loop(
+    mut inbound: mpsc::Receiver<OutboundDatagram>,
+    inflight: Arc<AtomicUsize>,
+    metrics: Arc<Metrics>,
+    failures: mpsc::Sender<u16>,
+) {
+    while let Some(datagram) = inbound.recv().await {
+        let socket = &datagram.socket;
+        let result = match socket.try_send_to(&datagram.payload, datagram.destination) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                match timeout(
+                    SEND_WAIT,
+                    socket.send_to(&datagram.payload, datagram.destination),
+                )
+                .await
+                {
+                    Ok(result) => result.map(|_| ()),
+                    // The send buffer stayed full for the short bound. UDP
+                    // congestion is expected to drop datagrams, not stall the
+                    // mux.
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "XUDP send buffer stayed full",
+                    )),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let fatal = match &result {
+            Ok(()) => false,
+            Err(error) => !matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+        };
+        if result.is_err() {
+            metrics.record_xudp_send_dropped();
+        }
+        if fatal {
+            let _ = failures.send(datagram.session_id).await;
+        }
+        inflight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl MuxState {
+    /// Sends a datagram now, or queues it without blocking the read loop.
+    fn dispatch_datagram(
+        &self,
+        session_id: u16,
+        socket: Arc<UdpSocket>,
+        payload: &[u8],
+        destination: SocketAddr,
+    ) -> io::Result<()> {
+        eprintln!(
+            "DBG dispatch inflight={} dst={destination}",
+            self.send_inflight.load(Ordering::Acquire)
+        );
+        if self.send_inflight.load(Ordering::Acquire) == 0 {
+            match try_send_now(&socket, payload, destination) {
+                Ok(true) => {
+                    eprintln!("DBG sent fast");
+                    return Ok(());
+                }
+                Ok(false) => {
+                    eprintln!("DBG wouldblock");
+                }
+                Err(error) => {
+                    eprintln!("DBG send err {error}");
+                    return Err(error);
+                }
+            }
+        }
+        let datagram = OutboundDatagram {
+            session_id,
+            socket,
+            destination,
+            payload: payload.to_vec(),
+        };
+        self.send_inflight.fetch_add(1, Ordering::AcqRel);
+        match self.send_tx.try_send(datagram) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.send_inflight.fetch_sub(1, Ordering::AcqRel);
+                self.limiter.metrics().record_xudp_send_dropped();
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.send_inflight.fetch_sub(1, Ordering::AcqRel);
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "XUDP send queue closed",
+                ))
+            }
+        }
+    }
+
     /// Dispatches one parsed frame.
     async fn handle_frame(&self, parsed: &Frame<'_>) -> Result<(), MuxError> {
         if parsed.payload.len() > self.config.max_datagram_size {
@@ -1183,24 +1310,10 @@ impl MuxState {
             }
         };
 
-        if parsed.option.has_data()
-            && !parsed.payload.is_empty()
-            && let Err(error) = send_datagram(&socket, parsed.payload, resolved).await
-        {
-            tracing::debug!(
-                session_id = id,
-                %error,
-                "XUDP first datagram send failed"
-            );
-            if reattached {
-                self.limiter.metrics().record_xudp_retained_discarded();
-            }
-            return self.send_end(id, true).await;
-        }
-
         let session = Arc::new(Session::new(
             id, global_id, socket, family, resolved, permit,
         ));
+        let session_socket = Arc::clone(&session.socket);
         let reply_task = spawn_reply_task(
             Arc::clone(&session),
             self.outbound.clone(),
@@ -1227,6 +1340,21 @@ impl MuxState {
             if let Some(task) = replaced.reply_task {
                 task.abort();
             }
+        }
+
+        if parsed.option.has_data()
+            && !parsed.payload.is_empty()
+            && let Err(error) = self.dispatch_datagram(id, session_socket, parsed.payload, resolved)
+        {
+            tracing::debug!(
+                session_id = id,
+                %error,
+                "XUDP first datagram send failed"
+            );
+            if reattached {
+                self.limiter.metrics().record_xudp_retained_discarded();
+            }
+            return self.close_with_error(id).await;
         }
 
         Ok(())
@@ -1273,7 +1401,9 @@ impl MuxState {
             None => session.destination(),
         };
 
-        if let Err(error) = send_datagram(&session.socket, parsed.payload, destination).await {
+        if let Err(error) =
+            self.dispatch_datagram(id, Arc::clone(&session.socket), parsed.payload, destination)
+        {
             tracing::debug!(session_id = id, %error, "XUDP relay send failed");
             if session.is_closed() {
                 Ok(())
@@ -1589,7 +1719,9 @@ fn lock_table(table: &Mutex<SessionTable>) -> MutexGuard<'_, SessionTable> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MuxError, MuxState, OwnedFrame, handle_mux_stream};
+    use super::{
+        MuxError, MuxState, OutboundDatagram, OwnedFrame, SEND_QUEUE_CAPACITY, handle_mux_stream,
+    };
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{
         FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_PAYLOAD_LEN, SessionStatus, TargetNetwork,
@@ -1601,7 +1733,7 @@ mod tests {
         spawn_reply_task,
     };
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -1611,6 +1743,103 @@ mod tests {
     use tokio::time::{Instant, sleep, timeout};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn test_send_sender() -> mpsc::Sender<OutboundDatagram> {
+        let (tx, mut rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        tx
+    }
+
+    #[tokio::test]
+    async fn send_queue_drops_when_full_without_blocking() {
+        let config = test_config();
+        let limiter = XudpSessionLimiter::default();
+        let metrics = limiter.metrics();
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        let (send_tx, mut send_rx) = mpsc::channel(1);
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let state = MuxState {
+            config: Arc::clone(&config),
+            table,
+            outbound,
+            queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
+            limiter,
+            send_tx,
+            send_inflight: Arc::clone(&inflight),
+        };
+        let socket = Arc::new(
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("socket"),
+        );
+        let destination = socket.local_addr().expect("local address");
+        state
+            .send_tx
+            .try_send(OutboundDatagram {
+                session_id: 1,
+                socket: Arc::clone(&socket),
+                destination,
+                payload: vec![1],
+            })
+            .expect("prefill queue");
+        let before = metrics.snapshot().xudp_send_dropped;
+        state
+            .dispatch_datagram(1, Arc::clone(&socket), b"second", destination)
+            .expect("a full queue drops rather than fails the session");
+        assert_eq!(metrics.snapshot().xudp_send_dropped, before + 1);
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
+        assert!(send_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn wouldblock_datagram_is_queued_instead_of_stalling() {
+        let receiver = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("receiver");
+        let destination = receiver.local_addr().expect("receiver address");
+        let sender = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("sender");
+        let payload = vec![0u8; 60_000];
+        let mut filled = false;
+        for _ in 0..10_000 {
+            match sender.try_send_to(&payload, destination) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    filled = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected send error: {error}"),
+            }
+        }
+        assert!(filled, "the UDP send buffer did not fill");
+
+        let config = test_config();
+        let limiter = XudpSessionLimiter::default();
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        let (send_tx, mut send_rx) = mpsc::channel(1);
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let state = MuxState {
+            config,
+            table: Arc::new(Mutex::new(SessionTable::default())),
+            outbound,
+            queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
+            limiter,
+            send_tx,
+            send_inflight: Arc::clone(&inflight),
+        };
+        let socket = Arc::new(sender);
+        state
+            .dispatch_datagram(1, Arc::clone(&socket), b"queued", destination)
+            .expect("a full send buffer queues instead of failing");
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
+        let queued = send_rx.try_recv().expect("datagram is queued");
+        assert_eq!(queued.destination, destination);
+        assert_eq!(queued.payload, b"queued");
+    }
 
     #[tokio::test]
     async fn end_enqueue_is_bounded_when_the_queue_is_full() {
@@ -1636,6 +1865,8 @@ mod tests {
             queued: Arc::new(AtomicUsize::new(0)),
             stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+            send_inflight: Arc::new(AtomicUsize::new(0)),
         };
 
         let started = Instant::now();
@@ -1672,6 +1903,8 @@ mod tests {
             queued: Arc::clone(&queued),
             stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+            send_inflight: Arc::new(AtomicUsize::new(0)),
         };
 
         let socket = Arc::new(
@@ -1757,6 +1990,8 @@ mod tests {
             queued: Arc::clone(&queued),
             stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+            send_inflight: Arc::new(AtomicUsize::new(0)),
         };
 
         let mut held = Vec::new();
@@ -2097,6 +2332,8 @@ mod tests {
             queued,
             stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+            send_inflight: Arc::new(AtomicUsize::new(0)),
         };
         let active = table
             .lock()
@@ -2751,6 +2988,8 @@ mod tests {
             queued: Arc::new(AtomicUsize::new(0)),
             stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+            send_inflight: Arc::new(AtomicUsize::new(0)),
         };
         outbound
             .try_send(QueuedFrame::new(vec![0], None, None))
@@ -3476,6 +3715,8 @@ mod tests {
             queued: Arc::new(AtomicUsize::new(0)),
             stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+            send_inflight: Arc::new(AtomicUsize::new(0)),
         };
 
         insert_test_session(&state, 21).await;
@@ -3538,6 +3779,8 @@ mod tests {
             queued: Arc::new(AtomicUsize::new(0)),
             stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
             limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+            send_inflight: Arc::new(AtomicUsize::new(0)),
         };
 
         insert_test_session(&state, 31).await;

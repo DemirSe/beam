@@ -16,6 +16,7 @@ pub struct Metrics {
     xudp_rejected_global: AtomicU64,
     xudp_retained_evicted: AtomicU64,
     xudp_replies_dropped: AtomicU64,
+    xudp_send_dropped: AtomicU64,
     xudp_end_dropped: AtomicU64,
     legacy_udp_limited: AtomicU64,
     splice_fallback: AtomicU64,
@@ -53,6 +54,8 @@ pub struct MetricsSnapshot {
     pub xudp_retained_evicted: u64,
     /// XUDP reply datagrams dropped at the queue, byte budget, or size checks.
     pub xudp_replies_dropped: u64,
+    /// XUDP request datagrams dropped because the send queue or socket was full.
+    pub xudp_send_dropped: u64,
     /// XUDP `End` frames that could not be queued before their deadline.
     pub xudp_end_dropped: u64,
     /// Legacy UDP / packetaddr streams rejected by their separate cap.
@@ -133,6 +136,11 @@ impl Metrics {
     /// Counts one XUDP `End` frame that could not be queued in time.
     pub fn record_xudp_end_dropped(&self) {
         self.xudp_end_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one XUDP request datagram dropped by the send path.
+    pub fn record_xudp_send_dropped(&self) {
+        self.xudp_send_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Counts one legacy UDP / packetaddr limit rejection.
@@ -223,6 +231,7 @@ impl Metrics {
             xudp_rejected_global: self.xudp_rejected_global.load(Ordering::Relaxed),
             xudp_retained_evicted: self.xudp_retained_evicted.load(Ordering::Relaxed),
             xudp_replies_dropped: self.xudp_replies_dropped.load(Ordering::Relaxed),
+            xudp_send_dropped: self.xudp_send_dropped.load(Ordering::Relaxed),
             xudp_end_dropped: self.xudp_end_dropped.load(Ordering::Relaxed),
             legacy_udp_limited: self.legacy_udp_limited.load(Ordering::Relaxed),
             splice_fallback: self.splice_fallback.load(Ordering::Relaxed),
