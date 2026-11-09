@@ -35,6 +35,46 @@ on:
         default: xudp
         type: choice
         options: [xudp, packetaddr, legacy]
+      scenarios:
+        description: "Optional scenario subset (comma list; empty = all)"
+        required: false
+        default: ""
+        type: string
+      https_mib:
+        description: "Optional HTTPS payload MiB override"
+        required: false
+        default: ""
+        type: string
+      https_parallel:
+        description: "Optional concurrent HTTPS override"
+        required: false
+        default: ""
+        type: string
+      rtt_ms:
+        description: "Optional RTT override"
+        required: false
+        default: ""
+        type: string
+      loss_pct:
+        description: "Optional loss percent override"
+        required: false
+        default: ""
+        type: string
+      reps:
+        description: "Optional repetition override"
+        required: false
+        default: ""
+        type: string
+      duration:
+        description: "Optional window seconds override"
+        required: false
+        default: ""
+        type: string
+      publish:
+        description: "Publish bench-results"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -78,6 +118,45 @@ jobs:
             *)
               echo "::error::unknown profile: ${{ inputs.profile }}"; exit 1 ;;
           esac
+
+          # Optional targeted-experiment overrides. Empty keeps the profile
+          # value. A filtered scenario list disables completeness checks and
+          # should normally be paired with publish=false.
+          scenarios="${{ inputs.scenarios }}"
+          https_mib="${{ inputs.https_mib }}"
+          https_parallel="${{ inputs.https_parallel }}"
+          rtt_override="${{ inputs.rtt_ms }}"
+          loss_override="${{ inputs.loss_pct }}"
+          reps_override="${{ inputs.reps }}"
+          duration_override="${{ inputs.duration }}"
+          if [ -n "$scenarios" ] \
+            && ! printf '%s' "$scenarios" | grep -Eq '^[a-z0-9,-]+$'; then
+            echo "::error::scenarios must be a comma list of scenario ids"; exit 1
+          fi
+          for pair in "https_mib:$https_mib" "https_parallel:$https_parallel" \
+                      "reps:$reps_override" "duration:$duration_override"; do
+            name=${pair%%:*}; value=${pair#*:}
+            if [ -n "$value" ] && ! printf '%s' "$value" | grep -Eq '^[0-9]+$'; then
+              echo "::error::$name must be a non-negative integer"; exit 1
+            fi
+          done
+          for pair in "rtt_ms:$rtt_override" "loss_pct:$loss_override"; do
+            name=${pair%%:*}; value=${pair#*:}
+            if [ -n "$value" ] \
+              && ! printf '%s' "$value" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+              echo "::error::$name must be numeric"; exit 1
+            fi
+          done
+          [ -z "$rtt_override" ] || rtt="$rtt_override"
+          [ -z "$loss_override" ] || loss="$loss_override"
+          [ -z "$reps_override" ] || reps="$reps_override"
+          [ -z "$duration_override" ] || duration="$duration_override"
+          scenarios="${scenarios:-all}"
+          if [ "$scenarios" = all ]; then
+            require_complete=1
+          else
+            require_complete=0
+          fi
           {
             echo "RTT_MS=$rtt"
             echo "SERVER_CPU_QUOTA=$quota"
@@ -87,8 +166,12 @@ jobs:
             echo "QUICK=$quick"
             echo "BENCH_TIMEOUT=$bench_timeout"
             echo "TUN_TIMEOUT=$tun_timeout"
+            echo "BENCH_SCENARIOS=$scenarios"
+            echo "BENCH_HTTPS_MIB=$https_mib"
+            echo "BENCH_HTTPS_PARALLEL=$https_parallel"
+            echo "BENCH_REQUIRE_COMPLETE=$require_complete"
           } >> "$GITHUB_ENV"
-          echo "profile=${{ inputs.profile }} rtt=$rtt quota=$quota reps=$reps duration=$duration quick=$quick"
+          echo "profile=${{ inputs.profile }} scenarios=$scenarios rtt=$rtt loss=$loss reps=$reps duration=$duration https_mib=$https_mib https_parallel=$https_parallel complete=$require_complete"
 
       - name: Capability gate
         if: inputs.suite != 'stress'
@@ -222,9 +305,12 @@ jobs:
             BENCH_LOSS="$LOSS" \
             BENCH_RTT_MS="$RTT_MS" \
             BENCH_MAX_LOAD=4 \
+            BENCH_SCENARIOS="$BENCH_SCENARIOS" \
+            BENCH_HTTPS_MIB="$BENCH_HTTPS_MIB" \
+            BENCH_HTTPS_PARALLEL="$BENCH_HTTPS_PARALLEL" \
             BENCH_REPORT=1 \
             BENCH_RATIO_ONLY=1 \
-            BENCH_REQUIRE_COMPLETE=1 \
+            BENCH_REQUIRE_COMPLETE="$BENCH_REQUIRE_COMPLETE" \
             SING_BOX="$RUNNER_TEMP/tools/sing-box" \
             XRAY_BIN="$RUNNER_TEMP/tools/xray-bin" \
             IPERF3=/usr/bin/iperf3 \
@@ -327,7 +413,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Publish results branch
-        if: always()
+        if: always() && inputs.publish
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/bench-out"
@@ -353,6 +439,7 @@ jobs:
             echo "commit=$GITHUB_SHA"
             echo "profile=${{ inputs.profile }} suite=${{ inputs.suite }}"
             echo "rtt_ms=$RTT_MS loss_pct=$LOSS reps=$REPS duration=$DURATION quick=$QUICK"
+            echo "scenarios=$BENCH_SCENARIOS https_mib=$BENCH_HTTPS_MIB https_parallel=$BENCH_HTTPS_PARALLEL"
             echo "image=${ImageOS:-?}/${ImageVersion:-?}"
             echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "$stage/run/README.txt"

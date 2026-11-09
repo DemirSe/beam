@@ -904,6 +904,20 @@ same suite locally:
 make stress   # release build + python3 tests/stress/loopback.py
 ```
 
+Targeted experiments keep the profile budget but override its knobs:
+
+```bash
+gh workflow run lab-hosted.yml -f suite=bench -f scenarios=https-bulk \
+  -f https_mib=16 -f rtt_ms=0 -f reps=3 -f publish=false
+gh workflow run lab-hosted.yml -f suite=bench -f scenarios=tcp-ul-4 \
+  -f reps=8 -f publish=false
+```
+
+`scenarios`, `https_mib`, `https_parallel`, `rtt_ms`, `loss_pct`, `reps`, and
+`duration` are optional; empty keeps the profile value. A filtered scenario
+list disables `--require-complete`, and `publish=false` keeps a partial cell
+from overwriting `bench-results`.
+
 The job is dispatch-only: no push, tag, or PR event runs it, so a shared
 runner's noise never blocks a release by itself. A green job means every
 selected suite passed: TUN 8/8 PASS, the bench cell complete
