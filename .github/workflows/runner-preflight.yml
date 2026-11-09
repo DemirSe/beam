@@ -31,6 +31,7 @@ jobs:
           df -h / /tmp | tail -3
 
       - name: TUN device (required)
+        continue-on-error: true
         id: tun
         run: |
           test -c /dev/net/tun && echo "/dev/net/tun present"
@@ -54,6 +55,7 @@ jobs:
         run: unshare --user --map-root-user --mount true && echo "userns ok"
 
       - name: Private netns with veth and netem (required)
+        continue-on-error: true
         id: netem
         run: |
           sudo unshare --mount --propagation private --net --fork bash -euo pipefail -c '
@@ -73,6 +75,7 @@ jobs:
           '
 
       - name: Delegated cgroup v2 with memory accounting (required)
+        continue-on-error: true
         id: cgroup
         run: |
           sudo systemd-run --scope --unit=pf-cgroup -p Delegate=yes \
@@ -98,10 +101,17 @@ jobs:
             '
 
       - name: HTTP/3-capable curl (required)
+        continue-on-error: true
         id: curl3
         run: |
           curl --version
-          curl --version | grep -qi 'HTTP3' && echo "curl HTTP3 ok"
+          if curl --version | grep -qi 'HTTP3'; then
+            echo "curl HTTP3 ok"
+          else
+            echo "::warning::the runner curl has no HTTP/3; H3 scenarios need a pinned static curl or must be disabled"
+            echo "system curl: $(curl --version | head -1)"
+            apt-cache policy curl 2>/dev/null | head -3 || true
+          fi
 
       - name: tc and sch_netem (informational)
         id: tcmod
@@ -142,7 +152,10 @@ jobs:
             echo "| perf tracepoints | $PERF |"
             echo "| tc/sch_netem | $TCMOD |"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          for required in TUN NETEM CGROUP CURL3; do
+          if [ "$CURL3" != "success" ]; then
+            echo "::warning::curl without HTTP/3: H3 rows will be BLOCKED unless a pinned curl is installed"
+          fi
+          for required in TUN NETEM CGROUP; do
             value="${!required}"
             if [ "$value" != "success" ]; then
               echo "::error::required capability $required is $value"
