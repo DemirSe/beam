@@ -737,12 +737,21 @@ start_arm() {
     # a fraction of a vCPU.
     SERVER_SCOPE="beam-bench-$arm-$rep-$$"
     SERVER_PID_FILE="$RUN_DIR/.server-$arm-$rep-$$.pid"
+    SERVER_WRAPPER="$RUN_DIR/.server-pid-$arm-$rep-$$.sh"
     rm -f "$SERVER_PID_FILE"
-    # The payload writes its own PID before exec, so nothing here depends on how
-    # systemd places the scope's cgroup or whether it exposes a MainPID.
+    # `systemd-run` rewrites `$$` in inline shell, and it exposes no usable
+    # MainPID for scopes, so a tiny wrapper reports the PID and then becomes the
+    # server. The PID therefore stays valid for the whole arm.
+    cat > "$SERVER_WRAPPER" <<'WRAPPER'
+#!/bin/sh
+echo $$ > "$1"
+shift
+exec "$@"
+WRAPPER
+    chmod 0755 "$SERVER_WRAPPER"
     systemd-run --scope --quiet --unit="$SERVER_SCOPE" \
       -p "CPUQuota=$SERVER_CPU_QUOTA" -- \
-      sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$SERVER_PID_FILE" \
+      "$SERVER_WRAPPER" "$SERVER_PID_FILE" \
       "${server_cmd[@]}" > "$server_log" 2>&1 &
     SERVER_PID=""
     for _ in $(seq 1 100); do
