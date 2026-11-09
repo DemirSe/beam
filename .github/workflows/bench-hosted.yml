@@ -171,6 +171,7 @@ jobs:
             ${{ runner.temp }}/bench-out/summary.json
             ${{ runner.temp }}/bench-out/meta.json
             ${{ runner.temp }}/bench-out/environment.txt
+            ${{ runner.temp }}/bench-out/masks.tsv
             ${{ runner.temp }}/bench-out/raw
             ${{ runner.temp }}/bench-out/logs
           retention-days: 3

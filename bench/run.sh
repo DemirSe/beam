@@ -768,7 +768,13 @@ WRAPPER
     local cg_rel
     cg_rel="$(sed -n 's/^0:://p' "/proc/$SERVER_PID/cgroup" 2>/dev/null || true)"
     SERVER_CPU_MAX="$(cat "/sys/fs/cgroup$cg_rel/cpu.max" 2>/dev/null || echo unknown)"
-    printf 'server_cpu_max=%s scope=%s\n' "$SERVER_CPU_MAX" "$SERVER_SCOPE" >> "$RUN_DIR/masks.tsv"
+    log "quota: scope=$SERVER_SCOPE cgroup=$cg_rel cpu.max=$SERVER_CPU_MAX requested=$SERVER_CPU_QUOTA"
+    case "$SERVER_CPU_MAX" in
+      unknown|''|max*)
+        die "CPU quota did not apply to the server (cpu.max='$SERVER_CPU_MAX' in ${cg_rel:-?})" ;;
+    esac
+    printf 'server_cpu_max=%s scope=%s cgroup=%s\n' \
+      "$SERVER_CPU_MAX" "$SERVER_SCOPE" "$cg_rel" >> "$RUN_DIR/masks.tsv"
   else
     "${server_cmd[@]}" > "$server_log" 2>&1 &
     SERVER_PID=$!
