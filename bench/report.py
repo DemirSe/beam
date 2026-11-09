@@ -647,6 +647,23 @@ def build(run_dir: Path) -> dict:
                 else core_stats["beam"]["driver"]["median"] < 85,
             }
         )
+    quotas = sorted({
+        value
+        for result in results
+        for value in [result.get("cpu", {}).get("server_cpu_max")]
+        if isinstance(value, str)
+    })
+    if quotas:
+        rows["resources"].append(
+            {
+                "label": "Server cgroup CPU ceiling (cpu.max)",
+                "stock": ", ".join(quotas),
+                "beam": ", ".join(quotas),
+                "ratio": "n/a",
+                "requirement": "informational",
+                "pass": None,
+            }
+        )
     rows["resources"].append(
         {
             "label": "Server core busy (TCP scenarios)",

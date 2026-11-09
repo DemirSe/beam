@@ -117,6 +117,7 @@ jobs:
             BENCH_SELF="$GITHUB_WORKSPACE/bench/run.sh" \
             BENCH_CLIENT_CPUS=0,1 \
             BENCH_DRIVER_CPU=0 \
+            BENCH_SERVER_CPU_QUOTA=50% \
             BENCH_MAX_LOAD=100 \
             SING_BOX="$tools/sing-box" \
             XRAY_BIN="$tools/xray-bin" \

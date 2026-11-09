@@ -144,6 +144,24 @@ def _cpu_delta(
     return round(max(0.0, busy) / total * 100.0, 2)
 
 
+def _cpu_max(pid: int) -> str | None:
+    """The cgroup v2 CPU ceiling of a process, when one is set."""
+    if not pid:
+        return None
+    try:
+        cgroup = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in cgroup.splitlines():
+        if line.startswith("0::"):
+            path = Path("/sys/fs/cgroup" + line[3:].strip() + "/cpu.max")
+            try:
+                return path.read_text(encoding="utf-8").strip()
+            except OSError:
+                return None
+    return None
+
+
 def _smt_siblings(core: int) -> set[int]:
     """The core plus its hyperthread siblings, if the topology exposes them.
 
@@ -885,6 +903,7 @@ def main() -> int:
             else None
         ),
         "client_cores": client_cores,
+        "server_cpu_max": _cpu_max(args.server_pid),
         "target_core_busy_pct": _cpu_delta(before["cpu"], after["cpu"], args.target_core),
         "driver_core_busy_pct": _cpu_delta(before["cpu"], after["cpu"], args.driver_core),
         "non_role_core_busy_pct_max": max(

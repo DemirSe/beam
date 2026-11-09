@@ -67,6 +67,7 @@ DRIVER_CPU="${BENCH_DRIVER_CPU:-}"
 CLIENT_CPUS="${BENCH_CLIENT_CPUS:-1}"
 RTT_MS="${BENCH_RTT_MS:-0}"
 MAX_LOAD="${BENCH_MAX_LOAD:-0.3}"
+SERVER_CPU_QUOTA="${BENCH_SERVER_CPU_QUOTA:-}"
 PERF="${BENCH_PERF:-0}"
 PERF_EVENTS="${BENCH_PERF_EVENTS:-task-clock,context-switches,cpu-migrations,page-faults,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_recvfrom,syscalls:sys_enter_sendto,syscalls:sys_enter_splice,sched:sched_wakeup,sched:sched_switch}"
 HTTPS_PARALLEL="${BENCH_HTTPS_PARALLEL:-1}"
@@ -188,6 +189,11 @@ case "$HTTPS_PARALLEL" in
 esac
 [ "$HTTPS_PARALLEL" -ge 1 ] || { echo "bench: BENCH_HTTPS_PARALLEL must be >= 1" >&2; exit 2; }
 case "$REPORT" in 0|1) ;; *) echo "bench: BENCH_REPORT must be 0 or 1" >&2; exit 2 ;; esac
+if [ -n "$SERVER_CPU_QUOTA" ]; then
+  case "$SERVER_CPU_QUOTA" in
+    *[!0-9%]*|'') echo "bench: BENCH_SERVER_CPU_QUOTA must look like 50%" >&2; exit 2 ;;
+  esac
+fi
 KNOWN_SCENARIOS="tcp-dl-1,tcp-dl-4,tcp-ul-1,tcp-ul-4,https-bulk,udp-echo,dns-a,h3-latency"
 if [ "$SCENARIOS" != "all" ]; then
   IFS=',' read -r -a SCENARIO_FILTER <<< "$SCENARIOS"
@@ -292,6 +298,7 @@ if [ "$INNER" != "1" ]; then
     BENCH_SERVER_CPU="$SERVER_CPU" BENCH_CLIENT_CPU="$CLIENT_CPU" \
     BENCH_TARGET_CPU="$TARGET_CPU" BENCH_DRIVER_CPU="$DRIVER_CPU" BENCH_CLIENT_CPUS="$CLIENT_CPUS" BENCH_RTT_MS="$RTT_MS" BENCH_MAX_LOAD="$MAX_LOAD" \
     BENCH_PERF="$PERF" BENCH_PERF_EVENTS="$PERF_EVENTS" \
+    BENCH_SERVER_CPU_QUOTA="$SERVER_CPU_QUOTA" \
     BENCH_HTTPS_PARALLEL="$HTTPS_PARALLEL" BENCH_LOG_LEVEL="$LOG_LEVEL" \
     BENCH_SCENARIOS="$SCENARIOS" BENCH_REPORT="$REPORT" \
     SING_BOX="$SING_BOX" XRAY_BIN="$XRAY_BIN" TEST_CONFIG="$TEST_CONFIG" \
@@ -342,6 +349,14 @@ die() {
   printf 'bench: HARNESS FAILURE: %s\n' "$*" >&2
   exit 1
 }
+
+if [ -n "$SERVER_CPU_QUOTA" ]; then
+  [ "$(id -u)" -eq 0 ] || die "BENCH_SERVER_CPU_QUOTA needs root; run with BENCH_INNER=1"
+  if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]+4294967295' /proc/self/uid_map; then
+    die "BENCH_SERVER_CPU_QUOTA needs real host root, not a mapped user namespace"
+  fi
+  command -v systemd-run >/dev/null 2>&1 || die "BENCH_SERVER_CPU_QUOTA needs systemd-run"
+fi
 
 if [ "$PERF" = "1" ]; then
   [ "$(id -u)" -eq 0 ] || die "BENCH_PERF=1 requires root; run with BENCH_INNER=1"
@@ -674,7 +689,7 @@ wait_for_port tun-target "$TARGET_HOST" "$IPERF3_PORT" "$IPERF3_PID" 10 \
   echo "reps=$REPS"
   echo "duration_s=$DURATION"
   echo "arms=$ARMS"
-  echo "server_cpu=$SERVER_CPU client_cpus=$CLIENT_MASK_SPEC target_cpu=$TARGET_CPU driver_cpu=$DRIVER_CPU"
+  echo "server_cpu=$SERVER_CPU client_cpus=$CLIENT_MASK_SPEC target_cpu=$TARGET_CPU driver_cpu=$DRIVER_CPU server_cpu_quota=${SERVER_CPU_QUOTA:-none}"
 echo "rtt_ms=$RTT_MS"
   echo "singbox=$SING_BOX"
   echo "xray=$XRAY_BIN"
@@ -703,14 +718,41 @@ start_arm() {
   : > "$server_log"
   : > "$client_log"
 
+  local -a server_cmd
   if [ "$arm" = "beam" ]; then
-    ip netns exec tun-server taskset -c "$SERVER_CPU" \
-      "$ROOT/target/release/beam" --config "$CONFIG_DIR/beam.toml" > "$server_log" 2>&1 &
+    server_cmd=(ip netns exec tun-server taskset -c "$SERVER_CPU" \
+      "$ROOT/target/release/beam" --config "$CONFIG_DIR/beam.toml")
   else
-    ip netns exec tun-server taskset -c "$SERVER_CPU" \
-      env GOMAXPROCS=1 "$XRAY_BIN" run -c "$CONFIG_DIR/xray-server.json" > "$server_log" 2>&1 &
+    server_cmd=(ip netns exec tun-server taskset -c "$SERVER_CPU" \
+      env GOMAXPROCS=1 "$XRAY_BIN" run -c "$CONFIG_DIR/xray-server.json")
   fi
-  SERVER_PID=$!
+  SERVER_SCOPE=""
+  if [ -n "$SERVER_CPU_QUOTA" ]; then
+    # The quota makes the server, not the harness, the bottleneck: both arms get
+    # the same ceiling, so ratios stay comparable while absolute numbers describe
+    # a fraction of a vCPU.
+    SERVER_SCOPE="beam-bench-$arm-$rep-$$"
+    systemd-run --scope --quiet --unit "$SERVER_SCOPE" \
+      -p "CPUQuota=$SERVER_CPU_QUOTA" -- "${server_cmd[@]}" > "$server_log" 2>&1 &
+    # systemd does not expose a usable MainPID for scopes, so read the scope's
+    # own cgroup. That file is also the evidence that the ceiling applied.
+    SERVER_PID=""
+    local scope_cg=""
+    for _ in $(seq 1 100); do
+      scope_cg="$(find /sys/fs/cgroup -maxdepth 3 -name "$SERVER_SCOPE.scope" 2>/dev/null | head -n 1)"
+      if [ -n "$scope_cg" ] && [ -s "$scope_cg/cgroup.procs" ]; then
+        SERVER_PID="$(head -n 1 "$scope_cg/cgroup.procs")"
+        if [ -n "$SERVER_PID" ]; then break; fi
+      fi
+      sleep 0.1
+    done
+    [ -n "$SERVER_PID" ] || die "could not resolve the server PID inside $SERVER_SCOPE"
+    SERVER_CPU_MAX="$(cat "$scope_cg/cpu.max" 2>/dev/null || echo unknown)"
+    printf 'server_cpu_max=%s scope=%s\n' "$SERVER_CPU_MAX" "$SERVER_SCOPE" >> "$RUN_DIR/masks.tsv"
+  else
+    "${server_cmd[@]}" > "$server_log" 2>&1 &
+    SERVER_PID=$!
+  fi
   if ! wait_for_port tun-server 10.10.1.1 443 "$SERVER_PID" 20; then
     tail -n 40 "$server_log" >&2 || true
     die "$arm did not start listening on $BEAM_ADDR"
@@ -756,6 +798,10 @@ stop_arm() {
   SINGBOX_PID=""
   stop_pid "$SERVER_PID"
   SERVER_PID=""
+  if [ -n "${SERVER_SCOPE:-}" ]; then
+    systemctl stop "$SERVER_SCOPE" >/dev/null 2>&1 || true
+    SERVER_SCOPE=""
+  fi
   ip netns exec tun-client ip link del tun0 >/dev/null 2>&1 || true
 }
 
@@ -769,7 +815,15 @@ measure() {
   fi
   local perf_pid=""
   local rc=0
-  if [ "$PERF" = "1" ]; then
+  if [ -n "$SERVER_CPU_QUOTA" ]; then
+  [ "$(id -u)" -eq 0 ] || die "BENCH_SERVER_CPU_QUOTA needs root; run with BENCH_INNER=1"
+  if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]+4294967295' /proc/self/uid_map; then
+    die "BENCH_SERVER_CPU_QUOTA needs real host root, not a mapped user namespace"
+  fi
+  command -v systemd-run >/dev/null 2>&1 || die "BENCH_SERVER_CPU_QUOTA needs systemd-run"
+fi
+
+if [ "$PERF" = "1" ]; then
     perf stat -x, -e "$PERF_EVENTS" -p "$SERVER_PID" -o "$out.perf.csv" &
     perf_pid=$!
     sleep 0.5
