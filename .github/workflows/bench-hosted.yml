@@ -29,7 +29,7 @@ on:
       duration:
         description: "seconds per iperf3 window"
         required: true
-        default: "10"
+        default: "5"
   push:
     paths:
       - .github/workflows/bench-hosted.yml
@@ -48,12 +48,12 @@ env:
   XRAY_SHA256: "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
   RTT_MS: ${{ inputs.rtt_ms || '50' }}
   REPS: ${{ inputs.reps || '2' }}
-  DURATION: ${{ inputs.duration || '10' }}
+  DURATION: ${{ inputs.duration || '5' }}
 
 jobs:
   bench:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
         with:
@@ -97,16 +97,16 @@ jobs:
           "$tools/xray-bin" version | head -2
           cd "$GITHUB_WORKSPACE" && git rev-parse HEAD
 
-      - name: Build beam and the H3 origin
+      - name: Build beam
         timeout-minutes: 15
         run: |
           source scripts/dev-env.sh
           rustc --version
           cargo build --locked --release -p beam
-          cargo build --locked --manifest-path tests/tun/h3-origin/Cargo.toml || true
           ls -l target/release/beam
 
       - name: Benchmark (root, private namespaces)
+        timeout-minutes: 7
         run: |
           set -euo pipefail
           tools="$RUNNER_TEMP/tools"
