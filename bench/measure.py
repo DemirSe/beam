@@ -144,6 +144,34 @@ def _cpu_delta(
     return round(max(0.0, busy) / total * 100.0, 2)
 
 
+def _smt_siblings(core: int) -> set[int]:
+    """The core plus its hyperthread siblings, if the topology exposes them.
+
+    A role pinned to one thread still spills work onto its sibling thread, so
+    the sibling is part of the role and must not be reported as host noise.
+    """
+    path = Path(f"/sys/devices/system/cpu/cpu{core}/topology/thread_siblings_list")
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return {core}
+    cores = {core}
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        low, _, high = chunk.partition("-")
+        try:
+            if high:
+                cores.update(range(int(low), int(high) + 1))
+            else:
+                cores.add(int(low))
+        except ValueError:
+            continue
+    return cores
+
+
+
 def _pct(values: list[float], percentile: float) -> float | None:
     if not values:
         return None
@@ -750,6 +778,14 @@ def main() -> int:
         "target": args.target_core,
         "driver": args.driver_core,
     }
+    excluded_cores: set[int] = set()
+    for core in (
+        args.server_core,
+        args.target_core,
+        args.driver_core,
+        *client_cores,
+    ):
+        excluded_cores |= _smt_siblings(core)
     before = snapshot(pids, role_cores)
     started = time.monotonic()
     try:
@@ -847,13 +883,7 @@ def main() -> int:
             (
                 value
                 for core in range(args.all_cores)
-                if core
-                not in (
-                    args.server_core,
-                    args.target_core,
-                    args.driver_core,
-                    *client_cores,
-                )
+                if core not in excluded_cores
                 if (value := _cpu_delta(before["cpu"], after["cpu"], core)) is not None
             ),
             default=None,

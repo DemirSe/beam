@@ -852,8 +852,20 @@ done
 # Manifest and report
 # ---------------------------------------------------------------------------
 
-LOAD_AFTER="$(awk '{print $1}' /proc/loadavg)"
 FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# The 1-minute load average still carries the run itself (the harness keeps one
+# thread per role and per client core busy), so sampling it immediately would
+# report the benchmark as host noise. Let it decay first, bounded; if the host
+# never settles the warning below is kept.
+LOAD_AFTER="$(awk '{print $1}' /proc/loadavg)"
+for _ in $(seq 1 180); do
+  if awk -v host_load="$LOAD_AFTER" -v max_load="$MAX_LOAD" \
+      'BEGIN { exit !(host_load <= max_load) }'; then
+    break
+  fi
+  sleep 1
+  LOAD_AFTER="$(awk '{print $1}' /proc/loadavg)"
+done
 if [ "$RTT_MS" -gt 0 ]; then
   ip netns exec tun-client "$TC" -s qdisc show > "$LOG_DIR/tc-client-final.txt" 2>&1 || true
   ip netns exec tun-server "$TC" -s qdisc show > "$LOG_DIR/tc-server-final.txt" 2>&1 || true
