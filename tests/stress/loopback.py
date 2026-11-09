@@ -145,9 +145,10 @@ def is_open(sock: socket.socket) -> bool:
 def wait_closed(sock: socket.socket, limit: float) -> str:
     """Classify how a socket ends within an absolute deadline.
 
-    Returns "timeout" if it is still open at the deadline, otherwise "eof"
-    (FIN), "reset" (RST), or "data" when payload arrived before the close.
-    The deadline is absolute: a peer that drips bytes cannot extend it.
+    Returns "timeout" (no payload, still open), "data" (payload but still
+    open at the deadline), "eof"/"reset" (closed with no payload), or
+    "data-eof"/"data-reset" (payload observed before the close). The deadline
+    is absolute: a peer that drips bytes cannot extend it.
     """
     deadline = time.monotonic() + limit
     saw_data = False
@@ -161,12 +162,87 @@ def wait_closed(sock: socket.socket, limit: float) -> str:
         except socket.timeout:
             return "data" if saw_data else "timeout"
         except ConnectionResetError:
-            return "reset"
+            return "data-reset" if saw_data else "reset"
         except OSError:
-            return "reset"
+            return "data-reset" if saw_data else "reset"
         if not chunk:
-            return "data" if saw_data else "eof"
+            return "data-eof" if saw_data else "eof"
         saw_data = True
+
+
+def clean_close(state: str) -> bool:
+    """The peer closed without sending a payload."""
+    return state in ("eof", "reset")
+
+
+def closed_state(state: str) -> bool:
+    """The peer closed, with or without a payload."""
+    return state in ("eof", "reset", "data-eof", "data-reset")
+
+
+def probe_classifier(results: list[dict]) -> None:
+    """Self-test the closure classifier with all four observed outcomes."""
+    expected = {
+        "eof": "eof",
+        "reset": "reset",
+        "data": "data",
+        "data-eof": "data-eof",
+    }
+    got = {}
+
+    for mode in expected:
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+
+        def serve(mode=mode):
+            try:
+                conn, _ = listener.accept()
+                try:
+                    if mode == "eof":
+                        conn.close()
+                    elif mode == "reset":
+                        conn.setsockopt(
+                            socket.SOL_SOCKET,
+                            socket.SO_LINGER,
+                            struct.pack("ii", 1, 0),
+                        )
+                        conn.close()
+                    elif mode == "data":
+                        conn.sendall(b"x")
+                        time.sleep(0.5)
+                        conn.close()
+                    else:  # data-eof
+                        conn.sendall(b"x")
+                        conn.shutdown(socket.SHUT_WR)
+                        time.sleep(0.2)
+                        conn.close()
+                except OSError:
+                    pass
+            finally:
+                listener.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        client = socket.create_connection(("127.0.0.1", port), timeout=2)
+        got[mode] = wait_closed(client, 0.3)
+        client.close()
+        thread.join(timeout=1)
+
+    ok = (
+        got == expected
+        and not clean_close("data")
+        and not closed_state("data")
+        and closed_state("data-eof")
+    )
+    check(
+        results,
+        "closure_classifier",
+        ok,
+        f"expected={expected} got={got} data_counts_as_closed={closed_state('data')}",
+    )
 
 
 def close_all(socks: list[socket.socket]) -> None:
@@ -314,7 +390,7 @@ def probe_basic(
     check(
         results,
         "handshake_deadline_idle",
-        idle_state in ("eof", "reset") and idle_s < 2.0,
+        clean_close(idle_state) and idle_s < 2.0,
         f"state={idle_state} after {idle_s}s",
     )
 
@@ -401,7 +477,7 @@ def probe_admission(beam: Path, out: Path, results: list[dict]) -> None:
         still = 0
         if open_holders:
             fresh = connect(server.port, "127.0.0.250")
-            rejected = wait_closed(fresh, 0.5) != "timeout"
+            rejected = clean_close(wait_closed(fresh, 0.5))
             fresh.close()
             open_holders[0].close()
             time.sleep(0.3)
@@ -415,7 +491,7 @@ def probe_admission(beam: Path, out: Path, results: list[dict]) -> None:
             full
             and rejected
             and admitted
-            and still >= len(open_holders) - 2,
+            and still == len(open_holders) - 1,
             f"held={len(open_holders)}/{MAX_CONNECTIONS} "
             f"fresh_rejected={rejected} readmitted_after_release={admitted} "
             f"other_holders_open={still}",
@@ -453,7 +529,7 @@ def probe_cover(server: Server, cover: SilentCover, results: list[dict]) -> None
     limited = connect(port, "127.0.0.10")
     limited.sendall(b"GET / HTTP/1.1\r\nHost: stress\r\n\r\n")
     limited_state = wait_closed(limited, 0.5)
-    limited_closed = limited_state != "timeout"
+    limited_closed = clean_close(limited_state)
     limited.close()
     log = server.log_path.read_text(encoding="utf-8", errors="replace")
     limited_logged = "cover limit reached" in log
@@ -500,7 +576,7 @@ def probe_refused_cover(beam: Path, out: Path, results: list[dict]) -> None:
         sock = connect(server.port)
         sock.sendall(b"GET / HTTP/1.1\r\nHost: stress\r\n\r\n")
         state = wait_closed(sock, 1.0)
-        closed = state != "timeout"
+        closed = clean_close(state)
         sock.close()
         time.sleep(0.3)
         after = server.fds()
@@ -541,7 +617,7 @@ def probe_shutdown(beam: Path, out: Path, results: list[dict]) -> None:
                 break
             time.sleep(0.05)
         states = [wait_closed(sock, 0.5) for sock in holders]
-        gone = sum(1 for state in states if state != "timeout")
+        gone = sum(1 for state in states if closed_state(state))
         log = server.log_path.read_text(encoding="utf-8", errors="replace")
         drain_logged = "shutdown drain deadline reached" in log
         preauth_logged = f"preauth_remaining={MAX_CONNECTIONS}" in log
@@ -623,6 +699,7 @@ def main() -> int:
         out.mkdir(parents=True, exist_ok=True)
 
     results: list[dict] = []
+    probe_classifier(results)
     cover = SilentCover()
     server = Server(beam, out, "basic", f"127.0.0.1:{cover.port}")
     try:
