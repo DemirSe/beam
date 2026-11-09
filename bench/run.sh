@@ -1006,6 +1006,10 @@ measure() {
   if [ -n "${SERVER_CGROUP:-}" ]; then
     server_peak="$(cat "/sys/fs/cgroup$SERVER_CGROUP/memory.peak" 2>/dev/null || true)"
   fi
+  local target_pid="$SERVICES_PID"
+  if [ "$kind" = "iperf3" ] && [ -n "${IPERF3_PID:-}" ]; then
+    target_pid="$IPERF3_PID"
+  fi
   ip netns exec tun-client taskset -c "$DRIVER_CPU" \
     env LD_LIBRARY_PATH="$IPERF3_LIB" BENCH_SERVER_CPU_MAX="$SERVER_CPU_MAX" \
     BENCH_SERVER_MEMORY_MAX="$SERVER_MEMORY_MAX_ACTUAL" \
@@ -1015,7 +1019,7 @@ measure() {
       --scenario "$scenario" --kind "$kind" \
       --out "$out" \
       --server-pid "$SERVER_PID" --client-pid "$SINGBOX_PID" \
-      --target-pid "$SERVICES_PID" \
+      --target-pid "$target_pid" \
       --server-core "$SERVER_CPU" --client-core "$CLIENT_CPU" \
       --target-core "$TARGET_CPU" --driver-core "$DRIVER_CPU" \
       --client-cores "$CLIENT_MASK_SPEC" --all-cores "$NPROC" \
@@ -1033,9 +1037,17 @@ run_warmup() {
   local arm=$1 rep=$2
   local base="$LOG_DIR/warmup-$arm-r$rep"
   local rc=0
+  local iperf_rc=0
   ip netns exec tun-client taskset -c "$DRIVER_CPU" \
     "$IPERF3" -c "$TARGET_HOST" -p "$IPERF3_PORT" -t 2 -P 1 -l 128K -4 \
-    > "$base-iperf3.log" 2>&1 || rc=1
+    > "$base-iperf3.log" 2>&1 || iperf_rc=1
+  if [ "$iperf_rc" != "0" ]; then
+    # The first iperf3 connection can race the freshly started tunnel.
+    sleep 1
+    ip netns exec tun-client taskset -c "$DRIVER_CPU" \
+      "$IPERF3" -c "$TARGET_HOST" -p "$IPERF3_PORT" -t 2 -P 1 -l 128K -4 \
+      > "$base-iperf3.log" 2>&1 || rc=1
+  fi
   ip netns exec tun-client taskset -c "$DRIVER_CPU" \
     curl --noproxy '*' -k -sS --http1.1 --max-time 60 \
     -o /dev/null "https://$TARGET_HOST:4443/large.bin" \
