@@ -33,6 +33,8 @@ on:
   push:
     paths:
       - .github/workflows/bench-hosted.yml
+      - bench/**
+      - config.example.toml
 
 permissions:
   contents: write
