@@ -1,4 +1,4 @@
-# Open stress findings — updated 2026-11-08
+# Open stress findings — updated 2026-11-09
 
 This file is intentionally separate from `README.md` for the findings that are
 still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
@@ -35,6 +35,7 @@ Do not treat the latter as fixed or as measured production incidents.
 | 9 | fixed 2026-11-08 | XUDP lifecycle | The empty-mux timer now tracks active sessions only, so retained GlobalID sockets cannot add another close timer. |
 | 10 | open | Lower-risk resources | Remaining mux-abort cleanup and session-table lock items; cover/Vision cancellation and CPU-spin issues are fixed. |
 | 12 | open | Client platform | Rootless Android cannot enable BBR while preserving the REALITY outer TCP cover. |
+| 13 | fixed 2026-11-09 | Cover relay | A disconnected probe could pin a cover slot and two sockets until the 30 s cover idle timeout, and slot saturation made the cover reply with an immediate reset. |
 
 ## Lab results
 
@@ -351,6 +352,34 @@ throughput, and whether the WAN side still shows `whatsapp.net` TCP/443). If
 that fails, quantify custom-client pacing/queue only; a QUIC transport is a
 separate product decision because it changes the visible transport.
 
+### 13. [RESOLVED] Cover probes pinned relays after disconnect — LOW-MEDIUM, loopback reproduced and fixed
+
+`crates/beam-core/src/tls/server.rs` (`forward_to_cover`, `relay_cover_bidirectional`)
+
+The cover relay used the authenticated two-direction relay, whose
+`try_join!` waits for both halves. When a probe closed its side while the
+cover peer stayed silent, the client-to-cover half finished but the
+cover-to-client half waited for the 30 s `COVER_IDLE_TIMEOUT`, holding the
+cover permit and both sockets. With `COVER_MAX_CONCURRENCY = 32` and
+`COVER_MAX_PER_IP = 8`, four source addresses could pin all cover slots; every
+new probe then got an immediate reset (`cover limit reached … reject=Global`)
+instead of the cover behavior, which is observable by a scanner.
+
+Loopback reproduction (reduced limits, `handshake_timeout_ms=1000`, silent
+cover peer): 32 relays filled from 4 source IPs, beam fds 10 → 106, a fresh
+probe reset with `reject=Global`, and the fds stayed at 106 for about 30 s
+after every probe disconnected. Refused-cover and idle-probe paths were
+already bounded.
+
+Fix: cover relays use a dedicated `relay_cover_bidirectional` that ends on the
+first half-close, so a disconnected probe releases the relay and its permit
+immediately. The authenticated relay is unchanged (Vision keeps its
+half-close semantics). Regression tests:
+`cover_relay_ends_when_the_probe_half_closes` (unit) and
+`tests/stress/loopback.py` (`cover_eof_release`, `cover_limit_fingerprint`).
+After the fix the same probe shows fds 10 → 10 and the fresh probe is
+forwarded.
+
 ## Non-findings
 
 - No fd, task, permit, or XUDP session leak appeared in normal load, the 10k
@@ -389,6 +418,9 @@ separate product decision because it changes the visible transport.
 9. If 8 does not hold, quantify custom-client pacing/queue only; treat
    Hysteria2/TUIC or another QUIC transport as a separate cover-changing
    product decision.
+10. ~~Cover slot retention after a probe disconnects (13).~~ Fixed and covered
+    by `tests/stress/loopback.py`; run it with `make stress` or
+    `gh workflow run lab-hosted.yml -f suite=stress`.
 
 ## 2026-11-08 follow-up
 
@@ -403,6 +435,9 @@ interaction. README and this file were updated with the measured behavior.
 
 ## Reproduction notes
 
-- Raw soak, impairment, slow-reader, and junk-idle outputs were scratch
-  evidence on the lab hosts, not committed test fixtures. Reproduce them with
-  the lab harness instead of relying on stale paths.
+- The loopback admission/cover probes are committed as
+  `tests/stress/loopback.py` (`make stress`, or `suite=stress` in the hosted
+  workflow); they need no root, namespace, or TUN. The remaining raw soak,
+  impairment, slow-reader, and junk-idle outputs were scratch evidence on the
+  lab hosts, not committed test fixtures. Reproduce them with the lab harness
+  instead of relying on stale paths.

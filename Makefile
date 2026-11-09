@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 CACHE_DIR ?= $(HOME)/.cache/beam
 
-.PHONY: help doctor check fmt clippy test build verify smoke acceptance fuzz-smoke bench-cache
+.PHONY: help doctor check fmt clippy test build verify smoke acceptance fuzz-smoke stress bench-cache
 
 help:
 	@printf '%s\n' \
@@ -11,6 +11,7 @@ help:
 	  'make smoke       release build, config check, shell syntax' \
 	  'make acceptance  verify + smoke' \
 	  'make fuzz-smoke  short fuzz run with corpus cache' \
+	  'make stress      loopback pre-auth and cover stability probes' \
 	  'make bench-cache benchmark into ~/.cache/beam/bench-results'
 
 doctor:
@@ -60,6 +61,10 @@ acceptance: verify smoke
 
 fuzz-smoke:
 	BEAM_FUZZ_CACHE="$(CACHE_DIR)/fuzz-corpus" bash scripts/fuzz-smoke.sh
+
+stress: build
+	python3 tests/stress/loopback.py --beam target/release/beam \
+	  --out "$(CACHE_DIR)/stress-results/$$(date -u +%Y%m%dT%H%M%SZ)"
 
 bench-cache:
 	bash bench/run.sh --out "$(CACHE_DIR)/bench-results/$$(date -u +%Y%m%dT%H%M%SZ)"

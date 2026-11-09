@@ -871,13 +871,15 @@ force the Vision async fallback.
 
 ### Hosted pre-release lab
 
-`.github/workflows/lab-hosted.yml` runs the functional 8-row TUN matrix and the
-stock-vs-beam A/B in one GitHub-hosted `ubuntu-24.04` job, on demand:
+`.github/workflows/lab-hosted.yml` runs the functional 8-row TUN matrix, the
+stock-vs-beam A/B, and the loopback stress probes in one GitHub-hosted
+`ubuntu-24.04` job, on demand:
 
 ```bash
 gh workflow run lab-hosted.yml -f profile=standard
 gh workflow run lab-hosted.yml -f profile=smoke -f suite=tun
 gh workflow run lab-hosted.yml -f profile=claim -f suite=bench
+gh workflow run lab-hosted.yml -f suite=stress
 ```
 
 | Profile | RTT | Server ceiling | Reps | Window | Duration | Use |
@@ -886,12 +888,26 @@ gh workflow run lab-hosted.yml -f profile=claim -f suite=bench
 | `standard` | 250 ms | 50% CPU, 1 GiB | 3 | full | ~40 min | routine pre-release |
 | `claim` | 250 ms | 50% CPU, 1 GiB | 10 | full | ~90 min | claim-grade cell |
 
+`suite=stress` takes seconds and ignores the profile budget. It starts its own
+server on loopback (no root, no net namespace, no TUN) with reduced limits and
+checks the admission and cover bounds: per-source and global pre-auth
+exhaustion, the ClientHello handoff deadline for idle/partial/trickled probes,
+fd stability under RST churn, the 32-slot cover cap and its response, prompt
+cover-slot release when a probe disconnects, a refused cover dial, and
+graceful shutdown under a full pre-auth pool. `tests/stress/loopback.py` is the
+same suite locally:
+
+```bash
+make stress   # release build + python3 tests/stress/loopback.py
+```
+
 The job is dispatch-only: no push, tag, or PR event runs it, so a shared
-runner's noise never blocks a release by itself. A green job means the TUN
-matrix was 8/8 PASS and the bench cell is complete (`--require-complete`) and
-unsaturated; a ratio outside 0.95-1.05 only emits a warning. Results land in
-the `bench-results` branch (latest run), a run artifact, and the step summary.
-`BLOCKED` TUN rows fail the job; `ALLOW_TUN_BLOCKED` is never used there.
+runner's noise never blocks a release by itself. A green job means every
+selected suite passed: TUN 8/8 PASS, the bench cell complete
+(`--require-complete`) and unsaturated, and every stress check PASS. A ratio
+outside 0.95-1.05 only emits a warning. Results land in the `bench-results`
+branch (latest run), a run artifact, and the step summary. `BLOCKED` TUN rows
+fail the job; `ALLOW_TUN_BLOCKED` is never used there.
 
 The runner is shared and the four vCPUs are all assigned to roles, so these are
 noisy, high-RTT probe measurements, not headline numbers, and the `non_role`

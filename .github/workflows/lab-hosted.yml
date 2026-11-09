@@ -2,7 +2,8 @@ name: lab-hosted
 
 # Pre-release lab on one GitHub-hosted ubuntu-24.04 runner: the functional
 # full-TUN matrix and the stock-vs-beam A/B, both as host root inside a private
-# mount+net namespace (the runner blocks unprivileged user namespaces).
+# mount+net namespace (the runner blocks unprivileged user namespaces), plus
+# loopback stress probes that need no root or namespace.
 #
 # Manual only: a shared runner's noisy, high-RTT numbers must never gate a
 # release by themselves, so this workflow is not triggered by pushes or tags.
@@ -26,7 +27,7 @@ on:
         required: true
         default: both
         type: choice
-        options: [both, bench, tun]
+        options: [both, bench, tun, stress]
       udp_mode:
         description: "sing-box packet encoding for the TUN suite"
         required: true
@@ -178,7 +179,7 @@ jobs:
           ls -l target/release/beam tests/tun/h3-origin/target/debug/h3-origin
 
       - name: TUN suite (root, private namespaces)
-        if: inputs.suite != 'bench'
+        if: inputs.suite == 'both' || inputs.suite == 'tun'
         timeout-minutes: 20
         run: |
           set -euo pipefail
@@ -196,7 +197,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/tun-run.log"
 
       - name: Benchmark (root, private namespaces)
-        if: inputs.suite != 'tun'
+        if: inputs.suite == 'both' || inputs.suite == 'bench'
         timeout-minutes: 110
         run: |
           set -euo pipefail
@@ -231,6 +232,16 @@ jobs:
             bash "$GITHUB_WORKSPACE/bench/run.sh" "${bench_args[@]}" \
             2>&1 | tee "$RUNNER_TEMP/bench-run.log"
 
+      - name: Loopback stress probes
+        if: inputs.suite == 'stress' || inputs.suite == 'both'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/stress-out"
+          python3 "$GITHUB_WORKSPACE/tests/stress/loopback.py" \
+            --beam "$GITHUB_WORKSPACE/target/release/beam" \
+            --out "$out" 2>&1 | tee "$RUNNER_TEMP/stress-run.log"
+
       - name: Make volatile output readable
         if: always()
         run: |
@@ -248,8 +259,8 @@ jobs:
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "${{ inputs.suite }}" = "tun" ]; then
-            echo "Bench: skipped (suite=tun)." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.suite }}" = "tun" ] || [ "${{ inputs.suite }}" = "stress" ]; then
+            echo "Bench: skipped (suite=${{ inputs.suite }})." >> "$GITHUB_STEP_SUMMARY"
           elif [ -f "$RUNNER_TEMP/bench-out/summary.md" ]; then
             echo "## Bench" >> "$GITHUB_STEP_SUMMARY"
             head -c 200000 "$RUNNER_TEMP/bench-out/summary.md" >> "$GITHUB_STEP_SUMMARY"
@@ -258,8 +269,8 @@ jobs:
             echo "Bench: no summary.md produced." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          if [ "${{ inputs.suite }}" = "bench" ]; then
-            echo "TUN: skipped (suite=bench)." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.suite }}" = "bench" ] || [ "${{ inputs.suite }}" = "stress" ]; then
+            echo "TUN: skipped (suite=${{ inputs.suite }})." >> "$GITHUB_STEP_SUMMARY"
           elif [ -f "$RUNNER_TEMP/tun-out/results-beam.tsv" ]; then
             {
               echo "## TUN"
@@ -273,6 +284,16 @@ jobs:
             echo "TUN: no results-beam.tsv produced." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          if [ "${{ inputs.suite }}" = "bench" ] || [ "${{ inputs.suite }}" = "tun" ]; then
+            echo "Stress: skipped (suite=${{ inputs.suite }})." >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f "$RUNNER_TEMP/stress-out/summary.md" ]; then
+            echo "## Stress" >> "$GITHUB_STEP_SUMMARY"
+            head -c 200000 "$RUNNER_TEMP/stress-out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Stress: no summary.md produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -281,6 +302,7 @@ jobs:
           path: |
             ${{ runner.temp }}/bench-run.log
             ${{ runner.temp }}/tun-run.log
+            ${{ runner.temp }}/stress-run.log
             ${{ runner.temp }}/bench-out/summary.md
             ${{ runner.temp }}/bench-out/summary.json
             ${{ runner.temp }}/bench-out/meta.json
@@ -297,6 +319,7 @@ jobs:
             ${{ runner.temp }}/tun-out/xray-version.txt
             ${{ runner.temp }}/tun-out/logs
             ${{ runner.temp }}/tun-out/probes
+            ${{ runner.temp }}/stress-out
           retention-days: 7
           if-no-files-found: warn
 
@@ -404,4 +427,29 @@ jobs:
               print("::error::TUN matrix did not pass: " + ", ".join(problems))
               raise SystemExit(1)
           print("TUN acceptance: 8/8 PASS")
+          PY
+
+      - name: Stress acceptance
+        if: always() && (inputs.suite == 'stress' || inputs.suite == 'both')
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/stress-out/summary.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          if not path.is_file():
+              print(f"::error::stress suite produced no summary at {path}")
+              raise SystemExit(1)
+          summary = json.loads(path.read_text(encoding="utf-8"))
+          failures = [
+              check["name"]
+              for check in summary.get("checks") or []
+              if check.get("ok") is not True
+          ]
+          if failures or summary.get("ok") is not True:
+              print("::error::stress checks failed: " + ", ".join(failures or ["summary"]))
+              raise SystemExit(1)
+          print("stress acceptance: all checks passed")
           PY
