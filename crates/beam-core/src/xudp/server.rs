@@ -38,7 +38,7 @@ use super::session::{
 use crate::address::{Address, NetLocation};
 use crate::metrics::Metrics;
 use crate::xudp::frame::{
-    self, Frame, FrameOption, GLOBAL_ID_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN,
+    self, Frame, FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN,
     METADATA_PREFIX_LEN, SessionStatus, TargetNetwork, XudpError,
 };
 
@@ -724,17 +724,14 @@ where
     while let Some(frame) = inbound.recv().await {
         batch.clear();
         frames.clear();
-        batch.extend_from_slice(&frame.bytes);
+        append_frame(&mut batch, &frame)?;
         frames.push(frame);
 
-        while frames.len() < MAX_WRITE_BATCH_FRAMES {
+        while frames.len() < MAX_WRITE_BATCH_FRAMES && batch.len() < MAX_WRITE_BATCH_BYTES {
             match inbound.try_recv() {
                 Ok(frame) => {
-                    batch.extend_from_slice(&frame.bytes);
+                    append_frame(&mut batch, &frame)?;
                     frames.push(frame);
-                    if batch.len() >= MAX_WRITE_BATCH_BYTES {
-                        break;
-                    }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -756,6 +753,29 @@ where
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XUDP stream shutdown timed out"))??;
     Ok(())
+}
+
+/// Encodes one queued frame into the writer's reusable batch.
+fn append_frame(batch: &mut Vec<u8>, frame: &QueuedFrame) -> io::Result<()> {
+    match &frame.reply {
+        Some(reply) => {
+            let spec = FrameSpec {
+                session_id: reply.session_id,
+                status: SessionStatus::Keep,
+                option: FrameOption::DATA,
+                network: Some(TargetNetwork::Udp),
+                destination: Some(&reply.destination),
+                global_id: None,
+                payload: &reply.payload,
+            };
+            frame::encode_frame(batch, spec)
+                .map_err(|error| io::Error::other(format!("XUDP reply encode failed: {error}")))
+        }
+        None => {
+            batch.extend_from_slice(&frame.bytes);
+            Ok(())
+        }
+    }
 }
 
 /// Writes and flushes one complete frame.
@@ -1951,7 +1971,8 @@ mod tests {
                 .await
                 .expect("data reply timed out")
                 .expect("data frame");
-            let (frame, _) = parse_frame(&queued_frame.bytes)
+            let encoded = queued_frame.encoded();
+            let (frame, _) = parse_frame(&encoded)
                 .expect("data parse")
                 .expect("complete data frame");
             assert_eq!(frame.status, SessionStatus::Keep);
@@ -1960,7 +1981,8 @@ mod tests {
             .await
             .expect("end frame timed out")
             .expect("end frame");
-        let (frame, _) = parse_frame(&queued_frame.bytes)
+        let encoded = queued_frame.encoded();
+        let (frame, _) = parse_frame(&encoded)
             .expect("end parse")
             .expect("complete end frame");
         assert_eq!(frame.session_id, 7);
@@ -2366,10 +2388,11 @@ mod tests {
             .await
             .expect("live reply timed out")
             .expect("live reply channel closed");
-        let (frame, used) = parse_frame(&queued.bytes)
+        let encoded = queued.encoded();
+        let (frame, used) = parse_frame(&encoded)
             .expect("live reply parse")
             .expect("complete live reply");
-        assert_eq!(used, queued.bytes.len());
+        assert_eq!(used, encoded.len());
         let reply = OwnedFrame::from_borrowed(&frame);
         assert_eq!(reply.session_id, 2);
         assert_eq!(reply.status, SessionStatus::Keep);
@@ -3795,10 +3818,11 @@ mod tests {
                 .await
                 .expect("sweep did not queue both End frames")
                 .expect("sweep closed the outbound queue");
-            let (frame, used) = parse_frame(&queued.bytes)
+            let encoded = queued.encoded();
+            let (frame, used) = parse_frame(&encoded)
                 .expect("sweep queued a malformed frame")
                 .expect("sweep queued an incomplete frame");
-            assert_eq!(used, queued.bytes.len());
+            assert_eq!(used, encoded.len());
             assert_eq!(frame.status, SessionStatus::End);
             ended.push(frame.session_id);
         }

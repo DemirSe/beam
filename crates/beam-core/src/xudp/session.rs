@@ -39,8 +39,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -51,7 +51,7 @@ use tokio::time::{Instant, timeout};
 use crate::address::{Address, NetLocation};
 use crate::metrics::Metrics;
 use crate::xudp::frame::{
-    self, FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_PAYLOAD_LEN, SessionStatus, TargetNetwork,
+    self, FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_PAYLOAD_LEN, SessionStatus,
 };
 
 /// Default maximum number of sessions (active and retained) per mux stream.
@@ -692,9 +692,18 @@ impl Drop for SlotGuard {
 /// queue.
 pub(crate) struct QueuedFrame {
     pub(crate) bytes: Vec<u8>,
+    /// Set for a data reply; the writer encodes it into its reusable batch.
+    pub(crate) reply: Option<ReplyPayload>,
     _budget: Option<OwnedSemaphorePermit>,
     _stream_budget: Option<OwnedSemaphorePermit>,
     _slot: Option<SlotGuard>,
+}
+
+/// Owned reply payload waiting for the mux writer.
+pub(crate) struct ReplyPayload {
+    pub(crate) session_id: u16,
+    pub(crate) destination: NetLocation,
+    pub(crate) payload: Vec<u8>,
 }
 
 impl QueuedFrame {
@@ -705,6 +714,28 @@ impl QueuedFrame {
     ) -> Self {
         Self {
             bytes,
+            reply: None,
+            _budget: budget,
+            _stream_budget: None,
+            _slot: slot,
+        }
+    }
+
+    /// Queues one owned data reply for writer-side encoding.
+    pub(crate) fn reply(
+        session_id: u16,
+        destination: NetLocation,
+        payload: Vec<u8>,
+        budget: Option<OwnedSemaphorePermit>,
+        slot: Option<SlotGuard>,
+    ) -> Self {
+        Self {
+            bytes: Vec::new(),
+            reply: Some(ReplyPayload {
+                session_id,
+                destination,
+                payload,
+            }),
             _budget: budget,
             _stream_budget: None,
             _slot: slot,
@@ -718,6 +749,40 @@ impl QueuedFrame {
         self._stream_budget = stream_budget;
         self
     }
+
+    /// Encodes the queued frame exactly as the writer would.
+    #[cfg(test)]
+    pub(crate) fn encoded(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match &self.reply {
+            Some(reply) => {
+                let spec = FrameSpec {
+                    session_id: reply.session_id,
+                    status: SessionStatus::Keep,
+                    option: FrameOption::DATA,
+                    network: Some(crate::xudp::frame::TargetNetwork::Udp),
+                    destination: Some(&reply.destination),
+                    global_id: None,
+                    payload: &reply.payload,
+                };
+                frame::encode_frame(&mut out, spec).expect("test reply encoding");
+            }
+            None => out.extend_from_slice(&self.bytes),
+        }
+        out
+    }
+}
+
+/// Process-wide monotonic epoch used by the atomic idle clock.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn epoch() -> Instant {
+    *EPOCH
+}
+
+/// Milliseconds since the process epoch.
+fn now_ms() -> u64 {
+    epoch().elapsed().as_millis() as u64
 }
 
 /// One UDP relay session.
@@ -731,7 +796,7 @@ pub(crate) struct Session {
     /// Socket family selected at creation.
     pub(crate) family: SocketFamily,
     destination: Mutex<SocketAddr>,
-    last_activity: Mutex<Instant>,
+    last_activity_ms: AtomicU64,
     /// Serializes reply admission with close so an old reply cannot be queued
     /// after its End.
     enqueue_gate: Mutex<()>,
@@ -759,7 +824,7 @@ impl Session {
             socket,
             family,
             destination: Mutex::new(destination),
-            last_activity: Mutex::new(Instant::now()),
+            last_activity_ms: AtomicU64::new(now_ms()),
             enqueue_gate: Mutex::new(()),
             stop,
             closed: AtomicBool::new(false),
@@ -775,7 +840,7 @@ impl Session {
 
     /// Marks request or reply activity.
     pub(crate) fn touch(&self) {
-        *lock(&self.last_activity) = Instant::now();
+        self.last_activity_ms.store(now_ms(), Ordering::Release);
     }
 
     /// Serializes a reply enqueue with session close.
@@ -785,7 +850,9 @@ impl Session {
 
     /// Returns how long the session has been idle at `now`.
     pub(crate) fn idle_for(&self, now: Instant) -> Duration {
-        now.saturating_duration_since(*lock(&self.last_activity))
+        let now_ms = now.saturating_duration_since(epoch()).as_millis() as u64;
+        let last = self.last_activity_ms.load(Ordering::Acquire);
+        Duration::from_millis(now_ms.wrapping_sub(last))
     }
 
     /// Returns the last destination used for a datagram.
@@ -1160,41 +1227,26 @@ async fn reply_loop(
                             continue;
                         };
 
-                        let mut frame = Vec::new();
-                        if frame.try_reserve_exact(frame_len).is_err() {
-                            tracing::trace!(
-                                session_id = session.id,
-                                length = frame_len,
-                                "XUDP reply allocation failed; dropping a datagram"
-                            );
-                            metrics.record_xudp_reply_dropped();
-                            continue;
-                        }
-                        let source = socket_addr_to_location(source);
-                        let spec = FrameSpec {
-                            session_id: session.id,
-                            status: SessionStatus::Keep,
-                            option: FrameOption::DATA,
-                            network: Some(TargetNetwork::Udp),
-                            destination: Some(&source),
-                            global_id: None,
-                            payload: &buffer[..len],
-                        };
-                        if frame::encode_frame(&mut frame, spec).is_err() {
-                            metrics.record_xudp_reply_dropped();
-                            continue;
-                        }
                         // Only a reply that is actually handed to the writer
                         // counts as session activity. Zero-length, oversize,
-                        // queue-pressure, and encoding drops must not keep an
-                        // otherwise idle session (and its global permit) alive.
+                        // queue-pressure, and allocation drops must not keep
+                        // an otherwise idle session (and its global permit)
+                        // alive.
+                        let payload = buffer[..len].to_vec();
+                        let destination = socket_addr_to_location(source);
                         let _gate = session.enqueue_guard();
                         if session.is_closed() {
                             break;
                         }
                         permit.send(
-                            QueuedFrame::new(frame, Some(budget), Some(slot))
-                                .with_stream_budget(Some(stream_budget)),
+                            QueuedFrame::reply(
+                                session.id,
+                                destination,
+                                payload,
+                                Some(budget),
+                                Some(slot),
+                            )
+                            .with_stream_budget(Some(stream_budget)),
                         );
                         session.touch();
                     }
@@ -1337,7 +1389,7 @@ mod tests {
     use super::{
         DEFAULT_MAX_GLOBAL_SESSIONS, DEFAULT_RESOLUTION_QUEUE_BUDGET, DEFAULT_STREAM_REPLY_BUDGET,
         ExpiringSession, ReplyQueueBudget, ResolveError, Session, SessionTable, SocketFamily,
-        XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
+        XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame, now_ms,
         queue_failed_session_end, reply_frame_len, reply_loop, resolve_destination,
         socket_addr_to_location,
     };
@@ -1347,7 +1399,7 @@ mod tests {
     };
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::net::UdpSocket;
     use tokio::time::{Instant, timeout};
@@ -1392,9 +1444,9 @@ mod tests {
             address,
             None,
         ));
-        *session.last_activity.lock().expect("last activity") = Instant::now()
-            .checked_sub(Duration::from_secs(5))
-            .expect("old instant");
+        session
+            .last_activity_ms
+            .store(now_ms().wrapping_sub(5000), Ordering::Release);
 
         let config = Arc::new(XudpConfig {
             max_datagram_size: 64,
@@ -1440,10 +1492,11 @@ mod tests {
             .await
             .expect("valid reply did not arrive")
             .expect("reply channel closed");
-        let (frame, used) = parse_frame(&queued.bytes)
+        let encoded = queued.encoded();
+        let (frame, used) = parse_frame(&encoded)
             .expect("valid reply frame")
             .expect("complete reply frame");
-        assert_eq!(used, queued.bytes.len());
+        assert_eq!(used, encoded.len());
         assert_eq!(frame.payload, b"ok");
         assert!(
             session.idle_for(Instant::now()) < Duration::from_secs(1),
@@ -1856,10 +1909,11 @@ mod tests {
             &limiter.metrics()
         ));
         let queued = inbound.recv().await.expect("current failure End");
-        let (frame, used) = parse_frame(&queued.bytes)
+        let encoded = queued.encoded();
+        let (frame, used) = parse_frame(&encoded)
             .expect("valid End")
             .expect("complete End");
-        assert_eq!(used, queued.bytes.len());
+        assert_eq!(used, encoded.len());
         assert_eq!(frame.status, SessionStatus::End);
         assert_eq!(frame.option, FrameOption::ERROR);
         assert_eq!(table.lock().expect("table").total(), 0);
