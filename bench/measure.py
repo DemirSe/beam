@@ -313,12 +313,19 @@ def run_https(args: argparse.Namespace) -> tuple[dict, list[str]]:
         return _curl(command, timeout=args.max_time + 30)
 
     if args.https_parallel > 1:
+        # Concurrent requests exist only to force the harness into the async
+        # fallback; request-time rates under contention are not comparable with
+        # the sequential workload, so say so in the result.
+        warnings.append(
+            f"concurrent HTTPS ({args.https_parallel} requests in flight); "
+            "probe only, not a sequential gate measurement"
+        )
         with ThreadPoolExecutor(max_workers=args.https_parallel) as pool:
-            completed_results = list(pool.map(run_one, range(args.count)))
+            completed_iter = iter(list(pool.map(run_one, range(args.count))))
     else:
-        completed_results = [run_one(index) for index in range(args.count)]
+        completed_iter = (run_one(index) for index in range(args.count))
 
-    for completed in completed_results:
+    for completed in completed_iter:
         if completed.returncode != 0:
             failure = f"curl exited {completed.returncode}: {completed.stderr.strip()[-300:]}"
             break
@@ -749,6 +756,7 @@ def main() -> int:
         "status": "ok",
         "reason": None,
         "command": [],
+        "parameters": {},
         "elapsed_s": 0.0,
         "metrics": {},
         "cpu": {},
@@ -902,6 +910,8 @@ def main() -> int:
     if client_cpu is not None and bytes_total > 0:
         run["cpu"]["client_s_per_gib"] = round(client_cpu / (bytes_total / GIB), 4)
 
+    if args.kind == "https":
+        run["parameters"]["https_parallel"] = args.https_parallel
     run["mem"] = {
         "rss_after_warmup_kib": (server_before or {}).get("rss_kib"),
         "rss_kib": (server_after or {}).get("rss_kib"),
