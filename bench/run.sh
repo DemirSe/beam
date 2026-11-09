@@ -32,6 +32,14 @@
 #   TEST_CONFIG   REALITY fixture (default: config.example.toml)
 #   H3_ORIGIN_BIN prebuilt tests/tun/h3-origin binary
 #   SKIP_BUILD=1  reuse target/release/beam and the H3 origin binary
+#   BENCH_CLIENT_CPUS   client CPU list; one core per thread of the client proxy
+#   BENCH_DRIVER_CPU    CPU for the measurement driver (defaults to the first client CPU)
+#   BENCH_PERF=1  root only: attach `perf stat` to the server for each scenario
+#   BENCH_PERF_EVENTS   event list for BENCH_PERF
+#   BENCH_HTTPS_PARALLEL concurrent HTTPS requests (default 1)
+#   BENCH_LOG_LEVEL     rendered config log level (default warn)
+#   BENCH_SCENARIOS=all comma list to measure a subset (warm-ups always run)
+#   BENCH_REPORT=0      skip report.py (perf probes only)
 #
 # The script re-execs itself under `unshare --user --map-root-user --mount --net`.
 # Every process is killed and every namespace is removed in the exit trap.
