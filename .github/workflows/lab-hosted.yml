@@ -367,7 +367,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Bench acceptance
-        if: always() && inputs.suite != 'tun'
+        if: always() && (inputs.suite == 'bench' || inputs.suite == 'both')
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP/bench-out/summary.json" <<'PY'
@@ -398,7 +398,7 @@ jobs:
           PY
 
       - name: TUN acceptance
-        if: always() && inputs.suite != 'bench'
+        if: always() && (inputs.suite == 'tun' || inputs.suite == 'both')
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP/tun-out/results-beam.tsv" <<'PY'
