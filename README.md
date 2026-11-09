@@ -143,17 +143,13 @@ The client normalizers have a focused regression test:
 make doctor          # required build tools, optional benchmark tools, local paths
 make verify          # fmt + clippy + test
 make smoke           # release build, example config check, shell syntax
-make lab-check       # external three-VM lab, 11/11, then teardown
-LAB_PROFILE=loss make lab-check   # same, with 30 ms +/- 8 ms and 0.5% loss
-make acceptance      # verify + smoke + lab-check
+make acceptance      # verify + smoke
 ```
 
-`lab-check` builds the current source, installs the binary on the lab server,
-restarts it, and reruns the matrix before the optional impaired run; the initial
-boot check uses whatever binary the lab already has. Lab output is written under
-`~/.cache/beam/lab-results/<timestamp>/`. Set `KEEP_LAB=1` to leave the VMs
-running or `LAB_SKIP_BUILD=1` to reuse the installed lab binary. The lab path
-defaults to `/home/demir/pi/beam-lab` and must match the lab scripts.
+The external three-VM lab was retired in favor of the dispatch-only
+[hosted pre-release lab](#hosted-pre-release-lab): `make acceptance` is now
+`verify + smoke`, and `gh workflow run lab-hosted.yml -f profile=standard`
+covers the functional TUN matrix and the stock-vs-beam A/B.
 
 ### Default stock-client IPv4-only and QUIC policy
 

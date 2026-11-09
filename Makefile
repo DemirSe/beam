@@ -1,9 +1,7 @@
 SHELL := /usr/bin/env bash
 CACHE_DIR ?= $(HOME)/.cache/beam
-LAB_DIR ?= /home/demir/pi/beam-lab
-LAB_PROFILE ?= clean
 
-.PHONY: help doctor check fmt clippy test build verify smoke lab-check acceptance fuzz-smoke bench-cache
+.PHONY: help doctor check fmt clippy test build verify smoke acceptance fuzz-smoke bench-cache
 
 help:
 	@printf '%s\n' \
@@ -11,8 +9,7 @@ help:
 	  'make check       fmt + clippy + test' \
 	  'make verify      alias for check' \
 	  'make smoke       release build, config check, shell syntax' \
-	  'make lab-check   start external lab, run checks, stop (LAB_PROFILE=clean|loss)' \
-	  'make acceptance  verify + smoke + lab-check' \
+	  'make acceptance  verify + smoke' \
 	  'make fuzz-smoke  short fuzz run with corpus cache' \
 	  'make bench-cache benchmark into ~/.cache/beam/bench-results'
 
@@ -29,7 +26,7 @@ doctor:
 	  else printf 'MISS %s (bench only)\n' "$$tool"; fi; \
 	done; \
 	printf '%s\n' '=== local paths ==='; \
-	for path in config.example.toml README.md "$(LAB_DIR)/start-lab.sh"; do \
+	for path in config.example.toml README.md; do \
 	  if [ -e "$$path" ]; then printf 'OK   %s\n' "$$path"; \
 	  else printf 'MISS %s\n' "$$path"; fi; \
 	done; \
@@ -59,10 +56,7 @@ smoke: build
 	  bash -n "$$script" || exit 1; \
 	done
 
-lab-check:
-	LAB_DIR="$(LAB_DIR)" LAB_PROFILE="$(LAB_PROFILE)" bash scripts/lab-check.sh
-
-acceptance: verify smoke lab-check
+acceptance: verify smoke
 
 fuzz-smoke:
 	BEAM_FUZZ_CACHE="$(CACHE_DIR)/fuzz-corpus" bash scripts/fuzz-smoke.sh
