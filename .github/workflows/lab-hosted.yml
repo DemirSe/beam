@@ -157,12 +157,15 @@ jobs:
           echo "${CURL_SHA256}  $RUNNER_TEMP/curl.tar.xz" | sha256sum -c -
           tar -xJf "$RUNNER_TEMP/curl.tar.xz" -C "$RUNNER_TEMP"
           sudo install -m 0755 "$RUNNER_TEMP/curl" /usr/local/bin/curl
-          curl --version | grep -qi HTTP3 \
+          # bash hashed the runner's /usr/bin/curl while downloading; drop the
+          # stale entry and check the installed path explicitly.
+          hash -r
+          /usr/local/bin/curl --version | grep -qi HTTP3 \
             || { echo "::error::the static curl has no HTTP/3 support"; exit 1; }
 
           "$tools/sing-box" version
           "$tools/xray-bin" version | head -2
-          curl --version | head -1
+          /usr/local/bin/curl --version | head -1
 
       - name: Build
         timeout-minutes: 20
