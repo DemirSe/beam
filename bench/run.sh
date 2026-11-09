@@ -908,7 +908,10 @@ META_ARGS+=(--large-file "$CONFIG_DIR/large.bin")
 [ -n "$H3_BLOCKED" ] && META_ARGS+=(--h3-blocked-reason "$H3_BLOCKED")
 META_ARGS+=("${WARNINGS[@]}")
 
-"$PYTHON" "$HERE/meta.py" "${META_ARGS[@]}" || die "could not write meta.json"
+# GIT_OPTIONAL_LOCKS=0 keeps `git status` from refreshing the index: a root-run
+# harness would otherwise leave .git/index owned by root and break the worktree
+# for the invoking user.
+GIT_OPTIONAL_LOCKS=0 "$PYTHON" "$HERE/meta.py" "${META_ARGS[@]}" || die "could not write meta.json"
 if [ "$REPORT" = "1" ]; then
   "$PYTHON" "$HERE/report.py" --run "$RUN_DIR" || die "could not write the summary"
 fi
