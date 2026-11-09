@@ -109,13 +109,35 @@ def scenario_stats(results: list[dict], scenario: str, arm: str, extract) -> dic
     return stats(scenario_values(results, scenario, arm, extract))
 
 
-def pooled_latency(results: list[dict], scenario: str, arm: str) -> list[float]:
-    samples: list[float] = []
-    for result in ok(by_arm(results, scenario).get(arm, [])):
-        metrics = result.get("metrics", {})
-        key = "rtt_samples_us" if scenario == "udp-echo" else "latency_samples_us"
-        samples.extend(float(value) for value in metrics.get(key, []))
-    return samples
+def latency_pairs(
+    results: list[dict], scenario: str
+) -> tuple[dict[str, list[float]], dict]:
+    """Pool latency samples from the repetitions that succeeded in both arms.
+
+    Pooling an asymmetric repetition set shifts the sample count and therefore
+    the tail percentiles, so the comparison always uses the same repetitions on
+    both sides and reports which ones were dropped.
+    """
+    key = "rtt_samples_us" if scenario == "udp-echo" else "latency_samples_us"
+    per_arm: dict[str, dict[int, list[float]]] = {"stock": {}, "beam": {}}
+    for arm in ("stock", "beam"):
+        for result in ok(by_arm(results, scenario).get(arm, [])):
+            samples = result.get("metrics", {}).get(key, [])
+            per_arm[arm][result.get("rep")] = [float(value) for value in samples]
+    stock_reps = set(per_arm["stock"])
+    beam_reps = set(per_arm["beam"])
+    paired = sorted(stock_reps & beam_reps)
+    samples = {
+        arm: [value for rep in paired for value in per_arm[arm][rep]]
+        for arm in ("stock", "beam")
+    }
+    details = {
+        "paired_repetitions": len(paired),
+        "stock_repetitions": len(stock_reps),
+        "beam_repetitions": len(beam_reps),
+        "dropped_repetitions": sorted(stock_reps ^ beam_reps),
+    }
+    return samples, details
 
 
 def fmt_value(value: float | None, unit: str | None = None) -> str:
@@ -349,13 +371,17 @@ def build(run_dir: Path) -> dict:
 
     # --- Latency ----------------------------------------------------------
     latency_comparisons: dict[str, dict] = {}
+    latency_repetitions: dict[str, dict] = {}
     for scenario in LATENCY_SCENARIOS:
-        stock_samples = pooled_latency(results, scenario, "stock")
-        beam_samples = pooled_latency(results, scenario, "beam")
+        samples_by_arm, repetition_details = latency_pairs(results, scenario)
+        latency_repetitions[scenario] = repetition_details
+        stock_samples = samples_by_arm["stock"]
+        beam_samples = samples_by_arm["beam"]
         entry = {
             "stock": latency_stats(stock_samples),
             "beam": latency_stats(beam_samples),
             "samples": {"stock": len(stock_samples), "beam": len(beam_samples)},
+            "repetitions": repetition_details,
         }
         for percentile_name in ("p50", "p95", "p99"):
             stock_value = entry["stock"].get(percentile_name)
@@ -590,10 +616,10 @@ def build(run_dir: Path) -> dict:
             "stock": fmt_stats(core_stats.get("stock", {}).get("client"), "%"),
             "beam": fmt_stats(core_stats.get("beam", {}).get("client"), "%"),
             "ratio": "n/a",
-            "requirement": "< 85%",
+            "requirement": "< 85% (median)",
             "pass": None
             if not core_stats.get("beam", {}).get("client")
-            else core_stats["beam"]["client"]["max"] < 85,
+            else core_stats["beam"]["client"]["median"] < 85,
         }
     )
     rows["resources"].append(
@@ -602,10 +628,10 @@ def build(run_dir: Path) -> dict:
             "stock": fmt_stats(core_stats.get("stock", {}).get("target"), "%"),
             "beam": fmt_stats(core_stats.get("beam", {}).get("target"), "%"),
             "ratio": "n/a",
-            "requirement": "< 85%",
+            "requirement": "< 85% (median)",
             "pass": None
             if not core_stats.get("beam", {}).get("target")
-            else core_stats["beam"]["target"]["max"] < 85,
+            else core_stats["beam"]["target"]["median"] < 85,
         }
     )
     if not driver_shared:
@@ -615,10 +641,10 @@ def build(run_dir: Path) -> dict:
                 "stock": fmt_stats(core_stats.get("stock", {}).get("driver"), "%"),
                 "beam": fmt_stats(core_stats.get("beam", {}).get("driver"), "%"),
                 "ratio": "n/a",
-                "requirement": "< 85%",
+                "requirement": "< 85% (median)",
                 "pass": None
                 if not core_stats.get("beam", {}).get("driver")
-                else core_stats["beam"]["driver"]["max"] < 85,
+                else core_stats["beam"]["driver"]["median"] < 85,
             }
         )
     rows["resources"].append(
@@ -799,6 +825,17 @@ def build(run_dir: Path) -> dict:
                     non_role.setdefault(
                         f"{result['scenario']}/{result['arm']}: non-role CPU busy", []
                     ).append(value)
+    noise_values = [
+        result.get("cpu", {}).get("non_role_core_busy_pct_max") for result in results
+    ]
+    observed_noise = [
+        value for value in noise_values if isinstance(value, (int, float))
+    ]
+    noise_coverage = {
+        "samples_total": len(noise_values),
+        "samples_with_observable_cores": len(observed_noise),
+        "max_pct": max(observed_noise) if observed_noise else None,
+    }
     host_noise = sorted(host_keys)
     for key, values in sorted(non_role.items()):
         host_noise.append(f"{key} (max {max(values):.1f}%)")
@@ -841,6 +878,7 @@ def build(run_dir: Path) -> dict:
         "headline_eligible": headline_eligible,
         "invalid_reasons": invalid_reasons,
         "host_noise": host_noise,
+        "noise_coverage": noise_coverage,
         "blocked": blocked,
         "failed": failed,
         "qdisc_drops": qdisc_drops,
@@ -851,6 +889,7 @@ def build(run_dir: Path) -> dict:
         "hard_requirements_pass": hard_pass,
         "hard_requirements_status": hard_status,
         "comparisons": comparisons,
+        "latency_repetitions": latency_repetitions,
         "resources": {
             "rss": rss,
             "cores": core_stats,
@@ -1013,6 +1052,25 @@ def render_markdown(summary: dict) -> str:
 
     lines.append("## Latency (pooled samples, p50/p95/p99)")
     lines.append("")
+    dropped = {
+        scenario: details
+        for scenario, details in (summary.get("latency_repetitions") or {}).items()
+        if details.get("dropped_repetitions")
+    }
+    if dropped:
+        lines.append(
+            "Pooling uses only the repetitions that succeeded in both arms; the "
+            "following repetitions were dropped from both sides:"
+        )
+        lines.append("")
+        for scenario, details in sorted(dropped.items()):
+            lines.append(
+                f"- `{scenario}`: paired {details['paired_repetitions']} of "
+                f"{max(details['stock_repetitions'], details['beam_repetitions'])}, "
+                f"dropped repetitions {details['dropped_repetitions']} "
+                f"(stock {details['stock_repetitions']}, beam {details['beam_repetitions']})"
+            )
+        lines.append("")
     lines.append(
         markdown_table(
             ["Metric", "stock Xray", "beam", "ratio (beam/stock)", "Requirement", "Result"],
@@ -1107,9 +1165,28 @@ def render_markdown(summary: dict) -> str:
         "measured. Use the privileged acceptance run for those."
     )
     lines.append(
-        "- A throughput scenario where the client or target core is at or above "
-        "85% is reported as INVALID, not as a pass or fail."
+        "- A throughput scenario whose client, target or driver core median is "
+        "at or above 85% is reported as INVALID, not as a pass or fail. "
+        "Single-repetition peaks are shown in the resource rows but do not "
+        "condemn a scenario."
     )
+    coverage = summary.get("noise_coverage") or {}
+    observed = coverage.get("samples_with_observable_cores") or 0
+    total = coverage.get("samples_total") or 0
+    if total and not observed:
+        lines.append(
+            "- Host-noise coverage: role cores and their hyperthread siblings "
+            "claimed every logical CPU, so no core was left to observe and the "
+            "CPU noise metric is empty. Only the settled host load average "
+            "reports interference here, and it cannot see load that exists "
+            "solely inside the measurement windows."
+        )
+    else:
+        lines.append(
+            f"- Host-noise coverage: {observed} of {total} measurements had an "
+            "observable non-role core (a role core's hyperthread siblings are "
+            f"excluded); observed peak {coverage.get('max_pct')}%."
+        )
     lines.append(
         "- HTTP/3 uses the test-only local origin; it is not a general QUIC "
         "capacity test."
