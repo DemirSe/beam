@@ -736,29 +736,29 @@ start_arm() {
     # the same ceiling, so ratios stay comparable while absolute numbers describe
     # a fraction of a vCPU.
     SERVER_SCOPE="beam-bench-$arm-$rep-$$"
-    systemd-run --scope --quiet --unit "$SERVER_SCOPE" \
-      -p "CPUQuota=$SERVER_CPU_QUOTA" -- "${server_cmd[@]}" > "$server_log" 2>&1 &
-    # systemd exposes no usable MainPID for scopes, so ask for the unit's cgroup
-    # path and read its members. That file is also the evidence the ceiling
-    # applied, and it works wherever systemd decided to place the scope.
+    SERVER_PID_FILE="$RUN_DIR/.server-$arm-$rep-$$.pid"
+    rm -f "$SERVER_PID_FILE"
+    # The payload writes its own PID before exec, so nothing here depends on how
+    # systemd places the scope's cgroup or whether it exposes a MainPID.
+    systemd-run --scope --quiet --unit="$SERVER_SCOPE" \
+      -p "CPUQuota=$SERVER_CPU_QUOTA" -- \
+      sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$SERVER_PID_FILE" \
+      "${server_cmd[@]}" > "$server_log" 2>&1 &
     SERVER_PID=""
-    local scope_cg="" scope_rel=""
     for _ in $(seq 1 100); do
-      scope_rel="$(systemctl show -p ControlGroup --value "$SERVER_SCOPE.scope" 2>/dev/null || true)"
-      if [ -n "$scope_rel" ]; then
-        scope_cg="/sys/fs/cgroup$scope_rel"
-        if [ -s "$scope_cg/cgroup.procs" ]; then
-          SERVER_PID="$(head -n 1 "$scope_cg/cgroup.procs")"
-          if [ -n "$SERVER_PID" ]; then break; fi
-        fi
+      if [ -s "$SERVER_PID_FILE" ]; then
+        SERVER_PID="$(cat "$SERVER_PID_FILE")"
+        if [ -n "$SERVER_PID" ]; then break; fi
       fi
       sleep 0.1
     done
     if [ -z "$SERVER_PID" ]; then
       tail -n 20 "$server_log" >&2 || true
-      die "could not resolve the server PID inside $SERVER_SCOPE (scope=$scope_rel)"
+      die "the server never reported its PID inside $SERVER_SCOPE"
     fi
-    SERVER_CPU_MAX="$(cat "$scope_cg/cpu.max" 2>/dev/null || echo unknown)"
+    local cg_rel
+    cg_rel="$(sed -n 's/^0:://p' "/proc/$SERVER_PID/cgroup" 2>/dev/null || true)"
+    SERVER_CPU_MAX="$(cat "/sys/fs/cgroup$cg_rel/cpu.max" 2>/dev/null || echo unknown)"
     printf 'server_cpu_max=%s scope=%s\n' "$SERVER_CPU_MAX" "$SERVER_SCOPE" >> "$RUN_DIR/masks.tsv"
   else
     "${server_cmd[@]}" > "$server_log" 2>&1 &
