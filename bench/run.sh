@@ -188,6 +188,17 @@ case "$HTTPS_PARALLEL" in
 esac
 [ "$HTTPS_PARALLEL" -ge 1 ] || { echo "bench: BENCH_HTTPS_PARALLEL must be >= 1" >&2; exit 2; }
 case "$REPORT" in 0|1) ;; *) echo "bench: BENCH_REPORT must be 0 or 1" >&2; exit 2 ;; esac
+KNOWN_SCENARIOS="tcp-dl-1,tcp-dl-4,tcp-ul-1,tcp-ul-4,https-bulk,udp-echo,dns-a,h3-latency"
+if [ "$SCENARIOS" != "all" ]; then
+  IFS=',' read -r -a SCENARIO_FILTER <<< "$SCENARIOS"
+  [ "${#SCENARIO_FILTER[@]}" -ge 1 ] || { echo "bench: BENCH_SCENARIOS is empty" >&2; exit 2; }
+  for scenario in "${SCENARIO_FILTER[@]}"; do
+    if [[ ",$KNOWN_SCENARIOS," != *",$scenario,"* ]]; then
+      echo "bench: unknown scenario '$scenario' (known: $KNOWN_SCENARIOS)" >&2
+      exit 2
+    fi
+  done
+fi
 
 # The documented vps-1c model runs the driver on the client core. A caller can
 # still separate it with --driver-cpu (useful for client-bound sensitivity runs).
@@ -332,9 +343,25 @@ die() {
   exit 1
 }
 
-if [ "$PERF" = "1" ] && [ "$(id -u)" -ne 0 ]; then
-  die "BENCH_PERF=1 requires root; run with BENCH_INNER=1"
+if [ "$PERF" = "1" ]; then
+  [ "$(id -u)" -eq 0 ] || die "BENCH_PERF=1 requires root; run with BENCH_INNER=1"
+  if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]+4294967295' /proc/self/uid_map; then
+    die "BENCH_PERF=1 needs real host root, not a mapped user namespace"
+  fi
 fi
+
+# `<not counted>` rows prove perf attached but never collected; an empty or
+# unparsable file must fail the run instead of shipping zero evidence.
+perf_require_counters() {
+  local csv=$1 scenario=$2
+  if ! awk -F, '
+    $3 ~ /^syscalls:sys_enter_splice(:|$)/ && $1 ~ /^[0-9]+$/ { splice = 1 }
+    $3 ~ /^sched:sched_wakeup(:|$)/ && $1 ~ /^[0-9]+$/ { wakeup = 1 }
+    END { exit !(splice && wakeup) }
+  ' "$csv" 2>/dev/null; then
+    die "perf collected no splice/wakeup counters for $scenario (see $csv)"
+  fi
+}
 
 scenario_enabled() {
   [ "$SCENARIOS" = "all" ] && return 0
@@ -767,6 +794,7 @@ measure() {
   if [ -n "$perf_pid" ]; then
     kill -INT "$perf_pid" 2>/dev/null || true
     wait "$perf_pid" 2>/dev/null || true
+    perf_require_counters "$out.perf.csv" "$scenario"
   fi
   return "$rc"
 }
