@@ -196,8 +196,11 @@ def probe_classifier(results: list[dict]) -> None:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         port = listener.getsockname()[1]
+        # Held until the client has classified the socket, so a scheduling
+        # delay cannot turn the payload-only fixture into payload-then-close.
+        release = threading.Event()
 
-        def serve(mode=mode):
+        def serve(mode=mode, release=release):
             try:
                 conn, _ = listener.accept()
                 try:
@@ -212,7 +215,7 @@ def probe_classifier(results: list[dict]) -> None:
                         conn.close()
                     elif mode == "data":
                         conn.sendall(b"x")
-                        time.sleep(0.5)
+                        release.wait(timeout=5)
                         conn.close()
                     else:  # data-eof
                         conn.sendall(b"x")
@@ -228,6 +231,7 @@ def probe_classifier(results: list[dict]) -> None:
         thread.start()
         client = socket.create_connection(("127.0.0.1", port), timeout=2)
         got[mode] = wait_closed(client, 0.3)
+        release.set()
         client.close()
         thread.join(timeout=1)
 
