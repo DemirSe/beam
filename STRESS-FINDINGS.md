@@ -372,10 +372,14 @@ after every probe disconnected. Refused-cover and idle-probe paths were
 already bounded.
 
 Fix: cover relays use a dedicated `relay_cover_bidirectional` that ends on the
-first half-close, so a disconnected probe releases the relay and its permit
-immediately. The authenticated relay is unchanged (Vision keeps its
-half-close semantics). Regression tests:
-`cover_relay_ends_when_the_probe_half_closes` (unit) and
+first half-close, so a disconnected probe releases the relay and its permit as
+soon as the completed direction's shutdown finishes instead of waiting for the
+idle timeout. The tradeoff is deliberate: a cover response sent after the
+probe's FIN is not forwarded, and a cover-first close cancels the remaining
+upload. The authenticated relay is unchanged (Vision keeps its half-close
+semantics). Regression tests:
+`cover_relay_ends_when_the_probe_half_closes` and
+`cover_relay_ends_when_the_cover_closes_first` (unit), plus
 `tests/stress/loopback.py` (`cover_eof_release`, `cover_limit_fingerprint`).
 After the fix the same probe shows fds 10 → 10 and the fresh probe is
 forwarded.

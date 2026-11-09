@@ -3,7 +3,8 @@ name: lab-hosted
 # Pre-release lab on one GitHub-hosted ubuntu-24.04 runner: the functional
 # full-TUN matrix and the stock-vs-beam A/B, both as host root inside a private
 # mount+net namespace (the runner blocks unprivileged user namespaces), plus
-# loopback stress probes that need no root or namespace.
+# loopback stress probes that need no root or namespace; the capability gate
+# and tool install are skipped for suite=stress.
 #
 # Manual only: a shared runner's noisy, high-RTT numbers must never gate a
 # release by themselves, so this workflow is not triggered by pushes or tags.
@@ -90,6 +91,7 @@ jobs:
           echo "profile=${{ inputs.profile }} rtt=$rtt quota=$quota reps=$reps duration=$duration quick=$quick"
 
       - name: Capability gate
+        if: inputs.suite != 'stress'
         run: |
           set -euo pipefail
           fail() { echo "::error::$*"; exit 1; }
@@ -127,6 +129,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install tools
+        if: inputs.suite != 'stress'
         run: |
           set -euo pipefail
           sudo apt-get update -qq

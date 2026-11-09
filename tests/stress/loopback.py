@@ -142,19 +142,31 @@ def is_open(sock: socket.socket) -> bool:
         return False
 
 
-def closes_within(sock: socket.socket, limit: float) -> bool:
-    sock.settimeout(limit)
-    deadline = time.time() + limit
-    try:
-        while time.time() < deadline:
-            if sock.recv(4096) == b"":
-                return True
-            deadline = time.time() + limit
-    except socket.timeout:
-        return False
-    except OSError:
-        return True
-    return False
+def wait_closed(sock: socket.socket, limit: float) -> str:
+    """Classify how a socket ends within an absolute deadline.
+
+    Returns "timeout" if it is still open at the deadline, otherwise "eof"
+    (FIN), "reset" (RST), or "data" when payload arrived before the close.
+    The deadline is absolute: a peer that drips bytes cannot extend it.
+    """
+    deadline = time.monotonic() + limit
+    saw_data = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "data" if saw_data else "timeout"
+        sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            return "data" if saw_data else "timeout"
+        except ConnectionResetError:
+            return "reset"
+        except OSError:
+            return "reset"
+        if not chunk:
+            return "data" if saw_data else "eof"
+        saw_data = True
 
 
 def close_all(socks: list[socket.socket]) -> None:
@@ -295,15 +307,15 @@ def probe_basic(
     #    idle probe closes, and a partial or trickled ClientHello is handed
     #    to the cover at the deadline instead of waiting for more bytes.
     idle = connect(port)
-    t0 = time.time()
-    idle_closed = closes_within(idle, 3.0)
-    idle_s = round(time.time() - t0, 3)
+    t0 = time.monotonic()
+    idle_state = wait_closed(idle, 3.0)
+    idle_s = round(time.monotonic() - t0, 3)
     idle.close()
     check(
         results,
         "handshake_deadline_idle",
-        idle_closed and idle_s < 2.0,
-        f"closed={idle_closed} after {idle_s}s",
+        idle_state in ("eof", "reset") and idle_s < 2.0,
+        f"state={idle_state} after {idle_s}s",
     )
 
     before = cover.accepted()
@@ -343,39 +355,7 @@ def probe_basic(
     )
     time.sleep(0.3)
 
-    # 3. Global admission: fill every permit, reject a fresh source, and
-    #    admit it again as soon as one permit is released.
-    sources = MAX_CONNECTIONS // MAX_PREAUTH_PER_IP
-    holders: list[socket.socket] = []
-    for index in range(sources):
-        src = f"127.0.0.{index + 1}"
-        for _ in range(MAX_PREAUTH_PER_IP + 2):
-            try:
-                holders.append(connect(port, src))
-            except OSError:
-                pass
-    time.sleep(0.5)
-    open_holders = [sock for sock in holders if is_open(sock)]
-    full = len(open_holders) == MAX_CONNECTIONS
-    fresh = connect(port, "127.0.0.250")
-    rejected = closes_within(fresh, 0.5)
-    fresh.close()
-    open_holders[0].close()
-    time.sleep(0.3)
-    retry = connect(port, "127.0.0.250")
-    admitted = not closes_within(retry, 0.5)
-    retry.close()
-    close_all(holders)
-    time.sleep(1.4)
-    check(
-        results,
-        "admission_global_exhaustion",
-        full and rejected and admitted,
-        f"held={len(open_holders)}/{MAX_CONNECTIONS} fresh_rejected={rejected} "
-        f"readmitted_after_release={admitted}",
-    )
-
-    # 4. RST churn must not leak descriptors.
+    # 3. RST churn must not leak descriptors.
     before = server.fds()
     accepted = 0
     for _ in range(2000):
@@ -396,6 +376,53 @@ def probe_basic(
         server.proc.poll() is None and after <= before + 2,
         f"accepted={accepted} fds {before}->{after} rss={server.rss()}KiB",
     )
+
+
+def probe_admission(beam: Path, out: Path, results: list[dict]) -> None:
+    # 4. Global admission: fill every permit on a server whose pre-auth
+    #    deadline (min(handshake, 5 s)) comfortably outlives this check, so a
+    #    naturally expired holder cannot fake a released permit.
+    server = Server(beam, out, "admission", "127.0.0.1:9", handshake_ms=10_000)
+    holders: list[socket.socket] = []
+    try:
+        sources = MAX_CONNECTIONS // MAX_PREAUTH_PER_IP
+        for index in range(sources):
+            src = f"127.0.0.{index + 1}"
+            for _ in range(MAX_PREAUTH_PER_IP + 2):
+                try:
+                    holders.append(connect(server.port, src))
+                except OSError:
+                    pass
+        time.sleep(0.5)
+        open_holders = [sock for sock in holders if is_open(sock)]
+        full = len(open_holders) == MAX_CONNECTIONS
+        rejected = False
+        admitted = False
+        still = 0
+        if open_holders:
+            fresh = connect(server.port, "127.0.0.250")
+            rejected = wait_closed(fresh, 0.5) != "timeout"
+            fresh.close()
+            open_holders[0].close()
+            time.sleep(0.3)
+            retry = connect(server.port, "127.0.0.250")
+            admitted = wait_closed(retry, 0.5) == "timeout"
+            retry.close()
+            still = sum(1 for sock in open_holders[1:] if is_open(sock))
+        check(
+            results,
+            "admission_global_exhaustion",
+            full
+            and rejected
+            and admitted
+            and still >= len(open_holders) - 2,
+            f"held={len(open_holders)}/{MAX_CONNECTIONS} "
+            f"fresh_rejected={rejected} readmitted_after_release={admitted} "
+            f"other_holders_open={still}",
+        )
+    finally:
+        close_all(holders)
+        server.stop()
 
 
 def probe_cover(server: Server, cover: SilentCover, results: list[dict]) -> None:
@@ -425,7 +452,8 @@ def probe_cover(server: Server, cover: SilentCover, results: list[dict]) -> None
 
     limited = connect(port, "127.0.0.10")
     limited.sendall(b"GET / HTTP/1.1\r\nHost: stress\r\n\r\n")
-    limited_closed = closes_within(limited, 0.5)
+    limited_state = wait_closed(limited, 0.5)
+    limited_closed = limited_state != "timeout"
     limited.close()
     log = server.log_path.read_text(encoding="utf-8", errors="replace")
     limited_logged = "cover limit reached" in log
@@ -433,22 +461,27 @@ def probe_cover(server: Server, cover: SilentCover, results: list[dict]) -> None
         results,
         "cover_limit_fingerprint",
         limited_closed and limited_logged,
-        f"fresh_probe_reset={limited_closed} logged={limited_logged}",
+        f"fresh_probe_closed={limited_closed} state={limited_state} "
+        f"logged={limited_logged}",
     )
 
     # 6. Regression: slots are released when the probes disconnect, not at the
-    #    30 s cover idle timeout.
+    #    30 s cover idle timeout. The replacement probe must reach cover, not
+    #    merely stay open.
     close_all(holders)
     released_fds = wait_for_slots(server, baseline_fds + 2, timeout_s=3.0)
+    before_accept = cover.accepted()
     after = connect(port, "127.0.0.11")
     after.sendall(b"GET / HTTP/1.1\r\nHost: stress\r\n\r\n")
-    forwarded = not closes_within(after, 0.5)
+    after_state = wait_closed(after, 0.5)
+    forwarded = after_state == "timeout" and cover.accepted() > before_accept
     after.close()
     check(
         results,
         "cover_eof_release",
         released_fds <= baseline_fds + 2 and forwarded,
-        f"fds {baseline_fds}->{released_fds} new_probe_forwarded={forwarded}",
+        f"fds {baseline_fds}->{released_fds} state={after_state} "
+        f"new_probe_forwarded={forwarded}",
     )
     time.sleep(0.3)
 
@@ -466,7 +499,8 @@ def probe_refused_cover(beam: Path, out: Path, results: list[dict]) -> None:
         baseline = server.fds()
         sock = connect(server.port)
         sock.sendall(b"GET / HTTP/1.1\r\nHost: stress\r\n\r\n")
-        closed = closes_within(sock, 1.0)
+        state = wait_closed(sock, 1.0)
+        closed = state != "timeout"
         sock.close()
         time.sleep(0.3)
         after = server.fds()
@@ -474,16 +508,18 @@ def probe_refused_cover(beam: Path, out: Path, results: list[dict]) -> None:
             results,
             "cover_refused_closes",
             closed and after <= baseline + 1,
-            f"closed={closed} fds {baseline}->{after}",
+            f"closed={closed} state={state} fds {baseline}->{after}",
         )
     finally:
         server.stop()
 
 
 def probe_shutdown(beam: Path, out: Path, results: list[dict]) -> None:
-    # 8. Graceful shutdown under a full pre-auth pool respects the drain
-    #    deadline and closes every held socket.
-    server = Server(beam, out, "shutdown", "127.0.0.1:9")
+    # 8. Graceful shutdown under a full pre-auth pool: the drain deadline must
+    #    close the pool before the 5 s pre-auth deadline expires, with a zero
+    #    exit status. A server that exits instantly, ignores the drain, or
+    #    crashes fails the bounds, the exit code, or the drain log check.
+    server = Server(beam, out, "shutdown", "127.0.0.1:9", handshake_ms=10_000)
     holders: list[socket.socket] = []
     try:
         sources = MAX_CONNECTIONS // MAX_PREAUTH_PER_IP
@@ -495,22 +531,35 @@ def probe_shutdown(beam: Path, out: Path, results: list[dict]) -> None:
                 except OSError:
                     pass
         time.sleep(0.4)
-        t0 = time.time()
+        held = sum(1 for sock in holders if is_open(sock))
+        t0 = time.monotonic()
         os.kill(server.pid, signal.SIGTERM)
         exited = None
-        while time.time() - t0 < DRAIN_MS / 1000 + 5:
+        while time.monotonic() - t0 < DRAIN_MS / 1000 + 6:
             if server.proc.poll() is not None:
-                exited = round(time.time() - t0, 3)
+                exited = round(time.monotonic() - t0, 3)
                 break
             time.sleep(0.05)
-        gone = sum(1 for sock in holders if closes_within(sock, 0.5))
+        states = [wait_closed(sock, 0.5) for sock in holders]
+        gone = sum(1 for state in states if state != "timeout")
+        log = server.log_path.read_text(encoding="utf-8", errors="replace")
+        drain_logged = "shutdown drain deadline reached" in log
+        preauth_logged = f"preauth_remaining={MAX_CONNECTIONS}" in log
+        in_bounds = (
+            exited is not None and 1.5 <= exited <= DRAIN_MS / 1000 + 1.0
+        )
         check(
             results,
             "shutdown_drain",
-            exited is not None
-            and exited <= DRAIN_MS / 1000 + 1.0
-            and gone == len(holders),
-            f"exit={exited}s drain={DRAIN_MS}ms sockets_closed={gone}/{len(holders)}",
+            held == MAX_CONNECTIONS
+            and server.proc.returncode == 0
+            and in_bounds
+            and gone == len(holders)
+            and drain_logged
+            and preauth_logged,
+            f"held={held} exit={exited}s code={server.proc.returncode} "
+            f"drain={DRAIN_MS}ms closed={gone}/{len(holders)} "
+            f"drain_logged={drain_logged} preauth_logged={preauth_logged}",
         )
     finally:
         close_all(holders)
@@ -526,6 +575,7 @@ def write_reports(out: Path, results: list[dict]) -> bool:
             "max_connections": MAX_CONNECTIONS,
             "max_preauth_per_ip": MAX_PREAUTH_PER_IP,
             "handshake_timeout_ms": HANDSHAKE_MS,
+            "long_handshake_timeout_ms": 10_000,
             "shutdown_drain_ms": DRAIN_MS,
             "cover_max_concurrency": COVER_MAX_CONCURRENCY,
             "cover_max_per_ip": COVER_MAX_PER_IP,
@@ -581,6 +631,7 @@ def main() -> int:
     finally:
         server.stop()
         cover.close()
+    probe_admission(beam, out, results)
     probe_refused_cover(beam, out, results)
     probe_shutdown(beam, out, results)
 

@@ -21,7 +21,7 @@ on 2026-11-08 17:53 UTC:
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
 | Host network | IPv6 disabled (`all/default/lo`), BBR + fq, conntrack 65536, 600 s UDP retention |
 | SSH | `AddressFamily inet`, `0.0.0.0:22`; no IPv6 listener |
-| Verification | Hash-pinned verifier PASS for plain and IPv4 HTTP/2 tunnel with `EXPECT_HOST_IPV6_DISABLED=1`; 120/120 HTTP 200 soak at 4-way concurrency; `NRestarts=0`; 44 threads, 17 MiB RSS, 208 fds at the verification snapshot (fds vary with active relays); cover TLS 1.3 `*.whatsapp.net`; lab matrix 11/11; TUN matrix 8/8 in xudp, packetaddr and legacy; `make check` 376 tests (local client stopped; see Verification before commit) and `make smoke` PASS |
+| Verification | Hash-pinned verifier PASS for plain and IPv4 HTTP/2 tunnel with `EXPECT_HOST_IPV6_DISABLED=1`; 120/120 HTTP 200 soak at 4-way concurrency; `NRestarts=0`; 44 threads, 17 MiB RSS, 208 fds at the verification snapshot (fds vary with active relays); cover TLS 1.3 `*.whatsapp.net`; lab matrix 11/11; TUN matrix 8/8 in xudp, packetaddr and legacy; `make check` 377 tests (local client stopped; see Verification before commit) and `make smoke` PASS |
 
 Production is IPv4-only end to end: the beam drop-in
 `/etc/systemd/system/beam.service.d/99-ipv4-only.conf` resets the base family
@@ -128,7 +128,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 376 tests: 345 `beam-core`,
+a benchmark comparison. The current workspace has 377 tests: 346 `beam-core`,
 1 `beam` CLI, 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 When the IPv4-only Linux client is active, run the workspace checks with
 `sudo systemctl stop beam-client` and restart it afterward: sing-box's
@@ -413,12 +413,15 @@ bind.
   bounds the in-flight permit race, the post-cache window, and cache pressure.
 - Unauthenticated traffic is relayed to the configured cover. Never send a
   TLS alert or a synthetic response on authentication failure.
-- A cover relay ends on the first half-close: when an unauthenticated probe
-  disconnects, beam releases the relay and its cover permit immediately
-  instead of holding them until the 30 s cover idle timeout. The authenticated
-  relay keeps its TCP half-close semantics, so an idle direction cannot cut a
-  download-only Vision stream. This bounds cover-slot retention after probes
-  leave and keeps the cover cap from being pinned by disconnected probes.
+- A cover relay ends on the first half-close: once the probe's write side
+  finishes (FIN or reset), beam releases the relay and its cover permit as
+  soon as that direction's shutdown completes, instead of holding them until
+  the 30 s cover idle timeout. This is a deliberate parity tradeoff: a
+  response the cover would send after the probe's FIN is not forwarded, and a
+  cover-first close cancels the remaining upload. The authenticated relay keeps
+  its TCP half-close semantics, so an idle direction cannot cut a
+  download-only Vision stream. Bounding unauthenticated retention keeps the
+  cover cap from being pinned by disconnected probes.
 
 ### VLESS and Vision
 
@@ -906,8 +909,10 @@ runner's noise never blocks a release by itself. A green job means every
 selected suite passed: TUN 8/8 PASS, the bench cell complete
 (`--require-complete`) and unsaturated, and every stress check PASS. A ratio
 outside 0.95-1.05 only emits a warning. Results land in the `bench-results`
-branch (latest run), a run artifact, and the step summary. `BLOCKED` TUN rows
-fail the job; `ALLOW_TUN_BLOCKED` is never used there.
+branch (latest bench run), a run artifact, and the step summary. Stress-only
+runs leave `bench-results` untouched; their summary is in the artifact and the
+step summary. `BLOCKED` TUN rows fail the job; `ALLOW_TUN_BLOCKED` is never
+used there.
 
 The runner is shared and the four vCPUs are all assigned to roles, so these are
 noisy, high-RTT probe measurements, not headline numbers, and the `non_role`
