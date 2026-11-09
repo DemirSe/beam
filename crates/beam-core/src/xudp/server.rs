@@ -1076,24 +1076,14 @@ impl MuxState {
         payload: &[u8],
         destination: SocketAddr,
     ) -> io::Result<()> {
-        eprintln!(
-            "DBG dispatch inflight={} dst={destination}",
-            self.send_inflight.load(Ordering::Acquire)
-        );
-        if self.send_inflight.load(Ordering::Acquire) == 0 {
-            match try_send_now(&socket, payload, destination) {
-                Ok(true) => {
-                    eprintln!("DBG sent fast");
-                    return Ok(());
-                }
-                Ok(false) => {
-                    eprintln!("DBG wouldblock");
-                }
-                Err(error) => {
-                    eprintln!("DBG send err {error}");
-                    return Err(error);
-                }
-            }
+        // Always try the socket first. Gating this on an empty queue sends
+        // every datagram through the allocation/channel path under sustained
+        // load, which costs more than the UDP ordering that the fast path
+        // could disturb (UDP does not guarantee ordering anyway).
+        match try_send_now(&socket, payload, destination) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => return Err(error),
         }
         let datagram = OutboundDatagram {
             session_id,
