@@ -692,7 +692,7 @@ def run_h3(args: argparse.Namespace) -> tuple[dict, list[str]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arm", required=True, choices=("stock", "beam"))
+    parser.add_argument("--arm", required=True, choices=("stock", "beam", "baseline"))
     parser.add_argument("--scenario", required=True)
     parser.add_argument("--rep", required=True, type=int)
     parser.add_argument("--run-id", required=True)

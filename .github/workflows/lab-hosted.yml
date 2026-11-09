@@ -75,6 +75,36 @@ on:
         required: false
         default: true
         type: boolean
+      baseline_ref:
+        description: "Optional baseline beam commit for a paired cell"
+        required: false
+        default: ""
+        type: string
+      perf:
+        description: "Attach perf counters (root tracepoints)"
+        required: false
+        default: false
+        type: boolean
+      udp_count:
+        description: "Optional UDP packet-count override"
+        required: false
+        default: ""
+        type: string
+      udp_window:
+        description: "Optional UDP window override (1..1024)"
+        required: false
+        default: ""
+        type: string
+      perf_events:
+        description: "Optional perf event list override"
+        required: false
+        default: ""
+        type: string
+      pipe_pages_soft:
+        description: "Optional fs.pipe-user-pages-soft override"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -157,6 +187,35 @@ jobs:
           else
             require_complete=0
           fi
+
+          baseline_ref="${{ inputs.baseline_ref }}"
+          if [ -n "$baseline_ref" ] \
+            && ! printf '%s' "$baseline_ref" | grep -Eq '^[0-9a-f]{7,40}$'; then
+            echo "::error::baseline_ref must be a commit SHA"; exit 1
+          fi
+          perf_flag="${{ inputs.perf }}"
+          perf_events="${{ inputs.perf_events }}"
+          if [ -n "$perf_events" ] \
+            && ! printf '%s' "$perf_events" | grep -Eq '^[A-Za-z0-9_:,*.-]+$'; then
+            echo "::error::perf_events contains unsupported characters"; exit 1
+          fi
+          udp_count_override="${{ inputs.udp_count }}"
+          udp_window_override="${{ inputs.udp_window }}"
+          pipe_soft="${{ inputs.pipe_pages_soft }}"
+          for pair in "udp_count:$udp_count_override" "udp_window:$udp_window_override" \
+                      "pipe_pages_soft:$pipe_soft"; do
+            name=${pair%%:*}; value=${pair#*:}
+            if [ -n "$value" ] && ! printf '%s' "$value" | grep -Eq '^[0-9]+$'; then
+              echo "::error::$name must be a non-negative integer"; exit 1
+            fi
+          done
+          if [ -n "$udp_window_override" ] \
+            && { [ "$udp_window_override" -lt 1 ] || [ "$udp_window_override" -gt 1024 ]; }; then
+            echo "::error::udp_window must be 1..1024"; exit 1
+          fi
+          arms=stock,beam
+          [ -z "$baseline_ref" ] || arms=baseline,beam
+          if [ "$perf_flag" = "true" ]; then perf_value=1; else perf_value=0; fi
           {
             echo "RTT_MS=$rtt"
             echo "SERVER_CPU_QUOTA=$quota"
@@ -170,8 +229,15 @@ jobs:
             echo "BENCH_HTTPS_MIB=$https_mib"
             echo "BENCH_HTTPS_PARALLEL=$https_parallel"
             echo "BENCH_REQUIRE_COMPLETE=$require_complete"
+            echo "BASELINE_REF=$baseline_ref"
+            echo "BENCH_ARMS=$arms"
+            echo "BENCH_PERF=$perf_value"
+            echo "BENCH_PERF_EVENTS=$perf_events"
+            [ -z "$udp_count_override" ] || echo "BENCH_UDP_COUNT=$udp_count_override"
+            [ -z "$udp_window_override" ] || echo "BENCH_UDP_WINDOW=$udp_window_override"
+            [ -z "$pipe_soft" ] || echo "PIPE_PAGES_SOFT=$pipe_soft"
           } >> "$GITHUB_ENV"
-          echo "profile=${{ inputs.profile }} scenarios=$scenarios rtt=$rtt loss=$loss reps=$reps duration=$duration https_mib=$https_mib https_parallel=$https_parallel complete=$require_complete"
+          echo "profile=${{ inputs.profile }} scenarios=$scenarios rtt=$rtt loss=$loss reps=$reps duration=$duration https_mib=$https_mib https_parallel=$https_parallel complete=$require_complete baseline=$baseline_ref arms=$arms perf=$perf_value"
 
       - name: Capability gate
         if: inputs.suite != 'stress'
@@ -254,6 +320,20 @@ jobs:
           "$tools/xray-bin" version | head -2
           /usr/local/bin/curl --version | head -1
 
+          if [ "$BENCH_PERF" = "1" ]; then
+            sudo apt-get install -y -qq linux-tools-common linux-tools-generic
+            sudo sysctl -w kernel.perf_event_paranoid=1
+            if ! command -v perf >/dev/null 2>&1; then
+              perf_bin="$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)"
+              [ -n "$perf_bin" ] || { echo "::error::perf is unavailable"; exit 1; }
+              sudo ln -sf "$perf_bin" /usr/local/bin/perf
+            fi
+            perf --version
+            perf stat -x, -e task-clock -- true >/dev/null
+            perf stat -x, -e syscalls:sys_enter_splice,sched:sched_wakeup -- true >/dev/null \
+              || { echo "::error::perf tracepoints are unavailable"; exit 1; }
+          fi
+
       - name: Build
         timeout-minutes: 20
         run: |
@@ -263,6 +343,21 @@ jobs:
           cargo build --locked --release -p beam
           cargo build --locked --manifest-path tests/tun/h3-origin/Cargo.toml
           ls -l target/release/beam tests/tun/h3-origin/target/debug/h3-origin
+
+      - name: Build baseline
+        if: inputs.baseline_ref != ''
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          source scripts/dev-env.sh
+          base="$RUNNER_TEMP/beam-base"
+          rm -rf "$base"
+          git worktree add --detach "$base" "$BASELINE_REF"
+          cargo build --locked --manifest-path "$base/Cargo.toml" --release -p beam
+          install -m 0755 "$base/target/release/beam" "$RUNNER_TEMP/beam-baseline"
+          git worktree remove --force "$base"
+          ls -l "$RUNNER_TEMP/beam-baseline"
+          "$RUNNER_TEMP/beam-baseline" --version
 
       - name: TUN suite (root, private namespaces)
         if: inputs.suite == 'both' || inputs.suite == 'tun'
@@ -289,9 +384,14 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/bench-out"
           bench_args=(--reps "$REPS" --duration "$DURATION" --rtt-ms "$RTT_MS"
-                      --arms stock,beam --out "$out")
+                      --arms "$BENCH_ARMS" --out "$out")
           if [ "$QUICK" = "1" ]; then
             bench_args+=(--quick)
+          fi
+          if [ -n "${PIPE_PAGES_SOFT:-}" ]; then
+            orig_pipe_pages="$(sysctl -n fs.pipe-user-pages-soft)"
+            sudo -n sysctl -w fs.pipe-user-pages-soft="$PIPE_PAGES_SOFT"
+            trap 'sudo -n sysctl -w fs.pipe-user-pages-soft="$orig_pipe_pages"' EXIT
           fi
           sudo -n unshare --mount --propagation private --net --fork env \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -308,6 +408,11 @@ jobs:
             BENCH_SCENARIOS="$BENCH_SCENARIOS" \
             BENCH_HTTPS_MIB="$BENCH_HTTPS_MIB" \
             BENCH_HTTPS_PARALLEL="$BENCH_HTTPS_PARALLEL" \
+            BENCH_UDP_COUNT="$BENCH_UDP_COUNT" \
+            BENCH_UDP_WINDOW="$BENCH_UDP_WINDOW" \
+            BENCH_PERF="$BENCH_PERF" \
+            BENCH_PERF_EVENTS="$BENCH_PERF_EVENTS" \
+            BEAM_BASELINE_BIN="$RUNNER_TEMP/beam-baseline" \
             BENCH_REPORT=1 \
             BENCH_RATIO_ONLY=1 \
             BENCH_REQUIRE_COMPLETE="$BENCH_REQUIRE_COMPLETE" \
@@ -484,7 +589,20 @@ jobs:
               value = comparison.get("ratio")
               if isinstance(value, (int, float)) and not 0.95 <= value <= 1.05:
                   print(f"::warning::{name}: ratio {value:.4f} outside [0.95, 1.05]")
-          print("bench acceptance: valid, complete, unsaturated")
+          reference = summary.get("reference_arm", "stock")
+          candidate = summary.get("candidate_arm", "beam")
+          if reference == "baseline":
+              for scenario, events in (summary.get("counters") or {}).items():
+                  for event, item in sorted(events.items()):
+                      print(
+                          f"counter {scenario} {event}: "
+                          f"ref={item.get('reference')} cand={item.get('candidate')} "
+                          f"ratio={item.get('ratio')}"
+                      )
+          print(
+              "bench acceptance: valid, complete, unsaturated "
+              f"(reference={reference}, candidate={candidate})"
+          )
           PY
 
       - name: TUN acceptance

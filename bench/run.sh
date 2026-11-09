@@ -63,6 +63,8 @@ ORIGINAL_ARGS=("$@")
 REPS="${BENCH_REPS:-3}"
 DURATION="${BENCH_DURATION:-10}"
 ARMS="${BENCH_ARMS:-stock,beam}"
+BASELINE_BIN="${BEAM_BASELINE_BIN:-}"
+UDP_WINDOW="${BENCH_UDP_WINDOW:-32}"
 OUT=""
 QUICK=0
 REPS_SET=0
@@ -274,10 +276,15 @@ CLIENT_MASK_SPEC="$(IFS=','; echo "${CLIENT_CPU_LIST[*]}")"
 IFS=',' read -r -a ARM_LIST <<< "$ARMS"
 for arm in "${ARM_LIST[@]}"; do
   case "$arm" in
-    stock|beam) ;;
-    *) echo "bench: unknown arm '$arm' (use stock,beam)" >&2; exit 2 ;;
+    stock|beam|baseline) ;;
+    *) echo "bench: unknown arm '$arm' (use stock,beam,baseline)" >&2; exit 2 ;;
   esac
 done
+case "$UDP_WINDOW" in
+  ''|*[!0-9]*) echo "bench: BENCH_UDP_WINDOW must be an integer" >&2; exit 2 ;;
+esac
+[ "$UDP_WINDOW" -ge 1 ] && [ "$UDP_WINDOW" -le 1024 ] \
+  || { echo "bench: BENCH_UDP_WINDOW must be 1..1024" >&2; exit 2; }
 
 if [ "$INNER" != "1" ]; then
   if ! command -v unshare >/dev/null 2>&1; then
@@ -336,6 +343,7 @@ if [ "$INNER" != "1" ]; then
     BENCH_SERVER_CPU_QUOTA="$SERVER_CPU_QUOTA" \
     BENCH_HTTPS_PARALLEL="$HTTPS_PARALLEL" BENCH_LOG_LEVEL="$LOG_LEVEL" \
     BENCH_SCENARIOS="$SCENARIOS" BENCH_REPORT="$REPORT" \
+    BEAM_BASELINE_BIN="$BASELINE_BIN" BENCH_UDP_WINDOW="$UDP_WINDOW" \
     SING_BOX="$SING_BOX" XRAY_BIN="$XRAY_BIN" TEST_CONFIG="$TEST_CONFIG" \
     IPERF3="$IPERF3" IPERF3_LIB="$IPERF3_LIB" TC="$TC" H3_ORIGIN_BIN="$H3_ORIGIN_BIN" \
     bash "$SELF" "${ORIGINAL_ARGS[@]}"
@@ -444,6 +452,11 @@ export LD_LIBRARY_PATH="$IPERF3_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$IPERF3" --version >/dev/null 2>&1 || die "iperf3 cannot run (check IPERF3_LIB)"
 if [[ " ${ARM_LIST[*]} " == *" stock "* ]]; then
   XRAY_BIN="$(resolve_bin "$XRAY_BIN")" || die "stock Xray not found: $XRAY_BIN (set XRAY_BIN)"
+fi
+if [[ " ${ARM_LIST[*]} " == *" baseline "* ]]; then
+  [ -n "$BASELINE_BIN" ] || die "baseline arm needs BEAM_BASELINE_BIN"
+  BASELINE_BIN="$(resolve_bin "$BASELINE_BIN")" \
+    || die "baseline beam not found: $BASELINE_BIN (set BEAM_BASELINE_BIN)"
 fi
 if ! curl --version 2>/dev/null | grep -qi 'HTTP3'; then
   H3_BLOCKED="${H3_BLOCKED:-the local curl has no HTTP/3 support; cannot send a QUIC Initial}"
@@ -780,6 +793,8 @@ wait_for_port tun-target "$TARGET_HOST" "$IPERF3_PORT" "$IPERF3_PID" 10 \
   echo "reps=$REPS"
   echo "duration_s=$DURATION"
   echo "arms=$ARMS"
+  echo "udp_window=$UDP_WINDOW"
+  [ -n "$BASELINE_BIN" ] && echo "baseline_bin=$BASELINE_BIN"
   echo "server_cpu=$SERVER_CPU client_cpus=$CLIENT_MASK_SPEC target_cpu=$TARGET_CPU driver_cpu=$DRIVER_CPU server_cpu_quota=${SERVER_CPU_QUOTA:-none}"
 echo "rtt_ms=$RTT_MS"
   echo "singbox=$SING_BOX"
@@ -811,7 +826,10 @@ start_arm() {
   : > "$client_log"
 
   local -a server_cmd
-  if [ "$arm" = "beam" ]; then
+  if [ "$arm" = "baseline" ]; then
+    server_cmd=(ip netns exec tun-server taskset -c "$SERVER_CPU" \
+      "$BASELINE_BIN" --config "$CONFIG_DIR/beam.toml")
+  elif [ "$arm" = "beam" ]; then
     server_cmd=(ip netns exec tun-server taskset -c "$SERVER_CPU" \
       "$ROOT/target/release/beam" --config "$CONFIG_DIR/beam.toml")
   else
@@ -1063,7 +1081,7 @@ run_scenarios() {
     || die "measure.py failed for https-bulk/$arm"
   measure "$arm" "$rep" udp-echo udp "$raw/$arm-udp-echo-r$rep.json" \
     --host "$TARGET_HOST" --port "$UDP_PORT" --payload 1200 \
-    --packet-count "$UDP_COUNT" --window 32 --latency-count "$UDP_LATENCY_COUNT" \
+    --packet-count "$UDP_COUNT" --window "$UDP_WINDOW" --latency-count "$UDP_LATENCY_COUNT" \
     --timeout 2 || die "measure.py failed for udp-echo/$arm"
   measure "$arm" "$rep" dns-a dns "$raw/$arm-dns-a-r$rep.json" \
     --dns-server "$TARGET_HOST" --dns-count "$DNS_COUNT" --timeout 2 \
@@ -1080,10 +1098,10 @@ run_scenarios() {
 }
 
 for rep in $(seq 1 "$REPS"); do
-  if [ $((rep % 2)) -eq 1 ]; then
-    ORDER=(stock beam)
-  else
-    ORDER=(beam stock)
+  ORDER=("${ARM_LIST[@]}")
+  rotate=$(( (rep - 1) % ${#ORDER[@]} ))
+  if [ "$rotate" -gt 0 ]; then
+    ORDER=("${ORDER[@]:$rotate}" "${ORDER[@]:0:$rotate}")
   fi
   for arm in "${ORDER[@]}"; do
     if [[ ! " ${ARM_LIST[*]} " == *" $arm "* ]]; then
@@ -1158,6 +1176,8 @@ META_ARGS=(
   --host-load-after "$LOAD_AFTER"
 )
 [ -x "$XRAY_BIN" ] && META_ARGS+=(--stock-bin "$XRAY_BIN")
+[ -n "$BASELINE_BIN" ] && [ -x "$BASELINE_BIN" ] \
+  && META_ARGS+=(--baseline-bin "$BASELINE_BIN")
 [ -x "$H3_ORIGIN_BIN" ] && META_ARGS+=(--h3-origin "$H3_ORIGIN_BIN")
 META_ARGS+=(--large-file "$CONFIG_DIR/large.bin")
 [ -n "$H3_BLOCKED" ] && META_ARGS+=(--h3-blocked-reason "$H3_BLOCKED")

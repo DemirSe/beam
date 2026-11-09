@@ -15,6 +15,7 @@ The report is deliberately conservative:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import statistics
@@ -27,6 +28,17 @@ LATENCY_SCENARIOS = ("dns-a", "h3-latency", "udp-echo")
 # measure.py flags a single repetition at this utilisation; build() aggregates
 # the repetitions with the median before a scenario is condemned.
 SATURATION_PCT = 85.0
+
+
+def _load_perf_module():
+    path = Path(__file__).with_name("perf.py")
+    spec = importlib.util.spec_from_file_location("bench_perf", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+PERF = _load_perf_module()
 
 SCENARIO_META = {
     "tcp-dl-1": {"label": "TCP download, 1 flow", "unit": "Mbit/s"},
@@ -110,7 +122,7 @@ def scenario_stats(results: list[dict], scenario: str, arm: str, extract) -> dic
 
 
 def latency_pairs(
-    results: list[dict], scenario: str
+    results: list[dict], scenario: str, reference: str, candidate: str
 ) -> tuple[dict[str, list[float]], dict]:
     """Pool latency samples from the repetitions that succeeded in both arms.
 
@@ -120,10 +132,10 @@ def latency_pairs(
     """
     key = "rtt_samples_us" if scenario == "udp-echo" else "latency_samples_us"
     per_arm: dict[str, dict[int, list[float]]] = {"stock": {}, "beam": {}}
-    for arm in ("stock", "beam"):
+    for role, arm in (("stock", reference), ("beam", candidate)):
         for result in ok(by_arm(results, scenario).get(arm, [])):
             samples = result.get("metrics", {}).get(key, [])
-            per_arm[arm][result.get("rep")] = [float(value) for value in samples]
+            per_arm[role][result.get("rep")] = [float(value) for value in samples]
     stock_reps = set(per_arm["stock"])
     beam_reps = set(per_arm["beam"])
     paired = sorted(stock_reps & beam_reps)
@@ -240,9 +252,15 @@ def build(
         mib = meta["large_file"].get("bytes", 0) / 1048576.0
         SCENARIO_META["https-bulk"]["label"] = f"HTTPS Vision Direct, {mib:.0f} MiB"
     arms_present = sorted({item.get("arm") for item in results if item.get("arm")})
-    arms = [arm for arm in ("stock", "beam") if arm in arms_present]
-    if not arms:
+    reference_arm = "baseline" if "baseline" in arms_present else "stock"
+    candidate_arm = "beam"
+    arms = [arm for arm in (reference_arm, candidate_arm) if arm in arms_present]
+    if not arms or candidate_arm not in arms_present:
         raise SystemExit(f"no benchmark results under {run_dir / 'raw'}")
+    perf_data = PERF.load_perf(run_dir)
+    counters = (
+        PERF.summarize(perf_data, reference_arm, candidate_arm) if perf_data else {}
+    )
     required = REQUIRED
     h3_required = True
     if scenarios is not None:
@@ -263,7 +281,7 @@ def build(
     # Collect statuses once so blocked/failed rows are explicit.
     for scenario in SCENARIO_META:
         grouped = by_arm(results, scenario)
-        for arm in ("stock", "beam"):
+        for arm in (reference_arm, candidate_arm):
             for result in grouped.get(arm, []):
                 status = result.get("status")
                 if status == "blocked":
@@ -292,7 +310,7 @@ def build(
     # in the reason for context.
     saturation: dict[tuple[str, str], dict[str, tuple[float, float, int]]] = {}
     for scenario in TCP_SCENARIOS + ("https-bulk",):
-        for arm in ("stock", "beam"):
+        for arm in (reference_arm, candidate_arm):
             samples = ok(by_arm(results, scenario).get(arm, []))
             for role, key in (
                 ("client", "client_core_busy_pct"),
@@ -319,10 +337,10 @@ def build(
     tcp_ratios: dict[str, float | None] = {}
     for scenario in TCP_SCENARIOS:
         stock = scenario_stats(
-            results, scenario, "stock", lambda item: item["metrics"]["throughput_bps"]
+            results, scenario, reference_arm, lambda item: item["metrics"]["throughput_bps"]
         )
         beam = scenario_stats(
-            results, scenario, "beam", lambda item: item["metrics"]["throughput_bps"]
+            results, scenario, candidate_arm, lambda item: item["metrics"]["throughput_bps"]
         )
         current = ratio(beam, stock)
         tcp_ratios[scenario] = current
@@ -334,10 +352,10 @@ def build(
         }
         scale = lambda value: value / 1e6  # noqa: E731 - local formatting only
         stock_m = stats([scale(value) for value in scenario_values(
-            results, scenario, "stock", lambda item: item["metrics"]["throughput_bps"]
+            results, scenario, reference_arm, lambda item: item["metrics"]["throughput_bps"]
         )])
         beam_m = stats([scale(value) for value in scenario_values(
-            results, scenario, "beam", lambda item: item["metrics"]["throughput_bps"]
+            results, scenario, candidate_arm, lambda item: item["metrics"]["throughput_bps"]
         )])
         gate = 1.15 if scenario in ("tcp-dl-1", "tcp-ul-1") else 1.10
         invalid = scenario in invalid_scenarios
@@ -355,10 +373,10 @@ def build(
         rows["throughput"].append(row)
 
     https_stock = scenario_stats(
-        results, "https-bulk", "stock", lambda item: item["metrics"].get("mib_per_s")
+        results, "https-bulk", reference_arm, lambda item: item["metrics"].get("mib_per_s")
     )
     https_beam = scenario_stats(
-        results, "https-bulk", "beam", lambda item: item["metrics"].get("mib_per_s")
+        results, "https-bulk", candidate_arm, lambda item: item["metrics"].get("mib_per_s")
     )
     https_ratio = ratio(https_beam, https_stock)
     comparisons["https-bulk"] = {
@@ -384,7 +402,9 @@ def build(
     latency_comparisons: dict[str, dict] = {}
     latency_repetitions: dict[str, dict] = {}
     for scenario in LATENCY_SCENARIOS:
-        samples_by_arm, repetition_details = latency_pairs(results, scenario)
+        samples_by_arm, repetition_details = latency_pairs(
+            results, scenario, reference_arm, candidate_arm
+        )
         latency_repetitions[scenario] = repetition_details
         stock_samples = samples_by_arm["stock"]
         beam_samples = samples_by_arm["beam"]
@@ -432,8 +452,8 @@ def build(
     }
     udp_comparisons: dict[str, dict] = {}
     for key, (label, unit, extract) in udp_metrics.items():
-        stock = scenario_stats(results, "udp-echo", "stock", extract)
-        beam = scenario_stats(results, "udp-echo", "beam", extract)
+        stock = scenario_stats(results, "udp-echo", reference_arm, extract)
+        beam = scenario_stats(results, "udp-echo", candidate_arm, extract)
         current = ratio(beam, stock)
         udp_comparisons[key] = {"stock": stock, "beam": beam, "ratio": current}
         if key == "loss_pct":
@@ -459,10 +479,10 @@ def build(
     cpu_ratios: dict[str, float | None] = {}
     for scenario in TCP_SCENARIOS:
         stock = scenario_stats(
-            results, scenario, "stock", lambda item: item["cpu"].get("server_s_per_gib")
+            results, scenario, reference_arm, lambda item: item["cpu"].get("server_s_per_gib")
         )
         beam = scenario_stats(
-            results, scenario, "beam", lambda item: item["cpu"].get("server_s_per_gib")
+            results, scenario, candidate_arm, lambda item: item["cpu"].get("server_s_per_gib")
         )
         current = ratio(beam, stock)
         cpu_ratios[scenario] = current
@@ -478,7 +498,7 @@ def build(
         )
 
     rss = {}
-    for arm in ("stock", "beam"):
+    for role, arm in (("stock", reference_arm), ("beam", candidate_arm)):
         arm_results = [
             item
             for item in results
@@ -488,7 +508,7 @@ def build(
         warm = [value for value in warm if isinstance(value, int) and value > 0]
         peak = [item["mem"].get("rss_kib") for item in arm_results]
         peak = [value for value in peak if isinstance(value, int) and value > 0]
-        rss[arm] = {
+        rss[role] = {
             "after_warmup_median_kib": statistics.median(warm) if warm else None,
             "after_warmup_max_kib": max(warm) if warm else None,
             "peak_max_kib": max(peak) if peak else None,
@@ -514,10 +534,10 @@ def build(
     ):
         rss_ratio = rss["beam"]["after_warmup_max_kib"] / rss["stock"]["after_warmup_max_kib"]
     https_cpu_stock = scenario_stats(
-        results, "https-bulk", "stock", lambda item: item["cpu"].get("server_s_per_gib")
+        results, "https-bulk", reference_arm, lambda item: item["cpu"].get("server_s_per_gib")
     )
     https_cpu_beam = scenario_stats(
-        results, "https-bulk", "beam", lambda item: item["cpu"].get("server_s_per_gib")
+        results, "https-bulk", candidate_arm, lambda item: item["cpu"].get("server_s_per_gib")
     )
     rows["resources"].append(
         {
@@ -531,7 +551,7 @@ def build(
         }
     )
     client_cpu = {}
-    for arm in ("stock", "beam"):
+    for role, arm in (("stock", reference_arm), ("beam", candidate_arm)):
         medians = []
         for scenario in TCP_SCENARIOS:
             value = scenario_stats(
@@ -542,7 +562,7 @@ def build(
             )
             if value:
                 medians.append(value["median"])
-        client_cpu[arm] = statistics.median(medians) if medians else None
+        client_cpu[role] = statistics.median(medians) if medians else None
     client_cpu_ratio = None
     if client_cpu.get("stock") and client_cpu.get("beam"):
         client_cpu_ratio = client_cpu["beam"] / client_cpu["stock"]
@@ -600,7 +620,7 @@ def build(
 
     # Core saturation is a validity condition, not a performance result.
     core_stats: dict[str, dict] = {}
-    for arm in ("stock", "beam"):
+    for slot, arm in (("stock", reference_arm), ("beam", candidate_arm)):
         arm_results = [
             item
             for item in results
@@ -608,14 +628,14 @@ def build(
             and item.get("status") == "ok"
             and item.get("scenario") in TCP_SCENARIOS
         ]
-        core_stats[arm] = {}
+        core_stats[slot] = {}
         for role in ("server", "client", "target", "driver"):
             values = [
                 item.get("cpu", {}).get(f"{role}_core_busy_pct")
                 for item in arm_results
                 if item.get("cpu", {}).get(f"{role}_core_busy_pct") is not None
             ]
-            core_stats[arm][role] = stats(values)
+            core_stats[slot][role] = stats(values)
     meta_roles = meta.get("cpu_roles", {})
     meta_client_cores = meta_roles.get("client_cores") or [meta_roles.get("client")]
     driver_shared = meta_roles.get("driver") in meta_client_cores
@@ -688,16 +708,17 @@ def build(
         return f"{max(values) / 1048576:.1f} MiB" if values else "unavailable"
 
     memory_maxes = {
-        arm: sorted({
+        role: sorted({
             str((result.get("cpu") or {}).get("server_memory_max"))
             for result in results
             if result.get("arm") == arm
             and (result.get("cpu") or {}).get("server_memory_max")
         })
-        for arm in ("stock", "beam")
+        for role, arm in (("stock", reference_arm), ("beam", candidate_arm))
     }
     if any(memory_maxes.values()) or any(
-        memory_peak_mib(arm) != "unavailable" for arm in ("stock", "beam")
+        memory_peak_mib(arm) != "unavailable"
+        for arm in (reference_arm, candidate_arm)
     ):
         rows["resources"].append(
             {
@@ -864,6 +885,11 @@ def build(
             "status": "INVALID" if regression_invalid else status_word(no_regression_pass),
         },
     }
+    if reference_arm != "stock":
+        for gate in gates.values():
+            gate["pass"] = None
+            gate["requirement"] = "informational (baseline comparison)"
+            gate["status"] = "INFORMATIONAL"
 
     # --- Validity ---------------------------------------------------------
     # netem evidence: meta.json carries the qdisc state captured right after
@@ -925,7 +951,7 @@ def build(
         )
         invalid[f"{scenario}/{arm}: role core saturated"] = detail
     for scenario in required:
-        for arm in ("stock", "beam"):
+        for role, arm in (("stock", reference_arm), ("beam", candidate_arm)):
             if not ok(by_arm(results, scenario).get(arm, [])):
                 invalid[f"{scenario}/{arm}: missing required data"] = ""
     if len(set(arms)) < 2:
@@ -940,7 +966,7 @@ def build(
     if require_complete:
         reps = meta.get("reps")
         for scenario in required:
-            for arm in ("stock", "beam"):
+            for role, arm in (("stock", reference_arm), ("beam", candidate_arm)):
                 reps_seen = {
                     item.get("rep")
                     for item in ok(by_arm(results, scenario).get(arm, []))
@@ -950,7 +976,7 @@ def build(
                         f"{scenario}/{arm}: {len(reps_seen)}/{reps} repetitions"
                     ] = ""
         if h3_required and not meta.get("h3", {}).get("blocked_reason"):
-            for arm in ("stock", "beam"):
+            for role, arm in (("stock", reference_arm), ("beam", candidate_arm)):
                 if not ok(by_arm(results, "h3-latency").get(arm, [])):
                     invalid["h3-latency: missing repetitions"] = ""
 
@@ -1020,14 +1046,23 @@ def build(
         else all(bool(value) for value in hard_requirements.values())
     )
     numeric_status = (
-        "INVALID"
-        if any(gate.get("status") == "INVALID" for gate in gates.values())
-        else status_word(numeric_pass)
+        "INFORMATIONAL"
+        if reference_arm != "stock"
+        else (
+            "INVALID"
+            if any(gate.get("status") == "INVALID" for gate in gates.values())
+            else status_word(numeric_pass)
+        )
     )
     hard_status = (
-        "INVALID"
-        if not valid or any(gate.get("status") == "INVALID" for gate in gates.values())
-        else status_word(hard_pass)
+        "INFORMATIONAL"
+        if reference_arm != "stock"
+        else (
+            "INVALID"
+            if not valid
+            or any(gate.get("status") == "INVALID" for gate in gates.values())
+            else status_word(hard_pass)
+        )
     )
 
     summary = {
@@ -1035,6 +1070,10 @@ def build(
         "run_dir": str(run_dir),
         "meta": meta,
         "arms": arms,
+        "reference_arm": reference_arm,
+        "candidate_arm": candidate_arm,
+        "perf_present": bool(perf_data),
+        "counters": counters,
         "valid": valid,
         "headline_eligible": headline_eligible,
         "invalid_reasons": invalid_reasons,

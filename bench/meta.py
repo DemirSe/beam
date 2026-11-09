@@ -180,6 +180,7 @@ def main() -> int:
     parser.add_argument("--client-mask", default=None)
     parser.add_argument("--target-mask", default=None)
     parser.add_argument("--beam-bin", type=Path, default=None)
+    parser.add_argument("--baseline-bin", type=Path, default=None)
     parser.add_argument("--stock-bin", type=Path, default=None)
     parser.add_argument("--singbox", type=Path, default=None)
     parser.add_argument("--iperf3", type=Path, default=None)
@@ -266,6 +267,10 @@ def main() -> int:
             "beam": {
                 "path": str(args.beam_bin) if args.beam_bin else None,
                 "sha256": sha256(args.beam_bin) if args.beam_bin else None,
+            },
+            "baseline": {
+                "path": str(args.baseline_bin) if args.baseline_bin else None,
+                "sha256": sha256(args.baseline_bin) if args.baseline_bin else None,
             },
             "stock": {
                 "path": str(args.stock_bin) if args.stock_bin else None,

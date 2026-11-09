@@ -120,10 +120,18 @@ def _meta(reps, **overrides):
     return data
 
 
-def _results(reps, *, busy=30.0, busy_overrides=None, skip=(), scenarios=SCENARIOS):
+def _results(
+    reps,
+    *,
+    busy=30.0,
+    busy_overrides=None,
+    skip=(),
+    scenarios=SCENARIOS,
+    arms=("stock", "beam"),
+):
     overrides = busy_overrides or {}
     items = []
-    for arm in ("stock", "beam"):
+    for arm in arms:
         for scenario in scenarios:
             for rep in range(1, reps + 1):
                 if (scenario, arm, rep) in skip:
@@ -369,6 +377,49 @@ class ReportContractTests(unittest.TestCase):
                 for reason in unfiltered["invalid_reasons"]
             )
         )
+
+    def test_baseline_arm_pair_is_valid_and_informational(self):
+        import tempfile
+
+        results = _results(3, arms=("baseline", "beam"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _write(tmp, results, _meta(3))
+            summary = report.build(root, scenarios=SCENARIOS)
+        self.assertTrue(summary["valid"], summary["invalid_reasons"])
+        self.assertEqual(summary["reference_arm"], "baseline")
+        self.assertEqual(summary["candidate_arm"], "beam")
+        self.assertEqual(summary["hard_requirements_status"], "INFORMATIONAL")
+        self.assertEqual(summary["numeric_gates_status"], "INFORMATIONAL")
+        self.assertIn("stock", summary["comparisons"]["tcp-dl-1"])
+        self.assertIn("beam", summary["comparisons"]["tcp-dl-1"])
+
+    def test_perf_csv_is_aggregated(self):
+        import tempfile
+
+        results = _results(1, arms=("baseline", "beam"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _write(tmp, results, _meta(1))
+            (root / "raw" / "baseline-udp-echo-r1.json.perf.csv").write_text(
+                "100,,task-clock,100,100.00\n"
+                "4,,syscalls:sys_enter_splice,4,100.00\n"
+                "<not supported>,,cycles,0,0.00\n",
+                encoding="utf-8",
+            )
+            (root / "raw" / "beam-udp-echo-r1.json.perf.csv").write_text(
+                "100,,task-clock,100,100.00\n"
+                "8,,syscalls:sys_enter_splice,8,100.00\n",
+                encoding="utf-8",
+            )
+            summary = report.build(root, scenarios=("udp-echo",))
+        self.assertTrue(summary["perf_present"])
+        counters = summary["counters"]["udp-echo"]
+        self.assertEqual(counters["syscalls:sys_enter_splice"]["reference"], 4.0)
+        self.assertEqual(counters["syscalls:sys_enter_splice"]["candidate"], 8.0)
+        self.assertAlmostEqual(
+            counters["syscalls:sys_enter_splice"]["ratio"], 2.0, places=4
+        )
+        self.assertEqual(counters["task-clock"]["ratio"], 1.0)
+        self.assertNotIn("cycles", counters)
 
     def test_ratio_only_keeps_json_but_hides_verdicts(self):
         import tempfile
