@@ -851,6 +851,22 @@ capacity result is about 1.46x stock; the final smoke was about 1.40x. Treat
 older n=3 claims as provisional and require n>=10 with matched CPU accounting
 for any new headline.
 
+A scenario is condemned only when a harness role is saturated *typically*, not
+when one repetition spikes: `report.py` compares the median client, target and
+driver core utilisation across repetitions against 85% (peaks stay visible in
+the resource rows). Give the client proxy enough threads that its per-core
+median stays below that line, for example
+`BENCH_CLIENT_CPUS=0,1,4,5 BENCH_DRIVER_CPU=7` on a four-core/eight-thread
+host; one client core caps the whole comparison. Host-noise coverage excludes a
+role core's hyperthread siblings, so an allocation that claims every thread
+leaves no core to observe — the CPU noise metric is then empty and the
+settled host load average is the only interference signal, which cannot see
+load that exists solely inside the measurement windows. Latency pooling uses
+only the repetitions that succeeded in both arms and lists the repetitions it
+dropped. `BENCH_PERF=1` (root) and `BENCH_HTTPS_PARALLEL>1` produce probe
+measurements, not gate measurements; the concurrent HTTPS mode exists only to
+force the Vision async fallback.
+
 ### Baseline ledger
 
 These are decision baselines, not universal performance claims. Re-run the
