@@ -21,7 +21,7 @@ on:
       rtt_ms:
         description: "netem RTT in milliseconds (0 is a client-capped smoke cell)"
         required: true
-        default: "50"
+        default: "150"
       reps:
         description: "repetitions per arm"
         required: true
@@ -48,7 +48,7 @@ env:
   SING_BOX_SHA256: "e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee"
   XRAY_VERSION: "26.3.27"
   XRAY_SHA256: "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
-  RTT_MS: ${{ inputs.rtt_ms || '50' }}
+  RTT_MS: ${{ inputs.rtt_ms || '150' }}
   REPS: ${{ inputs.reps || '2' }}
   DURATION: ${{ inputs.duration || '5' }}
 

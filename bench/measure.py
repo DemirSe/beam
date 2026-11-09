@@ -904,6 +904,7 @@ def main() -> int:
         ),
         "client_cores": client_cores,
         "server_cpu_max": _cpu_max(args.server_pid),
+        "server_cpu_max_harness": os.environ.get("BENCH_SERVER_CPU_MAX") or None,
         "target_core_busy_pct": _cpu_delta(before["cpu"], after["cpu"], args.target_core),
         "driver_core_busy_pct": _cpu_delta(before["cpu"], after["cpu"], args.driver_core),
         "non_role_core_busy_pct_max": max(

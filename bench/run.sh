@@ -859,7 +859,7 @@ if [ "$PERF" = "1" ]; then
     fi
   fi
   ip netns exec tun-client taskset -c "$DRIVER_CPU" \
-    env LD_LIBRARY_PATH="$IPERF3_LIB" \
+    env LD_LIBRARY_PATH="$IPERF3_LIB" BENCH_SERVER_CPU_MAX="$SERVER_CPU_MAX" \
     "$PYTHON" "$HERE/measure.py" \
       --run-id "$RUN_ID" --arm "$arm" --rep "$rep" \
       --scenario "$scenario" --kind "$kind" \
