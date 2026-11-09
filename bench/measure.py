@@ -144,24 +144,6 @@ def _cpu_delta(
     return round(max(0.0, busy) / total * 100.0, 2)
 
 
-def _cpu_max(pid: int) -> str | None:
-    """The cgroup v2 CPU ceiling of a process, when one is set."""
-    if not pid:
-        return None
-    try:
-        cgroup = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    for line in cgroup.splitlines():
-        if line.startswith("0::"):
-            path = Path("/sys/fs/cgroup" + line[3:].strip() + "/cpu.max")
-            try:
-                return path.read_text(encoding="utf-8").strip()
-            except OSError:
-                return None
-    return None
-
-
 def _smt_siblings(core: int) -> set[int]:
     """The core plus its hyperthread siblings, if the topology exposes them.
 
@@ -903,8 +885,14 @@ def main() -> int:
             else None
         ),
         "client_cores": client_cores,
-        "server_cpu_max": _cpu_max(args.server_pid),
+        # The driver runs under `ip netns exec`, which remounts /sys and hides
+        # the cgroup2 mount, so the harness passes the readback values instead
+        # of letting this process chase /sys/fs/cgroup.
+        "server_cpu_max": os.environ.get("BENCH_SERVER_CPU_MAX") or None,
         "server_cpu_max_harness": os.environ.get("BENCH_SERVER_CPU_MAX") or None,
+        "server_memory_max": os.environ.get("BENCH_SERVER_MEMORY_MAX") or None,
+        "server_memory_peak": os.environ.get("BENCH_SERVER_MEMORY_PEAK") or None,
+        "server_memory_max_harness": os.environ.get("BENCH_SERVER_MEMORY_MAX") or None,
         "target_core_busy_pct": _cpu_delta(before["cpu"], after["cpu"], args.target_core),
         "driver_core_busy_pct": _cpu_delta(before["cpu"], after["cpu"], args.driver_core),
         "non_role_core_busy_pct_max": max(

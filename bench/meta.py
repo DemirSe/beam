@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -72,6 +73,91 @@ def cpu_info() -> dict:
     }
 
 
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_qdisc_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    qdisc = data[0] if isinstance(data, list) and data else data
+    if not isinstance(qdisc, dict):
+        return None
+    options = qdisc.get("options") or {}
+    stats = qdisc.get("stats")
+    if not isinstance(stats, dict):
+        # `tc -j -s qdisc` puts counters at the top level of the qdisc object.
+        stats = qdisc
+    delay = (options.get("delay") or {}).get("delay")
+    loss = (options.get("loss-random") or {}).get("loss")
+    return {
+        "source": "json",
+        "kind": qdisc.get("kind"),
+        "delay_ms": None if delay is None else round(float(delay) * 1000, 6),
+        "loss_pct": None if loss is None else round(float(loss) * 100, 6),
+        "drops": _int_or_none(stats.get("drops")),
+        "overlimits": _int_or_none(stats.get("overlimits")),
+        "qlen": _int_or_none(stats.get("qlen")),
+        "backlog": _int_or_none(stats.get("backlog")),
+    }
+
+
+def parse_qdisc_text(path: Path) -> dict | None:
+    try:
+        # `tc -s qdisc show` prints counts like "dropped 123,".
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if "netem" not in text:
+        return None
+    result = {
+        "source": "text",
+        "kind": "netem",
+        "delay_ms": None,
+        "loss_pct": None,
+        "drops": None,
+        "overlimits": None,
+        "qlen": None,
+        "backlog": None,
+    }
+    delay = re.search(r"\bdelay\s+([0-9.]+)ms", text)
+    if delay:
+        result["delay_ms"] = float(delay.group(1))
+    loss = re.search(r"\bloss\s+([0-9.]+)%", text)
+    if loss:
+        result["loss_pct"] = float(loss.group(1))
+    drops = re.search(r"\bdropped\s+([0-9,]+)", text)
+    if drops:
+        result["drops"] = _int_or_none(drops.group(1).replace(",", ""))
+    overlimits = re.search(r"\boverlimits\s+([0-9]+)", text)
+    if overlimits:
+        result["overlimits"] = _int_or_none(overlimits.group(1))
+    return result
+
+
+def qdisc_evidence(log_dir: Path | None) -> dict:
+    if log_dir is None:
+        return {}
+    result: dict[str, dict] = {}
+    for role in ("client", "server"):
+        # Drops accumulate during the run, so the final dump is the counter
+        # source; the initial dump is the fallback when the run never finished.
+        parsed = parse_qdisc_json(log_dir / f"tc-{role}-final.json")
+        if parsed is None:
+            parsed = parse_qdisc_json(log_dir / f"tc-{role}-initial.json")
+        if parsed is None:
+            parsed = parse_qdisc_text(log_dir / f"tc-{role}-final.txt")
+        if parsed is None:
+            parsed = parse_qdisc_text(log_dir / f"tc-{role}.txt")
+        result[role] = parsed or {"source": "unavailable"}
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
@@ -87,6 +173,9 @@ def main() -> int:
     parser.add_argument("--target-cpu", required=True, type=int)
     parser.add_argument("--driver-cpu", required=True, type=int)
     parser.add_argument("--rtt-ms", required=True, type=int)
+    parser.add_argument("--loss", type=float, default=0.0)
+    parser.add_argument("--max-load", type=float, default=0.3)
+    parser.add_argument("--qdisc-logs", type=Path, default=None)
     parser.add_argument("--server-mask", default=None)
     parser.add_argument("--client-mask", default=None)
     parser.add_argument("--target-mask", default=None)
@@ -168,6 +257,9 @@ def main() -> int:
         "reps": args.reps,
         "duration_s": args.duration,
         "rtt_ms": args.rtt_ms,
+        "loss_pct": args.loss,
+        "bench_max_load": args.max_load,
+        "qdisc": qdisc_evidence(args.qdisc_logs),
         "host_load1_before": args.host_load_before,
         "host_load1_after": args.host_load_after,
         "binaries": {

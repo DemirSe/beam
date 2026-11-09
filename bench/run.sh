@@ -32,6 +32,14 @@
 #   TEST_CONFIG   REALITY fixture (default: config.example.toml)
 #   H3_ORIGIN_BIN prebuilt tests/tun/h3-origin binary
 #   SKIP_BUILD=1  reuse target/release/beam and the H3 origin binary
+#   BENCH_RTT_MS        injected one-way delay per side (total RTT = 2x)
+#   BENCH_LOSS          packet loss percentage applied with netem to the
+#                       client-server links (default 0)
+#   BENCH_MAX_LOAD      host load average accepted as quiet (default 0.3)
+#   BENCH_SERVER_CPU_QUOTA  server cgroup CPU quota, e.g. 50% (needs root)
+#   BENCH_SERVER_MEMORY_MAX server cgroup memory ceiling, e.g. 1G (needs root)
+#   BENCH_RATIO_ONLY=1  report ratios without strict gate verdicts
+#   BENCH_REQUIRE_COMPLETE=1  invalidate a cell with missing repetitions
 #   BENCH_CLIENT_CPUS   client CPU list; one core per thread of the client proxy
 #   BENCH_DRIVER_CPU    CPU for the measurement driver (defaults to the first client CPU)
 #   BENCH_PERF=1  root only: attach `perf stat` to the server for each scenario
@@ -66,8 +74,15 @@ TARGET_CPU="${BENCH_TARGET_CPU:-3}"
 DRIVER_CPU="${BENCH_DRIVER_CPU:-}"
 CLIENT_CPUS="${BENCH_CLIENT_CPUS:-1}"
 RTT_MS="${BENCH_RTT_MS:-0}"
+LOSS="${BENCH_LOSS:-0}"
 MAX_LOAD="${BENCH_MAX_LOAD:-0.3}"
 SERVER_CPU_QUOTA="${BENCH_SERVER_CPU_QUOTA:-}"
+SERVER_MEMORY_MAX="${BENCH_SERVER_MEMORY_MAX:-}"
+SERVER_CPU_MAX=""
+SERVER_MEMORY_MAX_ACTUAL=""
+SERVER_CGROUP=""
+RATIO_ONLY="${BENCH_RATIO_ONLY:-0}"
+REQUIRE_COMPLETE="${BENCH_REQUIRE_COMPLETE:-0}"
 PERF="${BENCH_PERF:-0}"
 PERF_EVENTS="${BENCH_PERF_EVENTS:-task-clock,context-switches,cpu-migrations,page-faults,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_recvfrom,syscalls:sys_enter_sendto,syscalls:sys_enter_splice,sched:sched_wakeup,sched:sched_switch}"
 HTTPS_PARALLEL="${BENCH_HTTPS_PARALLEL:-1}"
@@ -149,6 +164,11 @@ while [ $# -gt 0 ]; do
       [ $# -gt 0 ] || { echo "bench: --rtt-ms needs milliseconds" >&2; exit 2; }
       RTT_MS="$1"
       ;;
+    --loss)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --loss needs a percentage" >&2; exit 2; }
+      LOSS="$1"
+      ;;
     --quick)
       QUICK=1
       ;;
@@ -181,6 +201,19 @@ esac
 case "$RTT_MS" in
   ''|*[!0-9]*) echo "bench: --rtt-ms must be a non-negative integer" >&2; exit 2 ;;
 esac
+case "$LOSS" in
+  ''|*[!0-9.]*|*.*.*|*.) echo "bench: --loss must be a percentage between 0 and 100" >&2; exit 2 ;;
+esac
+awk -v loss="$LOSS" 'BEGIN { exit !(loss >= 0 && loss <= 100) }' \
+  || { echo "bench: --loss must be a percentage between 0 and 100" >&2; exit 2; }
+NEEDS_SCOPE=0
+if [ -n "$SERVER_CPU_QUOTA" ] || [ -n "$SERVER_MEMORY_MAX" ]; then
+  NEEDS_SCOPE=1
+fi
+IMPAIRED=0
+if awk -v rtt="$RTT_MS" -v loss="$LOSS" 'BEGIN { exit !(rtt > 0 || loss > 0) }'; then
+  IMPAIRED=1
+fi
 [ "$REPS" -ge 1 ] || { echo "bench: --reps must be >= 1" >&2; exit 2; }
 [ "$DURATION" -ge 2 ] || { echo "bench: --duration must be >= 2" >&2; exit 2; }
 case "$PERF" in 0|1) ;; *) echo "bench: BENCH_PERF must be 0 or 1" >&2; exit 2 ;; esac
@@ -297,6 +330,8 @@ if [ "$INNER" != "1" ]; then
     BENCH_REPS="$REPS" BENCH_DURATION="$DURATION" BENCH_ARMS="$ARMS" \
     BENCH_SERVER_CPU="$SERVER_CPU" BENCH_CLIENT_CPU="$CLIENT_CPU" \
     BENCH_TARGET_CPU="$TARGET_CPU" BENCH_DRIVER_CPU="$DRIVER_CPU" BENCH_CLIENT_CPUS="$CLIENT_CPUS" BENCH_RTT_MS="$RTT_MS" BENCH_MAX_LOAD="$MAX_LOAD" \
+    BENCH_LOSS="$LOSS" BENCH_SERVER_MEMORY_MAX="$SERVER_MEMORY_MAX" \
+    BENCH_REQUIRE_COMPLETE="$REQUIRE_COMPLETE" BENCH_RATIO_ONLY="$RATIO_ONLY" \
     BENCH_PERF="$PERF" BENCH_PERF_EVENTS="$PERF_EVENTS" \
     BENCH_SERVER_CPU_QUOTA="$SERVER_CPU_QUOTA" \
     BENCH_HTTPS_PARALLEL="$HTTPS_PARALLEL" BENCH_LOG_LEVEL="$LOG_LEVEL" \
@@ -350,12 +385,13 @@ die() {
   exit 1
 }
 
-if [ -n "$SERVER_CPU_QUOTA" ]; then
-  [ "$(id -u)" -eq 0 ] || die "BENCH_SERVER_CPU_QUOTA needs root; run with BENCH_INNER=1"
+if [ "$NEEDS_SCOPE" = "1" ]; then
+  [ "$(id -u)" -eq 0 ] \
+    || die "BENCH_SERVER_CPU_QUOTA/BENCH_SERVER_MEMORY_MAX need root; run with BENCH_INNER=1"
   if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]+4294967295' /proc/self/uid_map; then
-    die "BENCH_SERVER_CPU_QUOTA needs real host root, not a mapped user namespace"
+    die "server resource limits need real host root, not a mapped user namespace"
   fi
-  command -v systemd-run >/dev/null 2>&1 || die "BENCH_SERVER_CPU_QUOTA needs systemd-run"
+  command -v systemd-run >/dev/null 2>&1 || die "server resource limits need systemd-run"
 fi
 
 if [ "$PERF" = "1" ]; then
@@ -560,15 +596,66 @@ ip netns exec tun-target ip addr add "$TARGET_ADDR" dev ts
 ip netns exec tun-target ip link set ts txqueuelen 10000
 ip netns exec tun-target ip link set ts up
 
-if [ "$RTT_MS" -gt 0 ]; then
-  HALF_MS="$(awk -v rtt="$RTT_MS" 'BEGIN { printf "%.3f", rtt / 2 }')ms"
-  log "applying netem delay $HALF_MS on each side (total RTT ${RTT_MS}ms)"
-  ip netns exec tun-client "$TC" qdisc add dev vc root netem delay "$HALF_MS" limit 20000 \
-    || die "could not add netem delay on vc"
-  ip netns exec tun-server "$TC" qdisc add dev sc root netem delay "$HALF_MS" limit 20000 \
-    || die "could not add netem delay on sc"
+# The harness must prove the requested impairment is actually on the wire;
+# qdisc evidence is captured as JSON and validated with tight tolerances.
+verify_netem() {
+  local role=$1 path=$2 rc=0
+  "$PYTHON" - "$role" "$path" "$RTT_MS" "$LOSS" <<'PY' || rc=$?
+import json
+import sys
+
+role, path, rtt, loss = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    qdisc = data[0] if isinstance(data, list) else data
+    options = qdisc["options"]
+except (OSError, ValueError, KeyError, IndexError) as exc:
+    raise SystemExit(f"could not read qdisc evidence {path}: {exc}")
+if rtt > 0:
+    delay = options.get("delay", {}).get("delay")
+    if delay is None:
+        raise SystemExit(f"{role}: netem has no delay")
+    want = rtt / 2
+    if abs(delay * 1000 - want) > 0.5:
+        raise SystemExit(
+            f"{role}: netem delay {delay * 1000:.3f}ms, wanted {want:.3f}ms"
+        )
+if loss > 0:
+    rate = options.get("loss-random", {}).get("loss")
+    if rate is None:
+        raise SystemExit(f"{role}: netem has no loss")
+    if abs(rate * 100 - loss) > 0.05:
+        raise SystemExit(f"{role}: netem loss {rate * 100:.3f}%, wanted {loss:.3f}%")
+PY
+  [ "$rc" = "0" ] \
+    || die "netem did not apply the requested impairment on the $role side"
+}
+
+if [ "$IMPAIRED" = "1" ]; then
+  netem_args=(limit 20000)
+  if [ "$RTT_MS" -gt 0 ]; then
+    HALF_MS="$(awk -v rtt="$RTT_MS" 'BEGIN { printf "%.3f", rtt / 2 }')"
+    netem_args+=(delay "${HALF_MS}ms")
+  fi
+  if awk -v loss="$LOSS" 'BEGIN { exit !(loss > 0) }'; then
+    netem_args+=(loss "${LOSS}%")
+  fi
+  log "applying netem on each side: ${netem_args[*]} (RTT ${RTT_MS}ms, loss ${LOSS}%)"
+  ip netns exec tun-client "$TC" qdisc add dev vc root netem "${netem_args[@]}" \
+    || die "could not add netem on vc"
+  ip netns exec tun-server "$TC" qdisc add dev sc root netem "${netem_args[@]}" \
+    || die "could not add netem on sc"
+  ip netns exec tun-client "$TC" -j -s qdisc show dev vc \
+    > "$LOG_DIR/tc-client-initial.json" \
+    || die "could not capture the client qdisc state"
+  ip netns exec tun-server "$TC" -j -s qdisc show dev sc \
+    > "$LOG_DIR/tc-server-initial.json" \
+    || die "could not capture the server qdisc state"
   ip netns exec tun-client "$TC" -s qdisc show > "$LOG_DIR/tc-client.txt" 2>&1
   ip netns exec tun-server "$TC" -s qdisc show > "$LOG_DIR/tc-server.txt" 2>&1
+  verify_netem client "$LOG_DIR/tc-client-initial.json"
+  verify_netem server "$LOG_DIR/tc-server-initial.json"
 fi
 # The lab uses one peer per veth; DAD adds no value and delays IPv6 binds.
 ip netns exec tun-server sysctl -qw net.ipv6.conf.vs.accept_dad=0 2>/dev/null || true
@@ -705,6 +792,7 @@ echo "rtt_ms=$RTT_MS"
   echo "https_mib=$HTTPS_MIB"
   echo "https_sha256=$HTTPS_SHA"
   echo "host_load_before=$LOAD_BEFORE"
+  echo "loss_pct=$LOSS"
 } > "$RUN_DIR/environment.txt"
 
 # ---------------------------------------------------------------------------
@@ -731,10 +819,13 @@ start_arm() {
       env GOMAXPROCS=1 "$XRAY_BIN" run -c "$CONFIG_DIR/xray-server.json")
   fi
   SERVER_SCOPE=""
-  if [ -n "$SERVER_CPU_QUOTA" ]; then
-    # The quota makes the server, not the harness, the bottleneck: both arms get
-    # the same ceiling, so ratios stay comparable while absolute numbers describe
-    # a fraction of a vCPU.
+  SERVER_CPU_MAX=""
+  SERVER_MEMORY_MAX_ACTUAL=""
+  SERVER_CGROUP=""
+  if [ "$NEEDS_SCOPE" = "1" ]; then
+    # The ceiling makes the server, not the harness, the bottleneck: both arms
+    # get the same limits, so ratios stay comparable while absolute numbers
+    # describe a fraction of a vCPU and a fixed memory budget.
     SERVER_SCOPE="beam-bench-$arm-$rep-$$"
     SERVER_PID_FILE="$RUN_DIR/.server-$arm-$rep-$$.pid"
     SERVER_WRAPPER="$RUN_DIR/.server-pid-$arm-$rep-$$.sh"
@@ -749,8 +840,15 @@ shift
 exec "$@"
 WRAPPER
     chmod 0755 "$SERVER_WRAPPER"
+    local -a scope_props=()
+    if [ -n "$SERVER_CPU_QUOTA" ]; then
+      scope_props+=(-p "CPUQuota=$SERVER_CPU_QUOTA")
+    fi
+    if [ -n "$SERVER_MEMORY_MAX" ]; then
+      scope_props+=(-p "MemoryMax=$SERVER_MEMORY_MAX")
+    fi
     systemd-run --scope --quiet --unit="$SERVER_SCOPE" \
-      -p "CPUQuota=$SERVER_CPU_QUOTA" -- \
+      "${scope_props[@]}" -- \
       "$SERVER_WRAPPER" "$SERVER_PID_FILE" \
       "${server_cmd[@]}" > "$server_log" 2>&1 &
     SERVER_PID=""
@@ -767,14 +865,25 @@ WRAPPER
     fi
     local cg_rel
     cg_rel="$(sed -n 's/^0:://p' "/proc/$SERVER_PID/cgroup" 2>/dev/null || true)"
+    SERVER_CGROUP="$cg_rel"
     SERVER_CPU_MAX="$(cat "/sys/fs/cgroup$cg_rel/cpu.max" 2>/dev/null || echo unknown)"
-    log "quota: scope=$SERVER_SCOPE cgroup=$cg_rel cpu.max=$SERVER_CPU_MAX requested=$SERVER_CPU_QUOTA"
-    case "$SERVER_CPU_MAX" in
-      unknown|''|max*)
-        die "CPU quota did not apply to the server (cpu.max='$SERVER_CPU_MAX' in ${cg_rel:-?})" ;;
-    esac
-    printf 'server_cpu_max=%s scope=%s cgroup=%s\n' \
-      "$SERVER_CPU_MAX" "$SERVER_SCOPE" "$cg_rel" >> "$RUN_DIR/masks.tsv"
+    SERVER_MEMORY_MAX_ACTUAL="$(cat "/sys/fs/cgroup$cg_rel/memory.max" 2>/dev/null || echo unknown)"
+    log "scope: scope=$SERVER_SCOPE cgroup=$cg_rel cpu.max=$SERVER_CPU_MAX memory.max=$SERVER_MEMORY_MAX_ACTUAL requested_cpu=$SERVER_CPU_QUOTA requested_memory=$SERVER_MEMORY_MAX"
+    if [ -n "$SERVER_CPU_QUOTA" ]; then
+      case "$SERVER_CPU_MAX" in
+        unknown|''|max*)
+          die "CPU quota did not apply to the server (cpu.max='$SERVER_CPU_MAX' in ${cg_rel:-?})" ;;
+      esac
+    fi
+    if [ -n "$SERVER_MEMORY_MAX" ]; then
+      case "$SERVER_MEMORY_MAX_ACTUAL" in
+        unknown|''|max*)
+          die "server memory limit did not apply (memory.max='$SERVER_MEMORY_MAX_ACTUAL' in ${cg_rel:-?})" ;;
+      esac
+    fi
+    printf 'server_cpu_max=%s server_memory_max=%s scope=%s cgroup=%s\n' \
+      "$SERVER_CPU_MAX" "$SERVER_MEMORY_MAX_ACTUAL" "$SERVER_SCOPE" "$cg_rel" \
+      >> "$RUN_DIR/masks.tsv"
   else
     "${server_cmd[@]}" > "$server_log" 2>&1 &
     SERVER_PID=$!
@@ -820,9 +929,34 @@ WRAPPER
 }
 
 stop_arm() {
+  local arm=$1 rep=$2
   stop_pid "$SINGBOX_PID"
   SINGBOX_PID=""
-  stop_pid "$SERVER_PID"
+  # Read the server cgroup before the process is reaped: /proc/$pid/cgroup and
+  # the scope's memory.peak both vanish with the last process in the scope.
+  # Unavailable is recorded as `unavailable`, never as a fake zero.
+  local peak=unavailable oom=unavailable oom_kill=unavailable cg_rel=""
+  local memory_max="${SERVER_MEMORY_MAX_ACTUAL:-unavailable}"
+  if [ -n "${SERVER_SCOPE:-}" ] && [ -n "${SERVER_PID:-}" ]; then
+    cg_rel="$(sed -n 's/^0:://p' "/proc/$SERVER_PID/cgroup" 2>/dev/null || true)"
+  fi
+  if [ -n "$cg_rel" ]; then
+    peak="$(cat "/sys/fs/cgroup$cg_rel/memory.peak" 2>/dev/null || echo unavailable)"
+    local events
+    events="$(cat "/sys/fs/cgroup$cg_rel/memory.events" 2>/dev/null || true)"
+    if [ -n "$events" ]; then
+      oom="$(awk '$1 == "oom" { print $2 }' <<<"$events")"
+      oom_kill="$(awk '$1 == "oom_kill" { print $2 }' <<<"$events")"
+      oom="${oom:-unavailable}"
+      oom_kill="${oom_kill:-unavailable}"
+    fi
+  fi
+  printf '%s\t%s\tserver-resources\t-\tmemory_peak=%s oom=%s oom_kill=%s memory_max=%s cgroup=%s\n' \
+    "$arm" "$rep" "$peak" "$oom" "$oom_kill" "$memory_max" \
+    "${cg_rel:-unavailable}" >> "$RUN_DIR/masks.tsv"
+  if [ -n "${SERVER_PID:-}" ]; then
+    stop_pid "$SERVER_PID"
+  fi
   SERVER_PID=""
   if [ -n "${SERVER_SCOPE:-}" ]; then
     systemctl stop "$SERVER_SCOPE" >/dev/null 2>&1 || true
@@ -841,15 +975,7 @@ measure() {
   fi
   local perf_pid=""
   local rc=0
-  if [ -n "$SERVER_CPU_QUOTA" ]; then
-  [ "$(id -u)" -eq 0 ] || die "BENCH_SERVER_CPU_QUOTA needs root; run with BENCH_INNER=1"
-  if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]+4294967295' /proc/self/uid_map; then
-    die "BENCH_SERVER_CPU_QUOTA needs real host root, not a mapped user namespace"
-  fi
-  command -v systemd-run >/dev/null 2>&1 || die "BENCH_SERVER_CPU_QUOTA needs systemd-run"
-fi
-
-if [ "$PERF" = "1" ]; then
+  if [ "$PERF" = "1" ]; then
     perf stat -x, -e "$PERF_EVENTS" -p "$SERVER_PID" -o "$out.perf.csv" &
     perf_pid=$!
     sleep 0.5
@@ -858,8 +984,14 @@ if [ "$PERF" = "1" ]; then
       die "perf stat failed for $scenario"
     fi
   fi
+  local server_peak=""
+  if [ -n "${SERVER_CGROUP:-}" ]; then
+    server_peak="$(cat "/sys/fs/cgroup$SERVER_CGROUP/memory.peak" 2>/dev/null || true)"
+  fi
   ip netns exec tun-client taskset -c "$DRIVER_CPU" \
     env LD_LIBRARY_PATH="$IPERF3_LIB" BENCH_SERVER_CPU_MAX="$SERVER_CPU_MAX" \
+    BENCH_SERVER_MEMORY_MAX="$SERVER_MEMORY_MAX_ACTUAL" \
+    BENCH_SERVER_MEMORY_PEAK="$server_peak" \
     "$PYTHON" "$HERE/measure.py" \
       --run-id "$RUN_ID" --arm "$arm" --rep "$rep" \
       --scenario "$scenario" --kind "$kind" \
@@ -960,7 +1092,7 @@ for rep in $(seq 1 "$REPS"); do
     start_arm "$arm" "$rep"
     run_warmup "$arm" "$rep"
     run_scenarios "$arm" "$rep"
-    stop_arm
+    stop_arm "$arm" "$rep"
   done
 done
 
@@ -982,7 +1114,11 @@ for _ in $(seq 1 180); do
   sleep 1
   LOAD_AFTER="$(awk '{print $1}' /proc/loadavg)"
 done
-if [ "$RTT_MS" -gt 0 ]; then
+if [ "$IMPAIRED" = "1" ]; then
+  ip netns exec tun-client "$TC" -j -s qdisc show dev vc \
+    > "$LOG_DIR/tc-client-final.json" 2>&1 || true
+  ip netns exec tun-server "$TC" -j -s qdisc show dev sc \
+    > "$LOG_DIR/tc-server-final.json" 2>&1 || true
   ip netns exec tun-client "$TC" -s qdisc show > "$LOG_DIR/tc-client-final.txt" 2>&1 || true
   ip netns exec tun-server "$TC" -s qdisc show > "$LOG_DIR/tc-server-final.txt" 2>&1 || true
 fi
@@ -1009,6 +1145,9 @@ META_ARGS=(
   --target-cpu "$TARGET_CPU"
   --driver-cpu "$DRIVER_CPU"
   --rtt-ms "$RTT_MS"
+  --loss "$LOSS"
+  --max-load "$MAX_LOAD"
+  --qdisc-logs "$LOG_DIR"
   --server-mask "$SERVER_MASK"
   --client-mask "$CLIENT_MASK"
   --target-mask "$TARGET_MASK"
@@ -1029,6 +1168,13 @@ META_ARGS+=("${WARNINGS[@]}")
 # for the invoking user.
 GIT_OPTIONAL_LOCKS=0 "$PYTHON" "$HERE/meta.py" "${META_ARGS[@]}" || die "could not write meta.json"
 if [ "$REPORT" = "1" ]; then
-  "$PYTHON" "$HERE/report.py" --run "$RUN_DIR" || die "could not write the summary"
+  REPORT_ARGS=(--run "$RUN_DIR")
+  if [ "$RATIO_ONLY" = "1" ]; then
+    REPORT_ARGS+=(--ratio-only)
+  fi
+  if [ "$REQUIRE_COMPLETE" = "1" ]; then
+    REPORT_ARGS+=(--require-complete)
+  fi
+  "$PYTHON" "$HERE/report.py" "${REPORT_ARGS[@]}" || die "could not write the summary"
 fi
 printf '\nbench: run directory: %s\n' "$RUN_DIR"
