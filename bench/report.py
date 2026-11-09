@@ -5,8 +5,9 @@ The report is deliberately conservative:
 
 * throughput and latency use the median of the per-repetition values,
 * latency percentiles pool the raw samples from every repetition,
-* a scenario whose client or target core exceeded 85% is marked
-  client-bound/target-bound and makes the measurement invalid for the headline,
+* a scenario whose median client, target or driver core utilisation exceeded
+  85% is marked producer-bound and makes the measurement invalid for the
+  headline; single-repetition peaks are reported but do not condemn a scenario,
 * a missing or failed scenario is never replaced by a guessed value: it is
   reported as BLOCKED or FAIL with the exact reason.
 """
@@ -23,6 +24,9 @@ from pathlib import Path
 TCP_SCENARIOS = ("tcp-dl-1", "tcp-dl-4", "tcp-ul-1", "tcp-ul-4")
 REQUIRED = TCP_SCENARIOS + ("https-bulk", "udp-echo", "dns-a")
 LATENCY_SCENARIOS = ("dns-a", "h3-latency", "udp-echo")
+# measure.py flags a single repetition at this utilisation; build() aggregates
+# the repetitions with the median before a scenario is condemned.
+SATURATION_PCT = 85.0
 
 SCENARIO_META = {
     "tcp-dl-1": {"label": "TCP download, 1 flow", "unit": "Mbit/s"},
@@ -248,21 +252,35 @@ def build(run_dir: Path) -> dict:
                         }
                     )
 
-    # A saturated client/target makes the throughput number a property of the
-    # harness, not of the server. Such a scenario is reported, but it cannot
-    # pass a gate.
-    invalid_scenarios: set[str] = set()
-    for result in results:
-        if result.get("scenario") not in TCP_SCENARIOS + ("https-bulk",):
-            continue
-        if result.get("status") != "ok":
-            continue
-        if (
-            result.get("client_bound")
-            or result.get("target_bound")
-            or result.get("driver_bound")
-        ):
-            invalid_scenarios.add(result["scenario"])
+    # A saturated client/target/driver makes the throughput number a property of
+    # the harness, not of the server. measure.py flags a single 10 s window, so
+    # one anomalous repetition must not condemn a scenario: the median across
+    # repetitions decides (like every other statistic here) and the peak is kept
+    # in the reason for context.
+    saturation: dict[tuple[str, str], dict[str, tuple[float, float, int]]] = {}
+    for scenario in TCP_SCENARIOS + ("https-bulk",):
+        for arm in ("stock", "beam"):
+            samples = ok(by_arm(results, scenario).get(arm, []))
+            for role, key in (
+                ("client", "client_core_busy_pct"),
+                ("target", "target_core_busy_pct"),
+                ("driver", "driver_core_busy_pct"),
+            ):
+                values = [
+                    value
+                    for value in (item["cpu"].get(key) for item in samples)
+                    if isinstance(value, (int, float))
+                ]
+                if not values:
+                    continue
+                median = statistics.median(values)
+                if median >= SATURATION_PCT:
+                    saturation.setdefault((scenario, arm), {})[role] = (
+                        median,
+                        max(values),
+                        len(values),
+                    )
+    invalid_scenarios: set[str] = {scenario for scenario, _ in saturation}
 
     # --- Throughput -------------------------------------------------------
     tcp_ratios: dict[str, float | None] = {}
@@ -738,41 +756,26 @@ def build(run_dir: Path) -> dict:
                         except ValueError:
                             pass
         qdisc_drops[name] = drops
-    invalid: dict[str, list[float | None]] = {}
-    for scenario in TCP_SCENARIOS + ("https-bulk",):
-        for arm in ("stock", "beam"):
-            for result in ok(by_arm(results, scenario).get(arm, [])):
-                if result.get("client_bound"):
-                    invalid.setdefault(f"{scenario}/{arm}: client core saturated", []).append(
-                        result["cpu"].get("client_core_busy_pct")
-                    )
-                if result.get("target_bound"):
-                    invalid.setdefault(f"{scenario}/{arm}: target core saturated", []).append(
-                        result["cpu"].get("target_core_busy_pct")
-                    )
-                if result.get("driver_bound"):
-                    invalid.setdefault(f"{scenario}/{arm}: driver core saturated", []).append(
-                        result["cpu"].get("driver_core_busy_pct")
-                    )
+    invalid: dict[str, str] = {}
+    for (scenario, arm), roles in sorted(saturation.items()):
+        detail = ", ".join(
+            f"{role} median {median:.1f}%, peak {peak:.1f}%, n={count}"
+            for role, (median, peak, count) in sorted(roles.items())
+        )
+        invalid[f"{scenario}/{arm}: role core saturated"] = detail
     for scenario in REQUIRED:
         for arm in ("stock", "beam"):
             if not ok(by_arm(results, scenario).get(arm, [])):
-                invalid.setdefault(f"{scenario}/{arm}: missing required data", [])
+                invalid[f"{scenario}/{arm}: missing required data"] = ""
     if len(set(arms)) < 2:
-        invalid.setdefault("both arms were not measured", [])
+        invalid["both arms were not measured"] = ""
     for name, drops in qdisc_drops.items():
         if drops > 0:
-            invalid.setdefault(f"{name}: netem qdisc dropped {drops} packets", [])
+            invalid[f"{name}: netem qdisc dropped {drops} packets"] = ""
 
-    invalid_reasons = []
-    for key, values in invalid.items():
-        numbers = [value for value in values if isinstance(value, (int, float))]
-        if numbers:
-            invalid_reasons.append(
-                f"{key} ({min(numbers):.1f}-{max(numbers):.1f}%)"
-            )
-        else:
-            invalid_reasons.append(key)
+    invalid_reasons = [
+        f"{key} ({detail})" if detail else key for key, detail in invalid.items()
+    ]
 
     host_keys: set[str] = set()
     non_role: dict[str, list[float]] = {}
