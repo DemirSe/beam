@@ -1168,7 +1168,7 @@ META_ARGS+=("${WARNINGS[@]}")
 # for the invoking user.
 GIT_OPTIONAL_LOCKS=0 "$PYTHON" "$HERE/meta.py" "${META_ARGS[@]}" || die "could not write meta.json"
 if [ "$REPORT" = "1" ]; then
-  REPORT_ARGS=(--run "$RUN_DIR")
+  REPORT_ARGS=(--run "$RUN_DIR" --scenarios "$SCENARIOS")
   if [ "$RATIO_ONLY" = "1" ]; then
     REPORT_ARGS+=(--ratio-only)
   fi

@@ -228,7 +228,12 @@ def markdown_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def build(run_dir: Path, *, require_complete: bool = False) -> dict:
+def build(
+    run_dir: Path,
+    *,
+    require_complete: bool = False,
+    scenarios: tuple[str, ...] | None = None,
+) -> dict:
     meta = load_meta(run_dir)
     results = load_results(run_dir)
     if meta.get("large_file"):
@@ -238,6 +243,12 @@ def build(run_dir: Path, *, require_complete: bool = False) -> dict:
     arms = [arm for arm in ("stock", "beam") if arm in arms_present]
     if not arms:
         raise SystemExit(f"no benchmark results under {run_dir / 'raw'}")
+    required = REQUIRED
+    h3_required = True
+    if scenarios is not None:
+        allowed = set(scenarios)
+        required = tuple(name for name in REQUIRED if name in allowed)
+        h3_required = "h3-latency" in allowed
 
     comparisons: dict[str, dict] = {}
     rows: dict[str, list[dict]] = {
@@ -913,7 +924,7 @@ def build(run_dir: Path, *, require_complete: bool = False) -> dict:
             for role, (median, peak, count) in sorted(roles.items())
         )
         invalid[f"{scenario}/{arm}: role core saturated"] = detail
-    for scenario in REQUIRED:
+    for scenario in required:
         for arm in ("stock", "beam"):
             if not ok(by_arm(results, scenario).get(arm, [])):
                 invalid[f"{scenario}/{arm}: missing required data"] = ""
@@ -928,7 +939,7 @@ def build(run_dir: Path, *, require_complete: bool = False) -> dict:
                 invalid[f"{name}: netem qdisc dropped {drops} packets"] = ""
     if require_complete:
         reps = meta.get("reps")
-        for scenario in REQUIRED:
+        for scenario in required:
             for arm in ("stock", "beam"):
                 reps_seen = {
                     item.get("rep")
@@ -938,7 +949,7 @@ def build(run_dir: Path, *, require_complete: bool = False) -> dict:
                     invalid[
                         f"{scenario}/{arm}: {len(reps_seen)}/{reps} repetitions"
                     ] = ""
-        if not meta.get("h3", {}).get("blocked_reason"):
+        if h3_required and not meta.get("h3", {}).get("blocked_reason"):
             for arm in ("stock", "beam"):
                 if not ok(by_arm(results, "h3-latency").get(arm, [])):
                     invalid["h3-latency: missing repetitions"] = ""
@@ -1380,10 +1391,24 @@ def main() -> int:
     parser.add_argument("--markdown", type=Path, default=None)
     parser.add_argument("--ratio-only", action="store_true")
     parser.add_argument("--require-complete", action="store_true")
+    parser.add_argument(
+        "--scenarios",
+        default="all",
+        help="comma list of measured scenarios (all = every required scenario)",
+    )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
-    summary = build(args.run, require_complete=args.require_complete)
+    scenarios = None
+    if args.scenarios != "all":
+        scenarios = tuple(
+            part for part in args.scenarios.split(",") if part
+        )
+    summary = build(
+        args.run,
+        require_complete=args.require_complete,
+        scenarios=scenarios,
+    )
     json_path = args.json or args.run / "summary.json"
     markdown_path = args.markdown or args.run / "summary.md"
     markdown = render_markdown(summary, ratio_only=args.ratio_only)

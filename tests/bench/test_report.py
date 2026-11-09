@@ -353,6 +353,23 @@ class ReportContractTests(unittest.TestCase):
             blocked["invalid_reasons"],
         )
 
+    def test_scenario_filter_validates_only_measured_scenarios(self):
+        import tempfile
+
+        results = _results(3, scenarios=("https-bulk",))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _write(tmp, results, _meta(3))
+            filtered = report.build(root, scenarios=("https-bulk",))
+            unfiltered = report.build(root)
+        self.assertTrue(filtered["valid"], filtered["invalid_reasons"])
+        self.assertFalse(unfiltered["valid"])
+        self.assertTrue(
+            any(
+                "missing required data" in reason
+                for reason in unfiltered["invalid_reasons"]
+            )
+        )
+
     def test_ratio_only_keeps_json_but_hides_verdicts(self):
         import tempfile
 
