@@ -21,7 +21,7 @@ on 2026-11-08 17:53 UTC:
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
 | Host network | IPv6 disabled (`all/default/lo`), BBR + fq, conntrack 65536, 600 s UDP retention |
 | SSH | `AddressFamily inet`, `0.0.0.0:22`; no IPv6 listener |
-| Verification | Hash-pinned verifier PASS for plain and IPv4 HTTP/2 tunnel with `EXPECT_HOST_IPV6_DISABLED=1`; 120/120 HTTP 200 soak at 4-way concurrency; `NRestarts=0`; 44 threads, 17 MiB RSS, 208 fds at the verification snapshot (fds vary with active relays); cover TLS 1.3 `*.whatsapp.net`; lab matrix 11/11; TUN matrix 8/8 in xudp, packetaddr and legacy; `make check` 377 tests (local client stopped; see Verification before commit) and `make smoke` PASS |
+| Verification | Hash-pinned verifier PASS for plain and IPv4 HTTP/2 tunnel with `EXPECT_HOST_IPV6_DISABLED=1`; 120/120 HTTP 200 soak at 4-way concurrency; `NRestarts=0`; 44 threads, 17 MiB RSS, 208 fds at the verification snapshot (fds vary with active relays); cover TLS 1.3 `*.whatsapp.net`; lab matrix 11/11; TUN matrix 8/8 in xudp, packetaddr and legacy; `make check` 381 tests (local client stopped; see Verification before commit) and `make smoke` PASS |
 
 Production is IPv4-only end to end: the beam drop-in
 `/etc/systemd/system/beam.service.d/99-ipv4-only.conf` resets the base family
@@ -128,7 +128,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 377 tests: 346 `beam-core`,
+a benchmark comparison. The current workspace has 381 tests: 350 `beam-core`,
 1 `beam` CLI, 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 When the IPv4-only Linux client is active, run the workspace checks with
 `sudo systemctl stop beam-client` and restart it afterward: sing-box's
@@ -855,6 +855,20 @@ identity. Full-TUN bulk is client-capped on this host
 capacity result is about 1.46x stock; the final smoke was about 1.40x. Treat
 older n=3 claims as provisional and require n>=10 with matched CPU accounting
 for any new headline.
+
+The 2026-11-10 hardening pass sizes each Vision splice pipe from
+`fs.pipe-user-pages-soft` and the splice permit count, so raising
+`BEAM_MAX_BLOCKING_THREADS` cannot silently fall back to the kernel's 8 KiB
+allocation default. XUDP request sends try the socket first and queue only a
+`WouldBlock` datagram in a bounded mux queue; a failed send closes that session
+with `End + Error` through a failure channel. The TLS record path reuses one
+initialized header+body buffer per stream, and XUDP replies are encoded in the
+writer batch while the idle clock is an atomic epoch counter. Hosted paired
+cells showed no regression (UDP pps/loss and p99 within noise; HTTPS
+beam-vs-beam 0.9988 over five repetitions), and a local no-TUN UDP A/B moved
+from about 78k to 83k pps after the send fast-path fix. The hosted runner has
+perf tracepoints disabled, so per-record CPU deltas are not claimed; the
+upload-side chunk copy remains.
 
 A scenario is condemned only when a harness role is saturated *typically*, not
 when one repetition spikes: `report.py` compares the median client, target and

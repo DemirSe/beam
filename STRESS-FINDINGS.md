@@ -384,6 +384,27 @@ semantics). Regression tests:
 After the fix the same probe shows fds 10 → 10 and the fresh probe is
 forwarded.
 
+## 2026-11-10 performance hardening
+
+The P0/P1 audit items were implemented on `dev` and measured against their
+parent commits in the hosted lab:
+
+- splice pipe budget from `fs.pipe-user-pages-soft` (unit-tested; local
+  pipe-page probe confirmed the 8 KiB allocation-time fallback);
+- XUDP send queue: the socket is tried first, and only a `WouldBlock`
+  datagram is queued (the first version gated the fast path on an empty queue
+  and dropped local UDP pps from ~78k to ~50k; fixed and re-measured at ~83k);
+- TLS record path reuses one initialized buffer per stream and feeds rustls
+  directly, removing the per-record allocation/zero-fill/pending copy;
+- XUDP replies are encoded in the writer batch, and the idle clock is an
+  atomic epoch counter.
+
+Hosted paired cells were valid with no loss/p99 regression; a five-repetition
+beam-vs-beam HTTPS cell measured 0.9988. Perf tracepoints are unavailable on
+the hosted runner, so only `server_s` and local privileged counters were used;
+splice counters attach after the blocking threads spawn, so they are not
+reported. The upload-side chunk copy and the 24 h soak remain open.
+
 ## Non-findings
 
 - No fd, task, permit, or XUDP session leak appeared in normal load, the 10k
