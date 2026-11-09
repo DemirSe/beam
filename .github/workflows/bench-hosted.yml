@@ -25,7 +25,7 @@ on:
       reps:
         description: "repetitions per arm"
         required: true
-        default: "3"
+        default: "2"
       duration:
         description: "seconds per iperf3 window"
         required: true
@@ -47,7 +47,7 @@ env:
   XRAY_VERSION: "26.3.27"
   XRAY_SHA256: "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
   RTT_MS: ${{ inputs.rtt_ms || '50' }}
-  REPS: ${{ inputs.reps || '3' }}
+  REPS: ${{ inputs.reps || '2' }}
   DURATION: ${{ inputs.duration || '10' }}
 
 jobs:
@@ -58,6 +58,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.99.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tests/tun/h3-origin -> target
+          cache-on-failure: true
 
       - name: Host facts
         run: |
@@ -89,8 +98,10 @@ jobs:
           cd "$GITHUB_WORKSPACE" && git rev-parse HEAD
 
       - name: Build beam and the H3 origin
+        timeout-minutes: 15
         run: |
           source scripts/dev-env.sh
+          rustc --version
           cargo build --locked --release -p beam
           cargo build --locked --manifest-path tests/tun/h3-origin/Cargo.toml || true
           ls -l target/release/beam
