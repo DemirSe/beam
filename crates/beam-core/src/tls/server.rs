@@ -1441,8 +1441,10 @@ async fn forward_to_cover(
     })??;
     // Cover is deliberately async: an unauthenticated probe must not hold a
     // detached blocking splice task or a splice permit for up to 30 seconds.
-    // Dropping this future on shutdown cancels the relay promptly.
-    relay_bidirectional(client, cover, COVER_IDLE_TIMEOUT).await?;
+    // Dropping this future on shutdown cancels the relay promptly, and the
+    // relay ends on the first half-close so a disconnected probe cannot pin a
+    // cover slot until the idle timeout.
+    relay_cover_bidirectional(client, cover, COVER_IDLE_TIMEOUT).await?;
     Ok(ConnectionOutcome::CoverForwarded)
 }
 
@@ -1641,6 +1643,43 @@ where
     );
     tokio::try_join!(left_to_right, right_to_left)?;
     Ok(())
+}
+
+/// Relays an unauthenticated cover connection.
+///
+/// Unlike an authenticated relay, a cover probe is over as soon as either
+/// peer half-closes. Waiting for the opposite direction would let a probe
+/// that already disconnected pin a cover permit and its two sockets for the
+/// full cover idle timeout, which makes slot saturation observable by a
+/// scanner with a handful of source addresses. The authenticated relay keeps
+/// its half-close semantics unchanged.
+async fn relay_cover_bidirectional<A, B>(
+    left: A,
+    right: B,
+    idle_timeout: Duration,
+) -> Result<(), TlsServerError>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut left_read, mut left_write) = tokio::io::split(left);
+    let (mut right_read, mut right_write) = tokio::io::split(right);
+    let activity = Arc::new(RelayActivity::new());
+
+    tokio::select! {
+        result = copy_direction(
+            &mut left_read,
+            &mut right_write,
+            idle_timeout,
+            Some(&activity),
+        ) => result.map(|_| ()),
+        result = copy_direction(
+            &mut right_read,
+            &mut left_write,
+            idle_timeout,
+            Some(&activity),
+        ) => result.map(|_| ()),
+    }
 }
 
 /// Relays a Vision stream, handing each raw direction to its own one-way
@@ -2665,6 +2704,52 @@ mod tests {
             .expect("fallback relay task");
         assert!(matches!(outcome, Ok(ConnectionOutcome::CoverForwarded)));
         cover_task.await.expect("cover task");
+    }
+
+    #[tokio::test]
+    async fn cover_relay_ends_when_the_probe_half_closes() {
+        // The cover peer accepts the forwarded record but never answers and
+        // never closes. Before the fix the relay waited for the 30 s cover
+        // idle timeout after the client was gone, pinning a cover permit.
+        let cover_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("cover listener");
+        let cover_port = cover_listener.local_addr().expect("cover address").port();
+        let cover_task = tokio::spawn(async move {
+            let (mut cover, _) = cover_listener.accept().await.expect("cover accept");
+            let mut record = [0u8; 5];
+            cover.read_exact(&mut record).await.expect("cover read");
+            assert_eq!(&record, b"hello");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut config = test_config();
+        config.cover = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: cover_port,
+        };
+        let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("front listener");
+        let front_port = front_listener.local_addr().expect("front address").port();
+        let connect = tokio::spawn(async move {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("client connect")
+        });
+        let (client, _) = front_listener.accept().await.expect("front accept");
+        let proxy = tokio::spawn(async move { forward_to_cover(client, b"hello", &config).await });
+        let mut peer = connect.await.expect("connect task");
+
+        // The probe disconnects without waiting for a cover reply.
+        peer.shutdown().await.expect("peer shutdown");
+
+        let outcome = timeout(Duration::from_secs(2), proxy)
+            .await
+            .expect("cover relay must not wait for the cover idle timeout")
+            .expect("cover relay task");
+        assert!(matches!(outcome, Ok(ConnectionOutcome::CoverForwarded)));
+        cover_task.abort();
     }
 
     #[tokio::test]
