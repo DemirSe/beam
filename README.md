@@ -867,6 +867,38 @@ dropped. `BENCH_PERF=1` (root) and `BENCH_HTTPS_PARALLEL>1` produce probe
 measurements, not gate measurements; the concurrent HTTPS mode exists only to
 force the Vision async fallback.
 
+### Hosted pre-release lab
+
+`.github/workflows/lab-hosted.yml` runs the functional 8-row TUN matrix and the
+stock-vs-beam A/B in one GitHub-hosted `ubuntu-24.04` job, on demand:
+
+```bash
+gh workflow run lab-hosted.yml -f profile=standard
+gh workflow run lab-hosted.yml -f profile=smoke -f suite=tun
+gh workflow run lab-hosted.yml -f profile=claim -f suite=bench
+```
+
+| Profile | RTT | Server ceiling | Reps | Window | Duration | Use |
+|---|---|---|---|---|---|---|
+| `smoke` | 250 ms | 50% CPU, 1 GiB | 2 | quick | ~15 min | wiring, pre-push |
+| `standard` | 250 ms | 50% CPU, 1 GiB | 3 | full | ~40 min | routine pre-release |
+| `claim` | 250 ms | 50% CPU, 1 GiB | 10 | full | ~90 min | claim-grade cell |
+
+The job is dispatch-only: no push, tag, or PR event runs it, so a shared
+runner's noise never blocks a release by itself. A green job means the TUN
+matrix was 8/8 PASS and the bench cell is complete (`--require-complete`) and
+unsaturated; a ratio outside 0.95-1.05 only emits a warning. Results land in
+the `bench-results` branch (latest run), a run artifact, and the step summary.
+`BLOCKED` TUN rows fail the job; `ALLOW_TUN_BLOCKED` is never used there.
+
+The runner is shared and the four vCPUs are all assigned to roles, so these are
+noisy, high-RTT probe measurements, not headline numbers, and the `non_role`
+noise metric is empty by construction. `quic-udp` depends on the pinned static
+curl having HTTP/3; if it ever loses it, the job fails closed instead of
+reporting a permanent BLOCKED row. Because the workflow is dispatch-only,
+harness changes no longer trigger a benchmark automatically; dispatch a
+`smoke` run before merging a harness change.
+
 ### Baseline ledger
 
 These are decision baselines, not universal performance claims. Re-run the

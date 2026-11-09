@@ -1,0 +1,404 @@
+name: lab-hosted
+
+# Pre-release lab on one GitHub-hosted ubuntu-24.04 runner: the functional
+# full-TUN matrix and the stock-vs-beam A/B, both as host root inside a private
+# mount+net namespace (the runner blocks unprivileged user namespaces).
+#
+# Manual only: a shared runner's noisy, high-RTT numbers must never gate a
+# release by themselves, so this workflow is not triggered by pushes or tags.
+# Green means "the TUN matrix passed and the bench cell is complete and
+# unsaturated"; ratios are reported, and a ratio outside +-5% only warns.
+#
+# Results go to the `bench-results` branch (latest run), an artifact, and the
+# step summary. Binaries are pinned by version and release-asset digest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Budget preset"
+        required: true
+        default: standard
+        type: choice
+        options: [smoke, standard, claim]
+      suite:
+        description: "What to run"
+        required: true
+        default: both
+        type: choice
+        options: [both, bench, tun]
+      udp_mode:
+        description: "sing-box packet encoding for the TUN suite"
+        required: true
+        default: xudp
+        type: choice
+        options: [xudp, packetaddr, legacy]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lab-hosted
+  cancel-in-progress: false
+
+env:
+  SING_BOX_VERSION: "1.14.3"
+  SING_BOX_SHA256: "e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee"
+  XRAY_VERSION: "26.3.27"
+  XRAY_SHA256: "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
+  CURL_VERSION: "8.23.0-1"
+  CURL_SHA256: "a9f5d72eb245623f82a649bf64acae0c935af3510700d2167857964c47fe9e5b"
+
+jobs:
+  lab:
+    runs-on: ubuntu-24.04
+    # Constant on purpose: per-profile budgets are enforced by `timeout` around
+    # each suite, so a smoke dispatch never sits here for two hours.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve profile
+        run: |
+          set -euo pipefail
+          case "${{ inputs.profile }}" in
+            smoke)
+              rtt=250; quota=50%; loss=0; reps=2; duration=5; quick=1
+              bench_timeout=900; tun_timeout=300 ;;
+            standard)
+              rtt=250; quota=50%; loss=0; reps=3; duration=10; quick=0
+              bench_timeout=2400; tun_timeout=600 ;;
+            claim)
+              rtt=250; quota=50%; loss=0; reps=10; duration=10; quick=0
+              bench_timeout=6000; tun_timeout=600 ;;
+            *)
+              echo "::error::unknown profile: ${{ inputs.profile }}"; exit 1 ;;
+          esac
+          {
+            echo "RTT_MS=$rtt"
+            echo "SERVER_CPU_QUOTA=$quota"
+            echo "LOSS=$loss"
+            echo "REPS=$reps"
+            echo "DURATION=$duration"
+            echo "QUICK=$quick"
+            echo "BENCH_TIMEOUT=$bench_timeout"
+            echo "TUN_TIMEOUT=$tun_timeout"
+          } >> "$GITHUB_ENV"
+          echo "profile=${{ inputs.profile }} rtt=$rtt quota=$quota reps=$reps duration=$duration quick=$quick"
+
+      - name: Capability gate
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [ "$(nproc)" -ge 4 ] || fail "need at least 4 vCPUs, found $(nproc)"
+          [ -c /dev/net/tun ] || fail "/dev/net/tun is missing"
+          sudo -n unshare --mount --propagation private --net --fork true \
+            || fail "unshare --mount --propagation private --net is unavailable"
+          sudo -n unshare --mount --propagation private --net --fork sh -euc '
+            ip link set lo up
+            ip link add cap0 type veth peer name cap1
+            ip link set cap0 up
+            ip link set cap1 up
+            tc qdisc add dev cap0 root netem delay 1ms limit 1000
+            tc qdisc show dev cap0 | grep -q netem
+            tc -j -s qdisc show dev cap0 > /dev/null
+            tc qdisc del dev cap0 root
+            ip link del cap0
+            ping -c1 -W1 127.0.0.1 > /dev/null
+          ' || fail "netem, veth or ping is unavailable in a private net namespace"
+          sudo -n systemd-run --scope --quiet --unit="lab-cap-$$" \
+            -p CPUQuota=50% -p MemoryMax=512M -- sh -euc '
+              cg=$(sed -n "s/^0:://p" /proc/self/cgroup)
+              grep -q "^50000 100000" "/sys/fs/cgroup$cg/cpu.max"
+              [ "$(cat "/sys/fs/cgroup$cg/memory.max")" = "536870912" ]
+            ' || fail "systemd scope with CPUQuota/MemoryMax is unavailable"
+          echo "capability gate: 4 vCPU, TUN, unshare, netem, cgroup delegation"
+
+      - uses: dtolnay/rust-toolchain@1.99.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tests/tun/h3-origin -> target
+          cache-on-failure: true
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iperf3 iproute2 iputils-ping unzip xz-utils dnsutils
+          for tool in dig iperf3 unzip xz systemd-run; do
+            command -v "$tool" >/dev/null || { echo "::error::missing $tool"; exit 1; }
+          done
+
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+
+          sing_url="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/sing-box.tgz" "$sing_url"
+          echo "${SING_BOX_SHA256}  $RUNNER_TEMP/sing-box.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/sing-box.tgz" -C "$tools"
+          install -m 0755 "$tools/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box" "$tools/sing-box"
+
+          xray_url="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip"
+          curl -fsSL -o "$RUNNER_TEMP/xray.zip" "$xray_url"
+          echo "${XRAY_SHA256}  $RUNNER_TEMP/xray.zip" | sha256sum -c -
+          unzip -q -o "$RUNNER_TEMP/xray.zip" -d "$tools/xray"
+          install -m 0755 "$tools/xray/xray" "$tools/xray-bin"
+
+          # The runner image's curl has no HTTP/3, which would turn quic-udp into
+          # a permanent BLOCKED row. A pinned static build is installed instead;
+          # if it ever loses HTTP/3 the job fails closed.
+          curl_url="https://github.com/stunnel/static-curl/releases/download/${CURL_VERSION}/curl-linux-x86_64-glibc-${CURL_VERSION}.tar.xz"
+          curl -fsSL -o "$RUNNER_TEMP/curl.tar.xz" "$curl_url"
+          echo "${CURL_SHA256}  $RUNNER_TEMP/curl.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/curl.tar.xz" -C "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/curl" /usr/local/bin/curl
+          curl --version | grep -qi HTTP3 \
+            || { echo "::error::the static curl has no HTTP/3 support"; exit 1; }
+
+          "$tools/sing-box" version
+          "$tools/xray-bin" version | head -2
+          curl --version | head -1
+
+      - name: Build
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          source scripts/dev-env.sh
+          rustc --version
+          cargo build --locked --release -p beam
+          cargo build --locked --manifest-path tests/tun/h3-origin/Cargo.toml
+          ls -l target/release/beam tests/tun/h3-origin/target/debug/h3-origin
+
+      - name: TUN suite (root, private namespaces)
+        if: inputs.suite != 'bench'
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/tun-out"
+          sudo -n unshare --mount --propagation private --net --fork env \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            TUN_ALLOW_ROOT=1 TUN_OUT="$out" \
+            SING_BOX="$RUNNER_TEMP/tools/sing-box" \
+            XRAY_BIN="$RUNNER_TEMP/tools/xray-bin" \
+            TEST_CONFIG="$GITHUB_WORKSPACE/config.example.toml" \
+            H3_ORIGIN_BIN="$GITHUB_WORKSPACE/tests/tun/h3-origin/target/debug/h3-origin" \
+            timeout -s INT --kill-after=120 "$TUN_TIMEOUT" \
+            bash "$GITHUB_WORKSPACE/tests/tun/run.sh" --release --no-build \
+              --udp-mode "${{ inputs.udp_mode }}" --out "$out" \
+            2>&1 | tee "$RUNNER_TEMP/tun-run.log"
+
+      - name: Benchmark (root, private namespaces)
+        if: inputs.suite != 'tun'
+        timeout-minutes: 110
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/bench-out"
+          bench_args=(--reps "$REPS" --duration "$DURATION" --rtt-ms "$RTT_MS"
+                      --arms stock,beam --out "$out")
+          if [ "$QUICK" = "1" ]; then
+            bench_args+=(--quick)
+          fi
+          sudo -n unshare --mount --propagation private --net --fork env \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            BENCH_INNER=1 \
+            BENCH_ROOT="$GITHUB_WORKSPACE" \
+            BENCH_SELF="$GITHUB_WORKSPACE/bench/run.sh" \
+            BENCH_CLIENT_CPUS=0,1 \
+            BENCH_DRIVER_CPU=0 \
+            BENCH_SERVER_CPU_QUOTA="$SERVER_CPU_QUOTA" \
+            BENCH_SERVER_MEMORY_MAX=1G \
+            BENCH_LOSS="$LOSS" \
+            BENCH_RTT_MS="$RTT_MS" \
+            BENCH_MAX_LOAD=4 \
+            BENCH_REPORT=1 \
+            BENCH_RATIO_ONLY=1 \
+            BENCH_REQUIRE_COMPLETE=1 \
+            SING_BOX="$RUNNER_TEMP/tools/sing-box" \
+            XRAY_BIN="$RUNNER_TEMP/tools/xray-bin" \
+            IPERF3=/usr/bin/iperf3 \
+            TEST_CONFIG="$GITHUB_WORKSPACE/config.example.toml" \
+            H3_ORIGIN_BIN="$GITHUB_WORKSPACE/tests/tun/h3-origin/target/debug/h3-origin" \
+            SKIP_BUILD=1 \
+            timeout -s INT --kill-after=120 "$BENCH_TIMEOUT" \
+            bash "$GITHUB_WORKSPACE/bench/run.sh" "${bench_args[@]}" \
+            2>&1 | tee "$RUNNER_TEMP/bench-run.log"
+
+      - name: Make volatile output readable
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" \
+            "$RUNNER_TEMP/bench-out" "$RUNNER_TEMP/tun-out" 2>/dev/null || true
+
+      - name: Step summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## lab-hosted: profile=${{ inputs.profile }} suite=${{ inputs.suite }}"
+            echo ""
+            echo "commit \`$GITHUB_SHA\` · run [$GITHUB_RUN_ID](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ inputs.suite }}" = "tun" ]; then
+            echo "Bench: skipped (suite=tun)." >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f "$RUNNER_TEMP/bench-out/summary.md" ]; then
+            echo "## Bench" >> "$GITHUB_STEP_SUMMARY"
+            head -c 200000 "$RUNNER_TEMP/bench-out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Bench: no summary.md produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "${{ inputs.suite }}" = "bench" ]; then
+            echo "TUN: skipped (suite=bench)." >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f "$RUNNER_TEMP/tun-out/results-beam.tsv" ]; then
+            {
+              echo "## TUN"
+              echo ""
+              echo "| Test | Result | Detail |"
+              echo "|---|---|---|"
+              awk -F'\t' '{printf "| %s | %s | %s |\n", $1, $2, substr($3, 1, 70)}' \
+                "$RUNNER_TEMP/tun-out/results-beam.tsv"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "TUN: no results-beam.tsv produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-hosted-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/bench-run.log
+            ${{ runner.temp }}/tun-run.log
+            ${{ runner.temp }}/bench-out/summary.md
+            ${{ runner.temp }}/bench-out/summary.json
+            ${{ runner.temp }}/bench-out/meta.json
+            ${{ runner.temp }}/bench-out/environment.txt
+            ${{ runner.temp }}/bench-out/masks.tsv
+            ${{ runner.temp }}/bench-out/network.txt
+            ${{ runner.temp }}/bench-out/raw
+            ${{ runner.temp }}/bench-out/logs
+            ${{ runner.temp }}/tun-out/results-beam.tsv
+            ${{ runner.temp }}/tun-out/results-xray.tsv
+            ${{ runner.temp }}/tun-out/environment.txt
+            ${{ runner.temp }}/tun-out/network.txt
+            ${{ runner.temp }}/tun-out/singbox-version.txt
+            ${{ runner.temp }}/tun-out/xray-version.txt
+            ${{ runner.temp }}/tun-out/logs
+            ${{ runner.temp }}/tun-out/probes
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Publish results branch
+        if: always()
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/bench-out"
+          stage="$RUNNER_TEMP/results"
+          if [ ! -f "$out/summary.json" ]; then
+            echo "no bench summary; leaving bench-results untouched"
+            exit 0
+          fi
+          rm -rf "$stage"; mkdir -p "$stage/run/logs" "$stage/run/tun"
+          cp -a "$out/summary.md" "$out/summary.json" "$out/meta.json" \
+                "$out/environment.txt" "$out/masks.tsv" "$out/network.txt" \
+                "$stage/run/" 2>/dev/null || true
+          cp -a "$out/raw" "$stage/run/raw" 2>/dev/null || true
+          cp -a "$out"/logs/. "$stage/run/logs/" 2>/dev/null || true
+          tun="$RUNNER_TEMP/tun-out"
+          cp -a "$tun/results-beam.tsv" "$tun/results-xray.tsv" \
+                "$tun/environment.txt" "$tun/network.txt" \
+                "$stage/run/tun/" 2>/dev/null || true
+          cp -a "$RUNNER_TEMP/bench-run.log" "$stage/run/" 2>/dev/null || true
+          cp -a "$RUNNER_TEMP/tun-run.log" "$stage/run/" 2>/dev/null || true
+          {
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "commit=$GITHUB_SHA"
+            echo "profile=${{ inputs.profile }} suite=${{ inputs.suite }}"
+            echo "rtt_ms=$RTT_MS loss_pct=$LOSS reps=$REPS duration=$DURATION quick=$QUICK"
+            echo "image=${ImageOS:-?}/${ImageVersion:-?}"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$stage/run/README.txt"
+          du -sh "$stage"
+          cd "$stage"
+          git init -q -b bench-results
+          git config user.name "lab-hosted"
+          git config user.email "lab-hosted@users.noreply.github.com"
+          git add -A
+          git commit -q -m "bench-results: run $GITHUB_RUN_ID (profile=${{ inputs.profile }})"
+          git push -q --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            bench-results
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bench acceptance
+        if: always() && inputs.suite != 'tun'
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/bench-out/summary.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          if not path.is_file():
+              print(f"::error::bench produced no summary at {path}")
+              raise SystemExit(1)
+          summary = json.loads(path.read_text(encoding="utf-8"))
+          if summary.get("valid") is not True:
+              reasons = "; ".join(summary.get("invalid_reasons") or ["unknown"])
+              print(f"::error::bench cell invalid: {reasons}")
+              raise SystemExit(1)
+          for scenario, details in (summary.get("latency_repetitions") or {}).items():
+              dropped = (details or {}).get("dropped_repetitions") or []
+              if dropped:
+                  print(f"::warning::{scenario}: dropped repetitions {dropped}")
+          for name, comparison in (summary.get("comparisons") or {}).items():
+              if not isinstance(comparison, dict):
+                  continue
+              value = comparison.get("ratio")
+              if isinstance(value, (int, float)) and not 0.95 <= value <= 1.05:
+                  print(f"::warning::{name}: ratio {value:.4f} outside [0.95, 1.05]")
+          print("bench acceptance: valid, complete, unsaturated")
+          PY
+
+      - name: TUN acceptance
+        if: always() && inputs.suite != 'bench'
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/tun-out/results-beam.tsv" <<'PY'
+          import sys
+          from pathlib import Path
+
+          required = (
+              "tcp-http-v4", "tcp-http-v6", "udp-echo", "udp-echo-v6",
+              "dns-udp", "dns-udp-v6", "quic-udp", "https-direct",
+          )
+          path = Path(sys.argv[1])
+          if not path.is_file():
+              print(f"::error::TUN produced no results at {path}")
+              raise SystemExit(1)
+          rows = {}
+          for line in path.read_text(encoding="utf-8").splitlines():
+              parts = line.split("\t")
+              if len(parts) >= 2:
+                  rows[parts[0]] = parts[1]
+          problems = [
+              f"{name}={rows.get(name, 'MISSING')}"
+              for name in required
+              if rows.get(name) != "PASS"
+          ]
+          if problems:
+              print("::error::TUN matrix did not pass: " + ", ".join(problems))
+              raise SystemExit(1)
+          print("TUN acceptance: 8/8 PASS")
+          PY
