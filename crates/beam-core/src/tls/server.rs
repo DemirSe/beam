@@ -41,7 +41,7 @@ use crate::metrics::Metrics;
 use crate::prepend_stream::PrependStream;
 use crate::reality::auth::decode_short_id;
 use crate::reality::{Auth, RealityAuthConfig, authenticate};
-use crate::relay::{RelayActivity, RelayConfig, copy_one_way};
+use crate::relay::{DEFAULT_PIPE_SIZE, RelayActivity, RelayConfig, copy_one_way};
 use crate::tls::stream::{TlsStream, TlsStreamError};
 use crate::tls::{
     ClientHello, MAX_CLIENT_HELLO_RECORDS, MAX_RECORD_LEN, TLS_HANDSHAKE_HEADER_LEN,
@@ -364,6 +364,8 @@ pub struct TlsServerConfig {
     pub handshake_timeout: Duration,
     /// Inactivity timeout for authenticated TCP relays.
     pub relay_idle_timeout: Duration,
+    /// Kernel pipe capacity for each Vision splice direction.
+    pub relay_pipe_size: usize,
     /// Maximum total ClientHello record size, including its five-byte header.
     pub max_client_hello_bytes: usize,
     /// The only authorized VLESS user id.
@@ -451,6 +453,7 @@ impl TlsServerConfig {
             cover,
             handshake_timeout,
             relay_idle_timeout: RELAY_IDLE_TIMEOUT,
+            relay_pipe_size: DEFAULT_PIPE_SIZE,
             max_client_hello_bytes,
             user_id,
             xudp: XudpConfig::default(),
@@ -543,6 +546,13 @@ impl TlsServerConfig {
     #[must_use]
     pub fn with_relay_idle_timeout(mut self, timeout: Duration) -> Self {
         self.relay_idle_timeout = timeout;
+        self
+    }
+
+    /// Overrides the kernel pipe capacity for Vision splice directions.
+    #[must_use]
+    pub fn with_relay_pipe_size(mut self, pipe_size: usize) -> Self {
+        self.relay_pipe_size = pipe_size;
         self
     }
 
@@ -657,6 +667,7 @@ impl fmt::Debug for TlsServerConfig {
             .field("cover", &self.cover)
             .field("handshake_timeout", &self.handshake_timeout)
             .field("relay_idle_timeout", &self.relay_idle_timeout)
+            .field("relay_pipe_size", &self.relay_pipe_size)
             .field("max_client_hello_bytes", &self.max_client_hello_bytes)
             .field("xudp", &self.xudp)
             .field("xudp_limiter", &self.xudp_limiter)
@@ -1311,6 +1322,7 @@ async fn handle_authenticated(
                     vision,
                     target,
                     config.relay_idle_timeout,
+                    config.relay_pipe_size,
                     Arc::clone(&config.splice_permits),
                     Arc::clone(&config.metrics),
                 )
@@ -1704,6 +1716,7 @@ async fn relay_vision(
     vision: VisionStream<TlsStream>,
     target: TcpStream,
     idle_timeout: Duration,
+    pipe_size: usize,
     splice_permits: Arc<Semaphore>,
     metrics: Arc<Metrics>,
 ) -> Result<(), TlsServerError> {
@@ -1777,7 +1790,7 @@ async fn relay_vision(
                 copied_up,
                 "Vision read switched to raw; starting one-way upload splice"
             );
-            let config = splice_config(idle_timeout);
+            let config = splice_config(idle_timeout, pipe_size);
             let relay_activity = Arc::clone(&up_activity);
             let result = tokio::task::spawn_blocking(move || {
                 let _splice_permit = splice_permit;
@@ -1853,7 +1866,7 @@ async fn relay_vision(
             copied_down,
             "Vision write switched to raw; starting one-way download splice"
         );
-        let config = splice_config(idle_timeout);
+        let config = splice_config(idle_timeout, pipe_size);
         let relay_activity = Arc::clone(&down_activity);
         let result = tokio::task::spawn_blocking(move || {
             let _splice_permit = splice_permit;
@@ -2093,9 +2106,10 @@ fn try_clone_tcp(stream: &TcpStream) -> Result<TcpStream, TlsServerError> {
     TcpStream::from_std(stream).map_err(TlsServerError::Io)
 }
 
-fn splice_config(idle_timeout: Duration) -> RelayConfig {
+fn splice_config(idle_timeout: Duration, pipe_size: usize) -> RelayConfig {
     RelayConfig::new()
         .with_idle_timeout(idle_timeout)
+        .with_pipe_size(pipe_size)
         // A half-closed direction no longer needs the full VPN idle budget.
         // Bound it so a finished mobile flow releases its blocking thread and
         // kernel pipe promptly instead of lingering for five minutes.

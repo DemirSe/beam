@@ -32,5 +32,5 @@ mod splice_copy;
 
 pub use splice_copy::{
     DEFAULT_PIPE_SIZE, MAX_PIPE_SIZE, MIN_PIPE_SIZE, RelayActivity, RelayConfig, RelayStats,
-    copy_bidirectional, copy_one_way,
+    copy_bidirectional, copy_one_way, pipe_size_for_budget,
 };

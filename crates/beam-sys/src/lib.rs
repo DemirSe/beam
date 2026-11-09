@@ -52,6 +52,26 @@ pub fn set_pipe_size(fd: RawFd, size: usize) -> io::Result<usize> {
     }
 }
 
+/// Returns the kernel page size used by pipe and splice accounting.
+#[must_use]
+pub fn page_size() -> u64 {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` takes no pointer arguments and returns
+    // the page size or -1 on error. A non-positive result falls back to the
+    // 4 KiB minimum assumed by the relay budget.
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if value > 0 { value as u64 } else { 4096 }
+}
+
+/// Reads the per-user soft limit on pipe pages.
+#[must_use]
+pub fn pipe_user_pages_soft() -> Option<u64> {
+    std::fs::read_to_string("/proc/sys/fs/pipe-user-pages-soft")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Returns the soft `RLIMIT_NOFILE` limit when it is finite.
 #[must_use]
 pub fn open_file_limit() -> Option<u64> {

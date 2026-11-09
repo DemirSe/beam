@@ -151,6 +151,18 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     // path instead of queueing forever in `spawn_blocking`.
     let max_splice_tasks = max_blocking_threads.saturating_sub(40).max(1);
     let splice_permits = Arc::new(Semaphore::new(max_splice_tasks));
+    let pipe_pages_soft = beam_sys::pipe_user_pages_soft().unwrap_or(16_384);
+    let relay_pipe_size = beam_core::relay::pipe_size_for_budget(
+        pipe_pages_soft,
+        max_splice_tasks,
+        beam_sys::page_size(),
+    );
+    tracing::info!(
+        soft_pages = pipe_pages_soft,
+        splice_tasks = max_splice_tasks,
+        pipe_size = relay_pipe_size,
+        "relay pipe budget"
+    );
     // Legacy/packetaddr UDP is compatibility-only; keep its socket count well
     // below the XUDP cap because packetaddr binds two sockets per stream.
     let legacy_udp_permits = Arc::new(Semaphore::new(64));
@@ -159,6 +171,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         build_tls_config(&config)?
             .with_connection_limiter(Arc::clone(&authenticated))
             .with_splice_limiter(splice_permits)
+            .with_relay_pipe_size(relay_pipe_size)
             .with_legacy_udp_limiter(legacy_udp_permits),
     );
     let listener = bind_listener(config.server.listen, config.limits.listen_backlog)?;

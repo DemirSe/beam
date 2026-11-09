@@ -29,8 +29,39 @@ pub const MIN_PIPE_SIZE: usize = 4096;
 /// a new measurement, so the accepted range stays deliberately small.
 pub const MAX_PIPE_SIZE: usize = 1024 * 1024;
 
-/// Maximum bytes moved by one fill or drain phase in one loop iteration.
+/// Selects the largest power-of-two pipe size that keeps every splice permit
+/// under the per-uid pipe-page soft limit.
 ///
+/// Each permitted splice direction owns one pipe, and a fully spliced
+/// connection needs two permits. A fixed reserve of 1024 pages covers other
+/// pipes owned by the same uid (the Tokio signal self-pipe and short-lived
+/// pipes). When the kernel refuses growth, a fresh pipe is clamped to its
+/// 8 KiB allocation-time default, not 64 KiB, so staying below the limit is
+/// the only way to avoid an 8x-64x splice-syscall cliff.
+#[must_use]
+pub fn pipe_size_for_budget(soft_pages: u64, splice_tasks: usize, page_size: u64) -> usize {
+    const RESERVE_PAGES: u64 = 1024;
+    if soft_pages == 0 {
+        return MIN_PIPE_SIZE;
+    }
+    if splice_tasks == 0 {
+        return DEFAULT_PIPE_SIZE;
+    }
+    let page = page_size.max(1);
+    let budget_pages = soft_pages.saturating_sub(RESERVE_PAGES);
+    let per_pipe = budget_pages.saturating_mul(page) / splice_tasks as u64;
+    let capped = per_pipe.min(MAX_PIPE_SIZE as u64);
+    if capped < MIN_PIPE_SIZE as u64 {
+        return MIN_PIPE_SIZE;
+    }
+    let mut size = 1_u64;
+    while size * 2 <= capped {
+        size *= 2;
+    }
+    size as usize
+}
+
+/// Maximum bytes moved by one fill or drain phase in one loop iteration.
 /// Both directions get a fill and a drain budget before the relay polls again,
 /// so a bulk transfer cannot starve a small request in the opposite direction.
 const WORK_PER_ROUND: usize = 1024 * 1024;
@@ -846,7 +877,7 @@ fn inactivity_timeout(
 mod tests {
     use super::{
         DEFAULT_PIPE_SIZE, MAX_PIPE_SIZE, MIN_PIPE_SIZE, RelayConfig, RelayStats,
-        copy_bidirectional, copy_one_way,
+        copy_bidirectional, copy_one_way, pipe_size_for_budget,
     };
     use std::io::{self, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
@@ -1429,6 +1460,25 @@ mod tests {
             zero_shutdown.validate().unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn pipe_budget_fits_the_soft_limit() {
+        assert_eq!(pipe_size_for_budget(16_384, 120, 4096), 512 * 1024);
+        assert_eq!(pipe_size_for_budget(16_384, 472, 4096), 128 * 1024);
+        assert_eq!(pipe_size_for_budget(4_096, 120, 4096), 64 * 1024);
+        assert_eq!(pipe_size_for_budget(1_024, 120, 4096), MIN_PIPE_SIZE);
+        assert_eq!(pipe_size_for_budget(0, 120, 4096), MIN_PIPE_SIZE);
+        assert_eq!(pipe_size_for_budget(16_384, 0, 4096), DEFAULT_PIPE_SIZE);
+    }
+
+    #[test]
+    fn pipe_budget_rounds_down_to_a_valid_pipe_size() {
+        let size = pipe_size_for_budget(16_384, 121, 4096);
+        assert!(size.is_power_of_two());
+        assert!(size <= 512 * 1024);
+        assert!(size >= MIN_PIPE_SIZE);
+        assert_eq!(size, 256 * 1024);
     }
 
     #[test]

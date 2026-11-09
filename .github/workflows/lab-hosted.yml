@@ -105,6 +105,11 @@ on:
         required: false
         default: ""
         type: string
+      log_level:
+        description: "Optional bench server log level"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -202,6 +207,11 @@ jobs:
           udp_count_override="${{ inputs.udp_count }}"
           udp_window_override="${{ inputs.udp_window }}"
           pipe_soft="${{ inputs.pipe_pages_soft }}"
+          log_level="${{ inputs.log_level }}"
+          if [ -n "$log_level" ] \
+            && ! printf '%s' "$log_level" | grep -Eq '^(trace|debug|info|warn|error)$'; then
+            echo "::error::log_level must be trace, debug, info, warn or error"; exit 1
+          fi
           for pair in "udp_count:$udp_count_override" "udp_window:$udp_window_override" \
                       "pipe_pages_soft:$pipe_soft"; do
             name=${pair%%:*}; value=${pair#*:}
@@ -236,6 +246,7 @@ jobs:
             [ -z "$udp_count_override" ] || echo "BENCH_UDP_COUNT=$udp_count_override"
             [ -z "$udp_window_override" ] || echo "BENCH_UDP_WINDOW=$udp_window_override"
             [ -z "$pipe_soft" ] || echo "PIPE_PAGES_SOFT=$pipe_soft"
+            [ -z "$log_level" ] || echo "BENCH_LOG_LEVEL=$log_level"
           } >> "$GITHUB_ENV"
           echo "profile=${{ inputs.profile }} scenarios=$scenarios rtt=$rtt loss=$loss reps=$reps duration=$duration https_mib=$https_mib https_parallel=$https_parallel complete=$require_complete baseline=$baseline_ref arms=$arms perf=$perf_value"
 
@@ -408,10 +419,11 @@ jobs:
             BENCH_SCENARIOS="$BENCH_SCENARIOS" \
             BENCH_HTTPS_MIB="$BENCH_HTTPS_MIB" \
             BENCH_HTTPS_PARALLEL="$BENCH_HTTPS_PARALLEL" \
-            BENCH_UDP_COUNT="$BENCH_UDP_COUNT" \
-            BENCH_UDP_WINDOW="$BENCH_UDP_WINDOW" \
+            BENCH_UDP_COUNT="${BENCH_UDP_COUNT:-}" \
+            BENCH_UDP_WINDOW="${BENCH_UDP_WINDOW:-}" \
             BENCH_PERF="$BENCH_PERF" \
             BENCH_PERF_EVENTS="$BENCH_PERF_EVENTS" \
+            BENCH_LOG_LEVEL="${BENCH_LOG_LEVEL:-}" \
             BEAM_BASELINE_BIN="$RUNNER_TEMP/beam-baseline" \
             BENCH_REPORT=1 \
             BENCH_RATIO_ONLY=1 \
