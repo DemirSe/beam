@@ -228,7 +228,7 @@ def markdown_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def build(run_dir: Path) -> dict:
+def build(run_dir: Path, *, require_complete: bool = False) -> dict:
     meta = load_meta(run_dir)
     results = load_results(run_dir)
     if meta.get("large_file"):
@@ -662,8 +662,81 @@ def build(run_dir: Path) -> dict:
                 "ratio": "n/a",
                 "requirement": "informational",
                 "pass": None,
+                "informational": True,
             }
         )
+
+    def memory_peak_mib(arm: str) -> str:
+        values = [
+            int(value)
+            for result in results
+            if result.get("arm") == arm
+            for value in [str((result.get("cpu") or {}).get("server_memory_peak") or "")]
+            if value.isdigit()
+        ]
+        return f"{max(values) / 1048576:.1f} MiB" if values else "unavailable"
+
+    memory_maxes = {
+        arm: sorted({
+            str((result.get("cpu") or {}).get("server_memory_max"))
+            for result in results
+            if result.get("arm") == arm
+            and (result.get("cpu") or {}).get("server_memory_max")
+        })
+        for arm in ("stock", "beam")
+    }
+    if any(memory_maxes.values()) or any(
+        memory_peak_mib(arm) != "unavailable" for arm in ("stock", "beam")
+    ):
+        rows["resources"].append(
+            {
+                "label": "Server cgroup memory ceiling (memory.max)",
+                "stock": ", ".join(memory_maxes["stock"]) or "unavailable",
+                "beam": ", ".join(memory_maxes["beam"]) or "unavailable",
+                "ratio": "n/a",
+                "requirement": "informational",
+                "pass": None,
+                "informational": True,
+            }
+        )
+        rows["resources"].append(
+            {
+                "label": "Server memory peak (memory.peak)",
+                "stock": memory_peak_mib("stock"),
+                "beam": memory_peak_mib("beam"),
+                "ratio": "n/a",
+                "requirement": "informational",
+                "pass": None,
+                "informational": True,
+            }
+        )
+
+    oom_kills: dict[str, set[str]] = {"stock": set(), "beam": set()}
+    masks_path = run_dir / "masks.tsv"
+    if masks_path.is_file():
+        for line in masks_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 5 or parts[2] != "server-resources":
+                continue
+            if parts[0] not in oom_kills:
+                continue
+            for token in parts[4].split():
+                key, _, value = token.partition("=")
+                if key == "oom_kill":
+                    oom_kills[parts[0]].add(value)
+    if any(oom_kills.values()):
+        rows["resources"].append(
+            {
+                "label": "Server OOM kills (memory.events)",
+                "stock": ", ".join(sorted(oom_kills["stock"])) or "unavailable",
+                "beam": ", ".join(sorted(oom_kills["beam"])) or "unavailable",
+                "ratio": "n/a",
+                "requirement": "informational",
+                "pass": None,
+                "informational": True,
+            }
+        )
+
     rows["resources"].append(
         {
             "label": "Server core busy (TCP scenarios)",
@@ -782,24 +855,58 @@ def build(run_dir: Path) -> dict:
     }
 
     # --- Validity ---------------------------------------------------------
+    # netem evidence: meta.json carries the qdisc state captured right after
+    # setup. A cell that requested an impairment must be able to prove it; when
+    # the JSON capture failed, meta falls back to `tc` text and says so.
+    loss_pct = float(meta.get("loss_pct") or 0.0)
+    qdisc = meta.get("qdisc") or {}
     qdisc_drops: dict[str, int] = {}
-    for name in ("tc-client-final.txt", "tc-server-final.txt"):
-        path = run_dir / "logs" / name
-        if not path.is_file():
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        drops = 0
-        for line in text.splitlines():
-            if "dropped" in line:
+    qdisc_problems: list[str] = []
+    if qdisc:
+        for role in ("client", "server"):
+            info = qdisc.get(role) or {}
+            if info.get("source") == "unavailable":
+                if meta.get("rtt_ms") or loss_pct:
+                    qdisc_problems.append(f"{role}: netem evidence unavailable")
+                continue
+            drops = info.get("drops")
+            if isinstance(drops, int):
+                qdisc_drops[role] = drops
+            want_delay = (meta.get("rtt_ms") or 0) / 2.0
+            if want_delay:
+                got = info.get("delay_ms")
+                if not isinstance(got, (int, float)) or abs(got - want_delay) > 0.5:
+                    qdisc_problems.append(
+                        f"{role}: netem delay {got}ms, wanted {want_delay:.3f}ms"
+                    )
+            if loss_pct:
+                got = info.get("loss_pct")
+                if not isinstance(got, (int, float)) or abs(got - loss_pct) > 0.05:
+                    qdisc_problems.append(
+                        f"{role}: netem loss {got}%, wanted {loss_pct:.3f}%"
+                    )
+    else:
+        # Legacy runs have no structured evidence; keep reading their text dump
+        # and strip the thousands separators `tc` prints ("dropped 1,234,").
+        for name in ("tc-client-final.txt", "tc-server-final.txt"):
+            path = run_dir / "logs" / name
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            drops = 0
+            for line in text.splitlines():
+                if "dropped" not in line:
+                    continue
                 parts = line.split()
                 for index, part in enumerate(parts):
                     if part == "dropped" and index + 1 < len(parts):
-                        try:
-                            drops += int(parts[index + 1])
-                        except ValueError:
-                            pass
-        qdisc_drops[name] = drops
+                        digits = parts[index + 1].replace(",", "").rstrip(",")
+                        if digits.isdigit():
+                            drops += int(digits)
+            qdisc_drops[name] = drops
     invalid: dict[str, str] = {}
+    for problem in qdisc_problems:
+        invalid[problem] = ""
     for (scenario, arm), roles in sorted(saturation.items()):
         detail = ", ".join(
             f"{role} median {median:.1f}%, peak {peak:.1f}%, n={count}"
@@ -812,9 +919,29 @@ def build(run_dir: Path) -> dict:
                 invalid[f"{scenario}/{arm}: missing required data"] = ""
     if len(set(arms)) < 2:
         invalid["both arms were not measured"] = ""
-    for name, drops in qdisc_drops.items():
-        if drops > 0:
-            invalid[f"{name}: netem qdisc dropped {drops} packets"] = ""
+    # Deliberate loss makes netem drop packets by design. Its aggregate counter
+    # cannot separate those from queue overflow, so a lossy cell reports device
+    # drops without condemning itself (and cannot claim a drop-free result).
+    if loss_pct == 0:
+        for name, drops in qdisc_drops.items():
+            if drops > 0:
+                invalid[f"{name}: netem qdisc dropped {drops} packets"] = ""
+    if require_complete:
+        reps = meta.get("reps")
+        for scenario in REQUIRED:
+            for arm in ("stock", "beam"):
+                reps_seen = {
+                    item.get("rep")
+                    for item in ok(by_arm(results, scenario).get(arm, []))
+                }
+                if isinstance(reps, int) and len(reps_seen) < reps:
+                    invalid[
+                        f"{scenario}/{arm}: {len(reps_seen)}/{reps} repetitions"
+                    ] = ""
+        if not meta.get("h3", {}).get("blocked_reason"):
+            for arm in ("stock", "beam"):
+                if not ok(by_arm(results, "h3-latency").get(arm, [])):
+                    invalid["h3-latency: missing repetitions"] = ""
 
     invalid_reasons = [
         f"{key} ({detail})" if detail else key for key, detail in invalid.items()
@@ -822,12 +949,18 @@ def build(run_dir: Path) -> dict:
 
     host_keys: set[str] = set()
     non_role: dict[str, list[float]] = {}
+    load_threshold = meta.get("bench_max_load")
+    if not isinstance(load_threshold, (int, float)):
+        load_threshold = 0.3
     for key, label in (
         ("host_load1_before", "before"),
         ("host_load1_after", "after"),
     ):
-        if meta.get(key) is not None and meta.get(key) > 0.3:
-            host_keys.add(f"host load {label}={meta[key]} (warning threshold 0.3)")
+        if meta.get(key) is not None and meta.get(key) > load_threshold:
+            host_keys.add(
+                f"host load {label}={meta[key]} "
+                f"(warning threshold {load_threshold:g})"
+            )
     for warning in meta.get("warnings", []):
         if not str(warning).startswith("host load"):
             host_keys.add(str(warning))
@@ -932,7 +1065,7 @@ def latency_stats(samples_us: list[float]) -> dict:
     }
 
 
-def render_markdown(summary: dict) -> str:
+def render_markdown(summary: dict, *, ratio_only: bool = False) -> str:
     meta = summary.get("meta", {})
     host = meta.get("host", {})
     roles = meta.get("cpu_roles", {})
@@ -984,7 +1117,12 @@ def render_markdown(summary: dict) -> str:
     )
     lines.append(
         f"- netem RTT: {meta.get('rtt_ms', 0)} ms total "
-        f"({meta.get('rtt_ms', 0) / 2:.3g} ms on each veth); target link clean."
+        f"({meta.get('rtt_ms', 0) / 2:.3g} ms on each veth); "
+        f"injected loss: {meta.get('loss_pct', 0)}%; target link clean."
+    )
+    lines.append(
+        f"- Host load threshold: {meta.get('bench_max_load', 0.3)} "
+        "(1-minute average)."
     )
     lines.append(
         "- Client: sing-box v1.14.3 full TUN, utls chrome, "
@@ -1019,7 +1157,9 @@ def render_markdown(summary: dict) -> str:
             [
                 key,
                 gate.get("requirement", ""),
-                gate.get("status", status_word(gate.get("pass"))),
+                "INFO"
+                if ratio_only
+                else gate.get("status", status_word(gate.get("pass"))),
             ]
         )
     lines.append(
@@ -1128,21 +1268,27 @@ def render_markdown(summary: dict) -> str:
 
     lines.append("## Validity")
     lines.append("")
-    lines.append(
-        f"- Measurement valid (no client/target saturation, required data present): "
-        f"**{'yes' if summary['valid'] else 'no'}**"
-    )
-    lines.append(
-        f"- Headline eligible (also free of host noise): "
-        f"**{'yes' if summary['headline_eligible'] else 'no'}**"
-    )
-    lines.append(
-        f"- All numeric gates: **{summary.get('numeric_gates_status', 'BLOCKED')}**"
-    )
-    lines.append(
-        f"- Hard requirements (aggregate + no regression + valid + clean host): "
-        f"**{summary.get('hard_requirements_status', 'BLOCKED')}**"
-    )
+    if ratio_only:
+        lines.append(
+            "- Ratio-only mode: gate results are informational; summary.json "
+            "keeps the strict verdicts."
+        )
+    else:
+        lines.append(
+            f"- Measurement valid (no client/target saturation, required data present): "
+            f"**{'yes' if summary['valid'] else 'no'}**"
+        )
+        lines.append(
+            f"- Headline eligible (also free of host noise): "
+            f"**{'yes' if summary['headline_eligible'] else 'no'}**"
+        )
+        lines.append(
+            f"- All numeric gates: **{summary.get('numeric_gates_status', 'BLOCKED')}**"
+        )
+        lines.append(
+            f"- Hard requirements (aggregate + no regression + valid + clean host): "
+            f"**{summary.get('hard_requirements_status', 'BLOCKED')}**"
+        )
     if summary["invalid_reasons"]:
         lines.append("- Invalidating conditions:")
         for reason in summary["invalid_reasons"]:
@@ -1208,6 +1354,21 @@ def render_markdown(summary: dict) -> str:
         "- HTTP/3 uses the test-only local origin; it is not a general QUIC "
         "capacity test."
     )
+    if (meta.get("loss_pct") or 0) > 0:
+        lines.append(
+            "- Packet loss is injected deliberately. netem's aggregate drop "
+            "counter does not separate intended loss from queue overflow, so "
+            "this cell cannot claim a drop-free measurement and overlimits do "
+            "not prove the difference."
+        )
+    if any(
+        (meta.get("qdisc") or {}).get(role, {}).get("source") == "text"
+        for role in ("client", "server")
+    ):
+        lines.append(
+            "- netem evidence came from text `tc` output, so the applied delay "
+            "and loss were not re-verified from JSON."
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -1217,20 +1378,23 @@ def main() -> int:
     parser.add_argument("--run", required=True, type=Path)
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--markdown", type=Path, default=None)
+    parser.add_argument("--ratio-only", action="store_true")
+    parser.add_argument("--require-complete", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
-    summary = build(args.run)
+    summary = build(args.run, require_complete=args.require_complete)
     json_path = args.json or args.run / "summary.json"
     markdown_path = args.markdown or args.run / "summary.md"
+    markdown = render_markdown(summary, ratio_only=args.ratio_only)
     json_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    markdown_path.write_text(render_markdown(summary), encoding="utf-8")
+    markdown_path.write_text(markdown, encoding="utf-8")
 
     if not args.quiet:
         print()
         print(f"== benchmark summary: {args.run} ==")
         print()
-        print(render_markdown(summary))
+        print(markdown)
     print(f"summary: {json_path}")
     print(f"markdown: {markdown_path}")
     return 0
