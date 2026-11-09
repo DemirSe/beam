@@ -132,6 +132,10 @@ jobs:
               2>&1 | tee "$RUNNER_TEMP/bench-run.log"
           sudo chown -R "$(id -u):$(id -g)" "$out"
 
+      - name: Make the run directory readable
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bench-out" 2>/dev/null || true
+
       - name: Step summary
         if: always()
         run: |

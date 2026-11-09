@@ -738,19 +738,26 @@ start_arm() {
     SERVER_SCOPE="beam-bench-$arm-$rep-$$"
     systemd-run --scope --quiet --unit "$SERVER_SCOPE" \
       -p "CPUQuota=$SERVER_CPU_QUOTA" -- "${server_cmd[@]}" > "$server_log" 2>&1 &
-    # systemd does not expose a usable MainPID for scopes, so read the scope's
-    # own cgroup. That file is also the evidence that the ceiling applied.
+    # systemd exposes no usable MainPID for scopes, so ask for the unit's cgroup
+    # path and read its members. That file is also the evidence the ceiling
+    # applied, and it works wherever systemd decided to place the scope.
     SERVER_PID=""
-    local scope_cg=""
+    local scope_cg="" scope_rel=""
     for _ in $(seq 1 100); do
-      scope_cg="$(find /sys/fs/cgroup -maxdepth 3 -name "$SERVER_SCOPE.scope" 2>/dev/null | head -n 1)"
-      if [ -n "$scope_cg" ] && [ -s "$scope_cg/cgroup.procs" ]; then
-        SERVER_PID="$(head -n 1 "$scope_cg/cgroup.procs")"
-        if [ -n "$SERVER_PID" ]; then break; fi
+      scope_rel="$(systemctl show -p ControlGroup --value "$SERVER_SCOPE.scope" 2>/dev/null || true)"
+      if [ -n "$scope_rel" ]; then
+        scope_cg="/sys/fs/cgroup$scope_rel"
+        if [ -s "$scope_cg/cgroup.procs" ]; then
+          SERVER_PID="$(head -n 1 "$scope_cg/cgroup.procs")"
+          if [ -n "$SERVER_PID" ]; then break; fi
+        fi
       fi
       sleep 0.1
     done
-    [ -n "$SERVER_PID" ] || die "could not resolve the server PID inside $SERVER_SCOPE"
+    if [ -z "$SERVER_PID" ]; then
+      tail -n 20 "$server_log" >&2 || true
+      die "could not resolve the server PID inside $SERVER_SCOPE (scope=$scope_rel)"
+    fi
     SERVER_CPU_MAX="$(cat "$scope_cg/cpu.max" 2>/dev/null || echo unknown)"
     printf 'server_cpu_max=%s scope=%s\n' "$SERVER_CPU_MAX" "$SERVER_SCOPE" >> "$RUN_DIR/masks.tsv"
   else
