@@ -449,9 +449,11 @@ if [ "$TUN_BLOCKED" = "1" ]; then
   finish
 fi
 
-mount -t tmpfs tmpfs /run >/dev/null 2>&1 \
-  || { fail_harness "could not mount tmpfs on /run"; exit 1; }
+# Shadow only the netns directory: masking all of /run hides the system bus
+# socket and breaks anything that talks to systemd while the suite runs.
 mkdir -p /run/netns
+mount -t tmpfs tmpfs /run/netns >/dev/null 2>&1 \
+  || { fail_harness "could not mount tmpfs on /run/netns"; exit 1; }
 
 for namespace in "${NAMESPACES[@]}"; do
   ip netns add "$namespace" \

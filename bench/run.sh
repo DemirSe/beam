@@ -529,7 +529,11 @@ mask_of() {
 # Namespace topology
 # ---------------------------------------------------------------------------
 
-mount -t tmpfs tmpfs /run >/dev/null 2>&1 || die "could not mount tmpfs on /run"
+# Shadow only the netns directory: masking all of /run hides the system bus
+# socket, which breaks anything that talks to systemd (for example a CPU quota
+# scope) while the harness runs.
+mkdir -p /run/netns
+mount -t tmpfs tmpfs /run/netns >/dev/null 2>&1 || die "could not mount tmpfs on /run/netns"
 mkdir -p /run/netns
 for namespace in "${NAMESPACES[@]}"; do
   ip netns add "$namespace" || die "could not create network namespace $namespace"

@@ -111,6 +111,7 @@ jobs:
           set -euo pipefail
           tools="$RUNNER_TEMP/tools"
           out="$RUNNER_TEMP/bench-out"
+          set -o pipefail
           sudo -n env \
             BENCH_INNER=1 \
             BENCH_ROOT="$GITHUB_WORKSPACE" \
@@ -127,7 +128,8 @@ jobs:
             SKIP_BUILD=1 \
             bash "$GITHUB_WORKSPACE/bench/run.sh" \
               --quick --reps "$REPS" --duration "$DURATION" \
-              --rtt-ms "$RTT_MS" --arms stock,beam --out "$out"
+              --rtt-ms "$RTT_MS" --arms stock,beam --out "$out" \
+              2>&1 | tee "$RUNNER_TEMP/bench-run.log"
           sudo chown -R "$(id -u):$(id -g)" "$out"
 
       - name: Step summary
@@ -152,10 +154,27 @@ jobs:
             echo "no summary.md produced" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Upload run directory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/bench-run.log
+            ${{ runner.temp }}/bench-out/summary.md
+            ${{ runner.temp }}/bench-out/summary.json
+            ${{ runner.temp }}/bench-out/meta.json
+            ${{ runner.temp }}/bench-out/environment.txt
+            ${{ runner.temp }}/bench-out/raw
+            ${{ runner.temp }}/bench-out/logs
+          retention-days: 3
+          if-no-files-found: warn
+
       - name: Publish results branch
         if: always()
         run: |
           set -euo pipefail
+          set -x
           out="$RUNNER_TEMP/bench-out"
           stage="$RUNNER_TEMP/results"
           rm -rf "$stage"; mkdir -p "$stage/run"
