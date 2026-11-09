@@ -20,6 +20,7 @@
 #
 # Usage:
 #   bash tests/tun/run.sh [--release] [--control] [--no-build] [--out DIR]
+#   sudo TUN_ALLOW_ROOT=1 bash tests/tun/run.sh --release --no-build ...
 #
 # Environment:
 #   SING_BOX        sing-box binary (default: sing-box from PATH)
@@ -33,6 +34,12 @@
 #   ALLOW_TUN_BLOCKED=1
 #                   accept a run whose matrix contains BLOCKED rows; without it
 #                   a blocked matrix exits 2
+#   TUN_ALLOW_ROOT=1
+#                   as real host root, run the suite inside a private
+#                   mount+network namespace instead of an unprivileged user
+#                   namespace. Implies SKIP_BUILD=1: crates.io is unreachable
+#                   inside the private network namespace, so binaries must be
+#                   prebuilt. This is the GitHub-hosted runner path.
 #
 # This is a local lab harness. It never reaches an external network in the
 # measured path; only the one-time dependency/build step runs outside it.
@@ -49,7 +56,15 @@ if [ "$INNER" != "1" ]; then
     echo "tun-harness: unshare is required" >&2
     exit 1
   fi
-  if ! unshare --user --map-root-user --net true 2>/dev/null; then
+  if [ "${TUN_ALLOW_ROOT:-0}" = "1" ]; then
+    [ "$(id -u)" -eq 0 ] \
+      || { echo "tun-harness: TUN_ALLOW_ROOT needs root" >&2; exit 1; }
+    grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]+4294967295' /proc/self/uid_map \
+      || { echo "tun-harness: TUN_ALLOW_ROOT needs real host root, not a mapped user namespace" >&2; exit 1; }
+    # crates.io is unreachable inside the private netns and this guard runs
+    # before the argument parser, so the root path always uses prebuilt binaries.
+    export SKIP_BUILD=1
+  elif ! unshare --user --map-root-user --net true 2>/dev/null; then
     echo "tun-harness: unprivileged user+network namespaces are unavailable" >&2
     exit 1
   fi
@@ -87,6 +102,13 @@ if [ "$INNER" != "1" ]; then
     fi
   fi
 
+  if [ "${TUN_ALLOW_ROOT:-0}" = "1" ]; then
+    exec unshare --mount --propagation private --net --fork \
+      env TUN_HARNESS_INNER=1 TUN_HARNESS_ROOT="$ROOT" TUN_HARNESS_SELF="$SELF" \
+      TUN_H3_BIN="$H3_ORIGIN_BIN" TUN_H3_BUILD_ERROR="$H3_BUILD_ERROR" \
+      TUN_H3_BUILD_LOG="$H3_BUILD_LOG" \
+      bash "$SELF" "$@"
+  fi
   exec unshare --user --map-root-user --mount --net --fork \
     env TUN_HARNESS_INNER=1 TUN_HARNESS_ROOT="$ROOT" TUN_HARNESS_SELF="$SELF" \
     TUN_H3_BIN="$H3_ORIGIN_BIN" TUN_H3_BUILD_ERROR="$H3_BUILD_ERROR" \
@@ -136,7 +158,7 @@ while [ $# -gt 0 ]; do
       UDP_MODE="$1"
       ;;
     --help|-h)
-      sed -n '2,40p' "$SELF" | sed 's/^# \{0,1\}//'
+      sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -165,12 +187,16 @@ if [ ! -x "$SING_BOX" ]; then
     exit 1
   fi
 fi
-for command in "$PYTHON" ip curl dig cargo; do
+for command in "$PYTHON" ip curl dig; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "tun-harness: required command not found: $command" >&2
     exit 1
   fi
 done
+if [ "${SKIP_BUILD:-0}" != "1" ] && ! command -v cargo >/dev/null 2>&1; then
+  echo "tun-harness: required command not found: cargo" >&2
+  exit 1
+fi
 if [ "$CONTROL" = "1" ]; then
   if [ -x "$XRAY_BIN" ]; then
     :
@@ -219,6 +245,10 @@ H3_ORIGIN_PID=""
 H3_READY=0
 XRAY_PID=""
 NAMESPACES=(tun-client tun-server tun-target)
+# Cleanup must only remove namespaces this run created: the trap is installed
+# before /run/netns is shadowed, so an early failure may still see whatever
+# the host already had under those names.
+CREATED_NAMESPACES=()
 UNEXPECTED_FAIL=0
 HARNESS_FAIL=0
 TUN_BLOCKED=0
@@ -254,7 +284,7 @@ cleanup() {
   stop_pid "$XRAY_PID"
   stop_pid "$H3_ORIGIN_PID"
   stop_pid "$SERVICES_PID"
-  for namespace in "${NAMESPACES[@]}"; do
+  for namespace in "${CREATED_NAMESPACES[@]}"; do
     ip netns del "$namespace" >/dev/null 2>&1
   done
   printf 'tun-harness: run directory: %s\n' "$RUN_DIR" >&2
@@ -458,6 +488,7 @@ mount -t tmpfs tmpfs /run/netns >/dev/null 2>&1 \
 for namespace in "${NAMESPACES[@]}"; do
   ip netns add "$namespace" \
     || { fail_harness "could not create network namespace $namespace"; exit 1; }
+  CREATED_NAMESPACES+=("$namespace")
 done
 
 for namespace in "${NAMESPACES[@]}"; do
