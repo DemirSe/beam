@@ -289,11 +289,21 @@ impl TlsStream {
                 return Poll::Ready(Ok(()));
             }
 
-            if self.pending_offset < self.pending.len() {
+            if self.record.filled() {
+                let consumed = self.conn.read_tls(&mut self.record.feed())?;
+                if consumed == 0 {
+                    return Poll::Ready(Err(TlsStreamError::NoProgress));
+                }
+                self.record.advance(consumed);
+                if self.record.complete() {
+                    self.record.reset();
+                    self.conn.process_new_packets()?;
+                    self.drain_plaintext()?;
+                }
                 continue;
             }
-            let recycled = std::mem::take(&mut self.pending);
-            match self.record.poll(&mut self.socket, cx, recycled) {
+
+            match self.record.poll(&mut self.socket, cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(TlsStreamError::Io(error))),
                 Poll::Ready(Ok(None)) => {
@@ -302,10 +312,7 @@ impl TlsStream {
                         "TLS peer closed during the handshake",
                     ))));
                 }
-                Poll::Ready(Ok(Some(record))) => {
-                    self.pending = record;
-                    self.pending_offset = 0;
-                }
+                Poll::Ready(Ok(Some(_))) => {}
             }
         }
     }
@@ -377,8 +384,24 @@ impl TlsStream {
                     return Poll::Ready(Ok(()));
                 }
             }
-            self.pending.clear();
-            self.pending_offset = 0;
+            if self.record.filled() {
+                let consumed = self.conn.read_tls(&mut self.record.feed())?;
+                if consumed == 0 {
+                    return Poll::Ready(Err(TlsStreamError::NoProgress));
+                }
+                self.record.advance(consumed);
+                if self.record.complete() {
+                    self.record.reset();
+                    self.conn.process_new_packets()?;
+                }
+                if self.drain_plaintext_into(buf)? {
+                    return Poll::Ready(Ok(()));
+                }
+                if self.closed {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
+            }
             if self.plaintext_offset < self.plaintext.len() {
                 continue;
             }
@@ -394,8 +417,7 @@ impl TlsStream {
             if self.closed {
                 return Poll::Ready(Ok(()));
             }
-            let recycled = std::mem::take(&mut self.pending);
-            match self.record.poll(&mut self.socket, cx, recycled) {
+            match self.record.poll(&mut self.socket, cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(TlsStreamError::Io(error))),
                 Poll::Ready(Ok(None)) => {
@@ -410,10 +432,7 @@ impl TlsStream {
                     }
                     return Poll::Ready(Ok(()));
                 }
-                Poll::Ready(Ok(Some(record))) => {
-                    self.pending = record;
-                    self.pending_offset = 0;
-                }
+                Poll::Ready(Ok(Some(_))) => {}
             }
         }
     }
@@ -664,36 +683,63 @@ impl RawTlsHandoff for TlsStream {
     }
 }
 
-#[derive(Default)]
 struct RecordRead {
     header: [u8; TLS_RECORD_HEADER_LEN],
     header_filled: usize,
     body: Vec<u8>,
+    body_len: usize,
     body_filled: usize,
+    body_fed: usize,
+    ready: bool,
+}
+
+impl Default for RecordRead {
+    fn default() -> Self {
+        Self {
+            header: [0; TLS_RECORD_HEADER_LEN],
+            header_filled: 0,
+            body: vec![0; TLS_RECORD_HEADER_LEN + MAX_TLS_RECORD_BODY],
+            body_len: 0,
+            body_filled: 0,
+            body_fed: 0,
+            ready: false,
+        }
+    }
 }
 
 impl RecordRead {
     fn is_partial(&self) -> bool {
-        self.header_filled != 0 || !self.body.is_empty()
+        self.header_filled != 0 || self.body_len != 0
     }
 
-    fn poll<R>(
-        &mut self,
-        socket: &mut R,
-        cx: &mut Context<'_>,
-        recycled: Vec<u8>,
-    ) -> Poll<io::Result<Option<Vec<u8>>>>
+    fn filled(&self) -> bool {
+        self.ready
+    }
+
+    fn complete(&self) -> bool {
+        self.ready && self.body_fed == self.body_len
+    }
+
+    fn feed(&self) -> &[u8] {
+        &self.body[self.body_fed..self.body_len]
+    }
+
+    fn advance(&mut self, consumed: usize) {
+        self.body_fed += consumed;
+    }
+
+    fn reset(&mut self) {
+        self.header_filled = 0;
+        self.body_len = 0;
+        self.body_filled = 0;
+        self.body_fed = 0;
+        self.ready = false;
+    }
+
+    fn poll<R>(&mut self, socket: &mut R, cx: &mut Context<'_>) -> Poll<io::Result<Option<usize>>>
     where
         R: AsyncRead + Unpin,
     {
-        // Reuse the previous record's allocation when no ciphertext is
-        // partially buffered. A partial record keeps its own buffer; recycling
-        // partially consumed ciphertext would corrupt the next read.
-        if self.body.is_empty() {
-            self.body = recycled;
-            self.body.clear();
-        }
-
         loop {
             if self.header_filled < TLS_RECORD_HEADER_LEN {
                 let mut buf = ReadBuf::new(&mut self.header[self.header_filled..]);
@@ -719,26 +765,16 @@ impl RecordRead {
                 }
 
                 validate_header(&self.header)?;
-                let length = usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
-                // Store the header and body in one buffer and reuse the
-                // allocation from the previous record. The capacity is bounded
-                // by the validated record length and never recycled from a
-                // partially consumed record.
-                let mut record = std::mem::take(&mut self.body);
-                record.clear();
-                record
-                    .try_reserve_exact(TLS_RECORD_HEADER_LEN + length)
-                    .map_err(|_| TlsStreamError::Allocation)?;
-                record.extend_from_slice(&self.header);
-                record.resize(TLS_RECORD_HEADER_LEN + length, 0);
-                self.body = record;
-                self.body_filled = 0;
+                let body_len = usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
+                self.body[..TLS_RECORD_HEADER_LEN].copy_from_slice(&self.header);
+                self.body_len = TLS_RECORD_HEADER_LEN + body_len;
+                self.body_filled = TLS_RECORD_HEADER_LEN;
+                self.body_fed = 0;
+                self.ready = false;
             }
 
-            let body_len = self.body.len() - TLS_RECORD_HEADER_LEN;
-            if self.body_filled < body_len {
-                let mut buf =
-                    ReadBuf::new(&mut self.body[TLS_RECORD_HEADER_LEN + self.body_filled..]);
+            if self.body_filled < self.body_len {
+                let mut buf = ReadBuf::new(&mut self.body[self.body_filled..self.body_len]);
                 match Pin::new(&mut *socket).poll_read(cx, &mut buf) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -751,17 +787,18 @@ impl RecordRead {
                             )));
                         }
                         self.body_filled += filled;
-                        if self.body_filled < body_len {
+                        if self.body_filled < self.body_len {
                             continue;
                         }
                     }
                 }
             }
 
-            let record = std::mem::take(&mut self.body);
             self.header_filled = 0;
             self.body_filled = 0;
-            return Poll::Ready(Ok(Some(record)));
+            self.body_fed = 0;
+            self.ready = true;
+            return Poll::Ready(Ok(Some(self.body_len)));
         }
     }
 }
@@ -802,20 +839,13 @@ mod tests {
     async fn read_record<R>(
         reader: &mut RecordRead,
         socket: &mut R,
-        recycled: Vec<u8>,
+        _recycled: Vec<u8>,
     ) -> io::Result<Option<Vec<u8>>>
     where
         R: AsyncRead + Unpin,
     {
-        let mut recycled = Some(recycled);
-        poll_fn(|cx| {
-            // The first poll moves the previous allocation into `RecordRead`.
-            // If the record is incomplete, that buffer stays in `body`; later
-            // polls do not need to pass it again.
-            let buffer = recycled.take().unwrap_or_default();
-            reader.poll(socket, cx, buffer)
-        })
-        .await
+        let length = poll_fn(|cx| reader.poll(socket, cx)).await?;
+        Ok(length.map(|length| reader.body[..length].to_vec()))
     }
 
     fn record(content_type: u8, body: &[u8]) -> Vec<u8> {
@@ -866,13 +896,11 @@ mod tests {
             .expect("first record read")
             .expect("first record");
         assert_eq!(parsed_first, first);
-        let first_capacity = parsed_first.capacity();
         let parsed_second = read_record(&mut reader, &mut socket, parsed_first)
             .await
             .expect("second record read")
             .expect("second record");
         assert_eq!(parsed_second, second);
-        assert_eq!(parsed_second.capacity(), first_capacity);
 
         let mut raw = [0u8; 3];
         socket.read_exact(&mut raw).await.expect("raw bytes");
