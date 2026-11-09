@@ -1,0 +1,152 @@
+name: runner-preflight
+
+# Capability probe for a GitHub-hosted runner: everything the local lab and the
+# A/B benchmark need, checked individually so the run's step conclusions are
+# the report. No secrets, no artifacts, read-only token.
+#
+#   rh-preflight (required): TUN device, private netns + veth + netem, delegated
+#   cgroup v2 with memory.peak, HTTP/3-capable curl.
+#   Informational: unprivileged user namespaces, perf tracepoints, disk, image.
+
+on:
+  push:
+    paths:
+      - .github/workflows/runner-preflight.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Image and host facts
+        run: |
+          echo "image_os=${ImageOS:-unknown} image_version=${ImageVersion:-unknown}"
+          uname -a
+          nproc
+          free -m
+          df -h / /tmp | tail -3
+
+      - name: TUN device (required)
+        id: tun
+        run: |
+          test -c /dev/net/tun && echo "/dev/net/tun present"
+          sudo python3 - <<'PY'
+          import fcntl, os, struct, sys
+          TUNSETIFF = 0x400454ca
+          IFF_TUN, IFF_NO_PI = 0x0001, 0x1000
+          fd = os.open("/dev/net/tun", os.O_RDWR)
+          ifr = struct.pack("16sH", b"preflight0", IFF_TUN | IFF_NO_PI)
+          try:
+              fcntl.ioctl(fd, TUNSETIFF, ifr)
+          except OSError as error:
+              print(f"TUNSETIFF failed: {error}", file=sys.stderr)
+              sys.exit(1)
+          print("TUNSETIFF ok")
+          PY
+
+      - name: Unprivileged user namespaces (informational)
+        id: userns
+        continue-on-error: true
+        run: unshare --user --map-root-user --mount true && echo "userns ok"
+
+      - name: Private netns with veth and netem (required)
+        id: netem
+        run: |
+          sudo unshare --mount --propagation private --net --fork bash -euo pipefail -c '
+            ip link set lo up
+            ip netns add pf
+            ip link add veth0 type veth peer name veth1
+            ip link set veth1 netns pf
+            ip addr add 10.7.0.1/24 dev veth0
+            ip link set veth0 up
+            ip netns exec pf ip addr add 10.7.0.2/24 dev veth1
+            ip netns exec pf ip link set veth1 up
+            ip netns exec pf ip link set lo up
+            tc qdisc add dev veth0 root netem delay 25ms
+            ping -c 2 -W 3 10.7.0.2
+            tc -s qdisc show dev veth0
+            echo "outer /run is untouched: $(findmnt -no TARGET /run)"
+          '
+
+      - name: Delegated cgroup v2 with memory accounting (required)
+        id: cgroup
+        run: |
+          sudo systemd-run --scope --unit=pf-cgroup -p Delegate=yes \
+            -p MemoryAccounting=yes -p MemoryMax=1G \
+            bash -euo pipefail -c '
+              unit=pf-cgroup.scope
+              base=$(find /sys/fs/cgroup -maxdepth 3 -name "$unit" | head -1)
+              test -n "$base" || { echo "scope cgroup not found"; exit 1; }
+              echo "scope=$base"
+              echo "controllers: $(cat "$base/cgroup.controllers")"
+              echo "memory.max: $(cat "$base/memory.max")"
+              mkdir "$base/sup"
+              echo $$ > "$base/sup/cgroup.procs"
+              echo "+memory" > "$base/cgroup.subtree_control" 2>/dev/null || true
+              mkdir "$base/role"
+              echo max > "$base/role/memory.max"
+              test -f "$base/role/memory.peak" && echo "memory.peak: $(cat "$base/role/memory.peak")"
+              test -f "$base/role/memory.swap.max" \
+                && echo "swap accounting: present" \
+                || echo "swap accounting: absent (memory.swap.max missing)"
+              test -f "$base/role/memory.events" && echo "memory.events: present"
+              cat "$base/role/memory.events" 2>/dev/null || true
+            '
+
+      - name: HTTP/3-capable curl (required)
+        id: curl3
+        run: |
+          curl --version
+          curl --version | grep -qi 'HTTP3' && echo "curl HTTP3 ok"
+
+      - name: tc and sch_netem (informational)
+        id: tcmod
+        continue-on-error: true
+        run: |
+          tc -V
+          modinfo sch_netem | head -3 || echo "sch_netem module metadata unavailable"
+          grep -c netem /proc/modules || true
+
+      - name: perf tracepoints (informational)
+        id: perf
+        continue-on-error: true
+        run: |
+          cat /proc/sys/kernel/perf_event_paranoid
+          command -v perf || echo "perf binary missing"
+          ls /sys/kernel/tracing/events/syscalls/sys_enter_splice 2>/dev/null \
+            || ls /sys/kernel/debug/tracing/events/syscalls/sys_enter_splice 2>/dev/null \
+            || echo "splice tracepoint missing"
+
+      - name: Capability summary (fails when a required probe failed)
+        env:
+          TUN: ${{ steps.tun.outcome }}
+          NETEM: ${{ steps.netem.outcome }}
+          CGROUP: ${{ steps.cgroup.outcome }}
+          CURL3: ${{ steps.curl3.outcome }}
+          USERNS: ${{ steps.userns.outcome }}
+          PERF: ${{ steps.perf.outcome }}
+          TCMOD: ${{ steps.tcmod.outcome }}
+        run: |
+          {
+            echo "| capability | result |"
+            echo "|---|---|"
+            echo "| tun | $TUN |"
+            echo "| netns+veth+netem | $NETEM |"
+            echo "| delegated cgroup v2 | $CGROUP |"
+            echo "| curl http3 | $CURL3 |"
+            echo "| unprivileged userns | $USERNS |"
+            echo "| perf tracepoints | $PERF |"
+            echo "| tc/sch_netem | $TCMOD |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          for required in TUN NETEM CGROUP CURL3; do
+            value="${!required}"
+            if [ "$value" != "success" ]; then
+              echo "::error::required capability $required is $value"
+              exit 1
+            fi
+          done
+          echo "all required capabilities present"
