@@ -575,6 +575,43 @@ impl CloseReason {
 }
 
 /// Shared state for one mux stream.
+/// Releases mux state when the handler stops, however it stops.
+///
+/// The explicit teardown in [`handle_mux_stream`] runs on the return path only.
+/// When the handler future is dropped — runtime shutdown, a cancelled task, a
+/// panic — nothing else stops the reply tasks, so they would keep their
+/// sessions, sockets, and global permits for the life of the process. This guard
+/// is registered for the whole handler lifetime and is idempotent: the normal
+/// teardown drains the table first, so it finds nothing to do.
+struct MuxTeardown {
+    table: Arc<Mutex<SessionTable>>,
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for MuxTeardown {
+    fn drop(&mut self) {
+        let (active, retained) = {
+            let mut table = lock_table(&self.table);
+            let active = table.drain_active();
+            (active, table.clear_expiring())
+        };
+        if retained > 0 {
+            self.metrics.record_xudp_retained_expired(retained);
+        }
+        for entry in active {
+            if entry.session.mark_closed() {
+                self.metrics.record_xudp_closed_mux();
+            }
+            entry.session.stop();
+            // Release the global slot now; the reply task only holds the socket.
+            drop(entry.session.take_permit());
+            if let Some(task) = entry.reply_task {
+                task.abort();
+            }
+        }
+    }
+}
+
 struct MuxState {
     config: Arc<XudpConfig>,
     table: Arc<Mutex<SessionTable>>,
@@ -635,6 +672,12 @@ where
 
     let table = Arc::new(Mutex::new(SessionTable::default()));
     limiter.register_table(&table);
+    // Covers cancellation and panics; the explicit teardown below still runs on
+    // the return path.
+    let _teardown = MuxTeardown {
+        table: Arc::clone(&table),
+        metrics: Arc::clone(&metrics),
+    };
     let state = MuxState {
         config: config.clone(),
         table: Arc::clone(&table),
