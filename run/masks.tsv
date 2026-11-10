@@ -1,0 +1,100 @@
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-stock-1-3345 cgroup=/system.slice/beam-bench-stock-1-3345.scope
+stock	1	server	2	2
+stock	1	client	1	0,1
+stock	1	target	3	3
+stock	1	server-resources	-	memory_peak=28602368 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-stock-1-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-beam-1-3345 cgroup=/system.slice/beam-bench-beam-1-3345.scope
+beam	1	server	2	2
+beam	1	client	1	0,1
+beam	1	target	3	3
+beam	1	server-resources	-	memory_peak=22409216 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-beam-1-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-beam-2-3345 cgroup=/system.slice/beam-bench-beam-2-3345.scope
+beam	2	server	2	2
+beam	2	client	1	0,1
+beam	2	target	3	3
+beam	2	server-resources	-	memory_peak=22753280 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-beam-2-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-stock-2-3345 cgroup=/system.slice/beam-bench-stock-2-3345.scope
+stock	2	server	2	2
+stock	2	client	1	0,1
+stock	2	target	3	3
+stock	2	server-resources	-	memory_peak=28368896 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-stock-2-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-stock-3-3345 cgroup=/system.slice/beam-bench-stock-3-3345.scope
+stock	3	server	2	2
+stock	3	client	1	0,1
+stock	3	target	3	3
+stock	3	server-resources	-	memory_peak=28475392 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-stock-3-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-beam-3-3345 cgroup=/system.slice/beam-bench-beam-3-3345.scope
+beam	3	server	2	2
+beam	3	client	1	0,1
+beam	3	target	3	3
+beam	3	server-resources	-	memory_peak=22364160 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-beam-3-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-beam-4-3345 cgroup=/system.slice/beam-bench-beam-4-3345.scope
+beam	4	server	2	2
+beam	4	client	1	0,1
+beam	4	target	3	3
+beam	4	server-resources	-	memory_peak=22302720 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-beam-4-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-stock-4-3345 cgroup=/system.slice/beam-bench-stock-4-3345.scope
+stock	4	server	2	2
+stock	4	client	1	0,1
+stock	4	target	3	3
+stock	4	server-resources	-	memory_peak=28569600 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-stock-4-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-stock-5-3345 cgroup=/system.slice/beam-bench-stock-5-3345.scope
+stock	5	server	2	2
+stock	5	client	1	0,1
+stock	5	target	3	3
+stock	5	server-resources	-	memory_peak=28127232 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-stock-5-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-beam-5-3345 cgroup=/system.slice/beam-bench-beam-5-3345.scope
+beam	5	server	2	2
+beam	5	client	1	0,1
+beam	5	target	3	3
+beam	5	server-resources	-	memory_peak=22269952 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-beam-5-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-beam-6-3345 cgroup=/system.slice/beam-bench-beam-6-3345.scope
+beam	6	server	2	2
+beam	6	client	1	0,1
+beam	6	target	3	3
+beam	6	server-resources	-	memory_peak=22429696 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-beam-6-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-stock-6-3345 cgroup=/system.slice/beam-bench-stock-6-3345.scope
+stock	6	server	2	2
+stock	6	client	1	0,1
+stock	6	target	3	3
+stock	6	server-resources	-	memory_peak=28655616 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-stock-6-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-stock-7-3345 cgroup=/system.slice/beam-bench-stock-7-3345.scope
+stock	7	server	2	2
+stock	7	client	1	0,1
+stock	7	target	3	3
+stock	7	server-resources	-	memory_peak=27914240 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-stock-7-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-beam-7-3345 cgroup=/system.slice/beam-bench-beam-7-3345.scope
+beam	7	server	2	2
+beam	7	client	1	0,1
+beam	7	target	3	3
+beam	7	server-resources	-	memory_peak=22786048 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-beam-7-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-beam-8-3345 cgroup=/system.slice/beam-bench-beam-8-3345.scope
+beam	8	server	2	2
+beam	8	client	1	0,1
+beam	8	target	3	3
+beam	8	server-resources	-	memory_peak=22487040 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-beam-8-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-stock-8-3345 cgroup=/system.slice/beam-bench-stock-8-3345.scope
+stock	8	server	2	2
+stock	8	client	1	0,1
+stock	8	target	3	3
+stock	8	server-resources	-	memory_peak=29184000 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-stock-8-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-stock-9-3345 cgroup=/system.slice/beam-bench-stock-9-3345.scope
+stock	9	server	2	2
+stock	9	client	1	0,1
+stock	9	target	3	3
+stock	9	server-resources	-	memory_peak=28250112 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-stock-9-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-beam-9-3345 cgroup=/system.slice/beam-bench-beam-9-3345.scope
+beam	9	server	2	2
+beam	9	client	1	0,1
+beam	9	target	3	3
+beam	9	server-resources	-	memory_peak=22847488 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-beam-9-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-beam-10-3345 cgroup=/system.slice/beam-bench-beam-10-3345.scope
+beam	10	server	2	2
+beam	10	client	1	0,1
+beam	10	target	3	3
+beam	10	server-resources	-	memory_peak=22339584 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-beam-10-3345.scope
+server_cpu_max=50000 100000 server_memory_max=1073741824 scope=beam-bench-stock-10-3345 cgroup=/system.slice/beam-bench-stock-10-3345.scope
+stock	10	server	2	2
+stock	10	client	1	0,1
+stock	10	target	3	3
+stock	10	server-resources	-	memory_peak=28200960 oom=0 oom_kill=0 memory_max=1073741824 cgroup=/system.slice/beam-bench-stock-10-3345.scope

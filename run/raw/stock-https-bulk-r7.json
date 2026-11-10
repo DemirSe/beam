@@ -1,0 +1,106 @@
+{
+  "schema": "beam-bench-run/1",
+  "run_id": "20261109T233215Z-3345",
+  "arm": "stock",
+  "scenario": "https-bulk",
+  "rep": 7,
+  "kind": "https",
+  "started_at": "2026-11-10T00:26:13Z",
+  "status": "ok",
+  "reason": null,
+  "command": [
+    "curl",
+    "--http1.1",
+    "--noproxy",
+    "*",
+    "-k",
+    "-sS",
+    "--max-time",
+    "120.0",
+    "-o",
+    "/dev/null",
+    "-w",
+    "%{http_code} %{size_download} %{time_total} %{speed_download}\\n",
+    "https://10.10.2.2:4443/large.bin"
+  ],
+  "parameters": {
+    "https_parallel": 1
+  },
+  "elapsed_s": 20.395,
+  "metrics": {
+    "samples": [
+      {
+        "http_code": 200,
+        "bytes": 67108864,
+        "seconds": 6.798937,
+        "mib_per_s": 9.413,
+        "speed_download": 9870535.0
+      },
+      {
+        "http_code": 200,
+        "bytes": 67108864,
+        "seconds": 6.791092,
+        "mib_per_s": 9.424,
+        "speed_download": 9881932.0
+      },
+      {
+        "http_code": 200,
+        "bytes": 67108864,
+        "seconds": 6.794126,
+        "mib_per_s": 9.42,
+        "speed_download": 9877522.0
+      }
+    ],
+    "bytes": 201326592,
+    "seconds": 20.384155,
+    "mib_per_s": 9.419,
+    "mib_per_s_samples": [
+      9.413,
+      9.424,
+      9.42
+    ]
+  },
+  "cpu": {
+    "server_s": 0.04,
+    "client_s": 1.17,
+    "target_s": 0.1,
+    "server_core_busy_pct": 14.68,
+    "client_core_busy_pct": 77.98,
+    "client_core_busy_pct_avg": 44.59,
+    "client_cores": [
+      0,
+      1
+    ],
+    "server_cpu_max": "50000 100000",
+    "server_cpu_max_harness": "50000 100000",
+    "server_memory_max": "1073741824",
+    "server_memory_peak": "27914240",
+    "server_memory_max_harness": "1073741824",
+    "target_core_busy_pct": 5.9,
+    "driver_core_busy_pct": 11.2,
+    "non_role_core_busy_pct_max": null,
+    "server_core_mhz_before": null,
+    "server_core_mhz_after": null,
+    "client_core_mhz_before": null,
+    "client_core_mhz_after": null,
+    "target_core_mhz_before": null,
+    "target_core_mhz_after": null,
+    "driver_core_mhz_before": null,
+    "driver_core_mhz_after": null,
+    "server_s_per_gib": 0.2133,
+    "client_s_per_gib": 6.24
+  },
+  "mem": {
+    "rss_after_warmup_kib": 36432,
+    "rss_kib": 36508,
+    "hwm_kib": 36508,
+    "fds": 16,
+    "threads": 8,
+    "client_rss_kib": 63204,
+    "client_threads": 8,
+    "client_fds": 15
+  },
+  "warnings": [],
+  "host_load1_before": 1.33,
+  "host_load1_after": 1.24
+}

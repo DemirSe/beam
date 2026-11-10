@@ -1,0 +1,8 @@
+target: http4 listening on ('10.10.2.2', 8080)
+target: http6 listening on ('fd00:2::2', 8080, 0, 0)
+target: https listening on ('10.10.2.2', 4443)
+target: udp-echo listening on ('10.10.2.2', 9999)
+target: dns listening on ('10.10.2.2', 53)
+target: udp-echo-v6 listening on ('fd00:2::2', 9999, 0, 0)
+target: READY
+target: dns listening on ('fd00:2::2', 53, 0, 0)

@@ -1,0 +1,1 @@
+2026-11-10T00:33:37.432190Z  WARN beam: process soft fd limit is below the deployment floor; validate the service limit actual_fd_limit=1024 deployment_floor=65536

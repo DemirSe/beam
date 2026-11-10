@@ -1,0 +1,88 @@
+{
+  "schema": "beam-bench-run/1",
+  "run_id": "20261109T233215Z-3345",
+  "arm": "stock",
+  "scenario": "warmup-dns",
+  "rep": 6,
+  "kind": "dns",
+  "started_at": "2026-11-10T00:20:52Z",
+  "status": "ok",
+  "reason": null,
+  "command": [
+    "dns",
+    "10.10.2.2",
+    "target.test",
+    "A"
+  ],
+  "parameters": {},
+  "elapsed_s": 3.01,
+  "metrics": {
+    "sent": 10,
+    "received": 10,
+    "loss_pct": 0.0,
+    "errors": [],
+    "latency_samples_us": [
+      753875.808,
+      251042.529,
+      250629.615,
+      250595.443,
+      250554.542,
+      250567.261,
+      250609.685,
+      250526.279,
+      250484.646,
+      250534.111
+    ],
+    "rtt_count": 10,
+    "rtt_p50_us": 250567.261,
+    "rtt_p95_us": 753875.808,
+    "rtt_p99_us": 753875.808,
+    "rtt_min_us": 250484.646,
+    "rtt_max_us": 753875.808,
+    "rtt_median_us": 250567.261
+  },
+  "cpu": {
+    "server_s": 0.0,
+    "client_s": 0.01,
+    "target_s": 0.01,
+    "server_core_busy_pct": 0.66,
+    "client_core_busy_pct": 96.01,
+    "client_core_busy_pct_avg": 50.33,
+    "client_cores": [
+      0,
+      1
+    ],
+    "server_cpu_max": "50000 100000",
+    "server_cpu_max_harness": "50000 100000",
+    "server_memory_max": "1073741824",
+    "server_memory_peak": "17924096",
+    "server_memory_max_harness": "1073741824",
+    "target_core_busy_pct": 0.0,
+    "driver_core_busy_pct": 4.65,
+    "non_role_core_busy_pct_max": null,
+    "server_core_mhz_before": null,
+    "server_core_mhz_after": null,
+    "client_core_mhz_before": null,
+    "client_core_mhz_after": null,
+    "target_core_mhz_before": null,
+    "target_core_mhz_after": null,
+    "driver_core_mhz_before": null,
+    "driver_core_mhz_after": null
+  },
+  "mem": {
+    "rss_after_warmup_kib": 36712,
+    "rss_kib": 36756,
+    "hwm_kib": 36756,
+    "fds": 16,
+    "threads": 6,
+    "client_rss_kib": 59796,
+    "client_threads": 8,
+    "client_fds": 14
+  },
+  "warnings": [
+    "client core saturated (96.01%)"
+  ],
+  "host_load1_before": 1.05,
+  "host_load1_after": 1.05,
+  "client_bound": true
+}
