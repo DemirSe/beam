@@ -276,6 +276,11 @@ impl Direction {
 
 /// Copies bytes in both directions between two connected, nonblocking streams.
 ///
+/// Not on the server's data path: the authenticated TCP relay uses the async
+/// `copy_direction`, and the Vision splice path uses `copy_one_way` per
+/// direction when splice capacity is available. This helper is kept for the
+/// bidirectional splice contract and its tests.
+///
 /// The descriptors are borrowed, not owned: the caller closes them after this
 /// function returns, including on error. `a` and `b` must be stream sockets;
 /// the relay uses `splice(2)` and `shutdown(2)`.
