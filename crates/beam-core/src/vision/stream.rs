@@ -150,6 +150,11 @@ where
     ///
     /// The value is `false` until both the read and write sides are raw. It is
     /// latched: once `true`, the stream is ready for [`Self::into_raw`].
+    ///
+    /// Ungated: true as soon as both directions are raw, even while
+    /// `write_carry` is still draining. The relay consumes the gated
+    /// `write_direct_watch` and `read_handoff_watch`; do not switch without a
+    /// byte-ordering test.
     pub fn direct_watch(&self) -> watch::Receiver<bool> {
         self.direct_tx.subscribe()
     }
@@ -214,6 +219,10 @@ where
     }
 
     /// Consumes the stream once both directions have switched to Direct.
+    ///
+    /// Not called by the production relay. The production Vision relay clones
+    /// the raw sockets and uses `copy_one_way` per direction when splice
+    /// capacity is available; the async fallback is `copy_direction`.
     pub fn into_raw(self) -> Result<RawTls, TlsStreamError> {
         if !self.read_is_raw() || !self.write_is_raw() {
             return Err(TlsStreamError::RawNotEnabled);

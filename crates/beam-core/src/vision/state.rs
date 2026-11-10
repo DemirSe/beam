@@ -65,9 +65,11 @@ impl TlsObservation {
 
 /// Shared TLS detector for both directions of one Vision connection.
 ///
-/// The detector consumes the eight-buffer filter budget even for buffers that
-/// contain no TLS signature, matching the stock writer. Once the budget is
-/// exhausted, further calls are cheap no-ops.
+/// The detector spends filter credits when inspecting new signatures, even for
+/// buffers that contain no TLS signature, matching the stock writer. An already
+/// buffered ServerHello may finish after those credits are exhausted; its
+/// record remains capped at [`MAX_TLS_RECORD_LEN`]. Without a pending
+/// ServerHello, exhausted-budget calls are no-ops.
 #[derive(PartialEq, Eq)]
 pub struct TlsDetector {
     filter_budget: u8,
@@ -166,17 +168,16 @@ impl TlsDetector {
     /// cannot enable Direct.
     pub fn inspect(&mut self, buffer: &[u8]) -> TlsObservation {
         let mut observation = TlsObservation::default();
+        if self.pending_server_hello.is_some() {
+            self.continue_server_hello(buffer);
+            return observation;
+        }
         if self.filter_budget == 0 {
             self.pending_server_hello = None;
             self.pending_server_hello_len = 0;
             return observation;
         }
         self.filter_budget -= 1;
-
-        if self.pending_server_hello.is_some() {
-            self.continue_server_hello(buffer);
-            return observation;
-        }
 
         if buffer.starts_with(TLS_APPLICATION_DATA_START) {
             observation.application_data = true;
@@ -196,15 +197,15 @@ impl TlsDetector {
             if record_len < MIN_SERVER_HELLO_LEN {
                 // Stock cannot enable Direct from a short ServerHello.
                 self.filter_budget = 0;
+            } else if record_len > MAX_TLS_RECORD_LEN {
+                // A record larger than the TLS plaintext limit is malformed;
+                // never buffer it and never let it enable Direct.
+                self.filter_budget = 0;
             } else if buffer.len() >= record_len {
                 self.apply_server_hello(buffer);
-            } else if record_len <= MAX_TLS_RECORD_LEN {
+            } else {
                 self.pending_server_hello = Some(buffer.to_vec());
                 self.pending_server_hello_len = record_len;
-            } else {
-                // A record larger than the TLS plaintext limit is malformed and
-                // must not cause unbounded buffering.
-                self.filter_budget = 0;
             }
         } else if header.starts_with(TLS_CLIENT_HELLO_START) && header[5] == HANDSHAKE_CLIENT_HELLO
         {
@@ -797,8 +798,9 @@ mod tests {
     use rand::rngs::SmallRng;
 
     use super::{
-        DEFAULT_FILTER_BUDGET, PaddingPolicy, TlsDetector, VisionReaderAction, VisionReaderMode,
-        VisionReaderState, VisionStateError, VisionWriterState, parse_server_hello,
+        DEFAULT_FILTER_BUDGET, MAX_TLS_RECORD_LEN, PaddingPolicy, TlsDetector, VisionReaderAction,
+        VisionReaderMode, VisionReaderState, VisionStateError, VisionWriterState,
+        parse_server_hello,
     };
     use crate::vision::frame::{Block, Command, MAX_PAYLOAD_LEN};
 
@@ -924,6 +926,40 @@ mod tests {
         assert!(!second.server_hello);
         assert!(detector.enable_xtls());
         assert_eq!(detector.cipher(), Some(0x1301));
+        assert_eq!(detector.filter_budget(), 0);
+    }
+
+    #[test]
+    fn split_server_hello_on_the_last_filter_credit_still_enables_direct() {
+        let record = server_hello(0x1301, 32, true, 0);
+
+        let mut detector = TlsDetector::with_filter_budget(1);
+        let first = detector.inspect(&record[..6]);
+        assert!(first.server_hello);
+        assert_eq!(detector.filter_budget(), 0);
+        assert!(!detector.enable_xtls());
+
+        let second = detector.inspect(&record[6..]);
+        assert!(!second.server_hello);
+        assert!(detector.enable_xtls());
+        assert_eq!(detector.cipher(), Some(0x1301));
+        assert_eq!(detector.filter_budget(), 0);
+    }
+
+    #[test]
+    fn complete_oversized_server_hello_cannot_enable_direct() {
+        // `record.len() == 9 + handshake_len`, so the fixture is internally
+        // consistent and only the new length cap can reject it.
+        let record = server_hello(0x1301, 32, true, 16_384);
+        assert!(record.len() > MAX_TLS_RECORD_LEN);
+        assert!(parse_server_hello(&record).is_some());
+
+        let mut detector = TlsDetector::new();
+        let observation = detector.inspect(&record);
+
+        assert!(observation.server_hello);
+        assert!(!detector.enable_xtls());
+        assert_eq!(detector.cipher(), None);
         assert_eq!(detector.filter_budget(), 0);
     }
 
