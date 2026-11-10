@@ -2369,7 +2369,8 @@ mod tests {
         let admitted = limiter.stats();
         assert_eq!(admitted.active, 3, "sessions did not admit: {admitted:?}");
         assert_eq!(
-            admitted.available, 1,
+            admitted.available,
+            max - 3,
             "permits did not account: {admitted:?}"
         );
 

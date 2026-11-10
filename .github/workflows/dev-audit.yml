@@ -26,4 +26,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace 2>&1 | tail -40
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tail -40
