@@ -68,6 +68,7 @@ stable.
 |---|---|
 | Current production state | [Status](#status), [Operations](#operations) |
 | Protocol behavior and invariants | [Protocol invariants](#protocol-invariants), [Decisions](#decisions) |
+| Implicit state machines and lifecycle risks | [`STATE-MACHINES.md`](STATE-MACHINES.md) |
 | Configuration | [Configuration and limits](#configuration-and-limits), [`config.example.toml`](config.example.toml) |
 | Client setup | [Windows tray launcher](#windows-tray-launcher), [Linux tray and DNS switch](#linux-tray-and-dns-switch), [Mobile profile](#mobile-profile) |
 | Tests and performance | [Testing and benchmarking](#testing-and-benchmarking), [One-command checks](#one-command-checks), `tests/tun`, `fuzz`, `bench` |
