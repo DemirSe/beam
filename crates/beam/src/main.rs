@@ -225,7 +225,8 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                     xudp_rejected_global = pressure.4.saturating_sub(last_pressure.4),
                     xudp_end_dropped = pressure.5.saturating_sub(last_pressure.5),
                     xudp_replies_dropped = pressure.6.saturating_sub(last_pressure.6),
-                    legacy_udp_limited = pressure.7.saturating_sub(last_pressure.7),
+                    xudp_send_dropped = pressure.7.saturating_sub(last_pressure.7),
+                    legacy_udp_limited = pressure.8.saturating_sub(last_pressure.8),
                     xudp_high_water = xudp.high_water,
                     preauth_active,
                     authenticated_active,
@@ -247,6 +248,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                     xudp_rejected_global = current.xudp_rejected_global,
                     xudp_retained_evicted = current.xudp_retained_evicted,
                     xudp_replies_dropped = current.xudp_replies_dropped,
+                    xudp_send_dropped = current.xudp_send_dropped,
                     xudp_end_dropped = current.xudp_end_dropped,
                     legacy_udp_limited = current.legacy_udp_limited,
                     splice_fallback = current.splice_fallback,
@@ -411,7 +413,7 @@ fn warn_if_config_permissions_are_loose(path: &std::path::Path) {
 /// Counters that indicate dropped or rejected traffic, in log order.
 fn pressure_counters(
     snapshot: &beam_core::metrics::MetricsSnapshot,
-) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     (
         snapshot.preauth_rejected,
         snapshot.cover_limited,
@@ -420,6 +422,7 @@ fn pressure_counters(
         snapshot.xudp_rejected_global,
         snapshot.xudp_end_dropped,
         snapshot.xudp_replies_dropped,
+        snapshot.xudp_send_dropped,
         snapshot.legacy_udp_limited,
     )
 }
@@ -554,5 +557,19 @@ mod tests {
         assert_eq!(replay_capacity(2000), REPLAY_CAPACITY_MAX);
         assert_eq!(replay_capacity(64), 4096);
         assert_eq!(replay_capacity(100), 6400);
+    }
+
+    #[test]
+    fn pressure_counters_includes_send_drops() {
+        let snapshot = beam_core::metrics::MetricsSnapshot {
+            xudp_end_dropped: 1,
+            xudp_replies_dropped: 2,
+            xudp_send_dropped: 3,
+            legacy_udp_limited: 4,
+            ..Default::default()
+        };
+        let counters = pressure_counters(&snapshot);
+        assert_eq!((counters.5, counters.6, counters.7), (1, 2, 3));
+        assert_eq!(counters.8, 4);
     }
 }
