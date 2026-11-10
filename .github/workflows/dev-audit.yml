@@ -28,4 +28,4 @@ jobs:
       - name: Test
         run: |
           set -o pipefail
-          cargo test --workspace 2>&1 | tail -40
+          cargo test --workspace 2>&1 | grep -E 'Running|Doc-tests|test result|^failures:|^    [a-z_0-9:]+$'

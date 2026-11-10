@@ -27,10 +27,9 @@ policy or an admission bound, it is marked **policy**.
   documentation/observability bucket, listed in
   [Confirmed defect register](#confirmed-defect-register). All seven and the
   bucket are fixed in this tree, each with the regression test named in the
-  register; no byte-level protocol change was made. What is still open is the
-  teardown gap recorded under D8e: mux teardown runs only on the return path, so
-  an aborted or panicking handler still relies on the reply tasks observing
-  `stop`.
+  register; no byte-level protocol change was made. The teardown gap recorded
+  under D8e is closed as well: a guard now releases sessions, sockets, and
+  permits when the handler is cancelled or panics.
 - **Main structural risk:** a future edit updates one source of truth and misses
   another. Vision Direct needs four booleans, three watch channels, and five
   buffers to agree; an XUDP session is table membership plus `closed` +
@@ -512,17 +511,21 @@ since the last byte read from the peer", so a peer that trickles any byte more
 often than that still extends the stream; that is the documented deviation from
 stock Xray.
 
-**D8e — teardown is still return-path only (open).** The drain/stop/join block
-runs only when `read_loop` returns. If the handler future is aborted (runtime
-shutdown) or panics, spawned reply tasks keep their `Arc<Session>`, table entry,
-socket, and permit until they observe `stop`; no `Drop` guard performs the
-teardown. The single shared deadline described above does not change that. Do
-not claim unconditional cleanup until cancellation and panic paths are tested.
+**D8e — teardown survives cancellation (fixed).** The drain/stop/join block
+still runs when `read_loop` returns. For every other ending — runtime shutdown,
+a cancelled task, a panic — `MuxTeardown` is registered for the handler's whole
+lifetime and, on drop, drains the table, clears retained sockets, claims and
+stops each session, releases its global permit, and aborts its reply task. It is
+idempotent: the return path drains first, so the guard then finds nothing. Pinned
+by `aborting_the_mux_handler_releases_sessions_and_permits`, which aborts a live
+handler with three sessions and requires `active == 0` and every permit back;
+before the guard it observably leaked three of eight permits.
 
 **Observability.** `xudp_closed_mux`, retained counters, pressure logs; no
 phase gauge or empty-timer gauge.
 
-**Tests.** `empty_stream_closes_after_the_idle_timeout` (2393),
+**Tests.** `aborting_the_mux_handler_releases_sessions_and_permits` (D8e),
+`empty_stream_closes_after_the_idle_timeout` (2393),
 `empty_mux_keepalive_does_not_extend_idle` (2409),
 `coalesced_new_end_restarts_the_empty_timer` (2449),
 `shutdown_releases_a_session_whose_reply_task_has_not_run` (2638),
@@ -753,7 +756,7 @@ tree; the status column names the test or symbol that enforces it.
 |D5|Split ServerHello on the final filter credit is discarded; Direct missed|low|apply the pending record before the budget-0 early return|fixed (`split_server_hello_on_the_last_filter_credit_still_enables_direct`)|
 |D6|Complete oversized ServerHello still reaches `apply_server_hello`|low|hoist the size check above the complete-record branch|fixed (`complete_oversized_server_hello_cannot_enable_direct`)|
 |D7|`insert` drops the in-flight count before the capacity check|low (advisory bound)|release only after a successful or duplicate verdict|fixed (`failed_replay_insert_keeps_the_in_flight_bound`)|
-|D8|Documentation/observability gaps (see below)|low|see below|fixed (docs/log fields); D8e's abort/panic teardown remains open|
+|D8|Documentation/observability gaps (see below)|low|see below|fixed (docs/log fields, `MuxTeardown`)|
 
 D8 sub-items, all verified, with the status of each fix:
 
@@ -775,9 +778,10 @@ D8 sub-items, all verified, with the status of each fix:
   without a new counter: `preauth` is released only after the cover permit is
   held (`forward_to_cover`, `cover_forward_releases_the_preauth_permit_on_failure`).
 - **e.** Mux teardown is return-path only (machine 14, STRESS-FINDINGS 10).
-  **Partially fixed:** the reply-task, writer, and sender joins now share one
-  `SHUTDOWN_TIMEOUT` instead of summing to three. An aborted or panicking
-  handler still performs no teardown; that remains open.
+  **Fixed:** the reply-task, writer, and sender joins now share one
+  `SHUTDOWN_TIMEOUT` instead of summing to three, and `MuxTeardown` releases
+  every session, retained socket, and permit when the handler is cancelled or
+  panics (`aborting_the_mux_handler_releases_sessions_and_permits`).
 - **f.** `copy_bidirectional`, `TlsStream::into_raw`, `VisionStream::into_raw`,
   and `direct_watch` have no production caller; the live path is
   `copy_one_way` + cloned sockets + the two gated watches. **Fixed:** each
@@ -805,8 +809,8 @@ D8 sub-items, all verified, with the status of each fix:
 5. **Timer comments now match the code.** The empty-mux timer
    (`session_idle_timeout`, ≤60 s) is effective, and the 24 h read backstop is
    now armed once outside the `select!` loop (D1), so both may be cited. The
-   teardown budget is a single `SHUTDOWN_TIMEOUT`; the abort/panic gap under
-   D8e is still open.
+   teardown budget is a single `SHUTDOWN_TIMEOUT` and `MuxTeardown` covers the
+   abort and panic paths.
 6. **Client state has no bounded "working" transition.** Linux can stay busy
    forever on a hung helper; Windows blocks its UI thread for up to 10 s on stop.
 7. **Dead handoff APIs are a reading trap.** Four production-dead primitives sit
