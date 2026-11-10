@@ -211,13 +211,19 @@ impl ReplayCache {
     /// authenticated sessions from one ClientHello. A full cache also returns
     /// `false` instead of evicting a live entry: evicting the oldest id would
     /// reopen its replay window while its timestamp is still acceptable.
+    ///
+    /// A rejected insert leaves `in_flight` alone: the caller still holds its
+    /// `ReplayReservation`, whose `Drop` releases exactly the one count that
+    /// connection reserved. Removing the count before the rejection check
+    /// would discard other live copies' reservations and let new copies
+    /// reserve past `REPLAY_MAX_IN_FLIGHT_PER_ID`.
     fn insert(&mut self, id: [u8; 32]) -> bool {
-        self.in_flight.remove(&id);
         let now = Instant::now();
         self.expire(now);
         if self.entries.contains_key(&id) || self.entries.len() >= self.capacity {
             return false;
         }
+        self.in_flight.remove(&id);
         self.entries.insert(id, now);
         self.order.push_back(id);
         true
@@ -257,6 +263,9 @@ const RELAY_BUFFER_LEN: usize = 16_384 + 256 + 5;
 pub enum ConnectionOutcome {
     /// The connection was not authenticated and was forwarded to the cover.
     CoverForwarded,
+    /// The peer closed or sent nothing before a plausible ClientHello.
+    /// No cover connection was dialed.
+    ClosedBeforeHello,
     /// The connection was not authenticated and was closed because the cover
     /// concurrency limit was reached.
     CoverLimited,
@@ -802,10 +811,12 @@ pub async fn handle_connection(
 
 /// Handles one accepted TCP connection.
 ///
-/// `preauth` is held only until the ClientHello is classified. An
-/// authenticated connection then acquires a separate connection permit; an
-/// unauthenticated probe releases the pre-auth permit before it is forwarded
-/// to the cover, whose own concurrency cap bounds it.
+/// `preauth` is held until the ClientHello is classified *and* the next permit
+/// is acquired: an authenticated connection takes a connection permit first, an
+/// unauthenticated probe takes the cover permit before releasing `preauth`, and
+/// a probe that closed before sending anything releases it without a dial. The
+/// drain loop can therefore never observe the pre-auth count at zero while a
+/// cover relay is about to start.
 pub async fn handle_connection_admitted(
     mut stream: TcpStream,
     config: Arc<TlsServerConfig>,
@@ -815,11 +826,11 @@ pub async fn handle_connection_admitted(
     let (record, wire) = match read {
         ClientHelloRead::Complete { record, wire } => (record, wire),
         ClientHelloRead::Forward(prefix) => {
-            drop(preauth);
             if prefix.is_empty() {
-                return Ok(ConnectionOutcome::CoverForwarded);
+                drop(preauth);
+                return Ok(ConnectionOutcome::ClosedBeforeHello);
             }
-            return forward_to_cover(stream, &prefix, &config).await;
+            return forward_to_cover(stream, &prefix, preauth, &config).await;
         }
     };
     let auth = match ClientHello::parse(&record) {
@@ -855,10 +866,7 @@ pub async fn handle_connection_admitted(
             drop(preauth);
             handle_authenticated(stream, record, auth, &config, permit, reservation).await
         }
-        None => {
-            drop(preauth);
-            forward_to_cover(stream, &wire, &config).await
-        }
+        None => forward_to_cover(stream, &wire, preauth, &config).await,
     }
 }
 
@@ -871,6 +879,10 @@ enum ClientHelloRead {
     /// The peer did not send a plausible, complete ClientHello. Forward the
     /// bytes already read (possibly only the five-byte header) to the cover,
     /// then relay the rest byte-for-byte.
+    ///
+    /// The prefix may be empty, which means the peer closed or sent nothing
+    /// before a plausible ClientHello; the caller then returns
+    /// [`ConnectionOutcome::ClosedBeforeHello`] without dialing the cover.
     Forward(Vec<u8>),
 }
 
@@ -1426,6 +1438,7 @@ fn vision_seed() -> u64 {
 async fn forward_to_cover(
     client: TcpStream,
     record: &[u8],
+    preauth: Option<IpPermit>,
     config: &TlsServerConfig,
 ) -> Result<ConnectionOutcome, TlsServerError> {
     // Fail fast rather than queueing an unbounded number of cover relays in
@@ -1441,6 +1454,11 @@ async fn forward_to_cover(
             return Ok(ConnectionOutcome::CoverLimited);
         }
     };
+    // Keep pre-auth until the cover permit is held: on this path the cover
+    // permit is held through the dial and relay, so the shutdown drain cannot
+    // observe pre-auth released with no cover relay in flight. The rejection
+    // arm above starts no relay and drops pre-auth on return.
+    drop(preauth);
 
     let mut cover = dial(&config.cover, cover_timeout(config.handshake_timeout)).await?;
     timeout(
@@ -2126,8 +2144,9 @@ fn join_error(error: tokio::task::JoinError) -> TlsServerError {
 /// dropping it detaches the task. The guard therefore publishes a cooperative
 /// stop flag before the handle is lost; the shared eventfd wakes a blocked
 /// relay immediately, with the older 250 ms check as a fallback when the
-/// descriptor cannot be created. A successful branch disarms the guard so the
-/// other direction can continue normally.
+/// descriptor cannot be created. Both directions disarm before returning. When
+/// one direction fails, `try_join!` drops the other future while its guard is
+/// still armed, and that drop stops the shared activity.
 struct RelayStopGuard<'a> {
     activity: &'a RelayActivity,
     armed: bool,
@@ -2652,6 +2671,28 @@ mod tests {
         assert!(!cache.try_reserve(id));
     }
 
+    #[test]
+    fn failed_replay_insert_keeps_the_in_flight_bound() {
+        let mut cache = ReplayCache::with_capacity(Duration::from_secs(60), 1);
+        assert!(cache.insert([1; 32]));
+        assert!(cache.try_reserve([9; 32]));
+        assert!(!cache.insert([9; 32]), "a full cache must reject");
+        assert_eq!(
+            cache.in_flight.get(&[9; 32]),
+            Some(&1),
+            "a rejected insert must not erase another copy's reservation"
+        );
+        for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID - 1 {
+            assert!(cache.try_reserve([9; 32]));
+        }
+        assert!(
+            !cache.try_reserve([9; 32]),
+            "the fifth copy must be rejected"
+        );
+        assert!(!cache.insert([1; 32]), "a settled id must still reject");
+        assert_eq!(cache.entries.len(), 1);
+    }
+
     #[tokio::test]
     async fn bidirectional_relay_keeps_a_one_way_transfer_alive() {
         let (left, mut left_peer) = tokio::io::duplex(1024);
@@ -2706,7 +2747,8 @@ mod tests {
                 .expect("client connect")
         });
         let (client, _) = front_listener.accept().await.expect("front accept");
-        let proxy = tokio::spawn(async move { forward_to_cover(client, b"hello", &config).await });
+        let proxy =
+            tokio::spawn(async move { forward_to_cover(client, b"hello", None, &config).await });
         let mut peer = connect.await.expect("connect task");
 
         let mut response = [0u8; 5];
@@ -2757,7 +2799,8 @@ mod tests {
                 .expect("client connect")
         });
         let (client, _) = front_listener.accept().await.expect("front accept");
-        let proxy = tokio::spawn(async move { forward_to_cover(client, b"hello", &config).await });
+        let proxy =
+            tokio::spawn(async move { forward_to_cover(client, b"hello", None, &config).await });
         let mut peer = connect.await.expect("connect task");
 
         // The probe disconnects without waiting for a cover reply. This is
@@ -2804,7 +2847,8 @@ mod tests {
                 .expect("client connect")
         });
         let (client, _) = front_listener.accept().await.expect("front accept");
-        let proxy = tokio::spawn(async move { forward_to_cover(client, b"hello", &config).await });
+        let proxy =
+            tokio::spawn(async move { forward_to_cover(client, b"hello", None, &config).await });
         let mut peer = connect.await.expect("connect task");
 
         // The client stays open; only the cover closes.
@@ -2815,6 +2859,90 @@ mod tests {
         assert!(matches!(outcome, Ok(ConnectionOutcome::CoverForwarded)));
         peer.shutdown().await.expect("peer shutdown");
         cover_task.await.expect("cover task");
+    }
+
+    #[tokio::test]
+    async fn empty_probe_reports_closed_before_hello() {
+        let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("front listener");
+        let front_port = front_listener.local_addr().expect("front address").port();
+        let connect = tokio::spawn(async move {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("client connect")
+        });
+        let (server, _) = front_listener.accept().await.expect("front accept");
+        // Drop the peer without writing anything: the next read returns EOF
+        // before a single plausible ClientHello byte arrives.
+        let peer = connect.await.expect("connect task");
+        drop(peer);
+
+        let config = Arc::new(test_config());
+        let before = config.cover_limiter.available_permits();
+        let outcome = timeout(
+            Duration::from_secs(2),
+            handle_connection_admitted(server, Arc::clone(&config), None),
+        )
+        .await
+        .expect("handler timed out")
+        .expect("handler failed");
+        assert_eq!(outcome, ConnectionOutcome::ClosedBeforeHello);
+        assert_eq!(
+            config.cover_limiter.available_permits(),
+            before,
+            "an empty probe must not dial the cover"
+        );
+    }
+
+    #[tokio::test]
+    async fn cover_forward_releases_the_preauth_permit_on_failure() {
+        let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("front listener");
+        let front_port = front_listener.local_addr().expect("front address").port();
+        let connect = tokio::spawn(async move {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("client connect")
+        });
+        let (client, _) = front_listener.accept().await.expect("front accept");
+        let _peer = connect.await.expect("connect task");
+
+        // A bound but unlistening socket refuses the dial immediately and
+        // cannot be taken over by another process while the test runs.
+        let closed_cover = TcpSocket::new_v4().expect("cover socket");
+        closed_cover
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("cover bind");
+        let mut config = test_config();
+        config.cover = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: closed_cover.local_addr().expect("cover address").port(),
+        };
+
+        let preauth_limiter = Arc::new(IpLimiter::new(4, 4));
+        let permit = preauth_limiter
+            .try_acquire(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("preauth permit");
+        assert_eq!(preauth_limiter.available_permits(), 3);
+        let result = timeout(
+            Duration::from_secs(2),
+            forward_to_cover(client, b"hello", Some(permit), &config),
+        )
+        .await
+        .expect("cover forward did not finish");
+        assert!(
+            result.is_err(),
+            "an unlistening cover port must fail the dial"
+        );
+        assert_eq!(
+            preauth_limiter.available_permits(),
+            4,
+            "the pre-auth permit must be released after the failed cover dial"
+        );
+        assert_eq!(config.cover_inflight(), 0);
+        drop(closed_cover);
     }
 
     #[tokio::test]

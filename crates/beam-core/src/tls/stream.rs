@@ -214,6 +214,10 @@ impl TlsStream {
     }
 
     /// Consumes the stream and returns the raw socket plus ordered prefixes.
+    ///
+    /// Called only by the test suite and `VisionStream::into_raw`. The
+    /// production Vision relay clones the raw sockets and uses `copy_one_way`;
+    /// the non-Vision TCP relay stays on the async `copy_direction` path.
     pub fn into_raw(mut self) -> Result<RawTls, TlsStreamError> {
         if !self.read_raw || !self.write_raw {
             return Err(TlsStreamError::RawNotEnabled);
