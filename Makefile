@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 CACHE_DIR ?= $(HOME)/.cache/beam
 
-.PHONY: help doctor check fmt clippy test build verify smoke acceptance fuzz-smoke stress bench-cache
+.PHONY: help doctor check fmt clippy test build verify smoke acceptance fuzz-smoke stress soak bench-cache
 
 help:
 	@printf '%s\n' \
@@ -12,6 +12,7 @@ help:
 	  'make acceptance  verify + smoke' \
 	  'make fuzz-smoke  short fuzz run with corpus cache' \
 	  'make stress      loopback pre-auth and cover stability probes' \
+	  'make soak        five-hour local data-path soak (SOAK_SECONDS to override)' \
 	  'make bench-cache benchmark into ~/.cache/beam/bench-results'
 
 doctor:
@@ -65,6 +66,9 @@ fuzz-smoke:
 stress: build
 	python3 tests/stress/loopback.py --beam target/release/beam \
 	  --out "$(CACHE_DIR)/stress-results/$$(date -u +%Y%m%dT%H%M%SZ)"
+
+soak: build
+	XRAY_BIN="$${XRAY_BIN:-xray}" python3 bench/soak.py
 
 bench-cache:
 	bash bench/run.sh --out "$(CACHE_DIR)/bench-results/$$(date -u +%Y%m%dT%H%M%SZ)"

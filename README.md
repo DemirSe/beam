@@ -57,9 +57,10 @@ The later IPv4-only client-profile and production-drop-in changes are
 client/deployment artifacts; they are not part of the deployed server binary.
 The process-wide resolver changes remain reverted after intermittent client DNS
 failures (`64d9856`); resolution is bounded to four concurrent lookups per mux.
-The RC is cut with these known gaps; the 24 h soak, privileged
-syscall/wakeup/splice measurements, cgroup OOM sampling, and final fuzzing
-are required for stable and were not completed for this tag.
+The RC is cut with these known gaps; the five-hour soak is now the default
+release gate and completed cleanly on 2026-11-10, while privileged
+syscall/wakeup/splice measurements and cgroup OOM sampling remain required for
+stable.
 
 ## Where to look
 
@@ -842,6 +843,7 @@ bash bench/run.sh --quick --reps 1    # smoke
 bash bench/run.sh --arms beam         # one arm
 bash bench/no-tun.sh                  # server-capacity smoke
 bash bench/churn.sh                   # connection-churn smoke
+make soak                             # five-hour local data-path soak
 make bench-cache                      # results under ~/.cache/beam/bench-results
 ```
 
@@ -962,9 +964,11 @@ specific scenario before using a number in a new release note.
 | 2026-11-06 | `647623b` | lab | captured ClientHello replay burst | 905/1024 established before fix; 12/1024 after |
 | 2026-11-06 | `2469971` | lab, clean | three-VM functional matrix | 11/11 PASS |
 | 2026-11-06 | `2469971` | production, local TUN | HTTPS through H2 | HTTP 200; 0.096–0.104 s |
+| 2026-11-10 | `9d67ebc` | local no-TUN | five-hour data-path soak | 181,677 downloads, 0 errors, 19 stress rounds PASS, fds 10, threads 9, RSS 8.5→23.3 MiB |
 
 The BBR value is from a virtual 1 Gbps lab link, not a 5G guarantee. The soak
-is short; the 24 h soak and privileged syscall/wakeup/splice gates remain open.
+default is five hours (completed 2026-11-10); privileged syscall/wakeup/splice
+gates remain open.
 The low-rate UDP A/B is provisional: the current arm ran at 3700.1 MHz versus
 the baseline's 3600 MHz with two repetitions. Its +1.99% throughput /
 -1.10% CPU delta is frequency-confounded and is not regression-freedom
@@ -1024,10 +1028,12 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   `/etc/beam/config.toml.bak-*` recovery backups. Existing Android/Windows
   profiles and any stock-Xray configuration are operator-managed outside this
   repository rollout.
-- A clean 24-hour mixed soak, privileged syscall/wakeup/splice gates, cgroup
-  socket-memory/OOM sampling, and a final fuzz run of the multi-record
-  ClientHello assembler remain required for stable promotion; they were not
-  completed for `v0.1.0-rc.1`.
+- A clean five-hour mixed soak is the release default (the 2026-11-10 run had
+  181,677 downloads with zero errors, stable fds/threads, and 19 stress
+  rounds). Privileged syscall/wakeup/splice gates, cgroup socket-memory/OOM
+  sampling, and a final fuzz run of the multi-record ClientHello assembler
+  remain required for stable promotion; they were not completed for
+  `v0.1.0-rc.1`.
 - Fully framed HTTPS uploads stay on the async path; early Direct acceleration
   requires the client to send Direct before the body (for example
   `Expect: 100-continue`). This is a performance gap, not a correctness defect.

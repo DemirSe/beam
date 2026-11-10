@@ -16,9 +16,10 @@ IPv6 disabled (`all/default/lo.disable_ipv6=1`), zero IPv6
 addresses/routes/listeners, and `sshd` `AddressFamily inet`; the lab is stopped
 after the 11/11 checks.
 The annotated `v0.1.0-rc.1` tag is the current source release candidate.
-Stable promotion remains blocked on the 24 h soak, privileged
-syscall/wakeup/splice measurements, cgroup OOM sampling, and final fuzzing;
-findings 10/12 remain open known gaps.
+Stable promotion remains blocked on privileged syscall/wakeup/splice
+measurements and cgroup OOM sampling; the five-hour soak is now the default
+release gate and passed on 2026-11-10, and the short fuzz campaign was clean.
+Findings 10/12 remain open known gaps.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 
@@ -403,7 +404,9 @@ Hosted paired cells were valid with no loss/p99 regression; a five-repetition
 beam-vs-beam HTTPS cell measured 0.9988. Perf tracepoints are unavailable on
 the hosted runner, so only `server_s` and local privileged counters were used;
 splice counters attach after the blocking threads spawn, so they are not
-reported. The upload-side chunk copy and the 24 h soak remain open.
+reported. The upload-side chunk copy remains open. The five-hour soak is the
+default release gate: the 2026-11-10 run completed 181,677 downloads with zero
+errors, 19 stress rounds, and stable fds/threads.
 
 ## Non-findings
 
@@ -435,9 +438,10 @@ reported. The upload-side chunk copy and the 24 h soak remain open.
    first-wins completion, five-minute timestamp window, and a 300 s cache at
    that time; current retention is 601 s.
 6. ~~Short-GlobalID lifecycle accounting (9).~~ Done 2026-11-08.
-7. Complete the post-v0.1.0-rc.1 stable-validation backlog: 24 h soak,
-   privileged syscall/wakeup/splice measurements, cgroup OOM sampling, and
-   final fuzzing.
+7. Complete the post-v0.1.0-rc.1 stable-validation backlog: five-hour soak
+   (default; passed 2026-11-10), privileged syscall/wakeup/splice
+   measurements, and cgroup OOM sampling. The short fuzz campaign is clean;
+   exhaustive fuzzing is not claimed.
 8. Test the external BBR Linux gateway path for finding 12 under the same loss
    matrix while keeping TCP/443 + `whatsapp.net` on the WAN side.
 9. If 8 does not hold, quantify custom-client pacing/queue only; treat
