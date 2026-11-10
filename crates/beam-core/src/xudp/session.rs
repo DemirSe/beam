@@ -849,10 +849,16 @@ impl Session {
     }
 
     /// Returns how long the session has been idle at `now`.
+    ///
+    /// The subtraction saturates: a `touch` that lands after a caller captured
+    /// `now` makes the last activity newer than the snapshot, which reads as
+    /// zero idle time instead of an enormous wrapped duration. Such a touch
+    /// delays expiry by at most one sweep; it can never make `take_idle`
+    /// select a session that was active at the snapshot.
     pub(crate) fn idle_for(&self, now: Instant) -> Duration {
         let now_ms = now.saturating_duration_since(epoch()).as_millis() as u64;
         let last = self.last_activity_ms.load(Ordering::Acquire);
-        Duration::from_millis(now_ms.wrapping_sub(last))
+        Duration::from_millis(now_ms.saturating_sub(last))
     }
 
     /// Returns the last destination used for a datagram.
@@ -919,6 +925,14 @@ pub(crate) struct ExpiringSession {
     pub(crate) expires_at: Instant,
     /// Global session slot held while the socket is retained.
     pub(crate) permit: Option<OwnedSemaphorePermit>,
+}
+
+/// Result of looking up a retained GlobalID socket.
+pub(crate) enum RetainedLookup {
+    /// Still within `close_expiry`; the caller may reattach it.
+    Live(ExpiringSession),
+    /// Past `close_expiry`; the entry was removed and its permit released.
+    Expired,
 }
 
 /// Per-mux-stream session table.
@@ -991,11 +1005,22 @@ impl SessionTable {
     }
 
     /// Removes a retained GlobalID socket for reattachment.
+    ///
+    /// An entry at or past its deadline is dropped (releasing its permit) and
+    /// reported as [`RetainedLookup::Expired`], so a `New` can never reattach
+    /// a socket the sweep would have expired. The boundary matches
+    /// [`Self::expire_retained`], which keeps only `expires_at > now`.
     pub(crate) fn take_expiring(
         &mut self,
         global_id: [u8; GLOBAL_ID_LEN],
-    ) -> Option<ExpiringSession> {
-        self.expiring.remove(&global_id)
+        now: Instant,
+    ) -> Option<RetainedLookup> {
+        let entry = self.expiring.remove(&global_id)?;
+        if now >= entry.expires_at {
+            Some(RetainedLookup::Expired)
+        } else {
+            Some(RetainedLookup::Live(entry))
+        }
     }
 
     /// Retains a closed GlobalID socket, returning any previous entry.
@@ -1389,7 +1414,7 @@ mod tests {
     use super::{
         DEFAULT_MAX_GLOBAL_SESSIONS, DEFAULT_RESOLUTION_QUEUE_BUDGET, DEFAULT_STREAM_REPLY_BUDGET,
         ExpiringSession, ReplyQueueBudget, ResolveError, Session, SessionTable, SocketFamily,
-        XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame, now_ms,
+        XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
         queue_failed_session_end, reply_frame_len, reply_loop, resolve_destination,
         socket_addr_to_location,
     };
@@ -1444,9 +1469,13 @@ mod tests {
             address,
             None,
         ));
-        session
-            .last_activity_ms
-            .store(now_ms().wrapping_sub(5000), Ordering::Release);
+        // Measure the untouched clock instead of backdating it: a backdated
+        // value can land in the future during the first seconds after the
+        // process epoch starts, which the saturating idle comparison reads as
+        // zero and would hide a refresh. The equality assertions below still
+        // fail if a dropped reply calls `touch`.
+        let untouched = session.last_activity_ms.load(Ordering::Acquire);
+        tokio::time::sleep(Duration::from_millis(2)).await;
 
         let config = Arc::new(XudpConfig {
             max_datagram_size: 64,
@@ -1471,9 +1500,10 @@ mod tests {
             .await
             .expect("zero-length send");
         wait_for_reply_drops(&limiter, 1).await;
-        assert!(
-            session.idle_for(Instant::now()) >= Duration::from_secs(4),
-            "zero-length junk refreshed the idle clock"
+        assert_eq!(
+            session.last_activity_ms.load(Ordering::Acquire),
+            untouched,
+            "a zero-length junk reply refreshed the idle clock"
         );
 
         let oversize = [0_u8; 65];
@@ -1482,9 +1512,10 @@ mod tests {
             .await
             .expect("oversize send");
         wait_for_reply_drops(&limiter, 2).await;
-        assert!(
-            session.idle_for(Instant::now()) >= Duration::from_secs(4),
-            "oversize junk refreshed the idle clock"
+        assert_eq!(
+            session.last_activity_ms.load(Ordering::Acquire),
+            untouched,
+            "an oversize junk reply refreshed the idle clock"
         );
 
         sender.send_to(b"ok", address).await.expect("valid send");
@@ -1499,12 +1530,98 @@ mod tests {
         assert_eq!(used, encoded.len());
         assert_eq!(frame.payload, b"ok");
         assert!(
+            session.last_activity_ms.load(Ordering::Acquire) > untouched,
+            "an accepted reply must refresh the idle clock"
+        );
+        assert!(
             session.idle_for(Instant::now()) < Duration::from_secs(1),
             "accepted reply must refresh the idle clock"
         );
 
         session.stop();
         let _ = timeout(Duration::from_secs(1), task).await;
+    }
+
+    #[tokio::test]
+    async fn idle_clock_never_wraps_after_a_concurrent_touch() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let address = socket.local_addr().expect("test address");
+        let session = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            None,
+        ));
+        // `Session::new` initializes the process epoch. Age it by more than a
+        // millisecond so the stale snapshot is observably older than the touch
+        // even when this test is the first `now_ms` caller; otherwise both
+        // millisecond values are 0 and the old wrapping subtraction
+        // coincidentally yields 0, hiding the regression.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        session.touch();
+
+        // The snapshot predates the touch, as the sweep's pre-lock `now` does.
+        let snapshot = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            session.idle_for(snapshot),
+            Duration::ZERO,
+            "a touch after the snapshot must saturate to zero idle"
+        );
+
+        let mut table = SessionTable::default();
+        table.insert(super::ActiveSession {
+            session,
+            reply_task: None,
+        });
+        let idle = table.take_idle(snapshot, Duration::from_secs(60));
+        assert!(
+            idle.is_empty(),
+            "a session touched after the sweep snapshot must not be selected"
+        );
+        assert_eq!(table.total(), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_socket_is_not_reattached_after_expiry() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let limiter = XudpSessionLimiter::new(1);
+        let permit = limiter.try_acquire().expect("global session permit");
+        assert_eq!(limiter.stats().available, 0);
+        let now = tokio::time::Instant::now();
+        let mut table = SessionTable::default();
+
+        table.insert_expiring(
+            [9; 8],
+            ExpiringSession {
+                socket: Arc::clone(&socket),
+                family: SocketFamily::V4,
+                expires_at: now,
+                permit: Some(permit),
+            },
+        );
+        // The deadline itself is expired, matching `expire_retained`.
+        let expired = table.take_expiring([9; 8], now);
+        assert!(matches!(expired, Some(super::RetainedLookup::Expired)));
+        assert!(table.retained_len() == 0);
+        assert_eq!(
+            limiter.stats().available,
+            1,
+            "an expired retained socket must release its global permit"
+        );
+
+        table.insert_expiring(
+            [9; 8],
+            ExpiringSession {
+                socket,
+                family: SocketFamily::V4,
+                expires_at: now + Duration::from_secs(60),
+                permit: None,
+            },
+        );
+        let live = table.take_expiring([9; 8], now + Duration::from_millis(1));
+        assert!(matches!(live, Some(super::RetainedLookup::Live(_))));
     }
 
     #[test]
@@ -1841,7 +1958,10 @@ mod tests {
         };
         table.insert_expiring([7; 8], entry);
         assert_eq!(table.total(), 2);
-        assert!(table.take_expiring([7; 8]).is_some());
+        assert!(matches!(
+            table.take_expiring([7; 8], tokio::time::Instant::now()),
+            Some(super::RetainedLookup::Live(_))
+        ));
         assert_eq!(table.total(), 1);
     }
 

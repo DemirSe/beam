@@ -27,13 +27,13 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{Semaphore, mpsc, watch};
-use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
 
 use super::session::{
     ActiveSession, DEFAULT_STREAM_REPLY_BUDGET, ExpiringSession, QueuedFrame, ReplyQueueBudget,
-    ResolveError, Session, SessionTable, SlotGuard, SocketFamily, XudpConfig, XudpConfigError,
-    XudpSessionLimiter, encode_end_frame, resolve_destination, socket_addr_to_location,
-    spawn_reply_task,
+    ResolveError, RetainedLookup, Session, SessionTable, SlotGuard, SocketFamily, XudpConfig,
+    XudpConfigError, XudpSessionLimiter, encode_end_frame, resolve_destination,
+    socket_addr_to_location, spawn_reply_task,
 };
 use crate::address::{Address, NetLocation};
 use crate::metrics::Metrics;
@@ -70,7 +70,11 @@ const MAX_CONCURRENT_RESOLUTIONS: usize = 4;
 /// indefinitely; this bound is a deliberate resource-safety deviation.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Bound on waiting for tasks to stop during stream shutdown.
+/// Bound on the whole stream teardown.
+///
+/// The reply-task joins and the writer/sender joins share one deadline, so a
+/// broken task cannot multiply the shutdown budget. Timed-out tasks are
+/// aborted without waiting for their cancellation to complete.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Bound on a send that could not be completed immediately.
@@ -81,8 +85,10 @@ const SEND_QUEUE_CAPACITY: usize = 128;
 
 /// One datagram waiting for a congested session socket.
 struct OutboundDatagram {
-    session_id: u16,
-    socket: Arc<UdpSocket>,
+    /// The session that queued the datagram. A failure must not be reported by
+    /// id alone: the client can end a session and reuse its 16-bit id while the
+    /// datagram is still queued.
+    session: Arc<Session>,
     destination: SocketAddr,
     payload: Vec<u8>,
 }
@@ -681,10 +687,15 @@ where
     }
 
     drop(state);
-    if timeout(SHUTDOWN_TIMEOUT, &mut writer_task).await.is_err() {
+    // The writer and sender reuse the reply-join deadline, so the whole
+    // teardown is bounded by one `SHUTDOWN_TIMEOUT` instead of one per task.
+    // A timed-out task is aborted without awaiting its cancellation.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if timeout(remaining, &mut writer_task).await.is_err() {
         writer_task.abort();
     }
-    if timeout(SHUTDOWN_TIMEOUT, &mut send_task).await.is_err() {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if timeout(remaining, &mut send_task).await.is_err() {
         send_task.abort();
     }
 
@@ -796,7 +807,7 @@ async fn read_loop<R>(
     reader: &mut R,
     state: &MuxState,
     writer_failed: &mut watch::Receiver<bool>,
-    send_failed: &mut mpsc::Receiver<u16>,
+    send_failed: &mut mpsc::Receiver<Arc<Session>>,
 ) -> Result<(), MuxError>
 where
     R: AsyncRead + Unpin,
@@ -809,6 +820,11 @@ where
     sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // The first interval tick is immediate; use the first real sweep later.
     sweep.tick().await;
+
+    // Arm the read backstop once. Rebuilding it per `select!` iteration would
+    // let any ready branch (the sweep tick, in particular) restart the window.
+    let read_deadline = sleep(STREAM_IDLE_TIMEOUT);
+    tokio::pin!(read_deadline);
 
     loop {
         // Consume every complete frame before waiting for more input. This
@@ -940,12 +956,8 @@ where
                 let _ = changed;
                 return Err(MuxError::WriterClosed);
             }
-            Some(id) = send_failed.recv() => {
-                if state.session(id).is_some() {
-                    state.close_with_error(id).await?;
-                } else {
-                    state.try_send_end(id, true);
-                }
+            Some(session) = send_failed.recv() => {
+                state.close_if_same(&session).await?;
             }
             resolved = resolutions.results.recv() => {
                 let Some(result) = resolved else {
@@ -980,15 +992,15 @@ where
                     }
                 }
             }
-            received = timeout(STREAM_IDLE_TIMEOUT, reader.read(&mut chunk)) => {
+            _ = &mut read_deadline => {
+                return Err(MuxError::Timeout {
+                    stage: "mux stream read",
+                });
+            }
+            received = reader.read(&mut chunk) => {
                 match received {
-                    Err(_) => {
-                        return Err(MuxError::Timeout {
-                            stage: "mux stream read",
-                        });
-                    }
-                    Ok(Err(error)) => return Err(MuxError::Io(error)),
-                    Ok(Ok(0)) => {
+                    Err(error) => return Err(MuxError::Io(error)),
+                    Ok(0) => {
                         return if buffer.is_empty() {
                             Ok(())
                         } else {
@@ -997,7 +1009,12 @@ where
                             })
                         };
                     }
-                    Ok(Ok(count)) => {
+                    Ok(count) => {
+                        // Only bytes from the peer extend the window; timer,
+                        // resolution, and failure branches must not.
+                        read_deadline
+                            .as_mut()
+                            .reset(Instant::now() + STREAM_IDLE_TIMEOUT);
                         if buffer.len().saturating_add(count) > MAX_BUFFERED_LEN {
                             return Err(MuxError::FrameTooLarge {
                                 buffered: buffer.len() + count,
@@ -1025,10 +1042,10 @@ async fn send_loop(
     mut inbound: mpsc::Receiver<OutboundDatagram>,
     inflight: Arc<AtomicUsize>,
     metrics: Arc<Metrics>,
-    failures: mpsc::Sender<u16>,
+    failures: mpsc::Sender<Arc<Session>>,
 ) {
     while let Some(datagram) = inbound.recv().await {
-        let socket = &datagram.socket;
+        let socket = &datagram.session.socket;
         let result = match socket.try_send_to(&datagram.payload, datagram.destination) {
             Ok(_) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1061,7 +1078,7 @@ async fn send_loop(
             metrics.record_xudp_send_dropped();
         }
         if fatal {
-            let _ = failures.send(datagram.session_id).await;
+            let _ = failures.send(Arc::clone(&datagram.session)).await;
         }
         inflight.fetch_sub(1, Ordering::AcqRel);
     }
@@ -1071,8 +1088,7 @@ impl MuxState {
     /// Sends a datagram now, or queues it without blocking the read loop.
     fn dispatch_datagram(
         &self,
-        session_id: u16,
-        socket: Arc<UdpSocket>,
+        session: &Arc<Session>,
         payload: &[u8],
         destination: SocketAddr,
     ) -> io::Result<()> {
@@ -1080,14 +1096,13 @@ impl MuxState {
         // every datagram through the allocation/channel path under sustained
         // load, which costs more than the UDP ordering that the fast path
         // could disturb (UDP does not guarantee ordering anyway).
-        match try_send_now(&socket, payload, destination) {
+        match try_send_now(&session.socket, payload, destination) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
             Err(error) => return Err(error),
         }
         let datagram = OutboundDatagram {
-            session_id,
-            socket,
+            session: Arc::clone(session),
             destination,
             payload: payload.to_vec(),
         };
@@ -1234,9 +1249,22 @@ impl MuxState {
         }
 
         // A clean close with a nonzero GlobalID retains its socket. Reattach
-        // when this New names the same identifier within the stream.
-        let retained =
-            global_id.and_then(|global_id| lock_table(&self.table).take_expiring(global_id));
+        // only while the retention deadline has not passed; `take_expiring`
+        // removes the entry either way and drops an expired entry (and its
+        // permit) before the slot is requested again. The deadline is sampled
+        // inside the lock so a descheduled caller cannot reattach an entry
+        // whose deadline passed while it waited.
+        let retained = match global_id.and_then(|global_id| {
+            let mut table = lock_table(&self.table);
+            table.take_expiring(global_id, Instant::now())
+        }) {
+            Some(RetainedLookup::Live(entry)) => Some(entry),
+            Some(RetainedLookup::Expired) => {
+                self.limiter.metrics().record_xudp_retained_expired(1);
+                None
+            }
+            None => None,
+        };
         let reattached = matches!(&retained, Some(entry) if entry.family == family);
         let (socket, permit) = match retained {
             Some(retained) if retained.family == family => (retained.socket, retained.permit),
@@ -1323,7 +1351,7 @@ impl MuxState {
         let session = Arc::new(Session::new(
             id, global_id, socket, family, resolved, permit,
         ));
-        let session_socket = Arc::clone(&session.socket);
+        let session_handle = Arc::clone(&session);
         let reply_task = spawn_reply_task(
             Arc::clone(&session),
             self.outbound.clone(),
@@ -1354,7 +1382,7 @@ impl MuxState {
 
         if parsed.option.has_data()
             && !parsed.payload.is_empty()
-            && let Err(error) = self.dispatch_datagram(id, session_socket, parsed.payload, resolved)
+            && let Err(error) = self.dispatch_datagram(&session_handle, parsed.payload, resolved)
         {
             tracing::debug!(
                 session_id = id,
@@ -1364,7 +1392,7 @@ impl MuxState {
             if reattached {
                 self.limiter.metrics().record_xudp_retained_discarded();
             }
-            return self.close_with_error(id).await;
+            return self.close_if_same(&session_handle).await;
         }
 
         Ok(())
@@ -1411,14 +1439,12 @@ impl MuxState {
             None => session.destination(),
         };
 
-        if let Err(error) =
-            self.dispatch_datagram(id, Arc::clone(&session.socket), parsed.payload, destination)
-        {
+        if let Err(error) = self.dispatch_datagram(&session, parsed.payload, destination) {
             tracing::debug!(session_id = id, %error, "XUDP relay send failed");
             if session.is_closed() {
                 Ok(())
             } else {
-                self.close_with_error(id).await
+                self.close_if_same(&session).await
             }
         } else {
             session.touch();
@@ -1575,6 +1601,20 @@ impl MuxState {
             self.close_active(active, CloseReason::RelayError).await
         } else {
             self.send_end(id, true).await
+        }
+    }
+
+    /// Closes the session only when it still owns its id.
+    ///
+    /// A queued datagram can fail after the client ended that session and
+    /// reused the 16-bit id. Reporting the failure by id alone would close, and
+    /// queue an error `End` for, an unrelated newer session; identity is the
+    /// `Arc<Session>` instance, so the guard is `take_if_same`.
+    async fn close_if_same(&self, session: &Arc<Session>) -> Result<(), MuxError> {
+        let taken = { lock_table(&self.table).take_if_same(session.id, session) };
+        match taken {
+            Some(active) => self.close_active(active, CloseReason::RelayError).await,
+            None => Ok(()),
         }
     }
 
@@ -1785,22 +1825,126 @@ mod tests {
                 .expect("socket"),
         );
         let destination = socket.local_addr().expect("local address");
+        let session = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            destination,
+            None,
+        ));
         state
             .send_tx
             .try_send(OutboundDatagram {
-                session_id: 1,
-                socket: Arc::clone(&socket),
+                session: Arc::clone(&session),
                 destination,
                 payload: vec![1],
             })
             .expect("prefill queue");
         let before = metrics.snapshot().xudp_send_dropped;
         state
-            .dispatch_datagram(1, Arc::clone(&socket), b"second", destination)
+            .dispatch_datagram(&session, b"second", destination)
             .expect("a full queue drops rather than fails the session");
         assert_eq!(metrics.snapshot().xudp_send_dropped, before + 1);
         assert_eq!(inflight.load(Ordering::Acquire), 1);
         assert!(send_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn stale_send_failure_does_not_close_the_replacement() {
+        let config = test_config();
+        let limiter = XudpSessionLimiter::default();
+        let metrics = limiter.metrics();
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let (outbound, mut outbound_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let state = MuxState {
+            config,
+            table: Arc::clone(&table),
+            outbound,
+            queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
+            limiter,
+            send_tx: test_send_sender(),
+            send_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        // Two distinct sessions share id 7, so an id-based close would hit the
+        // replacement instead of the session that reported the failure.
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let stale = Arc::new(Session::new(
+            7,
+            None,
+            Arc::new(
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .await
+                    .expect("stale session socket"),
+            ),
+            SocketFamily::V4,
+            destination,
+            None,
+        ));
+        let current = Arc::new(Session::new(
+            7,
+            None,
+            Arc::new(
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .await
+                    .expect("current session socket"),
+            ),
+            SocketFamily::V4,
+            destination,
+            None,
+        ));
+
+        table.lock().expect("table").insert(ActiveSession {
+            session: Arc::clone(&stale),
+            reply_task: None,
+        });
+        let replaced = table
+            .lock()
+            .expect("table")
+            .insert(ActiveSession {
+                session: Arc::clone(&current),
+                reply_task: None,
+            })
+            .expect("the reused id must replace the stale session");
+        drop(replaced);
+
+        state
+            .close_if_same(&stale)
+            .await
+            .expect("a stale failure is a no-op");
+        {
+            let table = table.lock().expect("table");
+            let entry = table.active(7).expect("the replacement must stay resident");
+            assert!(Arc::ptr_eq(&entry.session, &current));
+            assert_eq!(table.total(), 1);
+        }
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "a stale failure must not queue an End"
+        );
+        assert_eq!(metrics.snapshot().xudp_closed_error, 0);
+
+        state
+            .close_if_same(&current)
+            .await
+            .expect("the current owner closes");
+        assert!(table.lock().expect("table").active(7).is_none());
+        let queued = outbound_rx.try_recv().expect("exactly one error End");
+        let encoded = queued.encoded();
+        let (frame, used) = parse_frame(&encoded)
+            .expect("valid End")
+            .expect("complete End");
+        assert_eq!(used, encoded.len());
+        assert_eq!(frame.session_id, 7);
+        assert_eq!(frame.status, SessionStatus::End);
+        assert_eq!(frame.option, FrameOption::ERROR);
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "the close must queue exactly one End"
+        );
+        assert_eq!(metrics.snapshot().xudp_closed_error, 1);
     }
 
     #[tokio::test]
@@ -1842,13 +1986,22 @@ mod tests {
             send_inflight: Arc::clone(&inflight),
         };
         let socket = Arc::new(sender);
+        let session = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            destination,
+            None,
+        ));
         state
-            .dispatch_datagram(1, Arc::clone(&socket), b"queued", destination)
+            .dispatch_datagram(&session, b"queued", destination)
             .expect("a full send buffer queues instead of failing");
         assert_eq!(inflight.load(Ordering::Acquire), 1);
         let queued = send_rx.try_recv().expect("datagram is queued");
         assert_eq!(queued.destination, destination);
         assert_eq!(queued.payload, b"queued");
+        assert!(Arc::ptr_eq(&queued.session, &session));
     }
 
     #[tokio::test]
@@ -2443,6 +2596,55 @@ mod tests {
             .expect("keepalive-only mux stayed open while KeepAlive continued")
             .expect("mux handler panicked");
         assert!(result.is_ok(), "keepalive-only mux failed: {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mux_read_deadline_is_not_extended_by_sweeps() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let config = Arc::new(XudpConfig {
+            // Longer than the read backstop, so a session stays active and the
+            // empty-mux timer cannot close the stream first.
+            session_idle_timeout: Duration::from_secs(25 * 3600),
+            close_expiry: Duration::from_secs(5),
+            io_timeout: Duration::from_secs(2),
+            ..XudpConfig::default()
+        });
+        let limiter = XudpSessionLimiter::default();
+        let (mut client, task) = start_mux_with_limiter(config, limiter.clone());
+
+        // Empty payload: session 1 is created but no datagram is relayed, so
+        // only sweep ticks and the read deadline run.
+        write_frame(&mut client, new_spec(1, &destination, b"", None)).await;
+        // The handler is spawned but not yet polled, and `advance` moves the
+        // clock before yielding. Wait for admission so the pinned deadline is
+        // armed at 0 h and the New read cannot reset it at 23 h.
+        for _ in 0..64 {
+            if limiter.metrics().snapshot().xudp_admitted_fresh == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(limiter.metrics().snapshot().xudp_admitted_fresh, 1);
+
+        tokio::time::advance(Duration::from_secs(23 * 3600)).await;
+        assert!(
+            !task.is_finished(),
+            "23 h of peer silence must not close the mux"
+        );
+        tokio::time::advance(Duration::from_secs(2 * 3600)).await;
+        let result = timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the 24 h read deadline did not fire");
+        assert!(
+            matches!(
+                result,
+                Ok(Err(MuxError::Timeout {
+                    stage: "mux stream read"
+                }))
+            ),
+            "unexpected mux result: {result:?}"
+        );
     }
 
     #[tokio::test]
