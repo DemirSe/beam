@@ -2344,6 +2344,50 @@ mod tests {
         first_task.abort();
     }
 
+    #[tokio::test]
+    async fn aborting_the_mux_handler_releases_sessions_and_permits() {
+        // D8e: when the handler future is dropped (runtime shutdown, a
+        // cancelled task), nothing runs the teardown, so the reply tasks keep
+        // the sessions, their sockets, and their global permits alive.
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let limiter = XudpSessionLimiter::new(4);
+        let (mut client, task) = start_mux_with_limiter(test_config(), limiter.clone());
+
+        for id in 1..=3u16 {
+            write_frame(&mut client, new_spec(id, &destination, b"hello", None)).await;
+        }
+        for _ in 0..200 {
+            if limiter.stats().active >= 3 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        let admitted = limiter.stats();
+        assert_eq!(admitted.active, 3, "sessions did not admit: {admitted:?}");
+        assert_eq!(
+            admitted.available, 1,
+            "permits did not account: {admitted:?}"
+        );
+
+        task.abort();
+        let joined = task.await;
+        assert!(joined.is_err(), "the handler task must be cancelled");
+        // Let the aborted future finish dropping its locals.
+        sleep(Duration::from_millis(200)).await;
+
+        let after = limiter.stats();
+        assert_eq!(
+            after.active, 0,
+            "aborted mux left sessions registered: {after:?}"
+        );
+        assert_eq!(
+            after.available, 4,
+            "aborted mux leaked session permits: {after:?}"
+        );
+        drop(client);
+    }
+
     fn test_config() -> Arc<XudpConfig> {
         Arc::new(XudpConfig {
             session_idle_timeout: Duration::from_secs(30),

@@ -20,3 +20,6 @@ __pycache__/
 # Linux tray build artifacts
 /clients/linux-tray/beam-tray
 /clients/linux-tray/beam-helper
+
+# Editor and backup leftovers, never product code
+*.save
