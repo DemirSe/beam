@@ -535,8 +535,12 @@ phase gauge or empty-timer gauge.
 Closed. `closed` (first-close claim), `failed` (relay error), `stop` (task
 stop), table membership, and permit ownership all participate.
 
-**Transitions.** `New` create/reattach (`handle_new`, `1158`); `Keep`
-append/retarget or clean end for an unknown id; `End` remove; sweep removes idle
+**Transitions.** `New` create/reattach (`handle_new`, `1158`); `Keep` may append
+a non-empty Data datagram and update its destination after address/family
+validation. Empty and non-Data Keeps do not retarget the session or refresh
+session activity; address-less Keeps reuse the last destination accepted from
+`New` or a non-empty Data Keep. Domain destinations may still undergo resolution
+before this guard. `End` remove; sweep removes idle
 sessions (`1638-1683`); reply errors queue an error End. `close_active` is the shared
 close helper — claim → stop → fence enqueue → join ≤100 ms → End → maybe retain
 (`1496-1570`) — but it is not the only close path: reply errors go through

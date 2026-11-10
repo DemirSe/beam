@@ -2180,6 +2180,170 @@ mod tests {
         );
     }
 
+    /// UDP echo that prefixes every reply with `tag`, so a test can tell which
+    /// destination the server actually used. The task ends when the caller
+    /// aborts it.
+    async fn tagged_echo(tag: u8) -> (SocketAddr, JoinHandle<()>) {
+        let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("tagged echo");
+        let address = socket.local_addr().expect("echo address");
+        let task = tokio::spawn(async move {
+            let mut buffer = vec![0u8; MAX_PAYLOAD_LEN];
+            while let Ok((len, peer)) = socket.recv_from(&mut buffer).await {
+                let mut reply = Vec::with_capacity(len + 1);
+                reply.push(tag);
+                reply.extend_from_slice(&buffer[..len]);
+                let _ = socket.send_to(&reply, peer).await;
+            }
+        });
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn keep_destination_is_applied_when_the_payload_is_not_empty() {
+        let (first_addr, first_task) = tagged_echo(b'A').await;
+        let (second_addr, second_task) = tagged_echo(b'B').await;
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+        let (first_loc, second_loc) = (net_location(first_addr), net_location(second_addr));
+
+        write_frame(&mut client, new_spec(7, &first_loc, b"hello", None)).await;
+        let first = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("first reply");
+        assert_eq!(first.payload, b"Ahello", "session starts on A");
+
+        // A Data Keep with a destination retargets the session.
+        write_frame(&mut client, keep_spec(7, Some(&second_loc), b"x")).await;
+        let retargeted = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("retarget reply");
+        assert_eq!(retargeted.payload, b"Bx");
+
+        // Address-less Keeps reuse the destination the retarget accepted.
+        write_frame(&mut client, keep_spec(7, None, b"next")).await;
+        let second = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("second reply");
+        assert_eq!(second.payload, b"Bnext");
+
+        finish(client, task).await;
+        first_task.abort();
+        second_task.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_keep_does_not_retarget_the_session() {
+        let (first_addr, first_task) = tagged_echo(b'A').await;
+        let (second_addr, second_task) = tagged_echo(b'B').await;
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+        let (first_loc, second_loc) = (net_location(first_addr), net_location(second_addr));
+
+        write_frame(&mut client, new_spec(7, &first_loc, b"hello", None)).await;
+        let first = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("first reply");
+        assert_eq!(first.payload, b"Ahello", "session starts on A");
+
+        // Documented rule: a Data Keep with an empty payload is dropped and does
+        // not update the remembered destination.
+        write_frame(&mut client, keep_spec(7, Some(&second_loc), b"")).await;
+
+        write_frame(&mut client, keep_spec(7, None, b"next")).await;
+        let still_first = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("address-less reply");
+        assert_eq!(
+            still_first.payload, b"Anext",
+            "an empty Keep must not retarget the session"
+        );
+
+        // A later Data Keep with a payload still retargets it.
+        write_frame(&mut client, keep_spec(7, Some(&second_loc), b"x")).await;
+        let retargeted = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("retarget reply");
+        assert_eq!(retargeted.payload, b"Bx");
+
+        finish(client, task).await;
+        first_task.abort();
+        second_task.abort();
+    }
+
+    #[tokio::test]
+    async fn non_data_keep_does_not_retarget_the_session() {
+        let (first_addr, first_task) = tagged_echo(b'A').await;
+        let (second_addr, second_task) = tagged_echo(b'B').await;
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+        let (first_loc, second_loc) = (net_location(first_addr), net_location(second_addr));
+
+        write_frame(&mut client, new_spec(7, &first_loc, b"hello", None)).await;
+        let first = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("first reply");
+        assert_eq!(first.payload, b"Ahello");
+
+        // A control-only Keep (no Data option) carrying a destination updates
+        // nothing, matching the documented rule.
+        let control_only = FrameSpec {
+            session_id: 7,
+            status: SessionStatus::Keep,
+            option: FrameOption::new(0),
+            network: Some(TargetNetwork::Udp),
+            destination: Some(&second_loc),
+            global_id: None,
+            payload: b"",
+        };
+        write_frame(&mut client, control_only).await;
+
+        write_frame(&mut client, keep_spec(7, None, b"next")).await;
+        let still_first = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("address-less reply");
+        assert_eq!(
+            still_first.payload, b"Anext",
+            "a non-Data Keep must not retarget the session"
+        );
+
+        finish(client, task).await;
+        first_task.abort();
+        second_task.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_keep_with_an_unusable_family_keeps_the_session() {
+        let (first_addr, first_task) = tagged_echo(b'A').await;
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+        let first_loc = net_location(first_addr);
+        let ipv6_loc = NetLocation {
+            address: Address::Ipv6(Ipv6Addr::LOCALHOST),
+            port: first_addr.port(),
+        };
+
+        write_frame(&mut client, new_spec(7, &first_loc, b"hello", None)).await;
+        let first = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("first reply");
+        assert_eq!(first.payload, b"Ahello");
+
+        // The frame cannot be used by this V4 socket, but an empty payload means
+        // nothing is sent, nothing is resolved, and the session survives.
+        write_frame(&mut client, keep_spec(7, Some(&ipv6_loc), b"")).await;
+
+        write_frame(&mut client, keep_spec(7, None, b"next")).await;
+        let still_first = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("session must survive an unusable empty Keep");
+        assert_eq!(still_first.payload, b"Anext");
+
+        finish(client, task).await;
+        first_task.abort();
+    }
+
     fn test_config() -> Arc<XudpConfig> {
         Arc::new(XudpConfig {
             session_idle_timeout: Duration::from_secs(30),

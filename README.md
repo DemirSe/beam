@@ -451,7 +451,10 @@ bind.
   option, optional destination, optional GlobalID, payload length, payload.
   Statuses are New, Keep, End, KeepAlive; options are Data and Error.
 - Clients generally send New/Keep and close the flow with TCP FIN; do not
-  require an End. Keep frames may carry a new destination. Replies are Keep
+  require an End. Keep frames may carry a per-datagram destination; empty or
+  non-Data Keeps do not update the session destination, and address-less Keeps
+  reuse the last destination accepted from `New` or a non-empty Data Keep.
+  Replies are Keep
   with Data, plus End on closure (Error only when relay failed). An unknown
   stream ID gets a clean End and is discarded.
 - Accept zero GlobalID and per-frame destinations from sing-box. A nonzero
