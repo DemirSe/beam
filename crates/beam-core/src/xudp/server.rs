@@ -2351,7 +2351,10 @@ mod tests {
         // the sessions, their sockets, and their global permits alive.
         let echo = spawn_ipv4_echo().await;
         let destination = net_location(echo.address);
-        let limiter = XudpSessionLimiter::new(4);
+        // The per-stream active cap is max(global / 2, 1), so a global limit of
+        // 8 admits the three sessions this test needs.
+        let max = 8;
+        let limiter = XudpSessionLimiter::new(max);
         let (mut client, task) = start_mux_with_limiter(test_config(), limiter.clone());
 
         for id in 1..=3u16 {
