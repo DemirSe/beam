@@ -2429,7 +2429,7 @@ mod tests {
             "aborted mux left sessions registered: {after:?}"
         );
         assert_eq!(
-            after.available, 4,
+            after.available, max,
             "aborted mux leaked session permits: {after:?}"
         );
         drop(client);
