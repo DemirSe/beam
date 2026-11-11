@@ -208,8 +208,11 @@ def build_report(
 
     ordered = [merged[name] for name in REQUIRED_CASES if name in merged]
     ordered += [merged[name] for name in sorted(merged) if name not in REQUIRED_CASES]
-    planned = sum(int(case.get("planned") or 0) for case in ordered)
-    completed = sum(int(case.get("completed") or 0) for case in ordered)
+    # Case-level summary: the manifest size and how many required cases are
+    # present. Per-case work units live in the case rows; summing them would
+    # mix byte-denominated and request-denominated cases.
+    planned = len(REQUIRED_CASES)
+    completed = sum(1 for name in REQUIRED_CASES if name in merged)
     missing = [name for name in REQUIRED_CASES if name not in merged]
     complete = not missing and not duplicates and harness_complete
     return {

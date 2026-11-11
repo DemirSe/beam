@@ -556,8 +556,8 @@ def case_tcp_upload(args) -> int:
         outcome["ok"],
         detail,
         metrics,
-        planned=args.bytes,
-        completed=args.bytes if outcome["ok"] else 0,
+        planned=1,
+        completed=1 if outcome["ok"] else 0,
         deadline_ms=90_000,
         started=started,
     )
