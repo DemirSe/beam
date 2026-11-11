@@ -251,6 +251,16 @@ def wait_listen(port: int, limit: float = 10.0) -> None:
     raise RuntimeError(f"nothing listening on {port}")
 
 
+def recv_exact(sock: socket.socket, count: int) -> bytes:
+    data = bytearray()
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    return bytes(data)
+
+
 def wait_fds(pid: int, target: int, timeout: float = 5.0) -> int:
     deadline = time.time() + timeout
     count = beam_fds(pid)
@@ -310,7 +320,7 @@ def main() -> int:
             flow.settimeout(5.0)
             try:
                 flow.sendall(b"fd")
-                echoed = flow.recv(2) == b"fd"
+                echoed = recv_exact(flow, 2) == b"fd"
             except OSError:
                 echoed = False
             if echoed:
@@ -339,7 +349,7 @@ def main() -> int:
         sock = socks5_connect(("127.0.0.1", socks_port), "127.0.0.1", echo.port)
         sock.sendall(b"ping")
         sock.settimeout(5.0)
-        got = sock.recv(16)
+        got = recv_exact(sock, 4)
         ok = got == b"ping"
         failures += 0 if ok else 1
         print(f"{'PASS' if ok else 'FAIL'} tcp_relay: reply={got!r} fds_now={beam_fds(server.pid)}")
