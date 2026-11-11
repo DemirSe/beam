@@ -43,6 +43,18 @@ jobs:
         run: |
           set -o pipefail
           python3 tests/stress/vless_halfclose.py target/release/beam /usr/local/bin/sing-box
+      - name: Vision descriptor budget
+        if: matrix.encoding == 'xudp'
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_client.py --beam target/release/beam \
+            --sing-box /usr/local/bin/sing-box --selftest
+      - name: Splice-clone fallback
+        if: matrix.encoding == 'xudp'
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_tls_in_tls.py target/release/beam \
+            /usr/local/bin/sing-box --squeeze-clones
       - name: Campaign (${{ matrix.encoding }})
         run: |
           set -o pipefail

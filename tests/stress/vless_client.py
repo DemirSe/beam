@@ -251,6 +251,15 @@ def wait_listen(port: int, limit: float = 10.0) -> None:
     raise RuntimeError(f"nothing listening on {port}")
 
 
+def wait_fds(pid: int, target: int, timeout: float = 5.0) -> int:
+    deadline = time.time() + timeout
+    count = beam_fds(pid)
+    while count > target and time.time() < deadline:
+        time.sleep(0.05)
+        count = beam_fds(pid)
+    return count
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--beam", required=True)
@@ -289,6 +298,42 @@ def main() -> int:
         time.sleep(0.4)
         baseline = beam_fds(server.pid)
         print(f"server_fds_baseline={baseline}")
+
+        # Sixteen concurrent Vision TCP flows that never reach Vision Direct.
+        # Each flow costs one accepted socket, one target socket, and one
+        # RelayActivity eventfd. The four raw-socket duplicates must not exist
+        # before a direction's handoff.
+        flows = 16
+        held = []
+        for _ in range(flows):
+            flow = socks5_connect(("127.0.0.1", socks_port), "127.0.0.1", echo.port)
+            flow.settimeout(5.0)
+            try:
+                flow.sendall(b"fd")
+                echoed = flow.recv(2) == b"fd"
+            except OSError:
+                echoed = False
+            if echoed:
+                held.append(flow)
+            else:
+                flow.close()
+        held_fds = beam_fds(server.pid)
+        cap = 3 * flows + 8
+        ok = len(held) == flows and held_fds - baseline <= cap
+        failures += 0 if ok else 1
+        print(
+            f"{'PASS' if ok else 'FAIL'} vision_fd_budget: baseline={baseline} "
+            f"held={held_fds} delta={held_fds - baseline} cap={cap} flows={len(held)}"
+        )
+        for flow in held:
+            flow.close()
+        released = wait_fds(server.pid, baseline + 2)
+        ok = released <= baseline + 2
+        failures += 0 if ok else 1
+        print(
+            f"{'PASS' if ok else 'FAIL'} vision_fd_released: "
+            f"baseline={baseline} settled={released}"
+        )
 
         # One authenticated TCP flow through Vision.
         sock = socks5_connect(("127.0.0.1", socks_port), "127.0.0.1", echo.port)

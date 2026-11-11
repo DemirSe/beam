@@ -15,7 +15,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -1968,6 +1968,10 @@ where
 /// with one shared [`RelayActivity`] deadline. It does not switch to a single
 /// bidirectional relay, so neither direction has to wait for the other to
 /// finish.
+///
+/// The client and target descriptors are duplicated only after a direction's
+/// raw handoff is published and its splice permit is held. A connection that
+/// never reaches Vision Direct therefore keeps no duplicate descriptors.
 async fn relay_vision(
     vision: VisionStream<TlsStream>,
     target: TcpStream,
@@ -1979,25 +1983,10 @@ async fn relay_vision(
     let activity = Arc::new(RelayActivity::new());
     let mut write_direct = vision.write_direct_watch();
     let mut read_handoff = vision.read_handoff_watch();
-
-    let clones = (|| -> Result<_, TlsServerError> {
-        Ok((
-            vision.try_clone_raw_socket()?,
-            vision.try_clone_raw_socket()?,
-            try_clone_tcp(&target)?,
-            try_clone_tcp(&target)?,
-        ))
-    })();
-    let (client_read, client_write, target_read_splice, target_write_splice) = match clones {
-        Ok(clones) => clones,
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "could not clone raw Vision sockets; using the copy relay"
-            );
-            return relay_bidirectional(vision, target, idle_timeout).await;
-        }
-    };
+    // The split halves own the originals until both direction futures finish.
+    // Each direction duplicates these descriptors only at its raw handoff.
+    let client_fd = vision.raw_fd();
+    let target_fd = target.as_raw_fd();
 
     let (mut vision_read, mut vision_write) = tokio::io::split(vision);
     let (mut target_read, mut target_write) = tokio::io::split(target);
@@ -2027,11 +2016,6 @@ async fn relay_vision(
                     copied_up,
                     "Vision splice task limit reached; using async upload copy"
                 );
-                // The fallback does not use the raw socket clones. Release
-                // them now instead of holding two descriptors until the async
-                // relay reaches its idle timeout.
-                drop(client_read);
-                drop(target_write_splice);
                 copy_direction(
                     &mut vision_read,
                     &mut target_write,
@@ -2040,6 +2024,27 @@ async fn relay_vision(
                 )
                 .await?;
                 return Ok(());
+            };
+
+            let (client_dup, target_dup) = match clone_splice_fds(client_fd, target_fd) {
+                Ok(descriptors) => descriptors,
+                Err(error) => {
+                    drop(splice_permit);
+                    up_metrics.record_splice_fallback();
+                    tracing::debug!(
+                        %error,
+                        copied_up,
+                        "could not duplicate raw Vision sockets; using async upload copy"
+                    );
+                    copy_direction(
+                        &mut vision_read,
+                        &mut target_write,
+                        idle_timeout,
+                        Some(&up_activity),
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
 
             tracing::debug!(
@@ -2051,8 +2056,8 @@ async fn relay_vision(
             let result = tokio::task::spawn_blocking(move || {
                 let _splice_permit = splice_permit;
                 copy_one_way(
-                    client_read.as_raw_fd(),
-                    target_write_splice.as_raw_fd(),
+                    client_dup.as_raw_fd(),
+                    target_dup.as_raw_fd(),
                     &config,
                     Some(&relay_activity),
                 )
@@ -2104,10 +2109,6 @@ async fn relay_vision(
                 copied_down,
                 "Vision splice task limit reached; using async download copy"
             );
-            // The fallback does not use the raw socket clones. Release them
-            // rather than pinning two descriptors for the relay lifetime.
-            drop(target_read_splice);
-            drop(client_write);
             copy_direction(
                 &mut target_read,
                 &mut vision_write,
@@ -2116,6 +2117,27 @@ async fn relay_vision(
             )
             .await?;
             return Ok(());
+        };
+
+        let (target_dup, client_dup) = match clone_splice_fds(target_fd, client_fd) {
+            Ok(descriptors) => descriptors,
+            Err(error) => {
+                drop(splice_permit);
+                down_metrics.record_splice_fallback();
+                tracing::debug!(
+                    %error,
+                    copied_down,
+                    "could not duplicate raw Vision sockets; using async download copy"
+                );
+                copy_direction(
+                    &mut target_read,
+                    &mut vision_write,
+                    idle_timeout,
+                    Some(&down_activity),
+                )
+                .await?;
+                return Ok(());
+            }
         };
 
         tracing::debug!(
@@ -2127,8 +2149,8 @@ async fn relay_vision(
         let result = tokio::task::spawn_blocking(move || {
             let _splice_permit = splice_permit;
             copy_one_way(
-                target_read_splice.as_raw_fd(),
-                client_write.as_raw_fd(),
+                target_dup.as_raw_fd(),
+                client_dup.as_raw_fd(),
                 &config,
                 Some(&relay_activity),
             )
@@ -2354,12 +2376,15 @@ where
     Ok((relayed, false))
 }
 
-/// Duplicates a nonblocking TCP stream for a blocking one-way relay.
-fn try_clone_tcp(stream: &TcpStream) -> Result<TcpStream, TlsServerError> {
-    let fd = beam_sys::try_clone_fd(stream.as_raw_fd())?;
-    let stream = std::net::TcpStream::from(fd);
-    stream.set_nonblocking(true)?;
-    TcpStream::from_std(stream).map_err(TlsServerError::Io)
+/// Duplicates the client and target descriptors for one blocking splice.
+///
+/// The returned descriptors are owned so they stay open for `copy_one_way`
+/// after the split halves that own the originals drop. Callers duplicate only
+/// after a direction's raw handoff is published and a splice permit is held.
+fn clone_splice_fds(client_fd: RawFd, target_fd: RawFd) -> io::Result<(OwnedFd, OwnedFd)> {
+    let client = beam_sys::try_clone_fd(client_fd)?;
+    let target = beam_sys::try_clone_fd(target_fd)?;
+    Ok((client, target))
 }
 
 fn splice_config(idle_timeout: Duration, pipe_size: usize) -> RelayConfig {

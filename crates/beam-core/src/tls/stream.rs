@@ -7,7 +7,7 @@
 
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -107,14 +107,6 @@ pub trait RawTlsHandoff: AsyncRead + AsyncWrite + Unpin {
     /// Implementations must first drain any plaintext still buffered inside
     /// the TLS stack; otherwise a Direct handoff can bypass those bytes.
     fn take_plaintext(&mut self) -> Result<Vec<u8>, TlsStreamError>;
-
-    /// Duplicates the underlying socket for a one-way splice.
-    fn try_clone_socket(&self) -> io::Result<TcpStream> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "raw socket cloning is unavailable for this stream",
-        ))
-    }
 
     /// Consume the stream and return the raw socket with ordered prefixes.
     fn into_raw(self) -> Result<RawTls, TlsStreamError>
@@ -216,8 +208,9 @@ impl TlsStream {
     /// Consumes the stream and returns the raw socket plus ordered prefixes.
     ///
     /// Called only by the test suite and `VisionStream::into_raw`. The
-    /// production Vision relay clones the raw sockets and uses `copy_one_way`;
-    /// the non-Vision TCP relay stays on the async `copy_direction` path.
+    /// production Vision relay duplicates the raw sockets lazily after a
+    /// direction's handoff and uses `copy_one_way`; the non-Vision TCP relay
+    /// stays on the async `copy_direction` path.
     pub fn into_raw(mut self) -> Result<RawTls, TlsStreamError> {
         if !self.read_raw || !self.write_raw {
             return Err(TlsStreamError::RawNotEnabled);
@@ -675,15 +668,14 @@ impl RawTlsHandoff for TlsStream {
         TlsStream::take_plaintext(self)
     }
 
-    fn try_clone_socket(&self) -> io::Result<TcpStream> {
-        let fd = beam_sys::try_clone_fd(self.socket.as_raw_fd())?;
-        let stream = std::net::TcpStream::from(fd);
-        stream.set_nonblocking(true)?;
-        TcpStream::from_std(stream)
-    }
-
     fn into_raw(self) -> Result<RawTls, TlsStreamError> {
         TlsStream::into_raw(self)
+    }
+}
+
+impl AsRawFd for TlsStream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
     }
 }
 

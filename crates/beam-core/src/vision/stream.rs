@@ -8,6 +8,7 @@
 //! [`VisionStream::into_raw`] once both directions have switched.
 
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -175,11 +176,6 @@ where
         self.read_handoff_tx.subscribe()
     }
 
-    /// Returns a duplicate of the underlying raw socket for a one-way splice.
-    pub fn try_clone_raw_socket(&self) -> io::Result<tokio::net::TcpStream> {
-        self.inner.try_clone_socket()
-    }
-
     fn publish_direct(&self) {
         self.direct_tx
             .send_replace(self.read_is_raw() && self.write_is_raw());
@@ -220,9 +216,10 @@ where
 
     /// Consumes the stream once both directions have switched to Direct.
     ///
-    /// Not called by the production relay. The production Vision relay clones
-    /// the raw sockets and uses `copy_one_way` per direction when splice
-    /// capacity is available; the async fallback is `copy_direction`.
+    /// Not called by the production relay. The production Vision relay
+    /// duplicates the raw sockets lazily after each direction's handoff and
+    /// uses `copy_one_way` per direction when splice capacity is available;
+    /// the async fallback is `copy_direction`.
     pub fn into_raw(self) -> Result<RawTls, TlsStreamError> {
         if !self.read_is_raw() || !self.write_is_raw() {
             return Err(TlsStreamError::RawNotEnabled);
@@ -431,6 +428,19 @@ where
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl<S, R> VisionStream<S, R>
+where
+    S: AsRawFd,
+{
+    /// Returns the underlying socket descriptor.
+    ///
+    /// Valid only while this stream is alive. Callers duplicate it before the
+    /// owner drops; the relay duplicates lazily at a direction's raw handoff.
+    pub fn raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
     }
 }
 

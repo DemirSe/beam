@@ -68,7 +68,8 @@ pub struct MetricsSnapshot {
     pub xudp_end_dropped: u64,
     /// Legacy UDP / packetaddr streams rejected by their separate cap.
     pub legacy_udp_limited: u64,
-    /// Vision relays that used the async copy path because splice was full.
+    /// Vision relays that used the async copy path because a splice permit was
+    /// unavailable or a raw descriptor could not be duplicated.
     pub splice_fallback: u64,
     /// XUDP `New` frames observed.
     pub xudp_new_frames: u64,
@@ -167,7 +168,8 @@ impl Metrics {
         self.legacy_udp_limited.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Counts one Vision relay async fallback.
+    /// Counts one Vision relay async fallback after a splice permit was
+    /// unavailable or a raw descriptor could not be duplicated.
     pub fn record_splice_fallback(&self) {
         self.splice_fallback.fetch_add(1, Ordering::Relaxed);
     }

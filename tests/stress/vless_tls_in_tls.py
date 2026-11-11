@@ -7,12 +7,14 @@ through the socks proxy with curl, then compares hashes and looks for the
 raw-handoff log lines that prove Direct engaged.
 """
 from __future__ import annotations
-import hashlib, http.server, os, socket, ssl, subprocess, sys, tempfile, threading, time
+import argparse, hashlib, http.server, os, resource, socket, ssl, subprocess, sys
+import tempfile, threading, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vless_client import (  # noqa: E402
-    free_port, reality_public_key, wait_listen, write_client_config, write_server_config,
+    beam_fds, free_port, reality_public_key, socks5_connect, wait_listen,
+    write_client_config, write_server_config,
 )
 
 FAILURES = 0
@@ -50,8 +52,96 @@ def serve_tls(out: Path) -> tuple[int, ssl.SSLContext]:
     return ctx
 
 
+def squeeze_clones(
+    out: Path,
+    server: subprocess.Popen,
+    socks_port: int,
+    tls_port: int,
+) -> None:
+    """Force the lazy descriptor duplication to fail after the raw handoff.
+
+    The soft limit is set below the current open count so a late close cannot
+    restore headroom. The fallback copy path allocates no descriptors, so the
+    transfer must still be byte-exact.
+    """
+    sock = socks5_connect(("127.0.0.1", socks_port), "127.0.0.1", tls_port, timeout=20.0)
+    try:
+        # The VLESS stream and the target dial exist by the time the socks
+        # handshake returns; beam is inside relay_vision.
+        time.sleep(0.2)
+        open_fds = beam_fds(server.pid)
+        if open_fds < 1:
+            raise RuntimeError(f"could not read beam descriptors: {open_fds}")
+        old_soft, old_hard = resource.prlimit(server.pid, resource.RLIMIT_NOFILE)
+        resource.prlimit(
+            server.pid,
+            resource.RLIMIT_NOFILE,
+            (max(1, open_fds - 4), old_hard),
+        )
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            try:
+                tls = context.wrap_socket(sock, server_hostname="127.0.0.1")
+                try:
+                    tls.sendall(
+                        b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                        b"Connection: close\r\n\r\n"
+                    )
+                    got = bytearray()
+                    while True:
+                        chunk = tls.recv(65536)
+                        if not chunk:
+                            break
+                        got.extend(chunk)
+                finally:
+                    tls.close()
+                body = bytes(got).partition(b"\r\n\r\n")[2]
+                check(
+                    "squeeze_tls_bytes",
+                    hashlib.sha256(body).digest() == hashlib.sha256(BODY).digest(),
+                    f"bytes={len(body)}/{len(BODY)}",
+                )
+            except (OSError, ssl.SSLError) as error:
+                check("squeeze_tls_bytes", False, f"error={error}")
+        finally:
+            try:
+                resource.prlimit(
+                    server.pid,
+                    resource.RLIMIT_NOFILE,
+                    (old_soft, old_hard),
+                )
+            except OSError:
+                pass
+    finally:
+        sock.close()
+
+    log_path = out / "beam.log"
+    deadline = time.time() + 3.0
+    text = ""
+    while time.time() < deadline:
+        text = log_path.read_text(errors="replace")
+        if "could not duplicate raw Vision sockets" in text:
+            break
+        time.sleep(0.05)
+    duplicated = "could not duplicate raw Vision sockets" in text
+    fallback = "using async upload copy" in text or "using async download copy" in text
+    check(
+        "squeeze_clone_fallback",
+        "switched to raw" in text and duplicated and fallback,
+        f"raw_switch={'switched to raw' in text} "
+        f"duplicate_error={duplicated} async_fallback={fallback}",
+    )
+
+
 def main() -> int:
-    beam, sing_box = Path(sys.argv[1]), Path(sys.argv[2])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("beam")
+    parser.add_argument("sing_box")
+    parser.add_argument("--squeeze-clones", action="store_true")
+    args = parser.parse_args()
+    beam, sing_box = Path(args.beam), Path(args.sing_box)
     repo = Path(".").resolve()
     template = repo / "config.example.toml"
     priv = next(l.split('"')[1] for l in template.read_text().splitlines() if l.startswith("private_key"))
@@ -95,6 +185,8 @@ def main() -> int:
         text = (out / "beam.log").read_text(errors="replace")
         direct = text.count("switched to raw")
         check("vision_direct_engaged", direct >= 1, f"raw_switch_lines={direct}")
+        if args.squeeze_clones:
+            squeeze_clones(out, server, socks_port, tls_port)
         check("server_alive", server.poll() is None, "running")
     finally:
         for proc in (client, server):
