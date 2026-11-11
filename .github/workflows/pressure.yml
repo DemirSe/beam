@@ -1,0 +1,32 @@
+name: pressure
+
+# Session-limit saturation, a datagram blast, and recovery. Runs for main and on
+# demand: it takes about three minutes because it waits for one counter tick.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  pressure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Build beam
+        run: cargo build --locked --release --bin beam
+      - name: Install pinned sing-box
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/sb.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64-glibc.tar.gz
+          echo "231e57c18378f780a08de832844a1ca9716e17a7bcf82964b350844d243c03ac  /tmp/sb.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          install -m 0755 /tmp/sing-box-1.14.4-linux-amd64-glibc/sing-box /usr/local/bin/sing-box
+      - name: Campaign
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_pressure.py target/release/beam /usr/local/bin/sing-box
