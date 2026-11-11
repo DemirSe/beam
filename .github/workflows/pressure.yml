@@ -30,6 +30,10 @@ jobs:
         run: |
           set -o pipefail
           python3 tests/stress/vless_pressure.py target/release/beam /usr/local/bin/sing-box
+      - name: Transport variants
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_variants.py target/release/beam /usr/local/bin/sing-box
       - name: Admission and crash restart
         run: |
           set -o pipefail
