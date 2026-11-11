@@ -294,10 +294,11 @@ shutdown. `empty_mux_keepalive_does_not_extend_idle` and
 ### 10. Lower-risk resource/CPU items
 
 - Vision Direct duplicates the client and target sockets for its blocking splice
-  directions (`relay_vision_direct` via `try_clone_raw_socket` and
+  directions (`relay_vision` via `try_clone_raw_socket` and
   `try_clone_tcp`): up to four extra fds per active Vision connection. At 1024
   connections this is about 4k fds; `LimitNOFILE=65536` keeps it safe, but the
-  churn cost is real.
+  churn cost is real. See the temporary [`fix.md`](fix.md) for the detailed
+  work item; delete it after the fix is verified.
 - ~~Cover relay uses `copy_bidirectional` without a stop/eventfd; cancellation
   could leave detached blocking work and fds for the 30 s cover idle limit.~~
   Cover now always uses the async cancellable relay and is counted in shutdown
