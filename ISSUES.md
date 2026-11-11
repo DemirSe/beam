@@ -5,8 +5,10 @@ Last updated 2026-11-11. Short register; the historical hardening audit is
 [`STATE-MACHINES.md`](STATE-MACHINES.md).
 
 Nothing here is a known-broken data path: byte integrity, admission bounds, and
-descriptor/memory stability are covered by CI gates. Both entries below are fixed
+descriptor/memory stability are covered by CI gates. Both I-entries are fixed
 and merged to `main`; they remain listed with the proof and deployment evidence.
+The one open entry (P1) is a compatibility-mode admission bound found by the
+protocol lab, not a data-path or integrity defect.
 
 ## Summary
 
@@ -14,6 +16,7 @@ and merged to `main`; they remain listed with the proof and deployment evidence.
 |---|---|---|---|
 |I1|Replay cache saturates under sustained heavy churn|Fixed on `main`, deployed|resolved|
 |I2|A client restart appeared to be refused as a replay|Fixed on `main`, deployed; same root cause as I1|resolved|
+|P1|Legacy/packetaddr UDP refuses flows above 64 concurrent streams|Open; found by the protocol lab, not fixed here|medium|
 
 ## I1 — replay cache saturates under sustained heavy churn (fixed)
 
@@ -98,3 +101,80 @@ Not defects; these are the places where the current evidence stops.
 - **Replay rejections were unobservable.** `replay_rejected` now counts both
   reservation-level and post-handshake rejections, and appears in the pressure
   warning and the periodic counter line.
+
+## Protocol lab findings (2026-11-11)
+
+The `suite=protocols` campaign ran three times on the hosted lab
+(`ubuntu-24.04`, `standard` profile, 250 ms netem RTT, 20 cases per arm) through
+the full-TUN sing-box -> beam path. Each run also ran the stock Xray control
+arm; the beam report is the gate and the control report is diagnostic. Reports,
+TSVs, server and target logs, qdisc JSON and per-case probes are in each run's
+`lab-hosted-*` artifact.
+
+|Run|UDP mode|Loss|Beam arm|Control arm|
+|---|---|---|---|---|
+|[A](https://github.com/DemirSe/beam/actions/runs/43099892457)|xudp|0%|20/20 accepted (19 PASS, 1 WARN)|15 PASS, 2 WARN, 3 FAIL|
+|[B](https://github.com/DemirSe/beam/actions/runs/43101196768)|xudp|1%|20/20 accepted (18 PASS, 2 WARN)|15 PASS, 2 WARN, 3 FAIL|
+|[C](https://github.com/DemirSe/beam/actions/runs/43103918524)|packetaddr|0%|19/20 accepted (18 PASS, 1 WARN, 1 FAIL)|9 PASS, 2 WARN, 9 FAIL|
+
+### P1 — legacy/packetaddr UDP exhausts a 64-stream permit pool (open)
+
+- **Check:** `dns-udp-200` with `udp_mode=packetaddr`; 10 sequential plus 190
+  queries across 16 workers.
+- **Observed:** 142/200 queries answered, p95 4,028 ms; the 58 queries that
+  failed still failed after dig's retry, and the beam log recorded 120
+  `legacy VLESS UDP stream limit reached` rejections (`legacy_udp_limited=120`)
+  in that window. `xudp_new_frames=0` confirms the traffic took the legacy
+  path, not XUDP. The same case answers 200/200 in both `xudp` runs.
+- **Expected:** 200/200 NOERROR, as with XUDP.
+- **Cause:** `legacy_udp_permits = Semaphore::new(64)` is a process-wide cap
+  (`crates/beam/src/main.rs`); each legacy/packetaddr VLESS UDP flow holds one
+  permit for its whole lifetime, and `LegacyUdpConfig::idle_timeout` defaults to
+  300 s. glibc's stub resolver opens a new UDP socket per query, so a modest
+  query rate (a few new flows per second) exhausts the 64 permits within
+  seconds, and refusals continue until the older flows idle out. Neither the cap
+  nor its retention is documented in `README.md`.
+- **User impact:** a client using `packet_encoding=packetaddr` (or a legacy
+  client) sees DNS and QUIC failures after a burst of short UDP flows even
+  though each individual flow is correct; it recovers as old flows expire. The
+  XUDP path, the production default, is unaffected.
+- **Attribution:** beam. Not fixed in this task (harness-only scope).
+- **Severity:** medium, compatibility mode only.
+
+### P2 — HTTP/2 origin peak is runner-bound (WARN, no beam signal)
+
+`h2-multiplex-16` always proves the hard contract: one TLS connection, 16/16
+exact bodies, client-side peak of 16 in flight. The origin's own `active=`
+counter peaks at 4 on the hosted runner (7-8 locally), below the case's WARN
+threshold of 8, so the row is WARN on every run. That is a function of the
+runner's vCPU count and batching, not of beam; the WARN is recorded and does
+not gate.
+
+### P3 — the stock Xray control is a diagnostic, not a like-for-like baseline
+
+The control arm fails DNS while beam passes: `dns-udp-200` 15-18/200,
+`dns-tcp-fallback` 17/20, `mixed-hol-60s` DNS 143-146/300, and its restart
+recovery is ~7.5 s against 3.0-3.8 s for beam. With `udp_mode=packetaddr` it
+also loses UDP entirely (0/1200 echoes, 0/200 DNS) and fails both H3 cases.
+These rows are why the beam report is the gate and the control report is
+attached as evidence instead.
+
+### Lab notes (behaviour, not defects)
+
+- XUDP and legacy UDP travel inside the VLESS TCP stream, so 1% link loss is
+  retransmitted rather than dropped: `udp-realtime-1200` still reports 0% loss
+  at 1% netem loss, while its p95 rises from ~0.65 s to ~1.06 s and DNS retries
+  raise p95 from ~0.77 s to ~1.50 s. Loss on this path shows up as latency, and
+  as slower bulk transfers (the 8 MiB HTTP/2 transfer went from ~3.5 s to
+  ~82 s at 1% loss).
+- A multi-destination UDP burst is retarget-sensitive in sing-box: with 75
+  packets to three echo ports plus 25 to an alternate-source port in one burst,
+  both arms lose the tail of the last destination (64/75 echoes). The case now
+  gives each destination its own reply window on the same socket and
+  association; with that pacing both arms deliver 75/75 echoes plus 25/25
+  alternate-source replies.
+- `udp-alt-source` passes on both arms: a reply from 10.10.2.2:9995 to a client
+  that sent to 10.10.2.2:9998 is delivered, i.e. full-cone behaviour holds.
+- The target DNS answer now carries the required CLASS field. Before the fix
+  `dig` reported a malformed packet for both A and AAAA, and the old 8-row TUN
+  suite passed only because its grep matched the `SERVER:` line.
