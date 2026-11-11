@@ -138,7 +138,7 @@ const REPLAY_MAX_IN_FLIGHT_PER_ID: usize = 4;
 enum ReplayPhase {
     Unseen,
     InFlight { reservations: u8 },
-    Settled { deadline: Instant },
+    Settled { deadline: Instant, reservations: u8 },
     Expired,
 }
 
@@ -196,7 +196,9 @@ fn replay_deadline(
             .saturating_sub(now_wall - timestamp)
             .saturating_add(REPLAY_RETENTION_SLACK.as_secs())
     };
-    now + Duration::from_secs(seconds.min(max.as_secs()))
+    let retention = Duration::from_secs(seconds.min(max.as_secs()));
+    now.checked_add(retention)
+        .unwrap_or_else(|| now + REPLAY_CACHE_TTL)
 }
 
 /// Bounded exact-replay filter for authenticated ClientHellos.
@@ -244,19 +246,35 @@ impl ReplayCache {
                 break;
             }
             self.deadlines.pop();
-            let current_deadline = match self.states.get(&id) {
-                Some(ReplayPhase::Settled { deadline: stored }) => Some(*stored),
+            let current = match self.states.get(&id) {
+                Some(ReplayPhase::Settled {
+                    deadline: stored,
+                    reservations,
+                }) => Some((*stored, *reservations)),
                 _ => None,
             };
-            if current_deadline == Some(deadline) {
+            if let Some((stored, reservations)) = current
+                && stored == deadline
+                && reservations == 0
+            {
                 self.states.remove(&id);
                 self.settled = self.settled.saturating_sub(1);
             }
+            // A settled entry with outstanding reservations stays until the
+            // last reservation is released, even after its timestamp
+            // deadline; that preserves first-wins for copies already
+            // admitted. Its heap entry is consumed here.
         }
     }
 
     fn expire_one(&mut self, id: [u8; 32]) {
-        if matches!(self.states.get(&id), Some(ReplayPhase::Settled { .. })) {
+        if matches!(
+            self.states.get(&id),
+            Some(ReplayPhase::Settled {
+                reservations: 0,
+                ..
+            })
+        ) {
             self.states.remove(&id);
             self.settled = self.settled.saturating_sub(1);
         }
@@ -264,7 +282,10 @@ impl ReplayCache {
 
     fn phase(&self, id: [u8; 32], now: Instant) -> ReplayPhase {
         match self.states.get(&id) {
-            Some(ReplayPhase::Settled { deadline }) if *deadline <= now => ReplayPhase::Expired,
+            Some(ReplayPhase::Settled {
+                deadline,
+                reservations: 0,
+            }) if *deadline <= now => ReplayPhase::Expired,
             Some(phase) => *phase,
             None => ReplayPhase::Unseen,
         }
@@ -306,6 +327,10 @@ impl ReplayCache {
     }
 
     fn release(&mut self, id: [u8; 32]) {
+        self.release_at(id, Instant::now());
+    }
+
+    fn release_at(&mut self, id: [u8; 32], now: Instant) {
         match self.states.get(&id).copied() {
             Some(ReplayPhase::InFlight { reservations }) if reservations > 1 => {
                 if let Some(ReplayPhase::InFlight { reservations }) = self.states.get_mut(&id) {
@@ -315,6 +340,25 @@ impl ReplayCache {
             Some(ReplayPhase::InFlight { .. }) => {
                 self.states.remove(&id);
                 self.in_flight = self.in_flight.saturating_sub(1);
+            }
+            Some(ReplayPhase::Settled { reservations, .. }) if reservations > 1 => {
+                if let Some(ReplayPhase::Settled { reservations, .. }) = self.states.get_mut(&id) {
+                    *reservations = reservations.saturating_sub(1);
+                }
+            }
+            Some(ReplayPhase::Settled {
+                deadline,
+                reservations: 1,
+            }) => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                if deadline <= now {
+                    self.states.remove(&id);
+                    self.settled = self.settled.saturating_sub(1);
+                } else if let Some(ReplayPhase::Settled { reservations, .. }) =
+                    self.states.get_mut(&id)
+                {
+                    *reservations = 0;
+                }
             }
             _ => {}
         }
@@ -337,24 +381,30 @@ impl ReplayCache {
         now_wall: Option<u64>,
     ) -> ReplayInsert {
         self.expire(now);
-        let had_reservation = match self.phase(id, now) {
+        let phase = self.phase(id, now);
+        let remaining = match phase {
             ReplayPhase::Settled { .. } => return ReplayInsert::Duplicate,
-            ReplayPhase::InFlight { .. } => true,
-            ReplayPhase::Unseen => false,
+            ReplayPhase::InFlight { reservations } => reservations.saturating_sub(1),
+            ReplayPhase::Unseen => 0,
             ReplayPhase::Expired => {
                 self.expire_one(id);
-                false
+                0
             }
         };
         if self.settled >= self.capacity {
             return ReplayInsert::Full;
         }
         let deadline = replay_deadline(timestamp, now, now_wall, self.window);
-        if had_reservation {
-            self.states.remove(&id);
+        if matches!(phase, ReplayPhase::InFlight { .. }) && remaining == 0 {
             self.in_flight = self.in_flight.saturating_sub(1);
         }
-        self.states.insert(id, ReplayPhase::Settled { deadline });
+        self.states.insert(
+            id,
+            ReplayPhase::Settled {
+                deadline,
+                reservations: remaining,
+            },
+        );
         self.deadlines.push(Reverse((deadline, id)));
         self.settled = self.settled.saturating_add(1);
         ReplayInsert::Inserted
@@ -2798,7 +2848,8 @@ mod tests {
         assert_eq!(
             cache.phase(id, now),
             ReplayPhase::Settled {
-                deadline: replay_deadline(wall, now, Some(u64::from(wall)), window)
+                deadline: replay_deadline(wall, now, Some(u64::from(wall)), window),
+                reservations: 0,
             }
         );
         assert!(!cache.try_reserve_at(id, now));
@@ -2914,6 +2965,14 @@ mod tests {
     }
 
     #[test]
+    fn replay_deadline_handles_an_unrepresentable_window() {
+        let now = Instant::now();
+        let base: u32 = 1_000_000;
+        let deadline = replay_deadline(base, now, Some(u64::from(base)), Some(Duration::MAX));
+        assert!(deadline >= now, "an extreme window must not panic");
+    }
+
+    #[test]
     fn replay_cache_limits_in_flight_duplicates() {
         let mut cache = ReplayCache::new(Some(Duration::from_secs(60)));
         let now = Instant::now();
@@ -2929,8 +2988,16 @@ mod tests {
             cache.insert_at(id, 1_000_000, now, Some(1_000_000)),
             ReplayInsert::Inserted
         );
-        assert_eq!(cache.stats(now).in_flight, 0);
+        assert_eq!(
+            cache.stats(now).in_flight,
+            1,
+            "the other reservations remain outstanding after settlement"
+        );
         assert!(!cache.try_reserve_at(id, now));
+        for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID - 1 {
+            cache.release(id);
+        }
+        assert_eq!(cache.stats(now).in_flight, 0);
     }
 
     #[test]
@@ -3001,7 +3068,13 @@ mod tests {
             cache.insert_at(id, wall, now, Some(u64::from(wall))),
             ReplayInsert::Inserted
         );
-        assert_eq!(cache.phase(id, now), ReplayPhase::Settled { deadline });
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::Settled {
+                deadline,
+                reservations: 0
+            }
+        );
         assert!(!cache.try_reserve_at(id, now));
         assert_eq!(
             cache.insert_at(id, wall, now, Some(u64::from(wall))),
@@ -3011,6 +3084,37 @@ mod tests {
         assert_eq!(
             cache.phase(id, now + Duration::from_secs(61)),
             ReplayPhase::Unseen
+        );
+    }
+
+    #[test]
+    fn replay_first_wins_survives_timestamp_deadline_expiry() {
+        let window = Some(Duration::from_secs(300));
+        let mut cache = ReplayCache::with_capacity(window, 2);
+        let now = Instant::now();
+        let base: u32 = 1_000_000;
+        let wall = u64::from(base);
+        let id = [6u8; 32];
+        // Two copies of a ClientHello aged to the last accepted second.
+        assert!(cache.try_reserve_at(id, now));
+        assert!(cache.try_reserve_at(id, now));
+        let aged = base - 300;
+        assert_eq!(
+            cache.insert_at(id, aged, now, Some(wall)),
+            ReplayInsert::Inserted
+        );
+        // The timestamp deadline is one second, but the second copy is still
+        // in flight. The settled marker must outlive it.
+        let later = now + Duration::from_secs(2);
+        assert_eq!(
+            cache.insert_at(id, aged, later, Some(wall + 2)),
+            ReplayInsert::Duplicate
+        );
+        cache.release_at(id, later);
+        assert_eq!(
+            cache.phase(id, later),
+            ReplayPhase::Unseen,
+            "the last release removes the drained marker after expiry"
         );
     }
 

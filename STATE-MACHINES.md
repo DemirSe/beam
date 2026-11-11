@@ -240,20 +240,26 @@ after `relay_cover_bidirectional` returns. No wire change.
 ### 5. REALITY replay cache (P1)
 
 **States per 32-byte session id.** `ReplayPhase::{Unseen, InFlight{reservations},
-Settled{deadline}, Expired}`. `states` stores only `InFlight` and `Settled`;
-`Unseen` and `Expired` are read results. A min-heap of `(deadline, id)` orders
-expiry; `in_flight` counts distinct reserved ids; `settled` is bounded by
-`capacity`. A full cache rejects rather than evicting.
+Settled{deadline, reservations}, Expired}`. `states` stores only `InFlight` and
+`Settled`; `Unseen` and `Expired` are read results. A min-heap of `(deadline,
+id)` orders expiry; `in_flight` counts distinct ids with at least one
+reservation; `settled` is bounded by `capacity`. A full cache rejects rather
+than evicting. A `Settled` entry with outstanding reservations is not removed at
+its deadline; it stays until the last reservation is released, preserving
+first-wins for copies admitted before the first completion.
 
 - `try_reserve`: expire, reject `Settled` or ≥4 `InFlight`, else increment or
   insert `InFlight { reservations: 1 }`.
 - `ReplayReservation::drop` releases only a `Pending` reservation.
 - `insert`: expire, first-wins; `Duplicate` for a settled id, `Full` at
   capacity, `Inserted` otherwise. The caller returns `ReplayRejected` for both
-  rejects, and counts `Full` separately.
+  rejects, and counts `Full` separately. A successful insert transitions
+  `InFlight(n)` to `Settled(deadline, n-1)`; `release` drains those reservations
+  and removes the marker only when the count is zero and the deadline passed.
 - Retention = authenticated envelope timestamp + timestamp window + 1 s,
   capped at `2 × window + 1 s`. Production window 300 s → 301 s for a timestamp
-  of “now”, 601 s worst case.
+  of “now”, 601 s worst case. A settled marker with outstanding reservations is
+  retained past that deadline until the copies drain.
 - Capacity = `clamp(128 × max_connections, 4096, 131072)`.
 
 **Capacity math.** Fail-closed cache, production clamp 131,072 entries with

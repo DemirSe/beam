@@ -412,12 +412,15 @@ bind.
   wired to `limits.max_connections`. Each entry is retained until its
   authenticated envelope timestamp plus the REALITY timestamp window plus one
   second: a timestamp at the current time is retained for 301 s, and the worst
-  case for a timestamp five minutes in the future is 601 s. A full cache
-  rejects the new handshake instead of evicting a live id; `replay_cache_full`
-  counts that case separately from a duplicate ClientHello. Concurrent
-  duplicates are first-wins: a second Finished handshake is closed rather than
-  served. This bounds the in-flight permit race, the post-cache window, and
-  cache pressure.
+  case for a timestamp five minutes in the future is 601 s. A settled entry
+  with admitted concurrent copies is held until those copies drain even past
+  that deadline, so first-wins is preserved. The deadline is monotonic; keep
+  the server clock disciplined, because a backward wall-clock step can keep an
+  envelope timestamp acceptable past the cache deadline. A full cache rejects
+  the new handshake instead of evicting a live id; `replay_cache_full` counts
+  that case separately from a duplicate ClientHello. Concurrent duplicates are
+  first-wins: a second Finished handshake is closed rather than served. This
+  bounds the in-flight permit race, the post-cache window, and cache pressure.
 - Unauthenticated traffic is relayed to the configured cover. Never send a
   TLS alert or a synthetic response on authentication failure.
 - A cover relay ends on the first half-close: once the probe's write side
