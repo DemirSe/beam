@@ -227,6 +227,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                     xudp_replies_dropped = pressure.6.saturating_sub(last_pressure.6),
                     xudp_send_dropped = pressure.7.saturating_sub(last_pressure.7),
                     legacy_udp_limited = pressure.8.saturating_sub(last_pressure.8),
+                    replay_rejected = pressure.9.saturating_sub(last_pressure.9),
                     xudp_high_water = xudp.high_water,
                     preauth_active,
                     authenticated_active,
@@ -251,6 +252,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                     xudp_send_dropped = current.xudp_send_dropped,
                     xudp_end_dropped = current.xudp_end_dropped,
                     legacy_udp_limited = current.legacy_udp_limited,
+                    replay_rejected = current.replay_rejected,
                     splice_fallback = current.splice_fallback,
                     xudp_new_frames = current.xudp_new_frames,
                     xudp_new_global_id = current.xudp_new_global_id,
@@ -413,7 +415,7 @@ fn warn_if_config_permissions_are_loose(path: &std::path::Path) {
 /// Counters that indicate dropped or rejected traffic, in log order.
 fn pressure_counters(
     snapshot: &beam_core::metrics::MetricsSnapshot,
-) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     (
         snapshot.preauth_rejected,
         snapshot.cover_limited,
@@ -424,6 +426,7 @@ fn pressure_counters(
         snapshot.xudp_replies_dropped,
         snapshot.xudp_send_dropped,
         snapshot.legacy_udp_limited,
+        snapshot.replay_rejected,
     )
 }
 
@@ -557,6 +560,15 @@ mod tests {
         assert_eq!(replay_capacity(2000), REPLAY_CAPACITY_MAX);
         assert_eq!(replay_capacity(64), 4096);
         assert_eq!(replay_capacity(100), 6400);
+    }
+
+    #[test]
+    fn pressure_counters_includes_replay_rejections() {
+        let snapshot = beam_core::metrics::MetricsSnapshot {
+            replay_rejected: 5,
+            ..Default::default()
+        };
+        assert_eq!(pressure_counters(&snapshot).9, 5);
     }
 
     #[test]

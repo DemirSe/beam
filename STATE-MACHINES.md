@@ -273,9 +273,12 @@ authentication.
 **Why implicit.** Three maps and a TTL form a four-state machine; no enum says
 "in flight vs settled".
 
-**Observability.** Debug logs only. No replay-rejection counter, cache
-occupancy, or in-flight peak — the clearest missing operator signal in the
-server.
+**Observability.** `replay_rejected` counts authenticated handshakes the cache
+refused after TLS finished (duplicate settled id, or a full cache) and appears in
+both the pressure warning and the periodic counter line. Cache occupancy and the
+in-flight peak are still not exported, and pre-reservation duplicates are not
+counted — they are forwarded to the cover by design, so counting them would mix
+scanning noise into the signal.
 
 **Tests.** `replay_cache_rejects_duplicates_and_stays_bounded` (2586),
 `replay_cache_uses_the_configured_capacity` (2614),

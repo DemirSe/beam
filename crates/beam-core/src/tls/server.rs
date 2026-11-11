@@ -1290,6 +1290,11 @@ async fn handle_authenticated(
     // served. This preserves the legitimate client's race while rejecting a
     // duplicate that also completed before the cache insert.
     if !config.replay_insert(auth.session_id) {
+        // The only post-handshake replay signal an operator can act on: a
+        // ClientHello that completed TLS but lost the first-wins race, or a
+        // full cache. Pre-reservation duplicates are forwarded to the cover and
+        // are not counted here.
+        config.metrics.record_replay_rejected();
         return Err(TlsServerError::ReplayRejected);
     }
     reservation.commit();
