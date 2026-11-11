@@ -1,4 +1,4 @@
-# Open stress findings — updated 2026-11-09
+# Open stress findings — updated 2026-11-11
 
 This file is intentionally separate from `README.md` for the findings that are
 still open. Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6,
@@ -8,22 +8,23 @@ timestamp/cache hardening, legacy UDP bounds, cover cancellation, parallel
 resolver lookups, and the descriptor budget are in `2e0a464` and deployed.
 Finding 4 is fixed in `fb45eda` and deployed.
 The process-wide resolver changes were reverted after intermittent client DNS
-failures. Finding 10 is fixed on the `fix/vision-lazy-fd-clone` branch
-(`fe9760e`) for the Vision raw-handoff fd clones; the
+failures. Finding 10 is fixed (`fe9760e`) and deployed in `66494a0` for the
+Vision raw-handoff fd clones; the
 rootless-Android limitation is tracked in `clients/TODO.md`; the 2026-11-08
 follow-up closed the lifecycle, reply-budget, replay-cache, resolver-task,
 legacy-send, installer, and harness issues listed below. Production runs
-`1b9113cde356-dirty` (SHA `6a9b4ffb…`) with `NRestarts=0`, an IPv4-only beam
+`0.1.0 (66494a09a092)` (SHA `176349b5…`) with `NRestarts=0`, an IPv4-only beam
 service drop-in, host IPv6 disabled (`all/default/lo.disable_ipv6=1`), zero IPv6
 addresses/routes/listeners, and `sshd` `AddressFamily inet`; the lab is stopped
 after the 11/11 checks.
-The annotated `v0.1.0-rc.1` tag is the current source release candidate.
+The annotated `v0.1.0-rc.1` tag is the previous release candidate; current
+`main` is `66494a0`.
 Stable-promotion validation (privileged syscall/wakeup/splice measurements and
 cgroup OOM sampling) is tracked in `ISSUES.md` test gaps; the five-hour soak is
 now the default release gate and passed on 2026-11-10, and the short fuzz
-campaign was clean. The Vision fd-clone cost (#10) is fixed on the
-`fix/vision-lazy-fd-clone` branch and no server finding remains open; the
-rootless-Android limitation is tracked in `clients/TODO.md`.
+campaign was clean. The Vision fd-clone cost (#10) is fixed and deployed, and
+no server finding remains open; the rootless-Android limitation is tracked in
+`clients/TODO.md`.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 
@@ -38,7 +39,7 @@ Do not treat the latter as fixed or as measured production incidents.
 | 4 | fixed `fb45eda` | XUDP close | Counted `SlotGuard` reservations make the End reserve strict; an End is still dropped and counted when all eight reserved slots are held. |
 | 5 | fixed 2026-11-08 | XUDP reply budget | A 2 MiB per-mux cap inside the 32 MiB process-wide budget prevents one slow reader from starving other mux streams. |
 | 9 | fixed 2026-11-08 | XUDP lifecycle | The empty-mux timer now tracks active sessions only, so retained GlobalID sockets cannot add another close timer. |
-| 10 | fixed `fe9760e` | Lower-risk resources | Vision raw-handoff descriptors are duplicated lazily after each direction's handoff; a non-handoff flow now keeps zero duplicates instead of four. Branch only, not merged or deployed. |
+| 10 | fixed `fe9760e`, deployed `66494a0` | Lower-risk resources | Vision raw-handoff descriptors are duplicated lazily after each direction's handoff; a non-handoff flow now keeps zero duplicates instead of four. |
 | 12 | moved | Client platform | Tracked in [`clients/TODO.md`](clients/TODO.md); no client work is planned for now. |
 | 13 | fixed 2026-11-09 | Cover relay | A disconnected probe could pin a cover slot and two sockets until the 30 s cover idle timeout, and slot saturation made the cover reply with an immediate reset. |
 
@@ -298,17 +299,18 @@ shutdown. `empty_mux_keepalive_does_not_extend_idle` and
 - ~~Vision Direct duplicates the client and target sockets for its blocking
   splice directions (`relay_vision` via `try_clone_raw_socket` and
   `try_clone_tcp`): up to four extra fds per active Vision connection, even
-  when no direction reaches Vision Direct.~~ Fixed on
-  `fix/vision-lazy-fd-clone` (`fe9760e`): each direction duplicates its two
-  descriptors only after its raw handoff is published and a splice permit is
-  held, so a non-handoff flow keeps zero duplicates. Regression:
+  when no direction reaches Vision Direct.~~ Fixed (`fe9760e`) and deployed in
+  `66494a0`: each direction duplicates its two descriptors only after its raw
+  handoff is published and a splice permit is held, so a non-handoff flow keeps
+  zero duplicates. Regression:
   `vless_client.py --selftest` (`vision_fd_budget`, `vision_fd_released`; 16
   flows measured delta 48 after vs 112 before) and
   `vless_tls_in_tls.py --squeeze-clones` (`squeeze_clone_fallback`, forcing
   descriptor duplication to fail and proving the async copy path). The fully
-  raw worst case remains four duplicates per flow (about 7 fds per flow,
-  ~7.2k at 1024 connections, ~11% of `LimitNOFILE=65536`). Branch only; not
-  merged or deployed.
+  raw worst case is four socket duplicates plus one pipe pair per raw
+  direction: about 11 fds for a fully spliced flow (3 base descriptors + 4
+  duplicates + 4 pipe fds), ~11.3k at 1024 connections, ~17% of
+  `LimitNOFILE=65536`. A non-handoff flow stays at 3 descriptors.
 - ~~Cover relay uses `copy_bidirectional` without a stop/eventfd; cancellation
   could leave detached blocking work and fds for the 30 s cover idle limit.~~
   Cover now always uses the async cancellable relay and is counted in shutdown

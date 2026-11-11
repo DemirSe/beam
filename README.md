@@ -8,20 +8,20 @@ note; the separate open stress findings live in
 ## Status
 
 Implemented, tested, and deployed. The current production build was verified
-on 2026-11-08 17:53 UTC:
+on 2026-11-11 16:39 UTC:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `6a9b4ffb25464445767504ce4fc908d330bb790b289d78f1de1c5db76faf243c` |
-| Version | `0.1.0 (1b9113cde356-dirty)` |
-| Source release | `v0.1.0-rc.1` release candidate (annotated tag) |
+| SHA-256 | `176349b54c5de007c34d87d789a9b3bbba142f2b5e232dca2b5bd57ee9195671` |
+| Version | `0.1.0 (66494a09a092)` |
+| Source release | current `main` (`66494a0`); supersedes `v0.1.0-rc.1` |
 | Service | `beam.service`, active, `NRestarts=0`, `RestrictAddressFamilies=AF_INET AF_UNIX` |
 | Listener | `0.0.0.0:443` (no IPv6 listener) |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
 | Host network | IPv6 disabled (`all/default/lo`), BBR + fq, conntrack 65536, 600 s UDP retention |
 | SSH | `AddressFamily inet`, `0.0.0.0:22`; no IPv6 listener |
-| Verification | Hash-pinned verifier PASS for plain and IPv4 HTTP/2 tunnel with `EXPECT_HOST_IPV6_DISABLED=1`; 120/120 HTTP 200 soak at 4-way concurrency; `NRestarts=0`; 44 threads, 17 MiB RSS, 208 fds at the verification snapshot (fds vary with active relays); cover TLS 1.3 `*.whatsapp.net`; lab matrix 11/11; TUN matrix 8/8 in xudp, packetaddr and legacy; `make check` 381 tests (local client stopped; see Verification before commit) and `make smoke` PASS |
+| Verification | Hash-pinned verifier PASS for plain and IPv4 HTTP/2 tunnel with `EXPECT_HOST_IPV6_DISABLED=1`; 20/20 HTTP 200 burst at 20-way concurrency; `NRestarts=0`; 42 threads, 26 MiB RSS, 137–158 fds while relays drain (fds vary with active relays); 900 s soak with fd 10→10 and byte-exact TCP/UDP; TUN matrix 8/8; config matrix 57/57; fuzz 7/7; A/B valid/complete/unsaturated; 405 workspace tests |
 
 Production is IPv4-only end to end: the beam drop-in
 `/etc/systemd/system/beam.service.d/99-ipv4-only.conf` resets the base family
@@ -34,10 +34,11 @@ has no IPv6 addresses, routes, or listeners, and `sshd` listens on
 `ipv6.disable=1` kernel-cmdline change is made. IPv6 HTTP/2 is intentionally
 not used in production verification.
 
-The release candidate is the annotated tag `v0.1.0-rc.1`. Production still
-runs the pre-release dirty build `0.1.0 (1b9113cde356-dirty)` (binary
-`6a9b4ffb…`, config `d20d16…`, drop-in `f852fce5…`) and is not redeployed by
-this tag. The RC contains the current server fixes plus the IPv4-only client
+The annotated tag `v0.1.0-rc.1` remains the previous release candidate.
+Production now runs the current `main` build `0.1.0 (66494a09a092)` (binary
+`176349b5…`, config `d20d16…`, drop-in `f852fce5…`), which adds the
+2026-11-11 Vision Direct lazy-descriptor fix (STRESS-FINDINGS #10) to the RC
+fix set. The RC contains the current server fixes plus the IPv4-only client
 and deployment artifacts. It includes the XUDP junk-reply
 idle-pinning fix (`2163c0a`), the mux-wide resolution/send-stall fix
 (`e0ca0bc`), the 2026-11-03 handshake/legacy-UDP/End-enqueue hardening, the
@@ -131,8 +132,8 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 381 tests: 350 `beam-core`,
-1 `beam` CLI, 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
+a benchmark comparison. The current workspace has 405 tests: 371 `beam-core`,
+4 `beam` CLI, 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 When the IPv4-only Linux client is active, run the workspace checks with
 `sudo systemctl stop beam-client` and restart it afterward: sing-box's
 `auto_redirect` rules reject local IPv6 loopback, so the Rust IPv6 loopback
@@ -1010,12 +1011,11 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   required.
 - **One user, one inbound, no hot reload/stats** keeps the attack surface and
   resource model bounded.
-- **Production is pinned at `1b9113cde356-dirty`; release source is
-  `v0.1.0-rc.1`** — the annotated RC tag contains the current fix set.
-  Production was built from the pre-release dirty tree and is not redeployed
-  by the tag. Move it only with `deploy/package.sh` plus
+- **Production runs the current `main` build `0.1.0 (66494a09a092)` (binary
+  `176349b5…`); the annotated `v0.1.0-rc.1` tag is the previous release
+  candidate.** Move it only with `deploy/package.sh` plus
   `BEAM_KEEP_CONFIG=1 bootstrap.sh`, then re-run the hash-pinned verifier and
-  update the dirty-build pin here when deployed.
+  update the pin here when deployed.
 - **Production is IPv4-only at the host boundary** — the beam
   `99-ipv4-only.conf` drop-in resets the base family list and sets
   `RestrictAddressFamilies=AF_INET AF_UNIX`; host IPv6 is disabled
