@@ -10,7 +10,8 @@
 //! UDP and packetaddr through [`crate::udp`], and reverse streams remain out
 //! of scope.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -18,7 +19,7 @@ use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use rand::SeedableRng;
@@ -105,22 +106,20 @@ fn cover_timeout(configured: Duration) -> Duration {
 /// IP/TCP headers.
 const TARGET_MSS: u16 = 1400;
 
-/// Bound on remembered authenticated ClientHello session ids.
+/// Bound on remembered authenticated ClientHello session ids before the
+/// production capacity override.
 const REPLAY_CACHE_CAPACITY: usize = 4_096;
 
 /// Retention for one replay-cache entry when no timestamp window is configured.
-///
-/// With a configured window, retention is `2 * window + slack`; see
-/// [`replay_retention`]. A timestamp `now + window` is accepted, so its
-/// ClientHello stays reusable until that future timestamp itself falls outside
-/// the window, which is at most `2 * window` after it is first seen.
 const REPLAY_CACHE_TTL: Duration = Duration::from_secs(300);
 
-/// Extra retention beyond twice the timestamp window to cover clock granularity.
+/// Extra retention beyond the timestamp window to cover the accepted boundary.
 const REPLAY_RETENTION_SLACK: Duration = Duration::from_secs(1);
 
-fn replay_retention(max_time_diff: Option<Duration>) -> Duration {
-    max_time_diff.map_or(REPLAY_CACHE_TTL, |window| {
+/// Maximum possible retention. With a window, a timestamp up to `window` in the
+/// future is accepted, so the worst case is `2 * window + slack`.
+fn replay_max_retention(window: Option<Duration>) -> Duration {
+    window.map_or(REPLAY_CACHE_TTL, |window| {
         window
             .saturating_mul(2)
             .saturating_add(REPLAY_RETENTION_SLACK)
@@ -133,118 +132,247 @@ fn replay_retention(max_time_diff: Option<Duration>) -> Duration {
 /// before the TLS Finished insert happens.
 const REPLAY_MAX_IN_FLIGHT_PER_ID: usize = 4;
 
+/// One exact-replay id's phase. `states` stores only `InFlight` and `Settled`;
+/// `Unseen` and `Expired` are read results, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayPhase {
+    Unseen,
+    InFlight { reservations: u8 },
+    Settled { deadline: Instant },
+    Expired,
+}
+
+/// Result of recording a completed handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayInsert {
+    Inserted,
+    Duplicate,
+    Full,
+}
+
+/// Snapshot of the replay cache for the periodic counter line.
+///
+/// `entries` is the number of settled ids after sweeping expiry; `in_flight` is
+/// the number of distinct ids currently holding at least one reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayStats {
+    pub entries: usize,
+    pub in_flight: usize,
+    pub capacity: usize,
+}
+
+fn wall_clock_seconds() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+/// Retain until a replay of this envelope would be rejected by
+/// `reality::auth::check_timestamp`, i.e. real time > timestamp + window.
+/// `check_timestamp` accepts `difference == window`, hence the +1 s slack.
+fn replay_deadline(
+    timestamp: u32,
+    now: Instant,
+    now_wall: Option<u64>,
+    window: Option<Duration>,
+) -> Instant {
+    let Some(window) = window else {
+        return now + REPLAY_CACHE_TTL;
+    };
+    let max = replay_max_retention(Some(window));
+    let Some(now_wall) = now_wall else {
+        return now + max;
+    };
+    let timestamp = u64::from(timestamp);
+    let seconds = if timestamp >= now_wall {
+        timestamp
+            .saturating_sub(now_wall)
+            .saturating_add(window.as_secs())
+            .saturating_add(REPLAY_RETENTION_SLACK.as_secs())
+    } else {
+        window
+            .as_secs()
+            .saturating_sub(now_wall - timestamp)
+            .saturating_add(REPLAY_RETENTION_SLACK.as_secs())
+    };
+    now + Duration::from_secs(seconds.min(max.as_secs()))
+}
+
 /// Bounded exact-replay filter for authenticated ClientHellos.
 ///
 /// The key is the encrypted 32-byte REALITY session id. It is not a secret and
 /// is not logged; the cache never stores a ClientHello, key share, or auth key.
+///
+/// Phase transitions:
+/// `Unseen -> InFlight(1)` on reserve; `InFlight(n) -> InFlight(n+1)` below the
+/// in-flight cap; `InFlight -> Unseen` when the last reservation is released;
+/// `InFlight -> Settled(deadline)` on the first completed handshake; `Settled`
+/// stays `Settled` and rejects duplicates; `Settled -> Expired -> Unseen` when
+/// the deadline passes. A full cache rejects a new id without changing its
+/// `InFlight` phase, so the reservation drop can release it.
 struct ReplayCache {
-    entries: HashMap<[u8; 32], Instant>,
-    order: VecDeque<[u8; 32]>,
-    in_flight: HashMap<[u8; 32], usize>,
-    ttl: Duration,
+    states: HashMap<[u8; 32], ReplayPhase>,
+    deadlines: BinaryHeap<Reverse<(Instant, [u8; 32])>>,
+    settled: usize,
+    in_flight: usize,
+    window: Option<Duration>,
     capacity: usize,
 }
 
 impl ReplayCache {
     #[cfg(test)]
-    fn new(ttl: Duration) -> Self {
-        Self::with_capacity(ttl, REPLAY_CACHE_CAPACITY)
+    fn new(window: Option<Duration>) -> Self {
+        Self::with_capacity(window, REPLAY_CACHE_CAPACITY)
     }
 
-    fn with_capacity(ttl: Duration, capacity: usize) -> Self {
+    fn with_capacity(window: Option<Duration>, capacity: usize) -> Self {
         let capacity = capacity.max(1);
         Self {
-            entries: HashMap::with_capacity(capacity),
-            order: VecDeque::with_capacity(capacity),
-            in_flight: HashMap::new(),
-            ttl,
+            states: HashMap::with_capacity(capacity),
+            deadlines: BinaryHeap::with_capacity(capacity),
+            settled: 0,
+            in_flight: 0,
+            window,
             capacity,
         }
     }
 
     fn expire(&mut self, now: Instant) {
-        while let Some(front) = self.order.front().copied() {
-            let expired = self
-                .entries
-                .get(&front)
-                .is_none_or(|seen| now.saturating_duration_since(*seen) >= self.ttl);
-            if !expired {
+        while let Some(&Reverse((deadline, id))) = self.deadlines.peek() {
+            if deadline > now {
                 break;
             }
-            self.order.pop_front();
-            self.entries.remove(&front);
+            self.deadlines.pop();
+            let current_deadline = match self.states.get(&id) {
+                Some(ReplayPhase::Settled { deadline: stored }) => Some(*stored),
+                _ => None,
+            };
+            if current_deadline == Some(deadline) {
+                self.states.remove(&id);
+                self.settled = self.settled.saturating_sub(1);
+            }
+        }
+    }
+
+    fn phase(&self, id: [u8; 32], now: Instant) -> ReplayPhase {
+        match self.states.get(&id) {
+            Some(ReplayPhase::Settled { deadline }) if *deadline <= now => ReplayPhase::Expired,
+            Some(phase) => *phase,
+            None => ReplayPhase::Unseen,
         }
     }
 
     /// Reserves one in-flight handshake for an authenticated ClientHello.
-    ///
-    /// Completed handshakes are rejected by `entries`; concurrent copies are
-    /// bounded so a captured ClientHello cannot occupy the global connection
-    /// permits while its TLS handshake is incomplete.
     fn try_reserve(&mut self, id: [u8; 32]) -> bool {
-        self.expire(Instant::now());
-        if self.entries.contains_key(&id) {
-            return false;
+        self.try_reserve_at(id, Instant::now())
+    }
+
+    fn try_reserve_at(&mut self, id: [u8; 32], now: Instant) -> bool {
+        self.expire(now);
+        match self.phase(id, now) {
+            ReplayPhase::Settled { .. } => false,
+            ReplayPhase::InFlight { reservations } => {
+                if usize::from(reservations) >= REPLAY_MAX_IN_FLIGHT_PER_ID {
+                    false
+                } else {
+                    if let Some(ReplayPhase::InFlight { reservations }) = self.states.get_mut(&id) {
+                        *reservations = reservations.saturating_add(1);
+                    }
+                    true
+                }
+            }
+            ReplayPhase::Unseen | ReplayPhase::Expired => {
+                self.states
+                    .insert(id, ReplayPhase::InFlight { reservations: 1 });
+                self.in_flight = self.in_flight.saturating_add(1);
+                true
+            }
         }
-        let count = self.in_flight.get(&id).copied().unwrap_or(0);
-        if count >= REPLAY_MAX_IN_FLIGHT_PER_ID {
-            return false;
-        }
-        self.in_flight.insert(id, count + 1);
-        true
     }
 
     fn release(&mut self, id: [u8; 32]) {
-        if let Some(count) = self.in_flight.get_mut(&id) {
-            if *count <= 1 {
-                self.in_flight.remove(&id);
-            } else {
-                *count -= 1;
+        match self.states.get(&id).copied() {
+            Some(ReplayPhase::InFlight { reservations }) if reservations > 1 => {
+                if let Some(ReplayPhase::InFlight { reservations }) = self.states.get_mut(&id) {
+                    *reservations = reservations.saturating_sub(1);
+                }
             }
+            Some(ReplayPhase::InFlight { .. }) => {
+                self.states.remove(&id);
+                self.in_flight = self.in_flight.saturating_sub(1);
+            }
+            _ => {}
         }
     }
 
     /// Records the first completed handshake for an id.
     ///
-    /// Returns `false` when another handshake with the same id completed
-    /// first; the caller must reject that duplicate rather than serving two
-    /// authenticated sessions from one ClientHello. A full cache also returns
-    /// `false` instead of evicting a live entry: evicting the oldest id would
-    /// reopen its replay window while its timestamp is still acceptable.
-    ///
-    /// A rejected insert leaves `in_flight` alone: the caller still holds its
-    /// `ReplayReservation`, whose `Drop` releases exactly the one count that
-    /// connection reserved. Removing the count before the rejection check
-    /// would discard other live copies' reservations and let new copies
-    /// reserve past `REPLAY_MAX_IN_FLIGHT_PER_ID`.
-    fn insert(&mut self, id: [u8; 32]) -> bool {
-        let now = Instant::now();
-        self.expire(now);
-        if self.entries.contains_key(&id) || self.entries.len() >= self.capacity {
-            return false;
-        }
-        self.in_flight.remove(&id);
-        self.entries.insert(id, now);
-        self.order.push_back(id);
-        true
+    /// A duplicate returns `Duplicate`; a full cache returns `Full`. Both leave
+    /// any `InFlight` phase and count unchanged so the caller's
+    /// `ReplayReservation::drop` releases exactly the reservation it holds.
+    fn insert(&mut self, id: [u8; 32], timestamp: u32) -> ReplayInsert {
+        self.insert_at(id, timestamp, Instant::now(), wall_clock_seconds())
     }
+
+    fn insert_at(
+        &mut self,
+        id: [u8; 32],
+        timestamp: u32,
+        now: Instant,
+        now_wall: Option<u64>,
+    ) -> ReplayInsert {
+        self.expire(now);
+        let had_reservation = match self.phase(id, now) {
+            ReplayPhase::Settled { .. } => return ReplayInsert::Duplicate,
+            ReplayPhase::InFlight { .. } => true,
+            ReplayPhase::Unseen | ReplayPhase::Expired => false,
+        };
+        if self.settled >= self.capacity {
+            return ReplayInsert::Full;
+        }
+        let deadline = replay_deadline(timestamp, now, now_wall, self.window);
+        if had_reservation {
+            self.states.remove(&id);
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
+        self.states.insert(id, ReplayPhase::Settled { deadline });
+        self.deadlines.push(Reverse((deadline, id)));
+        self.settled = self.settled.saturating_add(1);
+        ReplayInsert::Inserted
+    }
+
+    fn stats(&mut self, now: Instant) -> ReplayStats {
+        self.expire(now);
+        ReplayStats {
+            entries: self.settled,
+            in_flight: self.in_flight,
+            capacity: self.capacity,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReservationState {
+    Pending,
+    Committed,
 }
 
 struct ReplayReservation<'a> {
     cache: &'a Mutex<ReplayCache>,
     id: [u8; 32],
-    active: bool,
+    state: ReservationState,
 }
 
 impl ReplayReservation<'_> {
     fn commit(mut self) {
-        self.active = false;
+        self.state = ReservationState::Committed;
     }
 }
 
 impl Drop for ReplayReservation<'_> {
     fn drop(&mut self) {
-        if !self.active {
+        if matches!(self.state, ReservationState::Committed) {
             return;
         }
         match self.cache.lock() {
@@ -476,7 +604,7 @@ impl TlsServerConfig {
             cover_limiter: Arc::new(IpLimiter::new(COVER_MAX_CONCURRENCY, COVER_MAX_PER_IP)),
             metrics: Arc::new(Metrics::default()),
             replay_cache: Mutex::new(ReplayCache::with_capacity(
-                replay_retention(max_time_diff),
+                max_time_diff,
                 REPLAY_CACHE_CAPACITY,
             )),
         })
@@ -523,10 +651,7 @@ impl TlsServerConfig {
     /// Overrides the bounded exact-replay cache capacity.
     #[must_use]
     pub fn with_replay_capacity(mut self, capacity: usize) -> Self {
-        self.replay_cache = Mutex::new(ReplayCache::with_capacity(
-            replay_retention(self.max_time_diff),
-            capacity,
-        ));
+        self.replay_cache = Mutex::new(ReplayCache::with_capacity(self.max_time_diff, capacity));
         self
     }
 
@@ -593,15 +718,24 @@ impl TlsServerConfig {
         Some(ReplayReservation {
             cache: &self.replay_cache,
             id,
-            active: true,
+            state: ReservationState::Pending,
         })
     }
 
-    /// Returns `false` when this exact ClientHello already completed.
-    fn replay_insert(&self, id: [u8; 32]) -> bool {
+    /// Returns the outcome of recording this completed ClientHello.
+    fn replay_insert(&self, id: [u8; 32], timestamp: u32) -> ReplayInsert {
         match self.replay_cache.lock() {
-            Ok(mut cache) => cache.insert(id),
-            Err(poisoned) => poisoned.into_inner().insert(id),
+            Ok(mut cache) => cache.insert(id, timestamp),
+            Err(poisoned) => poisoned.into_inner().insert(id, timestamp),
+        }
+    }
+
+    /// Returns a consistent snapshot of the replay cache for the counter line.
+    #[must_use]
+    pub fn replay_stats(&self) -> ReplayStats {
+        match self.replay_cache.lock() {
+            Ok(mut cache) => cache.stats(Instant::now()),
+            Err(poisoned) => poisoned.into_inner().stats(Instant::now()),
         }
     }
 
@@ -1295,15 +1429,29 @@ async fn handle_authenticated(
     // reservation gate, but only the handshake that reaches Finished first is
     // served. This preserves the legitimate client's race while rejecting a
     // duplicate that also completed before the cache insert.
-    if !config.replay_insert(auth.session_id) {
-        // The only post-handshake replay signal an operator can act on: a
-        // ClientHello that completed TLS but lost the first-wins race, or a
-        // full cache. Pre-reservation duplicates are forwarded to the cover and
-        // are not counted here.
-        config.metrics.record_replay_rejected();
-        return Err(TlsServerError::ReplayRejected);
+    match config.replay_insert(auth.session_id, auth.timestamp) {
+        ReplayInsert::Inserted => {
+            reservation.commit();
+        }
+        ReplayInsert::Duplicate => {
+            // The only post-handshake duplicate signal an operator can act on:
+            // a ClientHello that completed TLS but lost the first-wins race.
+            // Pre-reservation duplicates are forwarded to the cover and are not
+            // counted here.
+            config.metrics.record_replay_rejected();
+            tracing::debug!("authenticated ClientHello replay after handshake");
+            return Err(TlsServerError::ReplayRejected);
+        }
+        ReplayInsert::Full => {
+            // The cache is at its configured bound. This is a capacity event,
+            // not evidence that the client reused a handshake; count it
+            // separately so an operator can tell the two apart.
+            config.metrics.record_replay_rejected();
+            config.metrics.record_replay_cache_full();
+            tracing::debug!("replay cache full; closing authenticated connection");
+            return Err(TlsServerError::ReplayRejected);
+        }
     }
-    reservation.commit();
 
     let request = timeout_at(
         deadline,
@@ -2614,94 +2762,311 @@ mod tests {
 
     #[test]
     fn replay_cache_rejects_duplicates_and_stays_bounded() {
-        let mut cache = ReplayCache::new(Duration::from_secs(60));
+        let window = Some(Duration::from_secs(60));
+        let mut cache = ReplayCache::new(window);
+        let now = Instant::now();
+        let wall = 1_000_000;
         let id = [7u8; 32];
-        assert!(!cache.entries.contains_key(&id));
-        assert!(cache.try_reserve(id));
-        assert!(cache.insert(id));
-        assert!(!cache.try_reserve(id));
+        assert_eq!(cache.phase(id, now), ReplayPhase::Unseen);
+        assert!(cache.try_reserve_at(id, now));
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::InFlight { reservations: 1 }
+        );
+        assert_eq!(
+            cache.insert_at(id, wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::Settled {
+                deadline: replay_deadline(wall, now, Some(u64::from(wall)), window)
+            }
+        );
+        assert!(!cache.try_reserve_at(id, now));
         let mut oldest = [0u8; 32];
         for index in 0..REPLAY_CACHE_CAPACITY - 1 {
             let mut next = [0u8; 32];
             next[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            assert!(cache.insert(next), "entry {index} must fit the cache");
+            assert_eq!(
+                cache.insert_at(next, wall, now, Some(u64::from(wall))),
+                ReplayInsert::Inserted,
+                "entry {index} must fit the cache"
+            );
             if index == 0 {
                 oldest = next;
             }
         }
         let mut extra = [0xffu8; 32];
         extra[..8].copy_from_slice(&(REPLAY_CACHE_CAPACITY as u64).to_be_bytes());
-        assert!(!cache.insert(extra), "a full cache must reject, not evict");
-        assert_eq!(cache.entries.len(), REPLAY_CACHE_CAPACITY);
-        assert_eq!(cache.order.len(), REPLAY_CACHE_CAPACITY);
+        assert_eq!(
+            cache.insert_at(extra, wall, now, Some(u64::from(wall))),
+            ReplayInsert::Full,
+            "a full cache must reject, not evict"
+        );
+        let stats = cache.stats(now);
+        assert_eq!(stats.entries, REPLAY_CACHE_CAPACITY);
+        assert_eq!(stats.in_flight, 0);
+        assert_eq!(cache.deadlines.len(), REPLAY_CACHE_CAPACITY);
         assert!(
-            !cache.try_reserve(oldest),
+            !cache.try_reserve_at(oldest, now),
             "the oldest live id must not be evicted"
         );
     }
 
     #[test]
     fn replay_cache_uses_the_configured_capacity() {
-        let mut cache = ReplayCache::with_capacity(Duration::from_secs(60), 2);
-        assert!(cache.insert([1; 32]));
-        assert!(cache.insert([2; 32]));
-        assert!(!cache.insert([3; 32]));
-        assert_eq!(cache.entries.len(), 2);
-        assert_eq!(cache.order.len(), 2);
-    }
-
-    #[test]
-    fn replay_cache_entries_expire_after_retention() {
-        let mut cache = ReplayCache::with_capacity(Duration::ZERO, 2);
-        assert!(cache.insert([4; 32]));
-        cache.expire(Instant::now());
-        assert!(cache.entries.is_empty());
-        assert!(cache.insert([4; 32]));
-    }
-
-    #[test]
-    fn replay_retention_covers_future_timestamps() {
+        let mut cache = ReplayCache::with_capacity(Some(Duration::from_secs(60)), 2);
+        let now = Instant::now();
+        let wall = 1_000_000;
         assert_eq!(
-            replay_retention(Some(Duration::from_secs(300))),
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert_eq!(
+            cache.insert_at([2; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert_eq!(
+            cache.insert_at([3; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Full
+        );
+        assert_eq!(cache.stats(now).entries, 2);
+        assert_eq!(cache.deadlines.len(), 2);
+    }
+
+    #[test]
+    fn replay_entry_expires_at_timestamp_plus_window() {
+        let window = Duration::from_secs(300);
+        let mut cache = ReplayCache::with_capacity(Some(window), 2);
+        let now = Instant::now();
+        let base: u32 = 1_000_000;
+        let wall = u64::from(base);
+        assert_eq!(
+            cache.insert_at([4; 32], base, now, Some(wall)),
+            ReplayInsert::Inserted
+        );
+        // difference == window is still accepted by check_timestamp.
+        cache.expire(now + window);
+        assert_ne!(
+            cache.phase([4; 32], now + window),
+            ReplayPhase::Unseen,
+            "the boundary second must stay cached"
+        );
+        cache.expire(now + window + REPLAY_RETENTION_SLACK);
+        assert_eq!(
+            cache.phase([4; 32], now + window + REPLAY_RETENTION_SLACK),
+            ReplayPhase::Unseen
+        );
+        let next_timestamp =
+            base + u32::try_from(window.as_secs()).expect("test window fits u32") + 1;
+        let next_wall = u64::from(next_timestamp);
+        assert_eq!(
+            cache.insert_at(
+                [4; 32],
+                next_timestamp,
+                now + window + REPLAY_RETENTION_SLACK,
+                Some(next_wall)
+            ),
+            ReplayInsert::Inserted
+        );
+    }
+
+    #[test]
+    fn replay_deadline_covers_the_timestamp_window() {
+        let now = Instant::now();
+        let window = Some(Duration::from_secs(300));
+        let base: u32 = 1_000_000;
+        let wall = u64::from(base);
+        let retention = |timestamp: u32| {
+            replay_deadline(timestamp, now, Some(wall), window).saturating_duration_since(now)
+        };
+        assert_eq!(retention(base), Duration::from_secs(301));
+        assert_eq!(retention(base + 300), Duration::from_secs(601));
+        assert_eq!(retention(base - 300), Duration::from_secs(1));
+        assert_eq!(retention(base - 301), Duration::from_secs(1));
+        assert_eq!(
+            replay_deadline(base, now, None, window).saturating_duration_since(now),
             Duration::from_secs(601)
         );
-        assert_eq!(replay_retention(None), Duration::from_secs(300));
+        assert_eq!(
+            replay_deadline(base, now, Some(wall), None).saturating_duration_since(now),
+            Duration::from_secs(300)
+        );
     }
 
     #[test]
     fn replay_cache_limits_in_flight_duplicates() {
-        let mut cache = ReplayCache::new(Duration::from_secs(60));
+        let mut cache = ReplayCache::new(Some(Duration::from_secs(60)));
+        let now = Instant::now();
         let id = [9u8; 32];
         for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID {
-            assert!(cache.try_reserve(id));
+            assert!(cache.try_reserve_at(id, now));
         }
-        assert!(!cache.try_reserve(id));
+        assert!(!cache.try_reserve_at(id, now));
         cache.release(id);
-        assert!(cache.try_reserve(id));
-        assert!(cache.insert(id));
-        assert!(!cache.try_reserve(id));
+        assert!(cache.try_reserve_at(id, now));
+        assert_eq!(cache.stats(now).in_flight, 1);
+        assert_eq!(
+            cache.insert_at(id, 1_000_000, now, Some(1_000_000)),
+            ReplayInsert::Inserted
+        );
+        assert_eq!(cache.stats(now).in_flight, 0);
+        assert!(!cache.try_reserve_at(id, now));
     }
 
     #[test]
     fn failed_replay_insert_keeps_the_in_flight_bound() {
-        let mut cache = ReplayCache::with_capacity(Duration::from_secs(60), 1);
-        assert!(cache.insert([1; 32]));
-        assert!(cache.try_reserve([9; 32]));
-        assert!(!cache.insert([9; 32]), "a full cache must reject");
+        let mut cache = ReplayCache::with_capacity(Some(Duration::from_secs(60)), 1);
+        let now = Instant::now();
+        let wall = 1_000_000;
         assert_eq!(
-            cache.in_flight.get(&[9; 32]),
-            Some(&1),
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert!(cache.try_reserve_at([9; 32], now));
+        assert_eq!(
+            cache.insert_at([9; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Full,
+            "a full cache must reject"
+        );
+        assert_eq!(
+            cache.phase([9; 32], now),
+            ReplayPhase::InFlight { reservations: 1 },
             "a rejected insert must not erase another copy's reservation"
         );
         for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID - 1 {
-            assert!(cache.try_reserve([9; 32]));
+            assert!(cache.try_reserve_at([9; 32], now));
         }
         assert!(
-            !cache.try_reserve([9; 32]),
+            !cache.try_reserve_at([9; 32], now),
             "the fifth copy must be rejected"
         );
-        assert!(!cache.insert([1; 32]), "a settled id must still reject");
-        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Duplicate,
+            "a settled id must still reject"
+        );
+        assert_eq!(cache.stats(now).entries, 1);
+        for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID {
+            cache.release([9; 32]);
+        }
+        assert_eq!(cache.phase([9; 32], now), ReplayPhase::Unseen);
+        assert_eq!(cache.stats(now).in_flight, 0);
+    }
+
+    #[test]
+    fn replay_phase_transitions_are_explicit() {
+        let window = Some(Duration::from_secs(60));
+        let mut cache = ReplayCache::new(window);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        let id = [5u8; 32];
+        assert_eq!(cache.phase(id, now), ReplayPhase::Unseen);
+        assert!(cache.try_reserve_at(id, now));
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::InFlight { reservations: 1 }
+        );
+        assert!(cache.try_reserve_at(id, now));
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::InFlight { reservations: 2 }
+        );
+        cache.release(id);
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::InFlight { reservations: 1 }
+        );
+        let deadline = replay_deadline(wall, now, Some(u64::from(wall)), window);
+        assert_eq!(
+            cache.insert_at(id, wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert_eq!(cache.phase(id, now), ReplayPhase::Settled { deadline });
+        assert!(!cache.try_reserve_at(id, now));
+        assert_eq!(
+            cache.insert_at(id, wall, now, Some(u64::from(wall))),
+            ReplayInsert::Duplicate
+        );
+        cache.expire(now + Duration::from_secs(61));
+        assert_eq!(
+            cache.phase(id, now + Duration::from_secs(61)),
+            ReplayPhase::Unseen
+        );
+    }
+
+    #[test]
+    fn replay_stats_track_settled_and_in_flight() {
+        let mut cache = ReplayCache::with_capacity(Some(Duration::from_secs(60)), 2);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        assert!(cache.try_reserve_at([1; 32], now));
+        assert_eq!(
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert!(cache.try_reserve_at([2; 32], now));
+        let stats = cache.stats(now);
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.in_flight, 1);
+        assert_eq!(stats.capacity, 2);
+        cache.release([2; 32]);
+        assert_eq!(cache.stats(now).in_flight, 0);
+    }
+
+    #[test]
+    fn replay_counters_match_states() {
+        let mut cache = ReplayCache::with_capacity(Some(Duration::from_secs(60)), 4);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        assert!(cache.try_reserve_at([1; 32], now));
+        assert_eq!(
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert!(cache.try_reserve_at([2; 32], now));
+        assert!(cache.try_reserve_at([2; 32], now));
+        assert!(cache.try_reserve_at([3; 32], now));
+        let stats = cache.stats(now);
+        let in_flight_states = cache
+            .states
+            .values()
+            .filter(|phase| matches!(phase, ReplayPhase::InFlight { .. }))
+            .count();
+        assert_eq!(stats.in_flight, in_flight_states);
+        assert_eq!(stats.entries, cache.deadlines.len());
+        cache.release([2; 32]);
+        cache.release([2; 32]);
+        cache.release([3; 32]);
+        let after = now + Duration::from_secs(61);
+        let stats = cache.stats(after);
+        assert_eq!(stats.entries, 0);
+        assert_eq!(cache.deadlines.len(), 0);
+        assert_eq!(stats.in_flight, 0);
+    }
+
+    #[test]
+    fn replay_insert_full_does_not_drop_a_reservation() {
+        let mut cache = ReplayCache::with_capacity(Some(Duration::from_secs(60)), 1);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        assert_eq!(
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert!(cache.try_reserve_at([2; 32], now));
+        assert_eq!(
+            cache.insert_at([2; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Full
+        );
+        assert_eq!(
+            cache.phase([2; 32], now),
+            ReplayPhase::InFlight { reservations: 1 }
+        );
+        assert_eq!(cache.stats(now).in_flight, 1);
+        cache.release([2; 32]);
+        assert_eq!(cache.phase([2; 32], now), ReplayPhase::Unseen);
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ pub struct Metrics {
     xudp_replies_dropped: AtomicU64,
     xudp_send_dropped: AtomicU64,
     replay_rejected: AtomicU64,
+    replay_cache_full: AtomicU64,
     xudp_end_dropped: AtomicU64,
     legacy_udp_limited: AtomicU64,
     splice_fallback: AtomicU64,
@@ -60,6 +61,9 @@ pub struct MetricsSnapshot {
     /// Authenticated ClientHellos refused by the replay cache, either before the
     /// TLS handshake (reservation) or after it (settled id or full cache).
     pub replay_rejected: u64,
+    /// Authenticated handshakes rejected because the replay cache was full;
+    /// distinct from a duplicate ClientHello.
+    pub replay_cache_full: u64,
     /// XUDP `End` frames that could not be queued before their deadline.
     pub xudp_end_dropped: u64,
     /// Legacy UDP / packetaddr streams rejected by their separate cap.
@@ -146,6 +150,12 @@ impl Metrics {
     /// Records an authenticated handshake rejected by the replay cache.
     pub fn record_replay_rejected(&self) {
         self.replay_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records an authenticated handshake rejected because the replay cache
+    /// reached its configured bound.
+    pub fn record_replay_cache_full(&self) {
+        self.replay_cache_full.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_xudp_send_dropped(&self) {
@@ -242,6 +252,7 @@ impl Metrics {
             xudp_replies_dropped: self.xudp_replies_dropped.load(Ordering::Relaxed),
             xudp_send_dropped: self.xudp_send_dropped.load(Ordering::Relaxed),
             replay_rejected: self.replay_rejected.load(Ordering::Relaxed),
+            replay_cache_full: self.replay_cache_full.load(Ordering::Relaxed),
             xudp_end_dropped: self.xudp_end_dropped.load(Ordering::Relaxed),
             legacy_udp_limited: self.legacy_udp_limited.load(Ordering::Relaxed),
             splice_fallback: self.splice_fallback.load(Ordering::Relaxed),
@@ -281,6 +292,8 @@ mod tests {
         metrics.record_xudp_reply_dropped();
         metrics.record_xudp_end_dropped();
         metrics.record_legacy_udp_limit();
+        metrics.record_replay_rejected();
+        metrics.record_replay_cache_full();
         metrics.record_splice_fallback();
         metrics.record_xudp_new(true);
         metrics.record_xudp_end();
@@ -305,6 +318,8 @@ mod tests {
         assert_eq!(snapshot.xudp_replies_dropped, 1);
         assert_eq!(snapshot.xudp_end_dropped, 1);
         assert_eq!(snapshot.legacy_udp_limited, 1);
+        assert_eq!(snapshot.replay_rejected, 1);
+        assert_eq!(snapshot.replay_cache_full, 1);
         assert_eq!(snapshot.splice_fallback, 1);
         assert_eq!(snapshot.xudp_new_frames, 1);
         assert_eq!(snapshot.xudp_new_global_id, 1);

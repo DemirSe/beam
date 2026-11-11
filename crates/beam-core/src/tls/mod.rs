@@ -16,7 +16,7 @@ pub use client_hello::{
     U16ListIter, client_hello_message_len,
 };
 pub use server::{
-    ConnectionOutcome, ReplayStream, TlsServerConfig, TlsServerError, handle_connection,
-    handle_connection_admitted,
+    ConnectionOutcome, ReplayStats, ReplayStream, TlsServerConfig, TlsServerError,
+    handle_connection, handle_connection_admitted,
 };
 pub use stream::{RawTls, RawTlsHandoff, TlsStream, TlsStreamError};

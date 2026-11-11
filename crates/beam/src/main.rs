@@ -26,15 +26,15 @@ use tokio::time::{Instant, sleep};
 const REALITY_TIMESTAMP_WINDOW: Duration = Duration::from_secs(300);
 
 /// Exact-replay entries remembered per configured authenticated connection.
-const REPLAY_CAPACITY_PER_CONNECTION: usize = 64;
+const REPLAY_CAPACITY_PER_CONNECTION: usize = 128;
 const REPLAY_CAPACITY_MIN: usize = 4_096;
-const REPLAY_CAPACITY_MAX: usize = 65_536;
+const REPLAY_CAPACITY_MAX: usize = 131_072;
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BEAM_GIT_HASH"), ")");
 
 /// Bounds the exact-replay cache for the configured connection pool.
 ///
-/// The README promises `max_connections * 64` bounded to 4096..65536. A full
+/// The README promises `max_connections * 128` bounded to 4096..131072. A full
 /// cache rejects new authenticated handshakes instead of evicting a live id.
 fn replay_capacity(max_connections: u32) -> usize {
     usize::try_from(max_connections)
@@ -193,6 +193,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     let metrics_task = Arc::clone(&metrics);
     let preauth_gauge = Arc::clone(&preauth);
     let authenticated_gauge = Arc::clone(&authenticated);
+    let replay_config = Arc::clone(&tls_config);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -203,6 +204,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
             max_connections.saturating_sub(authenticated_gauge.available_permits());
         let mut last_xudp = xudp_limiter.stats();
         let mut last_pressure = pressure_counters(&last);
+        let mut last_replay = replay_config.replay_stats();
         loop {
             ticker.tick().await;
             let current = metrics_task.snapshot();
@@ -211,6 +213,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
             let authenticated_active =
                 max_connections.saturating_sub(authenticated_gauge.available_permits());
             let xudp = xudp_limiter.stats();
+            let replay = replay_config.replay_stats();
             let pressure = pressure_counters(&current);
             if pressure != last_pressure {
                 // Keep a visible trace at the production `warn` level. The
@@ -228,6 +231,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                     xudp_send_dropped = pressure.7.saturating_sub(last_pressure.7),
                     legacy_udp_limited = pressure.8.saturating_sub(last_pressure.8),
                     replay_rejected = pressure.9.saturating_sub(last_pressure.9),
+                    replay_cache_full = pressure.10.saturating_sub(last_pressure.10),
                     xudp_high_water = xudp.high_water,
                     preauth_active,
                     authenticated_active,
@@ -239,6 +243,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                 || preauth_active != last_preauth_active
                 || authenticated_active != last_authenticated_active
                 || xudp != last_xudp
+                || replay != last_replay
             {
                 tracing::info!(
                     preauth_rejected = current.preauth_rejected,
@@ -253,6 +258,10 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                     xudp_end_dropped = current.xudp_end_dropped,
                     legacy_udp_limited = current.legacy_udp_limited,
                     replay_rejected = current.replay_rejected,
+                    replay_cache_full = current.replay_cache_full,
+                    replay_cache_entries = replay.entries,
+                    replay_in_flight = replay.in_flight,
+                    replay_capacity = replay.capacity,
                     splice_fallback = current.splice_fallback,
                     xudp_new_frames = current.xudp_new_frames,
                     xudp_new_global_id = current.xudp_new_global_id,
@@ -283,6 +292,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                 last_preauth_active = preauth_active;
                 last_authenticated_active = authenticated_active;
                 last_xudp = xudp;
+                last_replay = replay;
             }
         }
     });
@@ -415,7 +425,7 @@ fn warn_if_config_permissions_are_loose(path: &std::path::Path) {
 /// Counters that indicate dropped or rejected traffic, in log order.
 fn pressure_counters(
     snapshot: &beam_core::metrics::MetricsSnapshot,
-) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     (
         snapshot.preauth_rejected,
         snapshot.cover_limited,
@@ -427,6 +437,7 @@ fn pressure_counters(
         snapshot.xudp_send_dropped,
         snapshot.legacy_udp_limited,
         snapshot.replay_rejected,
+        snapshot.replay_cache_full,
     )
 }
 
@@ -558,8 +569,8 @@ mod tests {
         assert_eq!(replay_capacity(1), REPLAY_CAPACITY_MIN);
         assert_eq!(replay_capacity(1024), REPLAY_CAPACITY_MAX);
         assert_eq!(replay_capacity(2000), REPLAY_CAPACITY_MAX);
-        assert_eq!(replay_capacity(64), 4096);
-        assert_eq!(replay_capacity(100), 6400);
+        assert_eq!(replay_capacity(64), 8192);
+        assert_eq!(replay_capacity(100), 12800);
     }
 
     #[test]
@@ -569,6 +580,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(pressure_counters(&snapshot).9, 5);
+    }
+
+    #[test]
+    fn pressure_counters_includes_replay_cache_full() {
+        let snapshot = beam_core::metrics::MetricsSnapshot {
+            replay_cache_full: 7,
+            ..Default::default()
+        };
+        assert_eq!(pressure_counters(&snapshot).10, 7);
     }
 
     #[test]
