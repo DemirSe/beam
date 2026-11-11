@@ -68,6 +68,9 @@ Not defects; these are the places where the current evidence stops.
   target-initiated FIN.
 - The teardown guard's panic path relies on the same `Drop` mechanism as the tested
   abort path; it is not separately tested.
+- Stable-promotion validation remains open: privileged syscall/wakeup/splice
+  measurements and cgroup OOM sampling. The five-hour soak passed on 2026-11-10
+  and the short fuzz campaign is clean; exhaustive fuzzing is not claimed.
 - No throughput or latency benchmark was run for the last delta (the teardown guard
   and the replay counter). No performance claim is made.
 

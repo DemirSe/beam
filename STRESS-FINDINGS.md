@@ -8,8 +8,8 @@ timestamp/cache hardening, legacy UDP bounds, cover cancellation, parallel
 resolver lookups, and the descriptor budget are in `2e0a464` and deployed.
 Finding 4 is fixed in `fb45eda` and deployed.
 The process-wide resolver changes were reverted after intermittent client DNS
-failures. Finding 10 remains open for the Vision raw-handoff fd clones, and
-finding 12 remains open as a client-platform limitation; the 2026-11-08
+failures. Finding 10 remains open for the Vision raw-handoff fd clones; the
+rootless-Android limitation is tracked in `clients/TODO.md`; the 2026-11-08
 follow-up closed the lifecycle, reply-budget, replay-cache, resolver-task,
 legacy-send, installer, and harness issues listed below. Production runs
 `1b9113cde356-dirty` (SHA `6a9b4ffb…`) with `NRestarts=0`, an IPv4-only beam
@@ -17,11 +17,11 @@ service drop-in, host IPv6 disabled (`all/default/lo.disable_ipv6=1`), zero IPv6
 addresses/routes/listeners, and `sshd` `AddressFamily inet`; the lab is stopped
 after the 11/11 checks.
 The annotated `v0.1.0-rc.1` tag is the current source release candidate.
-Stable promotion remains blocked on privileged syscall/wakeup/splice
-measurements and cgroup OOM sampling; the five-hour soak is now the default
-release gate and passed on 2026-11-10, and the short fuzz campaign was clean.
-The remaining Vision fd-clone cost (#10) and the rootless-Android limitation
-(#12) remain open known gaps.
+Stable-promotion validation (privileged syscall/wakeup/splice measurements and
+cgroup OOM sampling) is tracked in `ISSUES.md` test gaps; the five-hour soak is
+now the default release gate and passed on 2026-11-10, and the short fuzz
+campaign was clean. The remaining Vision fd-clone cost (#10) is the only open
+server finding; the rootless-Android limitation is tracked in `clients/TODO.md`.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 
@@ -29,7 +29,7 @@ This note records the results of three read-only code audits plus the QEMU lab
 run. It distinguishes **lab-reproduced** findings from code-confirmed risks.
 Do not treat the latter as fixed or as measured production incidents.
 
-## Current open findings
+## Findings status
 
 | # | Status | Area | Summary |
 |---:|---|---|---|
@@ -37,7 +37,7 @@ Do not treat the latter as fixed or as measured production incidents.
 | 5 | fixed 2026-11-08 | XUDP reply budget | A 2 MiB per-mux cap inside the 32 MiB process-wide budget prevents one slow reader from starving other mux streams. |
 | 9 | fixed 2026-11-08 | XUDP lifecycle | The empty-mux timer now tracks active sessions only, so retained GlobalID sockets cannot add another close timer. |
 | 10 | open | Lower-risk resources | Vision raw-handoff clones add up to four extra fds per active Vision connection; mux-abort cleanup and the session-table lock item are fixed. |
-| 12 | open | Client platform | Rootless Android cannot enable BBR while preserving the REALITY outer TCP cover. |
+| 12 | moved | Client platform | Tracked in [`clients/TODO.md`](clients/TODO.md); no client work is planned for now. |
 | 13 | fixed 2026-11-09 | Cover relay | A disconnected probe could pin a cover slot and two sockets until the 30 s cover idle timeout, and slot saturation made the cover reply with an immediate reset. |
 
 ## Lab results
@@ -329,39 +329,9 @@ clock, matching the XUDP fix. `FrameDecoder` now keeps a consumed cursor and
 compacts once per read batch instead of `Vec::drain` per frame. Regression
 tests cover dropped-legacy-reply idle expiry and coalesced zero-length frames.
 
-### 12. [OPEN] Rootless Android cannot change the REALITY outer TCP congestion control — CLIENT PLATFORM
+### 12. [MOVED] Rootless Android BBR — CLIENT PLATFORM
 
-A rootless Android client can keep the REALITY/TCP cover (`TCP/443` with the
-`whatsapp.net` TLS ClientHello) or change congestion control, but not both on
-this device class.
-
-Device/lab evidence (2026-11-06):
-
-- Samsung SM-S721B, Android 17 / SDK 37, kernel `6.1.162-android14-11`.
-- `tcp_available_congestion_control` and `tcp_allowed_congestion_control` are
-  both `reno cubic`; `tcp_congestion_control=cubic`; no `tcp_bbr` module.
-- Root is absent (`ro.debuggable=0`, locked bootloader); `shell` cannot modify
-  the sysctls or qdisc.
-- Buffer tuning is already generous: `tcp_rmem` max 16 MiB, `tcp_wmem` max
-  8 MiB, `rmem_max` 32 MiB, `wmem_max` 16 MiB.
-- Stock SFA/sing-box is active; its VPN TUN is MTU 1500. sing-box exposes no
-  TCP congestion-control field for standard VLESS/TCP outbounds.
-- Lab, 20 Mbps UDP upload, client CUBIC, `30 ms ±8 ms`, 0.5% loss:
-  `xudp` **61.5%**, `packetaddr` **51.2%**, `legacy` **73.1%** loss.
-  The same client with BBR produced **0–0.74%** loss.
-- Hysteria2/TUIC or other QUIC/UDP transports use userspace congestion control,
-  but the WAN packet is UDP, not the visible `whatsapp.net` TCP/REALITY
-  stream. They therefore violate the current cover requirement.
-- A custom client on the same kernel TCP can add queueing/pacing or per-socket
-  options, but cannot replace missing kernel BBR; it is mitigation only.
-- Cover-preserving paths are: root/custom-kernel BBR, or an external BBR Linux
-  gateway/router that terminates REALITY/TCP while the phone stays rootless.
-
-Next probe: evaluate an external BBR Linux gateway as the rootless
-cover-preserving path (TUN/MTU, 20 Mbps UDP upload, loss matrix, latency,
-throughput, and whether the WAN side still shows `whatsapp.net` TCP/443). If
-that fails, quantify custom-client pacing/queue only; a QUIC transport is a
-separate product decision because it changes the visible transport.
+Moved to [`clients/TODO.md`](clients/TODO.md). No client work is planned for now.
 
 ### 13. [RESOLVED] Cover probes pinned relays after disconnect — LOW-MEDIUM, loopback reproduced and fixed
 
@@ -448,15 +418,17 @@ errors, 19 stress rounds, and stable fds/threads.
    first-wins completion, five-minute timestamp window, and a 300 s cache at
    that time; current retention is 601 s.
 6. ~~Short-GlobalID lifecycle accounting (9).~~ Done 2026-11-08.
-7. Complete the post-v0.1.0-rc.1 stable-validation backlog: five-hour soak
+7. ~~Complete the post-v0.1.0-rc.1 stable-validation backlog: five-hour soak
    (default; passed 2026-11-10), privileged syscall/wakeup/splice
    measurements, and cgroup OOM sampling. The short fuzz campaign is clean;
-   exhaustive fuzzing is not claimed.
-8. Test the external BBR Linux gateway path for finding 12 under the same loss
-   matrix while keeping TCP/443 + `whatsapp.net` on the WAN side.
-9. If 8 does not hold, quantify custom-client pacing/queue only; treat
+   exhaustive fuzzing is not claimed.~~ Moved to `ISSUES.md` test gaps.
+8. ~~Test the external BBR Linux gateway path for finding 12 under the same loss
+   matrix while keeping TCP/443 + `whatsapp.net` on the WAN side.~~ Moved to
+   `clients/TODO.md`; no client work is planned for now.
+9. ~~If 8 does not hold, quantify custom-client pacing/queue only; treat
    Hysteria2/TUIC or another QUIC transport as a separate cover-changing
-   product decision.
+   product decision.~~ Moved to `clients/TODO.md`; no client work is planned
+   for now.
 10. ~~Cover slot retention after a probe disconnects (13).~~ Fixed and covered
     by `tests/stress/loopback.py`; run it with `make stress` or
     `gh workflow run lab-hosted.yml -f suite=stress`.

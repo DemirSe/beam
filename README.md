@@ -73,6 +73,7 @@ stable.
 | Client setup | [Windows tray launcher](#windows-tray-launcher), [Linux tray and DNS switch](#linux-tray-and-dns-switch), [Mobile profile](#mobile-profile) |
 | Tests and performance | [Testing and benchmarking](#testing-and-benchmarking), [One-command checks](#one-command-checks), `tests/tun`, `fuzz`, `bench` |
 | Open risks | [Known gaps](#known-gaps), [`STRESS-FINDINGS.md`](STRESS-FINDINGS.md) |
+| Client backlog | [`clients/TODO.md`](clients/TODO.md) |
 | Agent rules | [`AGENTS.md`](AGENTS.md) |
 
 ## Scope
@@ -1032,9 +1033,11 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   `beam-core`/`beam`/server-deploy fixes; the IPv4-only client profiles, beam
   drop-in, SSH drop-in, and host IPv6 sysctl are deployment artifacts, and
   client installer/tray changes are not installed by that deploy.
-  `STRESS-FINDINGS.md` retains only the Vision raw-handoff fd-clone cost (#10)
-  and the rootless Android platform limitation (#12). Do not fold those
-  remaining items into this note until they are fixed and re-verified.
+  `STRESS-FINDINGS.md` retains only the Vision raw-handoff fd-clone cost (#10).
+  Stable-promotion validation is tracked in `ISSUES.md` test gaps; the rootless
+  Android BBR limitation is tracked in `clients/TODO.md` (no client work
+  planned). Do not fold those remaining items into this note until they are
+  fixed and re-verified.
 - The 11 local client `/etc/beam/config.json.bak-*` backups were removed after
   live-profile validation; the production host retains five
   `/etc/beam/config.toml.bak-*` recovery backups. Existing Android/Windows
