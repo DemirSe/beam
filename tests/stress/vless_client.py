@@ -187,7 +187,12 @@ def write_server_config(path: Path, port: int, cover_port: int, template: Path) 
 
 
 def write_client_config(
-    path: Path, port: int, socks_port: int, pubkey: str, packet_encoding: str = "xudp"
+    path: Path,
+    port: int,
+    socks_port: int,
+    pubkey: str,
+    packet_encoding: str = "xudp",
+    flow: str = "xtls-rprx-vision",
 ) -> None:
     # Built inline from the tracked example fixture: the mobile profile is not
     # in the repository (it carries real credentials), so nothing here depends
@@ -198,7 +203,6 @@ def write_client_config(
         "server": "127.0.0.1",
         "server_port": port,
         "uuid": "00000000-0000-0000-0000-000000000000",
-        "flow": "xtls-rprx-vision",
         "packet_encoding": packet_encoding,
         "tls": {
             "enabled": True,
@@ -211,6 +215,8 @@ def write_client_config(
             },
         },
     }
+    if flow:
+        vless["flow"] = flow
     config = {
         "log": {"level": "warn", "timestamp": True},
         "inbounds": [
