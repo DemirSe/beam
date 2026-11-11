@@ -930,7 +930,10 @@ run_protocol_suite() {
   local offset before after killed
 
   write_environment
-  run_case "$arm" h2-bulk-8m 90 --https "$https_h2"
+  # Throughput cases are loss-sensitive: at 1% netem loss the 8 MiB transfers
+  # took 50-85 s and the mixed cell's 16 MiB upload needs >100 s, so the harness
+  # timeout must not become the correctness gate.
+  run_case "$arm" h2-bulk-8m 180 --https "$https_h2"
 
   offset=$(wc -c < "$H3_LOG" 2>/dev/null || echo 0)
   ip netns exec tun-client timeout 90 "$H2_CLIENT_BIN" \
@@ -939,12 +942,12 @@ run_protocol_suite() {
   run_case "$arm" h2-multiplex-16 30 --client "$dir/h2-client-raw.json" \
     --streams 16 --origin-log "$H3_LOG" --origin-offset "$offset"
 
-  run_case "$arm" h3-bulk-8m 90 --https "$https_h3"
+  run_case "$arm" h3-bulk-8m 180 --https "$https_h3"
   offset=$(wc -c < "$H3_LOG" 2>/dev/null || echo 0)
   run_case "$arm" h3-concurrent-8 90 --https "$https_h3" \
     --origin-log "$H3_LOG" --origin-offset "$offset"
   run_case "$arm" http1-persistent-20 90 --http "$http"
-  run_case "$arm" tcp-upload-8m 90 --tcp "$tcp"
+  run_case "$arm" tcp-upload-8m 150 --tcp "$tcp"
   run_case "$arm" h2-cancel-64m 90 --https "$https_h2" --http "$http"
   run_case "$arm" udp-realtime-1200 90 --udp "$udp"
   run_case "$arm" udp-multidest-4 90 --udp "$udp" --ports 9996,9997,9998,9999
@@ -953,7 +956,7 @@ run_protocol_suite() {
   run_case "$arm" dns-tcp-fallback 90 --dns "$dns"
 
   before=$(sample_server)
-  run_case "$arm" mixed-hol-60s 120 --https "$https_h2" --http "$http" \
+  run_case "$arm" mixed-hol-60s 240 --https "$https_h2" --http "$http" \
     --udp "$udp" --tcp "$tcp" --dns "$dns"
   after=$(sample_server)
   "$PYTHON" - "$dir/resources.json" "$before" "$after" <<'RESOURCES'

@@ -164,7 +164,9 @@ def _curl_run(args, extra: list[str], timeout: float) -> subprocess.CompletedPro
 def _bulk(args, version: str) -> int:
     name = "h2-bulk-8m" if version == "2" else "h3-bulk-8m"
     started = time.time()
-    timeout_s = 120.0
+    # A 1% loss link stretched the 8 MiB transfer to ~85 s; the transfer
+    # deadline must not be the thing that fails the case.
+    timeout_s = 180.0
     url = f"https://{args.https}/?bytes={args.bytes}"
     flag = "--http2" if version == "2" else "--http3-only"
     with tempfile.NamedTemporaryFile(prefix="protocol-bulk-", delete=False) as handle:
