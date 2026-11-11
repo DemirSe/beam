@@ -1112,13 +1112,21 @@ def case_udp_alt_source(args) -> int:
 
 
 def _dig(args, name: str, qtype: str, *, tcp: bool) -> tuple[bool, str, float]:
+    """Run one dig query.
+
+    ``+tries=2`` is dig's default: a stub resolver retries a lost UDP datagram.
+    Without the retry a link that loses one packet in a hundred would fail a
+    correctness case for behaviour no resolver exposes; the retry still
+    requires every query to be answered, and a lost-and-retried query shows up
+    as latency instead.
+    """
     started = time.monotonic()
     host, port = split_addr(args.dns)
     command = [
         "dig",
         "+tcp" if tcp else "+notcp",
         "+time=2",
-        "+tries=1",
+        "+tries=2",
         "-p",
         str(port),
         f"@{host}",
