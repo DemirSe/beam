@@ -5,8 +5,8 @@ Last updated 2026-11-11. Short register; the evidence behind each entry lives in
 [`STATE-MACHINES.md`](STATE-MACHINES.md).
 
 Nothing here is a known-broken data path: byte integrity, admission bounds, and
-descriptor/memory stability are covered by CI gates. These are the items that are
-not clean.
+descriptor/memory stability are covered by CI gates. Both entries below are fixed
+on `fix/replay-cache` and await merge; they are kept here until then.
 
 ## Summary
 
