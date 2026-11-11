@@ -311,7 +311,9 @@ scanning noise.
 `replay_phase_transitions_are_explicit`,
 `replay_stats_track_settled_and_in_flight`,
 `replay_counters_match_states`,
-`replay_insert_full_does_not_drop_a_reservation`.
+`replay_insert_full_does_not_drop_a_reservation`,
+`replay_first_wins_survives_timestamp_deadline_expiry`,
+`replay_deadline_handles_an_unrepresentable_window`.
 
 ### 6. TLS record stream and raw handoff (P1)
 
