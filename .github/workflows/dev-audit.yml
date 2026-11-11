@@ -29,3 +29,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace 2>&1 | grep -E 'Running|Doc-tests|test result|^failures:|^    [a-z_0-9:]+$'
+      - name: Test (release)
+        run: |
+          set -o pipefail
+          cargo test --workspace --release 2>&1 | grep -E 'Running|Doc-tests|test result|^failures:|^    [a-z_0-9:]+$'
