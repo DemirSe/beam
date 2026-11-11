@@ -12,41 +12,48 @@ not clean.
 
 |ID|Issue|Status|Severity|
 |---|---|---|---|
-|I1|Transfers stop after sustained heavy churn in one test rig|Inconclusive|medium if real, not seen in real traffic|
-|I2|A client restart was once refused as a replay|Open, trigger unidentified|low, self-healing|
+|I1|Replay cache saturates under sustained heavy churn|Fixed on `fix/replay-cache` (pending merge)|resolved|
+|I2|A client restart appeared to be refused as a replay|Fixed on `fix/replay-cache` (pending merge)|resolved|
 
-## I1 — transfers stop after sustained heavy churn (inconclusive)
+## I1 — replay cache saturates under sustained heavy churn (fixed on branch)
 
-- **Status:** not reproducible on demand, and no server-side fault is visible.
+- **Status:** fixed on `fix/replay-cache`, pending merge; proof run 43015951357
+  pairs the pinned pre-fix SHA with the fixed branch. This was not a data-path
+  defect: descriptors, threads, and RSS stayed flat; the cache reached its
+  configured bound and failed closed.
 - **What a user would notice:** after unusually heavy sustained use, apps that use
   the tunnel stop getting replies while web browsing may still work; only a server
-  restart would bring the tunnel back.
-- **Evidence:** five soak-shaped runs stalled after roughly 7 300 rounds. A 420 s run
-  of the same shape passed with 6 953 sessions created, and a faster traffic shape
-  ran 7 800 rounds with no slowdown at all. In every run, including the failing
-  ones, descriptors stayed at 10-12, threads at 5, RSS plateaued near 18 MB, and
-  every rejection counter was zero.
-- **Runs:** 42930317510, 42933254782, 42935430888, 42937823294, 42939376474 (stalls);
-  42940524407 (pass), 42942423567 (fast shape), 42943941476 (probe never reached a
-  working baseline).
-- **Next step:** re-run with a probe that first proves a working baseline (N
-  successful rounds), then prints the server's `runtime counters` on both sides of
-  the transition. That single measurement decides whether this is beam or the test
-  client.
+  restart (or waiting for entries to age out) would bring the tunnel back.
+- **Cause:** capacity was `clamp(64 × max_connections, 4096, 65536)` = 65,536,
+  and every entry was retained for `2 × 300 s + 1 s` = 601 s, a sustainable rate
+  of about 109 authenticated handshakes/s. The soak shape creates 9 handshakes
+  per round at 16-28 rounds/s (146-255/s). The first rejection occurs at exactly
+  65,536 completed handshakes. Instrumented runs showed 65,536 unique session
+  ids, zero reserve-level rejections, and zero rejected ids that had completed
+  earlier, so this was cache saturation, not a client reusing a ClientHello.
+- **Evidence:** current-dev failing runs 43004235340, 43004266767,
+  43004276244; older run 42937823294; instrumented runs 43005043280,
+  43005052880, 43005143151; fixed proof run 43015951357.
+- **Fix:** `ReplayPhase::{Unseen,InFlight,Settled,Expired}` with a deadline
+  min-heap; entries expire at `envelope timestamp + window + 1 s` (301 s typical,
+  601 s worst case), and a settled entry with admitted copies remains until those
+  copies drain; capacity is `clamp(128 × max_connections, 4096, 131072)`;
+  `replay_cache_full` and occupancy/in-flight counters are exported. Pinned by
+  the replay tests in `tls/server.rs`.
 
-## I2 — a client restart was once refused as a replay (open)
+## I2 — a client restart appeared to be refused as a replay (fixed on branch)
 
-- **Status:** trigger unidentified; two targeted attempts to reproduce it were
-  negative.
-- **What a user would notice:** the client says connected but nothing loads for a few
-  minutes, then it recovers by itself or after another restart.
-- **Evidence:** `authenticated ClientHello replay` log lines after client restarts
-  during soak runs. Deliberate restarts — idle, and in the middle of eight
-  concurrent transfers — reconnected in 0.06 s with zero refusals.
-- **Runs:** 42937037698 (idle restart), 42937485208 (restart under load).
-- **Next step:** capture the client's handshake at the moment of refusal and compare
-  the REALITY session ids; check whether the client reuses ClientHello material
-  under load.
+- **Status:** fixed on `fix/replay-cache`; same root cause as I1.
+- **What a user would notice:** the client says connected but nothing loads for a
+  few minutes, then it recovers by itself or after another restart.
+- **Evidence:** the `authenticated ClientHello replay` lines appeared after the
+  replay cache was full, including the no-restart soak 42937823294. The dedicated
+  restart probes 42937037698 and 42937485208 never reached 65,536 handshakes.
+  Instrumented fingerprints showed every rejected id was a new id, not a
+  previously completed one; there is no evidence that the client reused
+  ClientHello material.
+- **Fix:** the capacity/retention fix removes the saturation window, and the new
+  `replay_cache_full` counter separates cache pressure from duplicate rejection.
 
 ## Test and observability gaps
 
@@ -59,7 +66,6 @@ Not defects; these are the places where the current evidence stops.
   target-initiated FIN.
 - The teardown guard's panic path relies on the same `Drop` mechanism as the tested
   abort path; it is not separately tested.
-- Replay cache occupancy and the in-flight peak are still not exported.
 - No throughput or latency benchmark was run for the last delta (the teardown guard
   and the replay counter). No performance claim is made.
 
@@ -76,6 +82,11 @@ Not defects; these are the places where the current evidence stops.
 
 ## Fixed in the 2026-11-11 pass
 
+- **Replay cache saturation under sustained churn.** The cache was bounded at
+  65,536 entries with 601 s retention and failed closed above ~109 authenticated
+  handshakes/s. The phase is now explicit, retention is per envelope timestamp
+  (301 s typical), capacity is 131,072, settled entries keep first-wins until
+  admitted copies drain, and `replay_cache_full`/occupancy are observable.
 - **Mux teardown skipped on cancellation.** Sessions, sockets, and global permits
   survived an aborted or panicking handler. Fixed with a lifetime guard; pinned by
   `aborting_the_mux_handler_releases_sessions_and_permits`.

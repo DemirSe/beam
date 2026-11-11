@@ -268,6 +268,12 @@ first-wins for copies admitted before the first completion.
 policy, easy to miss when tuning `max_connections` (`main.rs:29-31`,
 `tls/server.rs` replay constants).
 
+**Clock policy.** Expiry is a monotonic `Instant` computed from the wall-clock
+offset at insertion. A backward wall-clock step after insertion can keep an
+envelope timestamp acceptable past that deadline, so the server clock must stay
+disciplined (NTP or equivalent); this is the same assumption the timestamp check
+already makes.
+
 **Failed-insert accounting (D7, fixed).** `insert` used to remove the id from
 `in_flight` *before* the duplicate/capacity check, so a rejected insert
 discarded the in-flight count of every other live copy of that id and new
