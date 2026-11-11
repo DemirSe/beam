@@ -15,7 +15,7 @@ on 2026-11-11 16:39 UTC:
 | Binary | `/usr/local/bin/beam` |
 | SHA-256 | `176349b54c5de007c34d87d789a9b3bbba142f2b5e232dca2b5bd57ee9195671` |
 | Version | `0.1.0 (66494a09a092)` |
-| Source release | `66494a0` (deployed); `main` at `1f686ce` adds docs/test cleanup |
+| Source release | `66494a0` (deployed); later `main` commits are docs/test cleanup only |
 | Service | `beam.service`, active, `NRestarts=0`, `RestrictAddressFamilies=AF_INET AF_UNIX` |
 | Listener | `0.0.0.0:443` (no IPv6 listener) |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
@@ -1012,7 +1012,7 @@ Cover flight differences are diagnostic only by the SNI-level decision.
 - **One user, one inbound, no hot reload/stats** keeps the attack surface and
   resource model bounded.
 - **Production runs the `66494a0` build `0.1.0 (66494a09a092)` (binary
-  `176349b5…`); `main` at `1f686ce` adds docs/test cleanup. The annotated
+  `176349b5…`); later `main` commits are docs/test cleanup only. The annotated
   `v0.1.0-rc.1` tag is the previous release candidate.** Move it only with
   `deploy/package.sh` plus
   `BEAM_KEEP_CONFIG=1 bootstrap.sh`, then re-run the hash-pinned verifier and
