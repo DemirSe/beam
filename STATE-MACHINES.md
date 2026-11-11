@@ -276,10 +276,10 @@ authentication.
 **Observability.** `replay_rejected` counts authenticated ClientHellos the cache
 refused, both at reservation (a settled id) and after TLS finished (duplicate or
 a full cache), and appears in the pressure warning and the periodic counter line.
-Reservations are included on purpose: a client that restarts and reuses its
-ClientHello lands there, which looks like a dead tunnel while the server keeps
-forwarding the probe to the cover. Guessing a valid session id is infeasible, so
-this is not scanning noise. Cache occupancy and the in-flight peak are still not
+Reservations are included on purpose: a client that reuses ClientHello material
+lands there, which looks like a dead tunnel while the server keeps forwarding the
+probe to the cover. Guessing a valid session id is infeasible, so this is not
+scanning noise. Cache occupancy and the in-flight peak are still not
 exported.
 
 **Tests.** `replay_cache_rejects_duplicates_and_stays_bounded` (2586),

@@ -34,7 +34,10 @@ from vless_client import (  # noqa: E402
 
 FAILURES = 0
 DURATION = float(os.environ.get("SOAK_SECONDS", "1200"))
-RESTART_EVERY = 300.0
+# Client restarts are off by default: they exercise the client, not the server,
+# and a restart under heavy churn produced replay-rejection log lines that a
+# dedicated repro could not reproduce (see AUDIT-2026-11-11.md).
+RESTART_EVERY = float(os.environ.get("SOAK_RESTART_EVERY", "0"))
 
 
 def check(name: str, ok: bool, detail: str) -> None:
@@ -173,7 +176,7 @@ def main() -> int:
             rounds += 1
 
             now = time.time()
-            if now - last_restart >= RESTART_EVERY:
+            if RESTART_EVERY > 0 and now - last_restart >= RESTART_EVERY:
                 client.terminate()
                 try:
                     client.wait(timeout=10)

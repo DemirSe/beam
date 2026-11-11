@@ -838,11 +838,11 @@ pub async fn handle_connection_admitted(
             Ok(auth) => match config.replay_reserve(auth.session_id) {
                 Some(reservation) => Some((auth, reservation)),
                 None => {
-                    // A client that restarts and reuses its ClientHello lands
-                    // here, and it is the case an operator needs to see: the
-                    // tunnel looks down while the server keeps saying the probe
-                    // was forwarded to the cover. Guessing a valid session id is
-                    // infeasible, so this is not scanning noise.
+                    // A client that reuses ClientHello material lands here, and
+                    // it is the case an operator needs to see: the tunnel looks
+                    // down while the server only logs that the probe went to the
+                    // cover. Guessing a valid session id is infeasible, so this
+                    // is not scanning noise.
                     config.metrics.record_replay_rejected();
                     tracing::debug!("authenticated ClientHello replay; forwarding to cover");
                     None
