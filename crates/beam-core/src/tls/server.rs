@@ -126,6 +126,10 @@ fn replay_max_retention(window: Option<Duration>) -> Duration {
     })
 }
 
+/// Hard upper bound for a caller-supplied timestamp window. Production uses
+/// 300 s; this keeps retention arithmetic and the fail-closed cache bounded.
+const MAX_TIMESTAMP_WINDOW: Duration = Duration::from_secs(86_400);
+
 /// Maximum concurrent handshakes allowed for one exact replay id. The
 /// completion cache still rejects all later copies; this only prevents one
 /// captured ClientHello from occupying the global connection permit pool
@@ -182,7 +186,9 @@ fn replay_deadline(
     };
     let max = replay_max_retention(Some(window));
     let Some(now_wall) = now_wall else {
-        return now + max;
+        return now
+            .checked_add(max)
+            .unwrap_or_else(|| now + REPLAY_CACHE_TTL);
     };
     let timestamp = u64::from(timestamp);
     let seconds = if timestamp >= now_wall {
@@ -623,6 +629,11 @@ impl TlsServerConfig {
         if handshake_timeout.is_zero() {
             return Err(TlsServerError::InvalidConfig {
                 reason: "handshake timeout must be non-zero",
+            });
+        }
+        if max_time_diff.is_some_and(|window| window > MAX_TIMESTAMP_WINDOW) {
+            return Err(TlsServerError::InvalidConfig {
+                reason: "timestamp window exceeds the supported bound",
             });
         }
         if !(TLS_RECORD_HEADER_LEN..=TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN)
@@ -2970,6 +2981,11 @@ mod tests {
         let base: u32 = 1_000_000;
         let deadline = replay_deadline(base, now, Some(u64::from(base)), Some(Duration::MAX));
         assert!(deadline >= now, "an extreme window must not panic");
+        let without_wall = replay_deadline(base, now, None, Some(Duration::MAX));
+        assert!(
+            without_wall >= now,
+            "an extreme window without wall time must not panic"
+        );
     }
 
     #[test]
@@ -3596,6 +3612,26 @@ mod tests {
             },
             Duration::from_secs(5),
             TLS_RECORD_HEADER_LEN - 1,
+            [0x22; 16],
+        );
+        assert!(matches!(result, Err(TlsServerError::InvalidConfig { .. })));
+    }
+
+    #[test]
+    fn rejects_an_oversized_timestamp_window() {
+        let result = TlsServerConfig::new(
+            [0x11; 32],
+            vec!["0123456789abcdef".to_string()],
+            vec!["whatsapp.net".to_string()],
+            [0, 0, 0],
+            [255, 255, 255],
+            Some(MAX_TIMESTAMP_WINDOW + Duration::from_secs(1)),
+            NetLocation {
+                address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                port: 9,
+            },
+            Duration::from_secs(5),
+            TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
             [0x22; 16],
         );
         assert!(matches!(result, Err(TlsServerError::InvalidConfig { .. })));
