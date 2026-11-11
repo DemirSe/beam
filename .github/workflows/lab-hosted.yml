@@ -293,8 +293,22 @@ jobs:
         if: inputs.suite != 'stress'
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq iperf3 iproute2 iputils-ping unzip xz-utils dnsutils
+          # The hosted mirror is occasionally unreachable. The other packages
+          # are in the runner image; iperf3 is the only one that is not.
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq iperf3 iproute2 iputils-ping unzip xz-utils dnsutils || true
+          if ! command -v iperf3 >/dev/null 2>&1; then
+            iperf_url="https://github.com/esnet/iperf/releases/download/3.22/iperf-3.22.tar.gz"
+            curl -fsSL -o "$RUNNER_TEMP/iperf.tar.gz" "$iperf_url"
+            echo "1c0d0fb02c52626111d6e132db80edfbf27bbaff8bd9245df2a371dcb0b35a92  $RUNNER_TEMP/iperf.tar.gz" | sha256sum -c -
+            tar -xzf "$RUNNER_TEMP/iperf.tar.gz" -C "$RUNNER_TEMP"
+            (
+              cd "$RUNNER_TEMP/iperf-3.22"
+              ./configure --without-openssl >/dev/null
+              make -j"$(nproc)" >/dev/null
+            )
+            sudo install -m 0755 "$RUNNER_TEMP/iperf-3.22/src/iperf3" /usr/local/bin/iperf3
+          fi
           for tool in dig iperf3 unzip xz systemd-run; do
             command -v "$tool" >/dev/null || { echo "::error::missing $tool"; exit 1; }
           done
