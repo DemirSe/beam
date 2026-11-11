@@ -44,7 +44,7 @@ idle-pinning fix (`2163c0a`), the mux-wide resolution/send-stall fix
 bounded in-flight replay reservation (`647623b`), and the 2026-11-06 hardening
 batch: XUDP socket-budget validation, control-frame idle pinning, Vision
 empty-block rejection, replay first-wins with a 300-second timestamp window
-and 601-second retention, cancellable cover relays, bounded legacy UDP,
+and timestamp-based retention, cancellable cover relays, bounded legacy UDP,
 bounded resolver lookups, and the descriptor budget check, plus the packetaddr
 unbound-family admission fix (`5a1cc82`), the counted XUDP End control reserve
 (`fb45eda`), and the deploy preflight fd-limit fix (`8c64e5c`).
@@ -408,14 +408,16 @@ bind.
   comparisons are constant-time.
 - Stock has no replay cache. beam reserves in-flight handshakes before TLS and
   inserts the first Finished handshake into a bounded exact-replay cache.
-  Capacity scales with `max_connections` (64x, clamped to 4096..65536) and is
-  wired to `limits.max_connections`. Entries are retained for twice the
-  REALITY timestamp window plus one second (601 s by default), because a
-  timestamp up to five minutes in the future is accepted and stays reusable
-  until it too falls outside the window. A full cache rejects the new
-  handshake instead of evicting a live id. Concurrent duplicates are
-  first-wins: a second Finished handshake is closed rather than served. This
-  bounds the in-flight permit race, the post-cache window, and cache pressure.
+  Capacity scales with `max_connections` (128x, clamped to 4096..131072) and is
+  wired to `limits.max_connections`. Each entry is retained until its
+  authenticated envelope timestamp plus the REALITY timestamp window plus one
+  second: a timestamp at the current time is retained for 301 s, and the worst
+  case for a timestamp five minutes in the future is 601 s. A full cache
+  rejects the new handshake instead of evicting a live id; `replay_cache_full`
+  counts that case separately from a duplicate ClientHello. Concurrent
+  duplicates are first-wins: a second Finished handshake is closed rather than
+  served. This bounds the in-flight permit race, the post-cache window, and
+  cache pressure.
 - Unauthenticated traffic is relayed to the configured cover. Never send a
   TLS alert or a synthetic response on authentication failure.
 - A cover relay ends on the first half-close: once the probe's write side

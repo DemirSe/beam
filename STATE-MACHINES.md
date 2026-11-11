@@ -68,7 +68,7 @@ independent variables.
 |2|Accept backoff|implicit|`main.rs:307-327`|`accept_backoff`|
 |3|Pre-auth + authenticated admission **P1**|mixed|`admission.rs:39-108`, `tls/server.rs:807-862`|`IpLimiter`, `Semaphore`, `Option<IpPermit>` ownership|
 |4|Connection classification|explicit outcome, implicit path|`tls/server.rs:805-862`, `257-273`|`ClientHelloRead`, `Option<(Auth, ReplayReservation)>`, `ConnectionOutcome`|
-|5|REALITY replay cache **P1**|implicit|`tls/server.rs:140-250,576-601`|`entries` + `order` + `in_flight`|
+|5|REALITY replay cache **P1**|explicit|`tls/server.rs` replay section|`ReplayPhase` + `states` + `deadlines`|
 |6|TLS record stream + raw handoff **P1**|implicit|`tls/stream.rs:180-260,490-530`|`read_raw`, `write_raw`, `record`, `pending`, `plaintext`, `outgoing`, `pending_write`, `closed`|
 |7|Cover relay|implicit|`tls/server.rs:1426-1461,1673-1713`|cover permit + first-half-close `select!`|
 |8|Authenticated request pipeline|explicit command, implicit phases|`tls/server.rs:1253-1410`|absolute deadline + `match request.command`|
@@ -239,55 +239,67 @@ after `relay_cover_bidirectional` returns. No wire change.
 
 ### 5. REALITY replay cache (P1)
 
-**States per 32-byte session id.** Unseen → InFlight(n) → Settled → Expired.
-`in_flight` counts concurrent handshakes (max 4); `entries` + `order` hold
-settled ids until retention; a full cache rejects rather than evicting.
+**States per 32-byte session id.** `ReplayPhase::{Unseen, InFlight{reservations},
+Settled{deadline}, Expired}`. `states` stores only `InFlight` and `Settled`;
+`Unseen` and `Expired` are read results. A min-heap of `(deadline, id)` orders
+expiry; `in_flight` counts distinct reserved ids; `settled` is bounded by
+`capacity`. A full cache rejects rather than evicting.
 
-- `try_reserve`: expire, reject settled or ≥4 in flight, else increment
-  (`184-196`).
-- `ReplayReservation::drop` releases unless committed (`227-250`).
-- `insert` after TLS `Finished`: remove in-flight, expire, first-wins; false on
-  duplicate or full cache (`214-226`); caller returns `ReplayRejected`
-  (`1280-1283`).
-- Retention = `2 × timestamp window + 1 s`, 300 s when no window is set
-  (`122-127`). Production window 300 s → 601 s.
+- `try_reserve`: expire, reject `Settled` or ≥4 `InFlight`, else increment or
+  insert `InFlight { reservations: 1 }`.
+- `ReplayReservation::drop` releases only a `Pending` reservation.
+- `insert`: expire, first-wins; `Duplicate` for a settled id, `Full` at
+  capacity, `Inserted` otherwise. The caller returns `ReplayRejected` for both
+  rejects, and counts `Full` separately.
+- Retention = authenticated envelope timestamp + timestamp window + 1 s,
+  capped at `2 × window + 1 s`. Production window 300 s → 301 s for a timestamp
+  of “now”, 601 s worst case.
+- Capacity = `clamp(128 × max_connections, 4096, 131072)`.
 
-**Capacity math.** Fail-closed cache, production clamp 65,536 entries with
-601 s retention ≈ 109 distinct authenticated handshakes/s; the 4,096 minimum is
-≈ 6.8/s. Deliberate policy, easy to miss when tuning `max_connections`
-(`main.rs:39`, `tls/server.rs:122-127,214-225`).
+**Capacity math.** Fail-closed cache, production clamp 131,072 entries with
+301 s typical retention ≈ 435 distinct authenticated handshakes/s;
+601 s worst-case retention ≈ 218/s; the 4,096 minimum is ≈ 13.6/s. Deliberate
+policy, easy to miss when tuning `max_connections` (`main.rs:29-31`,
+`tls/server.rs` replay constants).
 
 **Failed-insert accounting (D7, fixed).** `insert` used to remove the id from
 `in_flight` *before* the duplicate/capacity check, so a rejected insert
 discarded the in-flight count of every other live copy of that id and new
-copies could reserve above `REPLAY_MAX_IN_FLIGHT_PER_ID`. The removal now
-happens only after a successful verdict (`ReplayCache::insert`,
-`failed_replay_insert_keeps_the_in_flight_bound`); a rejected insert leaves the
-counts alone so the caller's `ReplayReservation::drop` releases exactly the one
-count that connection reserved. Reaching `insert` requires a completed TLS
-handshake, which requires the client's key share, so this is reachable by the
-legitimate client's own parallel handshakes (or someone holding that ephemeral
-key), not by a passive replayer. The broken bound was permit pressure, not
-authentication.
+copies could reserve above `REPLAY_MAX_IN_FLIGHT_PER_ID`. A rejected insert now
+leaves the `InFlight` phase and count alone, and the caller's
+`ReplayReservation::drop` releases exactly the one reservation that connection
+holds (`failed_replay_insert_keeps_the_in_flight_bound`,
+`replay_insert_full_does_not_drop_a_reservation`). Reaching `insert` requires a
+completed TLS handshake, which requires the client's key share, so this is
+reachable by the legitimate client's own parallel handshakes (or someone
+holding that ephemeral key), not by a passive replayer. The broken bound was
+permit pressure, not authentication.
 
-**Why implicit.** Three maps and a TTL form a four-state machine; no enum says
-"in flight vs settled".
+**Why explicit.** One enum names the phase and one set of methods owns every
+transition; no reader infers “in flight vs settled” from map membership or a
+separate counter. The reservation's pending/committed state is likewise an
+enum.
 
 **Observability.** `replay_rejected` counts authenticated ClientHellos the cache
-refused, both at reservation (a settled id) and after TLS finished (duplicate or
-a full cache), and appears in the pressure warning and the periodic counter line.
+refused, both at reservation (a settled id or the in-flight cap) and after TLS
+finished (duplicate or a full cache). `replay_cache_full` isolates the capacity
+case. The periodic counter line also exports `replay_cache_entries`,
+`replay_in_flight`, and `replay_capacity`. The pressure warning shows deltas.
 Reservations are included on purpose: a client that reuses ClientHello material
 lands there, which looks like a dead tunnel while the server keeps forwarding the
 probe to the cover. Guessing a valid session id is infeasible, so this is not
-scanning noise. Cache occupancy and the in-flight peak are still not
-exported.
+scanning noise.
 
-**Tests.** `replay_cache_rejects_duplicates_and_stays_bounded` (2586),
-`replay_cache_uses_the_configured_capacity` (2614),
-`replay_cache_entries_expire_after_retention` (2624),
-`replay_retention_covers_future_timestamps` (2633),
-`replay_cache_limits_in_flight_duplicates` (2642). No concurrent failed-insert
-test.
+**Tests.** `replay_cache_rejects_duplicates_and_stays_bounded`,
+`replay_cache_uses_the_configured_capacity`,
+`replay_entry_expires_at_timestamp_plus_window`,
+`replay_deadline_covers_the_timestamp_window`,
+`replay_cache_limits_in_flight_duplicates`,
+`failed_replay_insert_keeps_the_in_flight_bound`,
+`replay_phase_transitions_are_explicit`,
+`replay_stats_track_settled_and_in_flight`,
+`replay_counters_match_states`,
+`replay_insert_full_does_not_drop_a_reservation`.
 
 ### 6. TLS record stream and raw handoff (P1)
 
@@ -861,13 +873,16 @@ abort/panic gap under D8e is still open.
 2. **Transition events with stable ids (debug only).** One event per transition:
    `tracing::debug!(conn_id, machine, from, to, reason, "state transition")`,
    plus a monotonic `conn_id`. Keep current levels; never log bytes or secrets.
-3. **Expose state already counted (additive).** Add replay `in_flight`, cache
-   occupancy, and `replay_rejected`; XUDP pending resolutions, queued replies,
-   `send_inflight`, and the missing D8a log fields; relay half-closes and Vision
-   Direct phase. Reuse the 60 s `runtime counters` line; no stats API.
-4. **Replay cache as a named phase.** `ReplayPhase::{Unseen,InFlight,Settled,
-   Expired}` behind `try_reserve`/`insert`/`expire`; preserve first-wins,
-   capacity, and retention exactly; fix D7 in the same transition function.
+3. **Expose state already counted (additive).** Replay `in_flight`, cache
+   occupancy, `replay_rejected`, and `replay_cache_full` are exported in the
+   periodic counter line (done). Remaining: XUDP pending resolutions, queued
+   replies, `send_inflight`, and the missing D8a log fields; relay half-closes
+   and Vision Direct phase. Reuse the 60 s `runtime counters` line; no stats API.
+4. **Replay cache as a named phase.** Done: `ReplayPhase::{Unseen,InFlight,
+   Settled,Expired}` behind `try_reserve`/`insert`/`expire`; first-wins,
+   capacity, and D7 are preserved, and retention is per envelope timestamp
+   (301 s typical, 601 s worst case) with capacity `128x` clamped to
+   4096..131072.
 5. **XUDP session as a named phase.** `SessionPhase::{Resolving,Active,Closing,
    Retained,Closed}` owned by the table/close path; `closed`/`stop` become
    implementation details. Highest-value server refactor because it spans

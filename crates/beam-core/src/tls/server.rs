@@ -255,6 +255,13 @@ impl ReplayCache {
         }
     }
 
+    fn expire_one(&mut self, id: [u8; 32]) {
+        if matches!(self.states.get(&id), Some(ReplayPhase::Settled { .. })) {
+            self.states.remove(&id);
+            self.settled = self.settled.saturating_sub(1);
+        }
+    }
+
     fn phase(&self, id: [u8; 32], now: Instant) -> ReplayPhase {
         match self.states.get(&id) {
             Some(ReplayPhase::Settled { deadline }) if *deadline <= now => ReplayPhase::Expired,
@@ -282,7 +289,14 @@ impl ReplayCache {
                     true
                 }
             }
-            ReplayPhase::Unseen | ReplayPhase::Expired => {
+            ReplayPhase::Unseen => {
+                self.states
+                    .insert(id, ReplayPhase::InFlight { reservations: 1 });
+                self.in_flight = self.in_flight.saturating_add(1);
+                true
+            }
+            ReplayPhase::Expired => {
+                self.expire_one(id);
                 self.states
                     .insert(id, ReplayPhase::InFlight { reservations: 1 });
                 self.in_flight = self.in_flight.saturating_add(1);
@@ -326,7 +340,11 @@ impl ReplayCache {
         let had_reservation = match self.phase(id, now) {
             ReplayPhase::Settled { .. } => return ReplayInsert::Duplicate,
             ReplayPhase::InFlight { .. } => true,
-            ReplayPhase::Unseen | ReplayPhase::Expired => false,
+            ReplayPhase::Unseen => false,
+            ReplayPhase::Expired => {
+                self.expire_one(id);
+                false
+            }
         };
         if self.settled >= self.capacity {
             return ReplayInsert::Full;
