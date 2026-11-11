@@ -352,7 +352,8 @@ SNI path is unchanged.
 crates/beam       CLI, config loading, logging, signals, listener lifecycle
 crates/beam-core  protocol/server logic; forbid(unsafe)
 crates/beam-sys   splice/socket/eventfd primitives; sole unsafe crate
-tests/tun         full-TUN interoperability harness and target services
+tests/tun         full-TUN interoperability harness, protocol lab and
+                  target services (protocol.py, protocol_report.py)
 bench             stock-Xray vs beam benchmark harness and no-TUN smoke
 fuzz              separate cargo-fuzz workspace
 deploy            package/bootstrap, systemd, nftables, client rotation
@@ -771,10 +772,15 @@ bash -n tests/tun/run.sh
 bash tests/tun/run.sh
 bash tests/tun/run.sh --udp-mode packetaddr
 bash tests/tun/run.sh --udp-mode legacy
+TUN_RTT_MS=250 TUN_LOSS_PCT=1 bash tests/tun/run.sh --suite protocols
 ```
 
 Each mode must report 8/8 PASS: TCP HTTP v4/v6, UDP echo v4/v6, DNS v4/v6,
-QUIC/H3, and HTTPS through Vision Direct. `BLOCKED` is not pass: any blocked
+QUIC/H3, and HTTPS through Vision Direct. `--suite protocols` replaces the
+eight probes with the protocol campaign: it applies netem (`TUN_RTT_MS`,
+`TUN_LOSS_PCT`), records the qdisc and baseline-RTT evidence, and merges the
+per-case JSON into `protocol-report-<arm>.json`; `tests/tun/protocol.py` is the
+per-case driver and `tests/tun/protocol_report.py validate` is the gate. `BLOCKED` is not pass: any blocked
 row makes the harness exit 2. If `/dev/net/tun` is unavailable, all rows are
 BLOCKED and the script also exits 2; set `ALLOW_TUN_BLOCKED=1` only when
 skipping the matrix is intended.
@@ -913,6 +919,7 @@ gh workflow run lab-hosted.yml -f profile=standard
 gh workflow run lab-hosted.yml -f profile=smoke -f suite=tun
 gh workflow run lab-hosted.yml -f profile=claim -f suite=bench
 gh workflow run lab-hosted.yml -f suite=stress
+gh workflow run lab-hosted.yml -f suite=protocols -f udp_mode=xudp
 ```
 
 | Profile | RTT | Server ceiling | Reps | Window | Duration | Use |
@@ -951,12 +958,25 @@ from overwriting `bench-results`.
 The job is dispatch-only: no push, tag, or PR event runs it, so a shared
 runner's noise never blocks a release by itself. A green job means every
 selected suite passed: TUN 8/8 PASS, the bench cell complete
-(`--require-complete`) and unsaturated, and every stress check PASS. A ratio
-outside 0.95-1.05 only emits a warning. Results land in the `bench-results`
-branch (latest bench run), a run artifact, and the step summary. Stress-only
-runs leave `bench-results` untouched; their summary is in the artifact and the
-step summary. `BLOCKED` TUN rows fail the job; `ALLOW_TUN_BLOCKED` is never
-used there.
+(`--require-complete`) and unsaturated, every stress check PASS, and for
+`suite=protocols` a validated 20-case beam report with no FAIL or BLOCKED row.
+A ratio outside 0.95-1.05 only emits a warning. Results land in the
+`bench-results` branch (latest bench run), a run artifact, and the step
+summary. Stress-only runs leave `bench-results` untouched; their summary is in
+the artifact and the step summary. `BLOCKED` TUN rows fail the job;
+`ALLOW_TUN_BLOCKED` is never used there.
+
+`suite=protocols` runs the real-protocol campaign (HTTP/1.1, HTTP/2, HTTP/3,
+UDP/XUDP, DNS over UDP and TCP, TCP echo, mixed load, idle and restart) through
+the same sing-box -> beam full-TUN path under netem. It writes
+`protocol-report-beam.json` and a stock-Xray control report; the beam report is
+the gate and the control report is diagnostic. Each report records the qdisc
+evidence, both baseline RTTs and the per-case metrics, and the acceptance step
+re-runs `tests/tun/test_protocol_report.py` so a truncated, incomplete,
+duplicated or FAIL-carrying report cannot pass. The same campaign runs locally
+with `bash tests/tun/run.sh --suite protocols` plus `TUN_RTT_MS` and
+`TUN_LOSS_PCT`; it needs root (or `TUN_ALLOW_ROOT=1`) and a prebuilt h3-origin
+and h2-client helper.
 
 The runner is shared and the four vCPUs are all assigned to roles, so these are
 noisy, high-RTT probe measurements, not headline numbers, and the `non_role`
