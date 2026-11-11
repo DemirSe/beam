@@ -414,9 +414,16 @@ def validate(args) -> int:
             print(f"::error::protocol: {problem}")
         print(f"protocol acceptance: {len(problems)} problem(s)")
         return 1
+    # A WARN row is an accepted quality observation, not a gate failure; the
+    # case manifest is complete when every required name is present and no row
+    # is FAIL or BLOCKED.
     passed = sum(1 for case in report["cases"] if case.get("status") == "PASS")
+    warned = sum(1 for case in report["cases"] if case.get("status") == "WARN")
     total = len(REQUIRED_CASES)
-    print(f"\nprotocol acceptance: {passed}/{total} PASS (complete={report['complete']})")
+    print(
+        f"\nprotocol acceptance: {passed + warned}/{total} cases "
+        f"({passed} PASS, {warned} WARN), complete={report['complete']}"
+    )
     return 0
 
 

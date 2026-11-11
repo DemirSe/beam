@@ -424,6 +424,7 @@ jobs:
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             TUN_ALLOW_ROOT=1 TUN_OUT="$out" \
             TUN_RTT_MS="${RTT_MS:-250}" TUN_LOSS_PCT="${LOSS:-0}" \
+            IMAGE_OS="${ImageOS:-local}" GIT_COMMIT="$GITHUB_SHA" \
             SING_BOX="$RUNNER_TEMP/tools/sing-box" \
             XRAY_BIN="$RUNNER_TEMP/tools/xray-bin" \
             TEST_CONFIG="$GITHUB_WORKSPACE/config.example.toml" \
