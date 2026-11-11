@@ -239,6 +239,10 @@ def main() -> int:
             f"baseline={base_threads} final={end_threads}",
         )
         check("soak_server_alive", server.poll() is None, "running")
+        lines = (out / "beam.log").read_text(errors="replace").splitlines()
+        counters = [line for line in lines if "runtime counters" in line]
+        if counters:
+            print(f"last_counters: {counters[-1].strip()}", flush=True)
     finally:
         for proc in (client, server):
             if proc.poll() is None:

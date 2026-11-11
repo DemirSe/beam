@@ -1,0 +1,83 @@
+name: replay-proof
+
+# Branch-only proof for the REALITY replay-cache fix. The baseline job checks
+# out the pinned pre-fix dev commit and must reproduce the 65,536-handshake
+# stall; the fixed jobs run the same soak on the dispatched (fix) branch and
+# must pass with no replay rejections or cache-full events. Manual only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 1625279c8ce734a95e39f70da6ca93d2fb2f5406
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Build beam
+        run: cargo build --locked --release --bin beam
+      - name: Install pinned sing-box
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/sb.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64-glibc.tar.gz
+          echo "231e57c18378f780a08de832844a1ca9716e17a7bcf82964b350844d243c03ac  /tmp/sb.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          install -m 0755 /tmp/sing-box-1.14.4-linux-amd64-glibc/sing-box /usr/local/bin/sing-box
+      - name: Expect the pre-fix stall
+        run: |
+          set +e
+          SOAK_SECONDS=600 python3 tests/stress/vless_soak.py target/release/beam /usr/local/bin/sing-box | tee soak.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          test "$rc" -ne 0
+          grep -q "unexplained_failures=[1-9]" soak.log
+          grep -q "error=authenticated ClientHello replay" soak.log
+          grep -q "replay_rejected=[1-9]" soak.log
+          grep -E "sample|final|FAIL" soak.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: baseline-soak
+          path: soak.log
+
+  fixed:
+    strategy:
+      matrix:
+        rep: [1, 2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Build beam
+        run: cargo build --locked --release --bin beam
+      - name: Install pinned sing-box
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/sb.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64-glibc.tar.gz
+          echo "231e57c18378f780a08de832844a1ca9716e17a7bcf82964b350844d243c03ac  /tmp/sb.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          install -m 0755 /tmp/sing-box-1.14.4-linux-amd64-glibc/sing-box /usr/local/bin/sing-box
+      - name: Expect the fixed soak to pass
+        run: |
+          set -o pipefail
+          SOAK_SECONDS=900 python3 tests/stress/vless_soak.py target/release/beam /usr/local/bin/sing-box | tee soak.log
+          grep -q "soak: PASS" soak.log
+          grep -q "replay_cache_full=0" soak.log
+          grep -q "replay_rejected=0" soak.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fixed-soak-${{ matrix.rep }}
+          path: soak.log
