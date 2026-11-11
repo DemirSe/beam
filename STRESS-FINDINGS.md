@@ -17,8 +17,8 @@ legacy-send, installer, and harness issues listed below. Production runs
 service drop-in, host IPv6 disabled (`all/default/lo.disable_ipv6=1`), zero IPv6
 addresses/routes/listeners, and `sshd` `AddressFamily inet`; the lab is stopped
 after the 11/11 checks.
-The annotated `v0.1.0-rc.1` tag is the previous release candidate; current
-`main` is `66494a0`.
+The annotated `v0.1.0-rc.1` tag is the previous release candidate; the
+deployed source is `66494a0`, and `main` at `1f686ce` adds docs/test cleanup.
 Stable-promotion validation (privileged syscall/wakeup/splice measurements and
 cgroup OOM sampling) is tracked in `ISSUES.md` test gaps; the five-hour soak is
 now the default release gate and passed on 2026-11-10, and the short fuzz

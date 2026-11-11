@@ -15,7 +15,7 @@ on 2026-11-11 16:39 UTC:
 | Binary | `/usr/local/bin/beam` |
 | SHA-256 | `176349b54c5de007c34d87d789a9b3bbba142f2b5e232dca2b5bd57ee9195671` |
 | Version | `0.1.0 (66494a09a092)` |
-| Source release | current `main` (`66494a0`); supersedes `v0.1.0-rc.1` |
+| Source release | `66494a0` (deployed); `main` at `1f686ce` adds docs/test cleanup |
 | Service | `beam.service`, active, `NRestarts=0`, `RestrictAddressFamilies=AF_INET AF_UNIX` |
 | Listener | `0.0.0.0:443` (no IPv6 listener) |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
@@ -35,7 +35,7 @@ has no IPv6 addresses, routes, or listeners, and `sshd` listens on
 not used in production verification.
 
 The annotated tag `v0.1.0-rc.1` remains the previous release candidate.
-Production now runs the current `main` build `0.1.0 (66494a09a092)` (binary
+Production now runs the `66494a0` build `0.1.0 (66494a09a092)` (binary
 `176349b5…`, config `d20d16…`, drop-in `f852fce5…`), which adds the
 2026-11-11 Vision Direct lazy-descriptor fix (STRESS-FINDINGS #10) to the RC
 fix set. The RC contains the current server fixes plus the IPv4-only client
@@ -1011,9 +1011,10 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   required.
 - **One user, one inbound, no hot reload/stats** keeps the attack surface and
   resource model bounded.
-- **Production runs the current `main` build `0.1.0 (66494a09a092)` (binary
-  `176349b5…`); the annotated `v0.1.0-rc.1` tag is the previous release
-  candidate.** Move it only with `deploy/package.sh` plus
+- **Production runs the `66494a0` build `0.1.0 (66494a09a092)` (binary
+  `176349b5…`); `main` at `1f686ce` adds docs/test cleanup. The annotated
+  `v0.1.0-rc.1` tag is the previous release candidate.** Move it only with
+  `deploy/package.sh` plus
   `BEAM_KEEP_CONFIG=1 bootstrap.sh`, then re-run the hash-pinned verifier and
   update the pin here when deployed.
 - **Production is IPv4-only at the host boundary** — the beam
