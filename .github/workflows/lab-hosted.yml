@@ -409,6 +409,7 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/bench-out"
+          iperf3_bin="$(command -v iperf3)"
           bench_args=(--reps "$REPS" --duration "$DURATION" --rtt-ms "$RTT_MS"
                       --arms "$BENCH_ARMS" --out "$out")
           if [ "$QUICK" = "1" ]; then
@@ -445,7 +446,7 @@ jobs:
             BENCH_REQUIRE_COMPLETE="$BENCH_REQUIRE_COMPLETE" \
             SING_BOX="$RUNNER_TEMP/tools/sing-box" \
             XRAY_BIN="$RUNNER_TEMP/tools/xray-bin" \
-            IPERF3=/usr/bin/iperf3 \
+            IPERF3="$iperf3_bin" \
             TEST_CONFIG="$GITHUB_WORKSPACE/config.example.toml" \
             H3_ORIGIN_BIN="$GITHUB_WORKSPACE/tests/tun/h3-origin/target/debug/h3-origin" \
             SKIP_BUILD=1 \
