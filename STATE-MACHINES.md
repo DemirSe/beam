@@ -272,7 +272,8 @@ policy, easy to miss when tuning `max_connections` (`main.rs:29-31`,
 offset at insertion. A backward wall-clock step after insertion can keep an
 envelope timestamp acceptable past that deadline, so the server clock must stay
 disciplined (NTP or equivalent); this is the same assumption the timestamp check
-already makes.
+already makes. The server constructor rejects a timestamp window above 24 h so
+retention arithmetic stays representable.
 
 **Failed-insert accounting (D7, fixed).** `insert` used to remove the id from
 `in_flight` *before* the duplicate/capacity check, so a rejected insert
