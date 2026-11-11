@@ -17,7 +17,7 @@ not clean.
 
 ## I1 — replay cache saturates under sustained heavy churn (fixed on branch)
 
-- **Status:** fixed on `fix/replay-cache`, pending merge; proof run 43015951357
+- **Status:** fixed on `fix/replay-cache`, pending merge; proof run 43016632684
   pairs the pinned pre-fix SHA with the fixed branch. This was not a data-path
   defect: descriptors, threads, and RSS stayed flat; the cache reached its
   configured bound and failed closed.
@@ -33,7 +33,7 @@ not clean.
   earlier, so this was cache saturation, not a client reusing a ClientHello.
 - **Evidence:** current-dev failing runs 43004235340, 43004266767,
   43004276244; older run 42937823294; instrumented runs 43005043280,
-  43005052880, 43005143151; fixed proof run 43015951357.
+  43005052880, 43005143151; fixed proof run 43016632684.
 - **Fix:** `ReplayPhase::{Unseen,InFlight,Settled,Expired}` with a deadline
   min-heap; entries expire at `envelope timestamp + window + 1 s` (301 s typical,
   601 s worst case), and a settled entry with admitted copies remains until those
