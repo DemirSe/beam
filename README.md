@@ -1032,9 +1032,9 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   `beam-core`/`beam`/server-deploy fixes; the IPv4-only client profiles, beam
   drop-in, SSH drop-in, and host IPv6 sysctl are deployment artifacts, and
   client installer/tray changes are not installed by that deploy.
-  `STRESS-FINDINGS.md` retains only the lower-risk resource/CPU items (#10) and
-  the rootless Android platform limitation (#12). Do not fold those remaining
-  items into this note until they are fixed and re-verified.
+  `STRESS-FINDINGS.md` retains only the Vision raw-handoff fd-clone cost (#10)
+  and the rootless Android platform limitation (#12). Do not fold those
+  remaining items into this note until they are fixed and re-verified.
 - The 11 local client `/etc/beam/config.json.bak-*` backups were removed after
   live-profile validation; the production host retains five
   `/etc/beam/config.toml.bak-*` recovery backups. Existing Android/Windows

@@ -8,18 +8,20 @@ timestamp/cache hardening, legacy UDP bounds, cover cancellation, parallel
 resolver lookups, and the descriptor budget are in `2e0a464` and deployed.
 Finding 4 is fixed in `fb45eda` and deployed.
 The process-wide resolver changes were reverted after intermittent client DNS
-failures. Findings 10 and 12 remain open; the 2026-11-08 follow-up closed the
-lifecycle, reply-budget, replay-cache, resolver-task, legacy-send, installer,
-and harness issues listed below. Production runs `1b9113cde356-dirty`
-(SHA `6a9b4ffb…`) with `NRestarts=0`, an IPv4-only beam service drop-in, host
-IPv6 disabled (`all/default/lo.disable_ipv6=1`), zero IPv6
+failures. Finding 10 remains open for the Vision raw-handoff fd clones, and
+finding 12 remains open as a client-platform limitation; the 2026-11-08
+follow-up closed the lifecycle, reply-budget, replay-cache, resolver-task,
+legacy-send, installer, and harness issues listed below. Production runs
+`1b9113cde356-dirty` (SHA `6a9b4ffb…`) with `NRestarts=0`, an IPv4-only beam
+service drop-in, host IPv6 disabled (`all/default/lo.disable_ipv6=1`), zero IPv6
 addresses/routes/listeners, and `sshd` `AddressFamily inet`; the lab is stopped
 after the 11/11 checks.
 The annotated `v0.1.0-rc.1` tag is the current source release candidate.
 Stable promotion remains blocked on privileged syscall/wakeup/splice
 measurements and cgroup OOM sampling; the five-hour soak is now the default
 release gate and passed on 2026-11-10, and the short fuzz campaign was clean.
-Findings 10/12 remain open known gaps.
+The remaining Vision fd-clone cost (#10) and the rootless-Android limitation
+(#12) remain open known gaps.
 Initial binary under test was final `1007354…` code (embedded identity
 `b4d9382`, deployed build `a41facef…`).
 
@@ -34,7 +36,7 @@ Do not treat the latter as fixed or as measured production incidents.
 | 4 | fixed `fb45eda` | XUDP close | Counted `SlotGuard` reservations make the End reserve strict; an End is still dropped and counted when all eight reserved slots are held. |
 | 5 | fixed 2026-11-08 | XUDP reply budget | A 2 MiB per-mux cap inside the 32 MiB process-wide budget prevents one slow reader from starving other mux streams. |
 | 9 | fixed 2026-11-08 | XUDP lifecycle | The empty-mux timer now tracks active sessions only, so retained GlobalID sockets cannot add another close timer. |
-| 10 | open | Lower-risk resources | Remaining mux-abort cleanup and session-table lock items; cover/Vision cancellation and CPU-spin issues are fixed. |
+| 10 | open | Lower-risk resources | Vision raw-handoff clones add up to four extra fds per active Vision connection; mux-abort cleanup and the session-table lock item are fixed. |
 | 12 | open | Client platform | Rootless Android cannot enable BBR while preserving the REALITY outer TCP cover. |
 | 13 | fixed 2026-11-09 | Cover relay | A disconnected probe could pin a cover slot and two sockets until the 30 s cover idle timeout, and slot saturation made the cover reply with an immediate reset. |
 
@@ -291,24 +293,32 @@ shutdown. `empty_mux_keepalive_does_not_extend_idle` and
 
 ### 10. Lower-risk resource/CPU items
 
-- Vision eagerly creates about five extra fds per connection
-  (`crates/beam-core/src/tls/server.rs:1439-1442`). At 1024 connections this is
-  about 6k fds; `LimitNOFILE=65536` kept the lab safe, but churn cost is real.
+- Vision Direct duplicates the client and target sockets for its blocking splice
+  directions (`relay_vision_direct` via `try_clone_raw_socket` and
+  `try_clone_tcp`): up to four extra fds per active Vision connection. At 1024
+  connections this is about 4k fds; `LimitNOFILE=65536` keeps it safe, but the
+  churn cost is real.
 - ~~Cover relay uses `copy_bidirectional` without a stop/eventfd; cancellation
   could leave detached blocking work and fds for the 30 s cover idle limit.~~
   Cover now always uses the async cancellable relay and is counted in shutdown
   drain; the blocking cover splice path was removed.
-- `handle_mux_stream` cleanup is skipped if the handler future is aborted or
+- ~~`handle_mux_stream` cleanup is skipped if the handler future is aborted or
   panics (`crates/beam-core/src/xudp/server.rs:192-221`); no in-process abort
-  path was found, so this is a shutdown/panic concern.
+  path was found, so this is a shutdown/panic concern.~~ Fixed by the
+  `MuxTeardown` lifetime guard and pinned by
+  `aborting_the_mux_handler_releases_sessions_and_permits`. The panic path uses
+  the same `Drop` mechanism but is not separately tested (see `ISSUES.md` test
+  gaps).
 - ~~Vision padding-only input still uses `wake_by_ref` after the empty-block
   budget (`crates/beam-core/src/vision/stream.rs:562-572`), so an authenticated
   hostile client can burn CPU while staying connected.~~ Fixed in `abdc033`:
   after 64 consecutive empty blocks with no coalesced content the stream
   returns `InvalidData`; regression tested.
-- `take_idle` holds the session-table lock while taking up to 2048 session
+- ~~`take_idle` holds the session-table lock while taking up to 2048 session
   locks (`crates/beam-core/src/xudp/session.rs:865-876`); bounded, no lock
-  cycle found.
+  cycle found.~~ Resolved: idle checks read `last_activity_ms` atomically. The
+  sweep still scans up to 2048 active entries under the table lock, but takes no
+  per-session locks.
 
 ### 11. [RESOLVED] Legacy UDP dropped replies and quadratic decoder — MEDIUM
 

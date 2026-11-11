@@ -1,9 +1,9 @@
 name: soak
 
 # Sustained mixed traffic with bounded descriptors, RSS, and threads. Run on
-# demand before a release. Keep it under about five minutes: beyond roughly
-# 65 500 connections this harness reproduces an open stall (AUDIT-2026-11-11.md),
-# which would fail the gate for a reason nobody has diagnosed yet.
+# demand before a release. The historical 65,500-connection stall was replay
+# cache saturation (see ISSUES.md); keep this under about five minutes as a
+# budget, not because of an undiagnosed fault.
 on:
   workflow_dispatch:
     inputs:

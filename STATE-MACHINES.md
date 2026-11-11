@@ -880,7 +880,9 @@ reattach, complete oversized ServerHello, split ServerHello on the final credit,
 
 *Done.* Each item above is implemented and pinned; the register names the test
 that covers it. The teardown bound was fixed to a single deadline, and the
-abort/panic gap under D8e is still open.
+abort/panic path under D8e is closed by the `MuxTeardown` guard; that panic path
+uses the same `Drop` mechanism but is not separately tested (see `ISSUES.md`
+test gaps).
 
 1. **Document the transition tables.** This file is the inventory; keep it
    current when a machine changes. Optionally move it under `docs/` if the

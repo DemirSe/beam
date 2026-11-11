@@ -1,7 +1,7 @@
 # Open issues
 
-Last updated 2026-11-11. Short register; the evidence behind each entry lives in
-[`AUDIT-2026-11-11.md`](AUDIT-2026-11-11.md), and the lifecycle defect history in
+Last updated 2026-11-11. Short register; the historical hardening audit is
+[`AUDIT-2026-11-11.md`](AUDIT-2026-11-11.md), and the lifecycle inventory is
 [`STATE-MACHINES.md`](STATE-MACHINES.md).
 
 Nothing here is a known-broken data path: byte integrity, admission bounds, and

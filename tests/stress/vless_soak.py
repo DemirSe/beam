@@ -34,9 +34,9 @@ from vless_client import (  # noqa: E402
 
 FAILURES = 0
 DURATION = float(os.environ.get("SOAK_SECONDS", "1200"))
-# Client restarts are off by default: they exercise the client, not the server,
-# and a restart under heavy churn produced replay-rejection log lines that a
-# dedicated repro could not reproduce (see AUDIT-2026-11-11.md).
+# Client restarts are off by default: they exercise the client, not the server.
+# The historical replay-rejection lines were replay-cache saturation, not client
+# handshake reuse; see ISSUES.md.
 RESTART_EVERY = float(os.environ.get("SOAK_RESTART_EVERY", "0"))
 
 
