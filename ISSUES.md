@@ -12,15 +12,17 @@ on `fix/replay-cache` and await merge; they are kept here until then.
 
 |ID|Issue|Status|Severity|
 |---|---|---|---|
-|I1|Replay cache saturates under sustained heavy churn|Fixed on `fix/replay-cache` (pending merge)|resolved|
-|I2|A client restart appeared to be refused as a replay|Fixed on `fix/replay-cache` (pending merge)|resolved|
+|I1|Replay cache saturates under sustained heavy churn|Fixed on `fix/replay-cache` (proof passed; pending merge)|resolved|
+|I2|A client restart appeared to be refused as a replay|Fixed on `fix/replay-cache` (proof passed; pending merge)|resolved|
 
 ## I1 — replay cache saturates under sustained heavy churn (fixed on branch)
 
 - **Status:** fixed on `fix/replay-cache`, pending merge; proof run 43016632684
-  pairs the pinned pre-fix SHA with the fixed branch. This was not a data-path
-  defect: descriptors, threads, and RSS stayed flat; the cache reached its
-  configured bound and failed closed.
+  passed. The baseline job reproduced the stall at 7,288 rounds / 65,536
+  handshakes; both fixed 900 s reps passed with zero unexplained failures and
+  `replay_rejected=0` / `replay_cache_full=0`. This was not a data-path defect:
+  descriptors, threads, and RSS stayed flat; the cache reached its configured
+  bound and failed closed.
 - **What a user would notice:** after unusually heavy sustained use, apps that use
   the tunnel stop getting replies while web browsing may still work; only a server
   restart (or waiting for entries to age out) would bring the tunnel back.
