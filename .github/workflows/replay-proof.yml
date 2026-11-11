@@ -2,10 +2,18 @@ name: replay-proof
 
 # Branch-only proof for the REALITY replay-cache fix. The baseline job checks
 # out the pinned pre-fix dev commit and must reproduce the 65,536-handshake
-# stall; the fixed jobs run the same soak on the dispatched (fix) branch and
-# must pass with no replay rejections or cache-full events. Manual only.
+# stall; the fixed jobs run the same soak on this branch and must pass with no
+# replay rejections or cache-full events. Push-triggered on the fix branch only;
+# this file is not merged to main.
 on:
-  workflow_dispatch:
+  push:
+    branches: [fix/replay-cache]
+    paths:
+      - .github/workflows/replay-proof.yml
+      - crates/**
+      - tests/stress/**
+      - Cargo.toml
+      - Cargo.lock
 
 permissions:
   contents: read
