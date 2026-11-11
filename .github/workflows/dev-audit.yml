@@ -35,3 +35,5 @@ jobs:
           cargo test --workspace --release 2>&1 | grep -E 'Running|Doc-tests|test result|^failures:|^    [a-z_0-9:]+$'
       - name: Bench report contract tests
         run: python3 tests/bench/test_report.py
+      - name: Protocol report contract tests
+        run: python3 tests/tun/test_protocol_report.py
