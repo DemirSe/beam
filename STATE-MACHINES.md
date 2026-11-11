@@ -273,12 +273,14 @@ authentication.
 **Why implicit.** Three maps and a TTL form a four-state machine; no enum says
 "in flight vs settled".
 
-**Observability.** `replay_rejected` counts authenticated handshakes the cache
-refused after TLS finished (duplicate settled id, or a full cache) and appears in
-both the pressure warning and the periodic counter line. Cache occupancy and the
-in-flight peak are still not exported, and pre-reservation duplicates are not
-counted — they are forwarded to the cover by design, so counting them would mix
-scanning noise into the signal.
+**Observability.** `replay_rejected` counts authenticated ClientHellos the cache
+refused, both at reservation (a settled id) and after TLS finished (duplicate or
+a full cache), and appears in the pressure warning and the periodic counter line.
+Reservations are included on purpose: a client that restarts and reuses its
+ClientHello lands there, which looks like a dead tunnel while the server keeps
+forwarding the probe to the cover. Guessing a valid session id is infeasible, so
+this is not scanning noise. Cache occupancy and the in-flight peak are still not
+exported.
 
 **Tests.** `replay_cache_rejects_duplicates_and_stays_bounded` (2586),
 `replay_cache_uses_the_configured_capacity` (2614),

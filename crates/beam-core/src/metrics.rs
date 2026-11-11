@@ -57,7 +57,8 @@ pub struct MetricsSnapshot {
     pub xudp_replies_dropped: u64,
     /// XUDP request datagrams dropped because the send queue or socket was full.
     pub xudp_send_dropped: u64,
-    /// Authenticated handshakes rejected because the replay id was already settled.
+    /// Authenticated ClientHellos refused by the replay cache, either before the
+    /// TLS handshake (reservation) or after it (settled id or full cache).
     pub replay_rejected: u64,
     /// XUDP `End` frames that could not be queued before their deadline.
     pub xudp_end_dropped: u64,
