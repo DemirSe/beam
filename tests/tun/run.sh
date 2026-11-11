@@ -496,12 +496,15 @@ apply_netem() {
   verify_netem server "$LOG_DIR/tc-server-initial.json"
 }
 
-# Average RTT of five pings, rounded to whole milliseconds. A 0.3 s interval
-# keeps the previous reply out of the netem queue: at the 1 s default the
-# reported average is inflated by one RTT of queueing, not by the qdisc delay.
+# Average RTT of five pings, rounded to whole milliseconds. The one-packet
+# warmup resolves the neighbour entry, whose own round trip would otherwise be
+# charged to the first measured packet (300 ms instead of 250 ms at a 250 ms
+# RTT). A 0.3 s interval keeps the previous reply out of the netem queue: at
+# the 1 s default the reported average is inflated by one RTT of queueing.
 measure_baseline_rtt() {
   local target=$1 namespace=$2
   local line value
+  ip netns exec "$namespace" ping -c 1 -W 1 "$target" >/dev/null 2>&1 || true
   line="$(ip netns exec "$namespace" ping -c 5 -i 0.3 -W 1 "$target" 2>/dev/null | tail -n 1 || true)"
   value="$(printf '%s' "$line" | awk -F'/' '/rtt|round-trip/ { printf "%.0f", $5 }')"
   printf '%s\n' "${value:-0}"
@@ -645,7 +648,9 @@ write_environment() {
     echo "baseline_target_rtt_ms=$BASELINE_TARGET_RTT_MS"
     echo "client=$("$SING_BOX" version 2>/dev/null | head -n 1 || echo unknown)"
     echo "curl=$(curl --version 2>/dev/null | head -n 1 || echo unknown)"
-    echo "runner=${ImageOS:-local}"
+    # sudo drops the runner's environment, so the workflow passes IMAGE_OS
+    # and GIT_COMMIT explicitly; both fall back to the local values.
+    echo "runner=${IMAGE_OS:-${ImageOS:-local}}"
   } > "$RUN_DIR/environment.txt"
   "$SING_BOX" version > "$RUN_DIR/singbox-version.txt" 2>&1 || true
   if [ -x "$XRAY_BIN" ]; then
@@ -1000,7 +1005,7 @@ RESOURCES
     --results "$dir" \
     --environment "$RUN_DIR/environment.txt" \
     --arm "$arm" \
-    --commit "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)" \
+    --commit "${GIT_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}" \
     --binary-sha256 "$(sha256sum "$BEAM_BIN" 2>/dev/null | cut -d' ' -f1)" \
     "${extras[@]}" \
     --out "$RUN_DIR/protocol-report-$arm.json" \
