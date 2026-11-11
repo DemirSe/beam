@@ -20,6 +20,7 @@
 #
 # Usage:
 #   bash tests/tun/run.sh [--release] [--control] [--no-build] [--out DIR]
+#                         [--suite tun|protocols]
 #   sudo TUN_ALLOW_ROOT=1 bash tests/tun/run.sh --release --no-build ...
 #
 # Environment:
@@ -31,6 +32,10 @@
 #   H3_ORIGIN_BIN   use a prebuilt h3-origin binary instead of building it
 #   UDP_MODE        sing-box packet_encoding: xudp, packetaddr, or legacy
 #                   (default xudp; legacy renders packet_encoding "")
+#   TUN_RTT_MS      round-trip delay to apply to the client/server veth with
+#                   netem, split evenly across both sides (default 0)
+#   TUN_LOSS_PCT    packet loss percent to apply on both veth sides (default 0)
+#   TUN_MTU         sing-box TUN MTU recorded in the environment (default 1500)
 #   ALLOW_TUN_BLOCKED=1
 #                   accept a run whose matrix contains BLOCKED rows; without it
 #                   a blocked matrix exits 2
@@ -40,6 +45,12 @@
 #                   namespace. Implies SKIP_BUILD=1: crates.io is unreachable
 #                   inside the private network namespace, so binaries must be
 #                   prebuilt. This is the GitHub-hosted runner path.
+#
+# --suite tun runs the eight functional probes. --suite protocols runs the
+# real-protocol campaign (HTTP/1.1, HTTP/2, HTTP/3, UDP, DNS, TCP, mixed load,
+# idle and restart) through the same sing-box -> beam path and writes a
+# validated report per arm. The protocol suite also applies netem when
+# TUN_RTT_MS or TUN_LOSS_PCT is non-zero and records the qdisc evidence.
 #
 # This is a local lab harness. It never reaches an external network in the
 # measured path; only the one-time dependency/build step runs outside it.
@@ -102,17 +113,18 @@ if [ "$INNER" != "1" ]; then
     fi
   fi
 
+  H2_CLIENT_BIN="${H2_CLIENT_BIN:-$(dirname "$H3_ORIGIN_BIN")/h2-client}"
   if [ "${TUN_ALLOW_ROOT:-0}" = "1" ]; then
     exec unshare --mount --propagation private --net --fork \
       env TUN_HARNESS_INNER=1 TUN_HARNESS_ROOT="$ROOT" TUN_HARNESS_SELF="$SELF" \
       TUN_H3_BIN="$H3_ORIGIN_BIN" TUN_H3_BUILD_ERROR="$H3_BUILD_ERROR" \
-      TUN_H3_BUILD_LOG="$H3_BUILD_LOG" \
+      TUN_H3_BUILD_LOG="$H3_BUILD_LOG" TUN_H2_CLIENT_BIN="$H2_CLIENT_BIN" \
       bash "$SELF" "$@"
   fi
   exec unshare --user --map-root-user --mount --net --fork \
     env TUN_HARNESS_INNER=1 TUN_HARNESS_ROOT="$ROOT" TUN_HARNESS_SELF="$SELF" \
     TUN_H3_BIN="$H3_ORIGIN_BIN" TUN_H3_BUILD_ERROR="$H3_BUILD_ERROR" \
-    TUN_H3_BUILD_LOG="$H3_BUILD_LOG" \
+    TUN_H3_BUILD_LOG="$H3_BUILD_LOG" TUN_H2_CLIENT_BIN="$H2_CLIENT_BIN" \
     bash "$SELF" "$@"
 fi
 
@@ -129,7 +141,13 @@ SKIP_BUILD="${SKIP_BUILD:-0}"
 UDP_MODE="${UDP_MODE:-xudp}"
 PROFILE="debug"
 CONTROL=0
+SUITE="tun"
 OUT="${TUN_OUT:-}"
+TUN_RTT_MS="${TUN_RTT_MS:-0}"
+TUN_LOSS_PCT="${TUN_LOSS_PCT:-0}"
+TUN_MTU="${TUN_MTU:-1500}"
+TUN_LOG_LEVEL="${TUN_LOG_LEVEL:-debug}"
+TC="${TC:-tc}"
 BEAM_ADDR="10.10.1.1:443"
 CLIENT_ADDR="10.10.1.2/24"
 SERVER_ADDR="10.10.1.1/24"
@@ -139,6 +157,7 @@ TARGET_V6="fd00:2::2/64"
 SERVER_TARGET_V6="fd00:2::1/64"
 COVER="10.10.2.2:4443"
 H3_ORIGIN_BIN="${H3_ORIGIN_BIN:-${TUN_H3_BIN:-$HERE/h3-origin/target/debug/h3-origin}}"
+H2_CLIENT_BIN="${H2_CLIENT_BIN:-${TUN_H2_CLIENT_BIN:-$(dirname "$H3_ORIGIN_BIN")/h2-client}}"
 H3_ORIGIN_ERROR="${TUN_H3_BUILD_ERROR:-}"
 H3_BUILD_LOG="${TUN_H3_BUILD_LOG:-}"
 
@@ -157,8 +176,13 @@ while [ $# -gt 0 ]; do
       [ $# -gt 0 ] || { echo "tun-harness: --udp-mode needs a value" >&2; exit 2; }
       UDP_MODE="$1"
       ;;
+    --suite)
+      shift
+      [ $# -gt 0 ] || { echo "tun-harness: --suite needs a value" >&2; exit 2; }
+      SUITE="$1"
+      ;;
     --help|-h)
-      sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'
+      sed -n '2,60p' "$SELF" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -172,6 +196,16 @@ done
 case "$UDP_MODE" in
   xudp|packetaddr|legacy) ;;
   *) echo "tun-harness: unknown UDP mode: $UDP_MODE" >&2; exit 2 ;;
+esac
+case "$SUITE" in
+  tun|protocols) ;;
+  *) echo "tun-harness: unknown suite: $SUITE" >&2; exit 2 ;;
+esac
+case "$TUN_RTT_MS" in
+  ''|*[!0-9.]*) echo "tun-harness: TUN_RTT_MS must be numeric" >&2; exit 2 ;;
+esac
+case "$TUN_LOSS_PCT" in
+  ''|*[!0-9.]*) echo "tun-harness: TUN_LOSS_PCT must be numeric" >&2; exit 2 ;;
 esac
 
 if [ ! -f "$TEST_CONFIG" ]; then
@@ -187,7 +221,7 @@ if [ ! -x "$SING_BOX" ]; then
     exit 1
   fi
 fi
-for command in "$PYTHON" ip curl dig; do
+for command in "$PYTHON" ip curl dig tc ping; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "tun-harness: required command not found: $command" >&2
     exit 1
@@ -232,8 +266,19 @@ H3_LOG="$LOG_DIR/h3-origin.log"
 XRAY_LOG="$LOG_DIR/xray.log"
 BEAM_TSV="$RUN_DIR/results-beam.tsv"
 XRAY_TSV="$RUN_DIR/results-xray.tsv"
+PROTO_DIR="$PROBE_DIR/protocol"
+PROTO_BEAM_TSV="$RUN_DIR/protocol-results-beam.tsv"
+PROTO_XRAY_TSV="$RUN_DIR/protocol-results-xray.tsv"
+PROTO_BEAM_REPORT="$RUN_DIR/protocol-report-beam.json"
+PROTO_XRAY_REPORT="$RUN_DIR/protocol-report-xray.json"
+PROTO_HARNESS_OK=1
+RESTART_KILLED_MS=""
+: > "$BEAM_LOG"
+: > "$XRAY_LOG"
 : > "$BEAM_TSV"
 : > "$XRAY_TSV"
+: > "$PROTO_BEAM_TSV"
+: > "$PROTO_XRAY_TSV"
 if [ -n "$H3_BUILD_LOG" ] && [ -f "$H3_BUILD_LOG" ]; then
   cp "$H3_BUILD_LOG" "$LOG_DIR/h3-origin-build.log" 2>/dev/null || true
 fi
@@ -244,6 +289,13 @@ SERVICES_PID=""
 H3_ORIGIN_PID=""
 H3_READY=0
 XRAY_PID=""
+# The active server under test: the protocol suite restarts it, so the harness
+# tracks whichever arm (beam or stock Xray) owns the listening process.
+SERVER_PID=""
+SERVER_LOG=""
+SERVER_KIND=""
+BASELINE_RTT_MS=0
+BASELINE_TARGET_RTT_MS=0
 NAMESPACES=(tun-client tun-server tun-target)
 # Cleanup must only remove namespaces this run created: the trap is installed
 # before /run/netns is shadowed, so an early failure may still see whatever
@@ -280,6 +332,7 @@ cleanup() {
   trap - EXIT INT TERM
   set +e
   stop_pid "$SINGBOX_PID"
+  stop_pid "$SERVER_PID"
   stop_pid "$BEAM_PID"
   stop_pid "$XRAY_PID"
   stop_pid "$H3_ORIGIN_PID"
@@ -365,6 +418,193 @@ wait_for_command() {
   return 1
 }
 
+wait_for_marker_after() {
+  local file=$1 mark=$2 marker=$3 pid=${4:-} timeout=${5:-15}
+  local steps=$((timeout * 10))
+  for _ in $(seq 1 "$steps"); do
+    if has_marker "$file" "$mark" "$marker"; then
+      return 0
+    fi
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# The harness must prove the requested impairment is on the wire; qdisc
+# evidence is captured as JSON and validated with tight tolerances.
+verify_netem() {
+  local role=$1 path=$2 rc=0
+  "$PYTHON" - "$role" "$path" "$TUN_RTT_MS" "$TUN_LOSS_PCT" <<'VERIFY' || rc=$?
+import json
+import sys
+
+role, path, rtt, loss = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    qdisc = data[0] if isinstance(data, list) else data
+    options = qdisc["options"]
+except (OSError, ValueError, KeyError, IndexError) as error:
+    raise SystemExit(f"could not read qdisc evidence {path}: {error}")
+if rtt > 0:
+    delay = options.get("delay", {}).get("delay")
+    if delay is None:
+        raise SystemExit(f"{role}: netem has no delay")
+    want = rtt / 2
+    if abs(delay * 1000 - want) > 0.5:
+        raise SystemExit(
+            f"{role}: netem delay {delay * 1000:.3f}ms, wanted {want:.3f}ms"
+        )
+if loss > 0:
+    rate = options.get("loss-random", {}).get("loss")
+    if rate is None:
+        raise SystemExit(f"{role}: netem has no loss")
+    if abs(rate * 100 - loss) > 0.05:
+        raise SystemExit(f"{role}: netem loss {rate * 100:.3f}%, wanted {loss:.3f}%")
+VERIFY
+  [ "$rc" = "0" ] \
+    || fail_harness "netem did not apply the requested impairment on the $role side"
+}
+
+apply_netem() {
+  local netem_args=(limit 20000)
+  local half
+  if awk -v rtt="$TUN_RTT_MS" 'BEGIN { exit !(rtt > 0) }'; then
+    half="$(awk -v rtt="$TUN_RTT_MS" 'BEGIN { printf "%.3f", rtt / 2 }')"
+    netem_args+=(delay "${half}ms")
+  fi
+  if awk -v loss="$TUN_LOSS_PCT" 'BEGIN { exit !(loss > 0) }'; then
+    netem_args+=(loss "${TUN_LOSS_PCT}%")
+  fi
+  log "applying netem on each side: ${netem_args[*]} (RTT ${TUN_RTT_MS}ms, loss ${TUN_LOSS_PCT}%)"
+  ip netns exec tun-client "$TC" qdisc add dev vc root netem "${netem_args[@]}" \
+    || { fail_harness "could not add netem on vc"; return 1; }
+  ip netns exec tun-server "$TC" qdisc add dev sc root netem "${netem_args[@]}" \
+    || { fail_harness "could not add netem on sc"; return 1; }
+  ip netns exec tun-client "$TC" -j -s qdisc show dev vc \
+    > "$LOG_DIR/tc-client-initial.json" \
+    || { fail_harness "could not capture the client qdisc state"; return 1; }
+  ip netns exec tun-server "$TC" -j -s qdisc show dev sc \
+    > "$LOG_DIR/tc-server-initial.json" \
+    || { fail_harness "could not capture the server qdisc state"; return 1; }
+  ip netns exec tun-client "$TC" -s qdisc show > "$LOG_DIR/tc-client.txt" 2>&1
+  ip netns exec tun-server "$TC" -s qdisc show > "$LOG_DIR/tc-server.txt" 2>&1
+  verify_netem client "$LOG_DIR/tc-client-initial.json"
+  verify_netem server "$LOG_DIR/tc-server-initial.json"
+}
+
+# Average RTT of five pings, rounded to whole milliseconds. A 0.3 s interval
+# keeps the previous reply out of the netem queue: at the 1 s default the
+# reported average is inflated by one RTT of queueing, not by the qdisc delay.
+measure_baseline_rtt() {
+  local target=$1 namespace=$2
+  local line value
+  line="$(ip netns exec "$namespace" ping -c 5 -i 0.3 -W 1 "$target" 2>/dev/null | tail -n 1 || true)"
+  value="$(printf '%s' "$line" | awk -F'/' '/rtt|round-trip/ { printf "%.0f", $5 }')"
+  printf '%s\n' "${value:-0}"
+}
+
+start_beam() {
+  ip netns exec tun-server "$BEAM_BIN" --config "$CONFIG_DIR/beam.toml" \
+    >> "$BEAM_LOG" 2>&1 &
+  BEAM_PID=$!
+  SERVER_PID=$BEAM_PID
+  SERVER_LOG=$BEAM_LOG
+  SERVER_KIND=beam
+  wait_for_log "$BEAM_LOG" "beam listening" "$BEAM_PID" 15
+}
+
+start_xray() {
+  ip netns exec tun-server "$XRAY_BIN" run -c "$CONFIG_DIR/xray-server.json" \
+    >> "$XRAY_LOG" 2>&1 &
+  XRAY_PID=$!
+  SERVER_PID=$XRAY_PID
+  SERVER_LOG=$XRAY_LOG
+  SERVER_KIND=xray
+  wait_for_command "$XRAY_PID" 20 \
+    ip netns exec tun-server "$PYTHON" -c 'import socket; socket.create_connection(("10.10.1.1", 443), 0.2).close()'
+}
+
+# Kill the active server and start a fresh process with the same config.
+# Prints the kill timestamp in epoch milliseconds for the recovery driver.
+restart_server() {
+  local out=$1
+  local old_pid=$SERVER_PID
+  local old_start="" new_start="" new_pid="" reaped=0 mark killed
+  if [ -z "$old_pid" ] || [ ! -r "/proc/$old_pid/stat" ]; then
+    fail_harness "cannot restart the $SERVER_KIND server: no live pid"
+    return 1
+  fi
+  old_start=$(awk '{print $22}' "/proc/$old_pid/stat")
+  killed=$("$PYTHON" -c 'import time; print(int(time.time() * 1000))')
+  kill -TERM "$old_pid" 2>/dev/null || true
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$old_pid" 2>/dev/null; then
+      reaped=1
+      break
+    fi
+    if [ "$(awk '{print $3}' "/proc/$old_pid/stat" 2>/dev/null)" = "Z" ]; then
+      reaped=1
+      break
+    fi
+    sleep 0.1
+  done
+  wait "$old_pid" 2>/dev/null || true
+  mark=$(wc -c < "$SERVER_LOG" 2>/dev/null || echo 0)
+  if [ "$SERVER_KIND" = "beam" ]; then
+    if ! start_beam; then
+      fail_harness "the restarted beam process did not start"
+      return 1
+    fi
+    if ! wait_for_marker_after "$SERVER_LOG" "$mark" "beam listening" "$SERVER_PID" 15; then
+      fail_harness "the restarted beam process produced no new listening line"
+      return 1
+    fi
+  else
+    if ! start_xray; then
+      fail_harness "the restarted Xray process did not listen"
+      return 1
+    fi
+  fi
+  new_pid=$SERVER_PID
+  new_start=$(awk '{print $22}' "/proc/$new_pid/stat" 2>/dev/null || echo "")
+  "$PYTHON" - "$out" "$old_pid" "$new_pid" "$old_start" "$new_start" "$reaped" "$killed" <<'RESTART'
+import json
+import sys
+
+path, old_pid, new_pid, old_start, new_start, reaped, killed = sys.argv[1:8]
+payload = {
+    "metrics": {
+        "restart-recovery": {
+            "old_pid": int(old_pid),
+            "new_pid": int(new_pid),
+            "old_start": int(old_start) if old_start.isdigit() else 0,
+            "new_start": int(new_start) if new_start.isdigit() else 0,
+            "old_reaped": reaped == "1",
+            "killed_at_ms": int(killed),
+        }
+    }
+}
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload, sort_keys=True) + "\n")
+RESTART
+  RESTART_KILLED_MS="$killed"
+}
+
+# Process resources of the active server, as "rss_kib fds threads".
+sample_server() {
+  local rss=0 fds=0 threads=0
+  if [ -n "$SERVER_PID" ] && [ -r "/proc/$SERVER_PID/status" ]; then
+    rss=$(awk '/^VmRSS:/ {print $2}' "/proc/$SERVER_PID/status")
+    threads=$(awk '/^Threads:/ {print $2}' "/proc/$SERVER_PID/status")
+    fds=$(ls "/proc/$SERVER_PID/fd" 2>/dev/null | wc -l)
+  fi
+  printf '%s %s %s\n' "${rss:-0}" "${fds:-0}" "${threads:-0}"
+}
+
 print_table() {
   local file=$1 title=$2
   printf '\n== %s ==\n' "$title"
@@ -388,11 +628,41 @@ blocked_file() {
   done
 }
 
+write_environment() {
+  {
+    echo "run_dir=$RUN_DIR"
+    echo "beam=$BEAM_BIN"
+    echo "sing-box=$SING_BOX"
+    echo "profile=$PROFILE"
+    echo "control=$CONTROL"
+    echo "suite=$SUITE"
+    echo "udp_mode=$UDP_MODE"
+    echo "rtt_ms=$TUN_RTT_MS"
+    echo "loss_pct=$TUN_LOSS_PCT"
+    echo "tun_mtu=$TUN_MTU"
+    echo "log_level=$TUN_LOG_LEVEL"
+    echo "baseline_rtt_ms=$BASELINE_RTT_MS"
+    echo "baseline_target_rtt_ms=$BASELINE_TARGET_RTT_MS"
+    echo "client=$("$SING_BOX" version 2>/dev/null | head -n 1 || echo unknown)"
+    echo "curl=$(curl --version 2>/dev/null | head -n 1 || echo unknown)"
+    echo "runner=${ImageOS:-local}"
+  } > "$RUN_DIR/environment.txt"
+  "$SING_BOX" version > "$RUN_DIR/singbox-version.txt" 2>&1 || true
+  if [ -x "$XRAY_BIN" ]; then
+    "$XRAY_BIN" version > "$RUN_DIR/xray-version.txt" 2>&1 || true
+  fi
+}
+
 print_summary() {
   local beam_pass beam_blocked beam_failed
   beam_pass=$(count_status "$BEAM_TSV" PASS)
   beam_blocked=$(count_status "$BEAM_TSV" BLOCKED)
   beam_failed=$(count_status "$BEAM_TSV" FAIL)
+  if [ "$SUITE" = "protocols" ]; then
+    protocol_summary
+    write_environment
+    return
+  fi
   print_table "$BEAM_TSV" "beam (server $BEAM_ADDR)"
   printf '\nsummary: %s passed, %s blocked, %s failed\n' "$beam_pass" "$beam_blocked" "$beam_failed"
   if [ "$CONTROL" = "1" ] && [ -s "$XRAY_TSV" ]; then
@@ -403,18 +673,7 @@ print_summary() {
     print_table "$XRAY_TSV" "stock Xray control (same client and targets)"
     printf '\nsummary: %s passed, %s blocked, %s failed\n' "$control_pass" "$control_blocked" "$control_failed"
   fi
-  {
-    echo "run_dir=$RUN_DIR"
-    echo "beam=$BEAM_BIN"
-    echo "sing-box=$SING_BOX"
-    echo "profile=$PROFILE"
-    echo "control=$CONTROL"
-    echo "udp_mode=$UDP_MODE"
-  } > "$RUN_DIR/environment.txt"
-  "$SING_BOX" version > "$RUN_DIR/singbox-version.txt" 2>&1 || true
-  if [ -x "$XRAY_BIN" ]; then
-    "$XRAY_BIN" version > "$RUN_DIR/xray-version.txt" 2>&1 || true
-  fi
+  write_environment
 }
 
 finish() {
@@ -432,6 +691,320 @@ finish() {
     exit 2
   fi
   exit 0
+}
+
+record_protocol() {
+  local arm=$1 file=$2 name=$3 status=$4 detail=$5
+  detail="${detail//$'\t'/ }"
+  detail="${detail//$'\n'/ }"
+  printf '%s\t%s\t%s\n' "$name" "$status" "$detail" >> "$file"
+  printf '  %-24s %-8s %s\n' "$name" "$status" "$detail"
+  if [ "$arm" = "beam" ] && [ "$status" = "BLOCKED" ]; then
+    PROTO_HARNESS_OK=0
+    fail_harness "beam protocol row $name is BLOCKED; every tool for the suite is pinned"
+  fi
+  if [ "$arm" = "beam" ] && [ "$status" = "FAIL" ]; then
+    UNEXPECTED_FAIL=1
+  fi
+}
+
+run_case() {
+  local arm=$1 name=$2 timeout_s=$3
+  shift 3
+  local out="$PROTO_DIR/$arm/$name.json"
+  local log="$PROTO_DIR/$arm/$name.log"
+  local rc=0 status detail
+  ip netns exec tun-client timeout "$timeout_s" "$PYTHON" "$HERE/protocol.py" "$name" "$@" \
+    --out "$out" > "$log" 2>&1 || rc=$?
+  status="$(json_field "$out" status)"
+  detail="$(json_field "$out" detail)"
+  if [ -z "$status" ]; then
+    status="FAIL"
+    detail="driver produced no result (rc=$rc): $(tail -n 2 "$log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+  elif [ "$rc" -ne 0 ] && [ "$status" != "FAIL" ]; then
+    status="FAIL"
+    detail="driver exited $rc after reporting $status: $detail"
+  fi
+  [ -n "$detail" ] || detail="no detail"
+  record_protocol "$arm" "$RUN_DIR/protocol-results-$arm.tsv" "$name" "$status" "$detail"
+}
+
+write_case_failure() {
+  local path=$1 name=$2 detail=$3
+  "$PYTHON" - "$path" "$name" "$detail" <<'FAILURE'
+import json
+import sys
+import time
+
+path, name, detail = sys.argv[1:4]
+now = round(time.time(), 3)
+payload = {
+    "name": name,
+    "status": "FAIL",
+    "correctness": False,
+    "ok": False,
+    "planned": 1,
+    "completed": 0,
+    "deadline_ms": 0,
+    "started": now,
+    "ended": now,
+    "metrics": {},
+    "warnings": [],
+    "detail": detail,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload, sort_keys=True) + "\n")
+FAILURE
+}
+
+write_preflight_row() {
+  local name=$1 status=$2 code=$3 version=$4 size=$5 detail=$6
+  "$PYTHON" - "$PROTO_DIR/$name.json" "$name" "$status" "$code" "$version" "$size" "$detail" <<'PREFLIGHT'
+import json
+import sys
+import time
+
+path, name, status, code, version, size, detail = sys.argv[1:8]
+now = round(time.time(), 3)
+payload = {
+    "name": name,
+    "status": status,
+    "correctness": status != "FAIL",
+    "ok": status != "FAIL",
+    "planned": 1,
+    "completed": 0 if status == "FAIL" else 1,
+    "deadline_ms": 20000,
+    "started": now,
+    "ended": now,
+    "metrics": {
+        "http_code": int(code) if code.isdigit() else 0,
+        "http_version": version or "?",
+        "bytes": int(size),
+    },
+    "warnings": [],
+    "detail": detail,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload, sort_keys=True) + "\n")
+PREFLIGHT
+}
+
+# Direct-origin preflights: from tun-server, before beam exists. They prove the
+# origins, the target namespace and the ports work; a failure is a harness
+# failure, not a beam finding.
+run_preflight() {
+  local name=$1 url=$2 flag=${3:-} marker=$4
+  local body="$PROTO_DIR/$name.body"
+  local log="$LOG_DIR/$name.log"
+  local rc=0 fields code version size marker_ok=0
+  : > "$body"
+  if [ -n "$flag" ]; then
+    fields=$(ip netns exec tun-server timeout 25 curl -sS -k --noproxy '*' "$flag" \
+      --max-time 15 -o "$body" -w '%{http_code} %{http_version}' "$url" 2>"$log") || rc=$?
+  else
+    fields=$(ip netns exec tun-server timeout 25 curl -sS -k --noproxy '*' \
+      --max-time 15 -o "$body" -w '%{http_code} %{http_version}' "$url" 2>"$log") || rc=$?
+  fi
+  code="${fields%% *}"
+  version="${fields##* }"
+  size=$(wc -c < "$body" 2>/dev/null || echo 0)
+  if grep -qF -- "$marker" "$body" 2>/dev/null; then
+    marker_ok=1
+  fi
+  if [ "$rc" -eq 0 ] && [ "$code" = "200" ] && [ "$marker_ok" = "1" ]; then
+    write_preflight_row "$name" PASS "$code" "$version" "$size" \
+      "direct origin HTTP/$version 200, ${size} B marker, from tun-server" > /dev/null
+  else
+    PROTO_HARNESS_OK=0
+    fail_harness "preflight $name failed: rc=$rc code=${code:-none} $(tr '\n' ' ' < "$log" | cut -c1-160)"
+    write_preflight_row "$name" FAIL "${code:-0}" "$version" "$size" \
+      "harness failure: the direct origin did not answer correctly: $(tr '\n' ' ' < "$log" | cut -c1-160)" > /dev/null
+  fi
+}
+
+run_preflights() {
+  mkdir -p "$PROTO_DIR"
+  log "running direct-origin preflights from tun-server"
+  run_preflight preflight-h1 "http://10.10.2.2:8080/" "" "beam-tun-ok"
+  run_preflight preflight-h2 "https://10.10.2.2:8443/" "--http2" "beam-tun-h3-ok"
+  run_preflight preflight-h3 "https://10.10.2.2:4443/" "--http3-only" "beam-tun-h3-ok"
+  "$PYTHON" - "$PROTO_DIR" "$PROTO_DIR/preflights.json" "$PROTO_HARNESS_OK" <<'PREFLIGHTS'
+import json
+import sys
+import time
+from pathlib import Path
+
+directory, out, ok = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] == "1"
+cases = []
+for name in ("preflight-h1", "preflight-h2", "preflight-h3"):
+    path = directory / f"{name}.json"
+    if path.is_file():
+        cases.append(json.loads(path.read_text(encoding="utf-8")))
+    else:
+        now = round(time.time(), 3)
+        cases.append(
+            {
+                "name": name,
+                "status": "FAIL",
+                "correctness": False,
+                "ok": False,
+                "planned": 1,
+                "completed": 0,
+                "deadline_ms": 20000,
+                "started": now,
+                "ended": now,
+                "metrics": {"http_code": 0, "http_version": "?", "bytes": 0},
+                "warnings": [],
+                "detail": "harness failure: the preflight produced no result",
+            }
+        )
+payload = {"cases": cases, "complete": ok}
+out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PREFLIGHTS
+}
+
+protocol_summary() {
+  local arm tsv
+  for arm in beam xray; do
+    tsv="$RUN_DIR/protocol-results-$arm.tsv"
+    [ -s "$tsv" ] || continue
+    print_table "$tsv" "$arm protocol cases"
+    printf '\nsummary: %s passed, %s warn, %s failed\n' \
+      "$(count_status "$tsv" PASS)" "$(count_status "$tsv" WARN)" "$(count_status "$tsv" FAIL)"
+  done
+  if [ -f "$PROTO_BEAM_REPORT" ]; then
+    "$PYTHON" - "$PROTO_BEAM_REPORT" <<'SUMMARY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+print(
+    "beam protocol report: "
+    f"complete={report.get('complete')} "
+    f"cases={len(report.get('cases') or [])} "
+    f"missing={len(report.get('missing') or [])} "
+    f"duplicates={len(report.get('duplicates') or [])}"
+)
+SUMMARY
+    if ! "$PYTHON" - "$PROTO_BEAM_REPORT" <<'COMPLETE'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+raise SystemExit(0 if report.get("complete") is True else 1)
+COMPLETE
+    then
+      fail_harness "the beam protocol report is incomplete"
+    fi
+  else
+    fail_harness "no beam protocol report was produced"
+  fi
+  if [ "$CONTROL" = "1" ] && [ ! -f "$PROTO_XRAY_REPORT" ]; then
+    log "no Xray protocol report was produced (diagnostic arm only)"
+  fi
+}
+
+run_protocol_suite() {
+  local arm=$1
+  local tsv="$RUN_DIR/protocol-results-$arm.tsv"
+  local dir="$PROTO_DIR/$arm"
+  mkdir -p "$dir"
+  : > "$tsv"
+  printf '\n-- %s protocol suite --\n' "$arm"
+
+  local http="10.10.2.2:8080"
+  local https_h2="10.10.2.2:8443"
+  local https_h3="10.10.2.2:4443"
+  local tls="10.10.2.2:4443"
+  local tls12="10.10.2.2:8444"
+  local udp="10.10.2.2:9999"
+  local tcp="10.10.2.2:9000"
+  local dns="10.10.2.2:53"
+  local offset before after killed
+
+  write_environment
+  run_case "$arm" h2-bulk-8m 90 --https "$https_h2"
+
+  offset=$(wc -c < "$H3_LOG" 2>/dev/null || echo 0)
+  ip netns exec tun-client timeout 90 "$H2_CLIENT_BIN" \
+    --url "https://$https_h2/?bytes=65536" --streams 16 \
+    --out "$dir/h2-client-raw.json" > "$dir/h2-client.log" 2>&1 || true
+  run_case "$arm" h2-multiplex-16 30 --client "$dir/h2-client-raw.json" \
+    --streams 16 --origin-log "$H3_LOG" --origin-offset "$offset"
+
+  run_case "$arm" h3-bulk-8m 90 --https "$https_h3"
+  offset=$(wc -c < "$H3_LOG" 2>/dev/null || echo 0)
+  run_case "$arm" h3-concurrent-8 90 --https "$https_h3" \
+    --origin-log "$H3_LOG" --origin-offset "$offset"
+  run_case "$arm" http1-persistent-20 90 --http "$http"
+  run_case "$arm" tcp-upload-8m 90 --tcp "$tcp"
+  run_case "$arm" h2-cancel-64m 90 --https "$https_h2" --http "$http"
+  run_case "$arm" udp-realtime-1200 90 --udp "$udp"
+  run_case "$arm" udp-multidest-4 90 --udp "$udp" --ports 9996,9997,9998,9999
+  run_case "$arm" udp-alt-source 30 --udp 10.10.2.2:9998
+  run_case "$arm" dns-udp-200 90 --dns "$dns"
+  run_case "$arm" dns-tcp-fallback 90 --dns "$dns"
+
+  before=$(sample_server)
+  run_case "$arm" mixed-hol-60s 120 --https "$https_h2" --http "$http" \
+    --udp "$udp" --tcp "$tcp" --dns "$dns"
+  after=$(sample_server)
+  "$PYTHON" - "$dir/resources.json" "$before" "$after" <<'RESOURCES'
+import json
+import sys
+
+path, before, after = sys.argv[1], sys.argv[2].split(), sys.argv[3].split()
+metrics = {
+    "rss_before_kib": int(before[0]),
+    "fds_before": int(before[1]),
+    "threads_before": int(before[2]),
+    "rss_after_kib": int(after[0]),
+    "fds_after": int(after[1]),
+    "threads_after": int(after[2]),
+}
+payload = {"metrics": {"mixed-hol-60s": metrics}}
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload, sort_keys=True) + "\n")
+RESOURCES
+
+  run_case "$arm" idle-tcp-35s 120 --tcp "$tcp"
+
+  RESTART_KILLED_MS=""
+  killed=""
+  if restart_server "$dir/restart.json"; then
+    killed="$RESTART_KILLED_MS"
+  fi
+  if [ -n "$killed" ]; then
+    run_case "$arm" restart-recovery 90 --http "$http" --udp "$udp" \
+      --https "$https_h2" --deadline-ms 10000 --since-ms "$killed"
+  else
+    write_case_failure "$dir/restart-recovery.json" restart-recovery \
+      "harness failure: could not restart the $SERVER_KIND process: $(tail -n 3 "$SERVER_LOG" 2>/dev/null | tr '\n' ' ' | cut -c1-240)"
+    record_protocol "$arm" "$tsv" restart-recovery FAIL \
+      "harness failure: could not restart the $SERVER_KIND process"
+  fi
+
+  run_case "$arm" tls12-fallback 90 --tls "$tls12"
+  run_case "$arm" datagram-size-continuity 90 --udp "$udp" --tls "$tls"
+
+  local extras=(--extra "$PROTO_DIR/preflights.json")
+  [ -f "$dir/restart.json" ] && extras+=(--extra "$dir/restart.json")
+  [ -f "$dir/resources.json" ] && extras+=(--extra "$dir/resources.json")
+  local complete=false
+  [ "$PROTO_HARNESS_OK" = "1" ] && complete=true
+  printf '{"complete": %s}\n' "$complete" > "$dir/complete.json"
+  extras+=(--extra "$dir/complete.json")
+  "$PYTHON" "$HERE/protocol_report.py" merge \
+    --results "$dir" \
+    --environment "$RUN_DIR/environment.txt" \
+    --arm "$arm" \
+    --commit "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)" \
+    --binary-sha256 "$(sha256sum "$BEAM_BIN" 2>/dev/null | cut -d' ' -f1)" \
+    "${extras[@]}" \
+    --out "$RUN_DIR/protocol-report-$arm.json" \
+    --tsv "$tsv" || fail_harness "could not merge the $arm protocol report"
 }
 
 # ---------------------------------------------------------------------------
@@ -475,6 +1048,10 @@ fi
 # ---------------------------------------------------------------------------
 
 if [ "$TUN_BLOCKED" = "1" ]; then
+  if [ "$SUITE" = "protocols" ]; then
+    fail_harness "the protocol suite cannot run: $TUN_BLOCK_REASON"
+    finish
+  fi
   blocked_file "$TUN_BLOCK_REASON"
   finish
 fi
@@ -548,9 +1125,25 @@ if ! ip netns exec tun-client ip tuntap add dev tunprobe mode tun 2>"$LOG_DIR/tu
 fi
 ip netns exec tun-client ip link del tunprobe >/dev/null 2>&1 || true
 if [ "$TUN_BLOCKED" = "1" ]; then
+  if [ "$SUITE" = "protocols" ]; then
+    fail_harness "the protocol suite cannot run: $TUN_BLOCK_REASON"
+    finish
+  fi
   blocked_file "$TUN_BLOCK_REASON"
   finish
 fi
+
+# ---------------------------------------------------------------------------
+# Impairment and baseline evidence
+# ---------------------------------------------------------------------------
+
+if awk -v rtt="$TUN_RTT_MS" -v loss="$TUN_LOSS_PCT" \
+    'BEGIN { exit !(rtt > 0 || loss > 0) }'; then
+  apply_netem || finish
+fi
+BASELINE_RTT_MS=$(measure_baseline_rtt 10.10.1.1 tun-client)
+BASELINE_TARGET_RTT_MS=$(measure_baseline_rtt 10.10.2.2 tun-server)
+log "baseline RTT: client->server ${BASELINE_RTT_MS}ms, server->target ${BASELINE_TARGET_RTT_MS}ms"
 
 # ---------------------------------------------------------------------------
 # Configs
@@ -575,6 +1168,7 @@ XRAY_FLAG=()
 if [ "$CONTROL" = "1" ]; then
   XRAY_FLAG=(--xray)
 fi
+export TUN_MTU
 "$PYTHON" "$HERE/config.py" \
   --test-config "$TEST_CONFIG" \
   --out-dir "$CONFIG_DIR" \
@@ -592,17 +1186,44 @@ fi
 if [ -z "$H3_ORIGIN_ERROR" ] && [ ! -x "$H3_ORIGIN_BIN" ]; then
   H3_ORIGIN_ERROR="local HTTP/3 origin binary is missing: $H3_ORIGIN_BIN"
 fi
+if [ "$SUITE" = "protocols" ] && [ -n "$H3_ORIGIN_ERROR" ]; then
+  fail_harness "the protocol suite needs the local HTTP/3+HTTP/2 origin: $H3_ORIGIN_ERROR"
+  exit 1
+fi
+if [ "$SUITE" = "protocols" ] && [ ! -x "$H2_CLIENT_BIN" ]; then
+  fail_harness "the protocol suite needs the h2-client binary: $H2_CLIENT_BIN"
+  exit 1
+fi
 if [ -z "$H3_ORIGIN_ERROR" ]; then
-  log "starting local HTTP/3 origin on 10.10.2.2:4443"
-  ip netns exec tun-target "$H3_ORIGIN_BIN" --listen 10.10.2.2:4443 \
-    > "$H3_LOG" 2>&1 &
-  H3_ORIGIN_PID=$!
-  if wait_for_log "$H3_LOG" "h3-origin: READY" "$H3_ORIGIN_PID" 15; then
-    H3_READY=1
+  if [ "$SUITE" = "protocols" ]; then
+    # Per-request ?bytes= selects the body size; an inherited env default would
+    # mask a broken query parser.
+    unset H3_BODY_BYTES
+    log "starting local HTTP/3+HTTP/2 origin on 10.10.2.2:4443 and :8443"
+    ip netns exec tun-target "$H3_ORIGIN_BIN" \
+      --listen 10.10.2.2:4443 --h2-listen 10.10.2.2:8443 \
+      > "$H3_LOG" 2>&1 &
+    H3_ORIGIN_PID=$!
+    if wait_for_log "$H3_LOG" "h3-origin: READY" "$H3_ORIGIN_PID" 15 \
+      && wait_for_log "$H3_LOG" "h2-origin: READY" "$H3_ORIGIN_PID" 15; then
+      H3_READY=1
+    else
+      fail_harness "local HTTP/3+HTTP/2 origin did not become ready"
+      tail -n 40 "$H3_LOG" >&2 || true
+      exit 1
+    fi
   else
-    fail_harness "local HTTP/3 origin did not become ready"
-    tail -n 40 "$H3_LOG" >&2 || true
-    exit 1
+    log "starting local HTTP/3 origin on 10.10.2.2:4443"
+    ip netns exec tun-target "$H3_ORIGIN_BIN" --listen 10.10.2.2:4443 \
+      > "$H3_LOG" 2>&1 &
+    H3_ORIGIN_PID=$!
+    if wait_for_log "$H3_LOG" "h3-origin: READY" "$H3_ORIGIN_PID" 15; then
+      H3_READY=1
+    else
+      fail_harness "local HTTP/3 origin did not become ready"
+      tail -n 40 "$H3_LOG" >&2 || true
+      exit 1
+    fi
   fi
 else
   log "local HTTP/3 origin unavailable: $H3_ORIGIN_ERROR"
@@ -625,6 +1246,17 @@ if [ "$H3_READY" != "1" ]; then
   # the target, but it never speaks HTTP/3 and therefore never produces a pass.
   TARGET_ARGS+=(--quic-sink '10.10.2.2:4443')
 fi
+if [ "$SUITE" = "protocols" ]; then
+  TARGET_ARGS+=(
+    --keepalive
+    --tcp-echo 10.10.2.2:9000
+    --tls12 10.10.2.2:8444
+    --dns-tcp 10.10.2.2:53
+    --udp-alt 10.10.2.2:9998
+    --udp-extra 10.10.2.2:9996
+    --udp-extra 10.10.2.2:9997
+  )
+fi
 ip netns exec tun-target "$PYTHON" "$HERE/services.py" \
   "${TARGET_ARGS[@]}" \
   > "$TARGET_LOG" 2>&1 &
@@ -634,12 +1266,12 @@ if ! wait_for_log "$TARGET_LOG" "target: READY" "$SERVICES_PID" 15; then
   tail -n 40 "$TARGET_LOG" >&2 || true
   exit 1
 fi
+if [ "$SUITE" = "protocols" ]; then
+  run_preflights
+fi
 
 log "starting beam on $BEAM_ADDR"
-ip netns exec tun-server "$BEAM_BIN" --config "$CONFIG_DIR/beam.toml" \
-  > "$BEAM_LOG" 2>&1 &
-BEAM_PID=$!
-if ! wait_for_log "$BEAM_LOG" "beam listening" "$BEAM_PID" 15; then
+if ! start_beam; then
   fail_harness "beam did not start listening"
   tail -n 40 "$BEAM_LOG" >&2 || true
   exit 1
@@ -817,7 +1449,7 @@ probe_quic() {
   if [ "$arm" = "beam" ] && has_marker "$server_log" "$start" "authenticated VLESS command is not implemented yet"; then
     record "$RUN_DIR/results-$arm.tsv" "quic-udp" BLOCKED \
       "XUDP unimplemented; curl: $curl_error; beam: $(marker_line "$server_log" "$start" "authenticated VLESS command is not implemented yet")"
-  elif has_marker "$H3_LOG" "$origin_start" "-> 200"; then
+  elif has_marker "$H3_LOG" "$origin_start" "status=200"; then
     record "$RUN_DIR/results-$arm.tsv" "quic-udp" FAIL \
       "HTTP/3 origin answered but curl failed; curl: $curl_error"
     UNEXPECTED_FAIL=1
@@ -884,22 +1516,27 @@ run_suite() {
   probe_https_curl "$arm"
 }
 
-run_suite beam
+if [ "$SUITE" = "protocols" ]; then
+  run_protocol_suite beam
+else
+  run_suite beam
+fi
 
 if [ "$CONTROL" = "1" ]; then
-  log "stopping beam and starting the stock Xray control"
-  stop_pid "$BEAM_PID"
+  log "stopping the server under test and starting the stock Xray control"
+  stop_pid "$SERVER_PID"
+  SERVER_PID=""
   BEAM_PID=""
-  ip netns exec tun-server "$XRAY_BIN" run -c "$CONFIG_DIR/xray-server.json" \
-    > "$XRAY_LOG" 2>&1 &
-  XRAY_PID=$!
-  if ! wait_for_command "$XRAY_PID" 20 \
-      ip netns exec tun-server "$PYTHON" -c 'import socket; socket.create_connection(("10.10.1.1", 443), 0.2).close()'; then
+  if ! start_xray; then
     fail_harness "stock Xray control did not accept connections on $BEAM_ADDR"
     tail -n 40 "$XRAY_LOG" >&2 || true
     exit 1
   fi
-  run_suite xray
+  if [ "$SUITE" = "protocols" ]; then
+    run_protocol_suite xray
+  else
+    run_suite xray
+  fi
 fi
 
 finish

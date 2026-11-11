@@ -11,9 +11,16 @@ One process hosts every target in the target network namespace:
   routing failure (it intentionally does not speak HTTP/3). The harness omits
   the sink when the local HTTP/3 origin owns that address instead.
 
+The protocol lab additionally enables: a persistent HTTP/1.1 path
+(``--keepalive``), a TCP echo listener (``--tcp-echo``), a TLS 1.2-only listener
+(``--tls12``), a TCP DNS responder (``--dns-tcp``), extra UDP echo ports
+(``--udp-extra``) and a UDP listener that replies from a different source port
+(``--udp-alt``).
+
 An optional regular file can be exposed at ``/large.bin`` so the benchmark can
-measure HTTPS throughput through the tunnel. Per-request logging can be
-disabled with ``--quiet`` to keep the target core free for the data path.
+measure HTTPS throughput through the tunnel, and any response can ask for a
+marker body of ``?bytes=N`` bytes. Per-request logging can be disabled with
+``--quiet`` to keep the target core free for the data path.
 
 This is test-only code and is not part of the beam server.
 """
@@ -32,6 +39,8 @@ import threading
 from pathlib import Path
 
 MARKER = b"beam-tun-ok\n"
+MAX_BODY = 64 * 1024 * 1024
+KEEPALIVE = False
 DNS_TARGET = "target.test"
 DNS_V4 = "10.10.2.2"
 DNS_V6 = "fd00:2::2"
@@ -59,11 +68,44 @@ class _Server6(_Server):
     address_family = socket.AF_INET6
 
 
+def marker_body(size: int) -> bytes:
+    repeats = (size + len(MARKER) - 1) // len(MARKER)
+    return (MARKER * repeats)[:size]
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "beam-tun-target/1"
     sys_version = ""
     wbufsize = 1 << 20
     large_file: Path | None = None
+
+    def _requested_body(self) -> bytes:
+        """Body for this request: the marker, or ``?bytes=N`` of the marker.
+
+        Raises ``ValueError`` for a malformed or out-of-range size so the
+        caller can answer 400 instead of allocating an unbounded body.
+        """
+        _, _, query = self.path.partition("?")
+        for pair in query.split("&"):
+            key, _, value = pair.partition("=")
+            if key != "bytes":
+                continue
+            try:
+                size = int(value)
+            except ValueError as error:
+                raise ValueError(f"invalid bytes parameter: {value}") from error
+            if not 1 <= size <= MAX_BODY:
+                raise ValueError(f"bytes must be between 1 and {MAX_BODY}")
+            return marker_body(size)
+        return MARKER
+
+    def _send_body(self, body: bytes, connection: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", connection)
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = self.path.split("?", 1)[0]
@@ -80,13 +122,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
             return
-        body = MARKER
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
+        persist = KEEPALIVE and path == "/keepalive"
+        try:
+            body = self._requested_body()
+        except ValueError as error:
+            message = f"bad request: {error}\n".encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(message)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(message)
+            return
+        self._send_body(body, "keep-alive" if persist else "close")
 
     def log_message(self, fmt: str, *args) -> None:
         request_log(f"http {self.client_address[0]}: {fmt % args}")
@@ -153,10 +201,13 @@ def _dns_reply(query: bytes) -> bytes | None:
     flags = 0x8180  # standard response, recursion available, NOERROR
     answer = b""
     if name.lower() == DNS_TARGET and qclass == 1:
+        # NAME (compression pointer), TYPE, CLASS, TTL, RDLENGTH, RDATA. The
+        # class field is mandatory: without it the answer is unparseable and
+        # `dig` reports a malformed packet instead of the A/AAAA record.
         if qtype == 1:
-            answer = struct.pack("!HHIH", 0xC00C, 1, 60, 4) + socket.inet_aton(DNS_V4)
+            answer = struct.pack("!HHHIH", 0xC00C, 1, 1, 60, 4) + socket.inet_aton(DNS_V4)
         elif qtype == 28:
-            answer = struct.pack("!HHIH", 0xC00C, 28, 60, 16) + socket.inet_pton(
+            answer = struct.pack("!HHHIH", 0xC00C, 28, 1, 60, 16) + socket.inet_pton(
                 socket.AF_INET6, DNS_V6
             )
     elif name.lower() != DNS_TARGET:
@@ -192,6 +243,114 @@ def _bind_udp(host: str, port: int) -> socket.socket:
     return sock
 
 
+def _bind_tcp(host: str, port: int) -> socket.socket:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    listener = socket.socket(family, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((host, port))
+    listener.listen(64)
+    return listener
+
+
+def _tcp_echo_connection(conn: socket.socket, peer, label: str) -> None:
+    request_log(f"{label} connection from {peer}")
+    with conn:
+        while True:
+            try:
+                data = conn.recv(65536)
+            except OSError as error:
+                request_log(f"{label} connection from {peer} stopped: {error}")
+                return
+            if not data:
+                return
+            try:
+                conn.sendall(data)
+            except OSError as error:
+                request_log(f"{label} send to {peer} failed: {error}")
+                return
+
+
+def _tcp_echo_loop(listener: socket.socket, label: str) -> None:
+    log(f"{label} listening on {listener.getsockname()}")
+    while True:
+        try:
+            conn, peer = listener.accept()
+        except OSError as error:
+            log(f"{label} stopped: {error}")
+            return
+        threading.Thread(
+            target=_tcp_echo_connection, args=(conn, peer, label), daemon=True
+        ).start()
+
+
+def _recv_exact(conn: socket.socket, size: int) -> bytes | None:
+    chunks = bytearray()
+    while len(chunks) < size:
+        data = conn.recv(size - len(chunks))
+        if not data:
+            return None
+        chunks.extend(data)
+    return bytes(chunks)
+
+
+def _dns_tcp_connection(conn: socket.socket, peer) -> None:
+    request_log(f"dns-tcp connection from {peer}")
+    with conn:
+        conn.settimeout(15.0)
+        while True:
+            try:
+                header = _recv_exact(conn, 2)
+                if header is None:
+                    return
+                (length,) = struct.unpack("!H", header)
+                if length == 0:
+                    return
+                query = _recv_exact(conn, length)
+                if query is None:
+                    return
+                reply = _dns_reply(query)
+                if reply is None:
+                    return
+                conn.sendall(struct.pack("!H", len(reply)) + reply)
+            except OSError as error:
+                request_log(f"dns-tcp connection from {peer} stopped: {error}")
+                return
+
+
+def _dns_tcp_loop(listener: socket.socket) -> None:
+    log(f"dns-tcp listening on {listener.getsockname()}")
+    while True:
+        try:
+            conn, peer = listener.accept()
+        except OSError as error:
+            log(f"dns-tcp stopped: {error}")
+            return
+        threading.Thread(target=_dns_tcp_connection, args=(conn, peer), daemon=True).start()
+
+
+def _udp_alt_loop(listen: socket.socket, reply: socket.socket, label: str) -> None:
+    """Echo back from a different source port than the listener.
+
+    This is the STUN-like full-cone shape: a reply arrives from an address the
+    client never sent to, which is where XUDP source-address handling shows up.
+    """
+    log(
+        f"{label} listening on {listen.getsockname()} "
+        f"(replies from {reply.getsockname()})"
+    )
+    while True:
+        try:
+            data, peer = listen.recvfrom(65535)
+        except OSError as error:
+            log(f"{label} stopped: {error}")
+            return
+        request_log(f"{label} received {len(data)} bytes from {peer}")
+        try:
+            reply.sendto(data, peer)
+        except OSError as error:
+            log(f"{label} reply to {peer} failed: {error}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--http", default="10.10.2.2:8080")
@@ -224,10 +383,45 @@ def main() -> int:
         action="store_true",
         help="force the HTTPS origin to TLS 1.2 for fallback-path tests",
     )
+    parser.add_argument(
+        "--keepalive",
+        action="store_true",
+        help="serve /keepalive over a persistent HTTP/1.1 connection",
+    )
+    parser.add_argument(
+        "--tcp-echo",
+        default="",
+        help="optional TCP echo listen address (protocol lab uses 9000)",
+    )
+    parser.add_argument(
+        "--tls12",
+        default="",
+        help="optional TLS 1.2-only HTTPS listen address (protocol lab uses 8444)",
+    )
+    parser.add_argument(
+        "--dns-tcp",
+        default="",
+        help="optional TCP DNS listen address (protocol lab uses 53)",
+    )
+    parser.add_argument(
+        "--udp-alt",
+        default="",
+        help="optional UDP listen address that replies from another source port",
+    )
+    parser.add_argument(
+        "--udp-extra",
+        action="append",
+        default=[],
+        metavar="ADDR",
+        help="additional UDP echo listen address (repeatable)",
+    )
     args = parser.parse_args()
 
-    global QUIET
+    global QUIET, KEEPALIVE
     QUIET = args.quiet
+    KEEPALIVE = args.keepalive
+    if KEEPALIVE:
+        Handler.protocol_version = "HTTP/1.1"
     if args.large_file is not None:
         Handler.large_file = args.large_file
 
@@ -293,6 +487,59 @@ def main() -> int:
         threads.append(
             threading.Thread(
                 target=_udp_loop, args=(quic_sock, "quic-sink", False), daemon=True
+            )
+        )
+
+    if args.tls12:
+        tls12_host, tls12_port = split(args.tls12)
+        tls12 = _Server((tls12_host, tls12_port), Handler)
+        tls12_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls12_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls12_context.maximum_version = ssl.TLSVersion.TLSv1_2
+        tls12_context.load_cert_chain(certfile=str(args.cert), keyfile=str(args.key))
+        tls12.socket = tls12_context.wrap_socket(tls12.socket, server_side=True)
+        servers.append(tls12)
+        threads.append(
+            threading.Thread(target=_serve_http, args=(tls12, "tls12"), daemon=True)
+        )
+
+    if args.tcp_echo:
+        echo_host, echo_port = split(args.tcp_echo)
+        echo_listener = _bind_tcp(echo_host, echo_port)
+        threads.append(
+            threading.Thread(
+                target=_tcp_echo_loop, args=(echo_listener, "tcp-echo"), daemon=True
+            )
+        )
+
+    if args.dns_tcp:
+        dns_tcp_host, dns_tcp_port = split(args.dns_tcp)
+        dns_tcp_listener = _bind_tcp(dns_tcp_host, dns_tcp_port)
+        threads.append(
+            threading.Thread(target=_dns_tcp_loop, args=(dns_tcp_listener,), daemon=True)
+        )
+
+    for extra in args.udp_extra:
+        extra_host, extra_port = split(extra)
+        extra_sock = _bind_udp(extra_host, extra_port)
+        threads.append(
+            threading.Thread(
+                target=_udp_loop,
+                args=(extra_sock, f"udp-echo-{extra_port}", True),
+                daemon=True,
+            )
+        )
+
+    if args.udp_alt:
+        alt_host, alt_port = split(args.udp_alt)
+        alt_listen = _bind_udp(alt_host, alt_port)
+        # Distinct from every echo port so the reply's source is unambiguous.
+        alt_reply = _bind_udp(alt_host, 9995)
+        threads.append(
+            threading.Thread(
+                target=_udp_alt_loop,
+                args=(alt_listen, alt_reply, "udp-alt"),
+                daemon=True,
             )
         )
 

@@ -49,6 +49,7 @@ clippy:
 test:
 	cargo test --workspace
 	python3 tests/bench/test_report.py
+	python3 tests/tun/test_protocol_report.py
 
 build:
 	cargo build --locked --release

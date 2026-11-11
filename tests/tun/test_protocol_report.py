@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Contract tests for the protocol-lab report merger and validator.
+
+Fixtures are generated in a temporary directory: no network, no namespaces.
+Every test pins one decision the hosted protocol lab depends on.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import importlib.util
+import io
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+report = _load("protocol_report", ROOT / "tests" / "tun" / "protocol_report.py")
+
+
+def _case(name: str, **overrides) -> dict:
+    case = {
+        "name": name,
+        "status": "PASS",
+        "correctness": True,
+        "ok": True,
+        "planned": 1,
+        "completed": 1,
+        "deadline_ms": 1000,
+        "started": 0.0,
+        "ended": 1.0,
+        "metrics": {key: 1 for key in report.CASE_METRICS[name]},
+        "warnings": [],
+        "detail": f"{name} passed",
+    }
+    case.update(overrides)
+    return case
+
+
+def _valid_report(**overrides) -> dict:
+    payload = {
+        "schema": report.SCHEMA,
+        "complete": True,
+        "arm": "beam",
+        "commit": "0" * 40,
+        "binary_sha256": "1" * 64,
+        "environment": {"rtt_ms": 250, "loss_pct": 0, "udp_mode": "xudp"},
+        "required": list(report.REQUIRED_CASES),
+        "cases": [_case(name) for name in report.REQUIRED_CASES],
+        "missing": [],
+        "duplicates": [],
+        "counts": {"planned": len(report.REQUIRED_CASES), "completed": len(report.REQUIRED_CASES)},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _namespace(**values) -> argparse.Namespace:
+    return argparse.Namespace(**values)
+
+
+class ValidatorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write(self, payload) -> str:
+        path = self.dir / "protocol-report-beam.json"
+        if isinstance(payload, str):
+            path.write_text(payload, encoding="utf-8")
+        else:
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def _validate(self, path: str, control: str = "") -> tuple[int, str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            code = report.validate(
+                _namespace(report=path, control=control, require_arm="beam")
+            )
+        return code, buffer.getvalue()
+
+    def test_valid_report_passes(self) -> None:
+        code, output = self._validate(self._write(_valid_report()))
+        self.assertEqual(code, 0, output)
+        self.assertIn("protocol acceptance: 20/20 PASS", output)
+
+    def test_missing_required_case_fails(self) -> None:
+        payload = _valid_report()
+        payload["cases"] = [case for case in payload["cases"] if case["name"] != "h3-bulk-8m"]
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("missing case h3-bulk-8m", output)
+
+    def test_duplicate_case_fails(self) -> None:
+        payload = _valid_report()
+        payload["cases"].append(_case("h2-bulk-8m"))
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("duplicate case h2-bulk-8m", output)
+
+    def test_truncated_json_fails(self) -> None:
+        path = self._write('{"schema": 1, "complete": tr')
+        code, output = self._validate(path)
+        self.assertEqual(code, 1)
+        self.assertIn("protocol report unreadable", output)
+
+    def test_incomplete_report_fails(self) -> None:
+        code, output = self._validate(self._write(_valid_report(complete=False)))
+        self.assertEqual(code, 1)
+        self.assertIn("report is not marked complete", output)
+
+    def test_missing_list_fails(self) -> None:
+        code, output = self._validate(
+            self._write(_valid_report(missing=["dns-udp-200"]))
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("report lists missing cases: dns-udp-200", output)
+
+    def test_fail_case_fails(self) -> None:
+        payload = _valid_report()
+        payload["cases"][3] = _case("h2-bulk-8m", status="FAIL", detail="sha256 differed")
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("h2-bulk-8m: FAIL: sha256 differed", output)
+
+    def test_blocked_case_fails(self) -> None:
+        payload = _valid_report()
+        payload["cases"][5] = _case("h3-bulk-8m", status="BLOCKED", detail="no HTTP/3")
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("h3-bulk-8m: BLOCKED: no HTTP/3", output)
+
+    def test_incomplete_require_all_case_fails(self) -> None:
+        payload = _valid_report()
+        payload["cases"][3] = _case("h2-bulk-8m", planned=2, completed=1)
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("h2-bulk-8m: completed 1 != planned 2", output)
+
+    def test_partial_mixed_case_is_allowed(self) -> None:
+        payload = _valid_report()
+        index = report.REQUIRED_CASES.index("mixed-hol-60s")
+        payload["cases"][index] = _case("mixed-hol-60s", planned=100, completed=96)
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 0, output)
+
+    def test_missing_metric_fails(self) -> None:
+        payload = _valid_report()
+        case = payload["cases"][0]
+        del case["metrics"]["http_version"]
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("preflight-h1: missing metric http_version", output)
+
+    def test_empty_detail_fails(self) -> None:
+        payload = _valid_report()
+        payload["cases"][1]["detail"] = "  "
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("preflight-h2: empty detail", output)
+
+    def test_truncated_manifest_fails(self) -> None:
+        payload = _valid_report(required=list(report.REQUIRED_CASES[:5]))
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("required manifest does not match the contract", output)
+
+    def test_wrong_arm_fails(self) -> None:
+        code, output = self._validate(
+            self._write(_valid_report(arm="xray")), control=""
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("arm 'xray' != required 'beam'", output)
+
+    def test_missing_control_is_a_warning_only(self) -> None:
+        path = self._write(_valid_report())
+        code, output = self._validate(path, control=str(self.dir / "absent.json"))
+        self.assertEqual(code, 0, output)
+        self.assertIn("no control (Xray) report", output)
+
+    def test_control_report_adds_attribution(self) -> None:
+        beam = _valid_report()
+        beam["cases"][3] = _case("h2-bulk-8m", status="FAIL", detail="hash differed")
+        control = _valid_report(arm="xray")
+        control_path = self.dir / "protocol-report-xray.json"
+        control_path.write_text(json.dumps(control), encoding="utf-8")
+        code, output = self._validate(self._write(beam), control=str(control_path))
+        self.assertEqual(code, 1)
+        self.assertIn("h2-bulk-8m", output)
+        self.assertIn("beam", output)
+
+
+class MergeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.results = self.dir / "results"
+        self.results.mkdir()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _write_case(self, payload: dict, name: str) -> None:
+        (self.results / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    def _merge(self, extra: dict | None = None, environment: str = "") -> tuple[int, dict]:
+        extra_path = self.dir / "extra.json"
+        if extra is not None:
+            extra_path.write_text(json.dumps(extra), encoding="utf-8")
+        environment_path = self.dir / "environment.txt"
+        environment_path.write_text(environment, encoding="utf-8")
+        out = self.dir / "protocol-report-beam.json"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            code = report.merge(
+                _namespace(
+                    results=str(self.results),
+                    extra=[str(extra_path)] if extra is not None else [],
+                    environment=str(environment_path),
+                    arm="beam",
+                    commit="a" * 40,
+                    binary_sha256="b" * 64,
+                    out=str(out),
+                    tsv=str(self.dir / "results.tsv"),
+                )
+            )
+        self.assertEqual(code, 0, buffer.getvalue())
+        return code, json.loads(out.read_text(encoding="utf-8"))
+
+    def test_merge_builds_a_valid_report(self) -> None:
+        for name in report.REQUIRED_CASES:
+            if name.startswith("preflight") or name == "restart-recovery":
+                continue
+            self._write_case(_case(name), name)
+        extra = {
+            "complete": True,
+            "cases": [
+                _case("preflight-h1"),
+                _case("preflight-h2"),
+                _case("preflight-h3"),
+                _case("restart-recovery"),
+            ],
+            "metrics": {"h2-multiplex-16": {"origin_connections": 1, "origin_peak_active": 12}},
+            "environment": {"baseline_rtt_ms": 250, "baseline_target_rtt_ms": 0},
+        }
+        _, merged = self._merge(
+            extra=extra,
+            environment="rtt_ms=250\nloss_pct=1\nudp_mode=xudp\ntun_mtu=1500\n",
+        )
+        self.assertTrue(merged["complete"])
+        self.assertEqual(merged["missing"], [])
+        self.assertEqual(merged["required"], report.REQUIRED_CASES)
+        self.assertEqual(merged["environment"]["loss_pct"], 1)
+        self.assertEqual(merged["environment"]["baseline_rtt_ms"], 250)
+        multiplex = next(
+            case for case in merged["cases"] if case["name"] == "h2-multiplex-16"
+        )
+        self.assertEqual(multiplex["metrics"]["origin_peak_active"], 12)
+        self.assertEqual(report.check_report(merged, "beam"), [])
+
+    def test_merge_marks_missing_cases_incomplete(self) -> None:
+        self._write_case(_case("h2-bulk-8m"), "h2-bulk-8m")
+        _, merged = self._merge(extra={"complete": True})
+        self.assertFalse(merged["complete"])
+        self.assertIn("h3-bulk-8m", merged["missing"])
+        problems = report.check_report(merged, "beam")
+        self.assertTrue(any("missing case h3-bulk-8m" in problem for problem in problems))
+
+    def test_merge_ignores_non_case_json(self) -> None:
+        (self.results / "h2-client-raw.json").write_text(
+            json.dumps({"ok": True, "connections": 1}), encoding="utf-8"
+        )
+        for name in report.REQUIRED_CASES:
+            if name.startswith("preflight") or name == "restart-recovery":
+                continue
+            self._write_case(_case(name), name)
+        extra = {
+            "complete": True,
+            "cases": [
+                _case("preflight-h1"),
+                _case("preflight-h2"),
+                _case("preflight-h3"),
+                _case("restart-recovery"),
+            ],
+        }
+        _, merged = self._merge(extra=extra)
+        self.assertEqual(merged["duplicates"], [])
+        self.assertTrue(merged["complete"])
+
+    def test_merge_detects_duplicate_cases(self) -> None:
+        self._write_case(_case("h2-bulk-8m"), "h2-bulk-8m")
+        self._write_case(_case("h2-bulk-8m"), "h2-bulk-8m-copy")
+        _, merged = self._merge(extra={"complete": True})
+        self.assertEqual(merged["duplicates"], ["h2-bulk-8m"])
+        self.assertFalse(merged["complete"])
+
+    def test_merge_requires_a_results_directory(self) -> None:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            code = report.merge(
+                _namespace(
+                    results=str(self.dir / "absent"),
+                    extra=[],
+                    environment="",
+                    arm="beam",
+                    commit="",
+                    binary_sha256="",
+                    out=str(self.dir / "out.json"),
+                    tsv="",
+                )
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("results directory missing", buffer.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()
