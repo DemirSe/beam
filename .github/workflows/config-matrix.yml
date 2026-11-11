@@ -1,0 +1,26 @@
+name: config-matrix
+
+# `beam --check` must answer for every boundary and malformed configuration:
+# exit 0 or 1, never a panic and never a hang.
+on:
+  push:
+    branches: [dev, main]
+    paths: ['crates/**', 'config.example.toml', 'tests/stress/config_matrix.py', '.github/workflows/config-matrix.yml']
+  workflow_dispatch:
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Build beam
+        run: cargo build --locked --release --bin beam
+      - name: Config matrix
+        run: |
+          set -o pipefail
+          python3 tests/stress/config_matrix.py target/release/beam

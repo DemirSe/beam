@@ -146,6 +146,9 @@ make doctor          # required build tools, optional benchmark tools, local pat
 make verify          # fmt + clippy + test
 make smoke           # release build, example config check, shell syntax
 make acceptance      # verify + smoke
+python3 tests/stress/config_matrix.py target/release/beam   # 57 boundary configs, no panic
+python3 tests/stress/vless_interop.py --beam target/release/beam \
+    --sing-box /usr/local/bin/sing-box --encoding xudp       # authenticated end-to-end
 ```
 
 The external three-VM lab was retired in favor of the dispatch-only
