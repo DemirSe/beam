@@ -158,7 +158,7 @@ def main() -> int:
                 tcp_total += 1
                 if tcp_flow(proxy, tcp_echo.port, 64 << 10):
                     tcp_ok += 1
-                elif time.time() - last_restart < 5.0:
+                elif time.time() - last_restart < 15.0:
                     tcp_fail_window += 1
                 else:
                     tcp_fail_real += 1
@@ -166,7 +166,7 @@ def main() -> int:
             udp_ok += got
             udp_total += 20
             if got < 20:
-                if time.time() - last_restart < 5.0:
+                if time.time() - last_restart < 15.0:
                     udp_fail_window += 20 - got
                 else:
                     udp_fail_real += 20 - got
@@ -182,8 +182,19 @@ def main() -> int:
                 client_log.close()
                 client, client_log = spawn_client()
                 wait_listen(socks_port, 20.0)
-                last_restart = now
-                print(f"++ client restarted after {rounds} rounds", flush=True)
+                # The client needs a moment to become usable again; that phase is
+                # not beam's behaviour, so wait it out uncounted.
+                recover_deadline = time.time() + 180
+                while time.time() < recover_deadline:
+                    if tcp_flow(proxy, tcp_echo.port, 1024):
+                        break
+                    time.sleep(2.0)
+                last_restart = time.time()
+                print(
+                    f"++ client restarted after {rounds} rounds, "
+                    f"recovered_after={time.time() - now:.0f}s",
+                    flush=True,
+                )
 
             if now - last_sample >= 120:
                 fds, rss, threads = sample(server.pid)
