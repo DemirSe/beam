@@ -11,11 +11,11 @@ is not yet proven there, so its lab run still gates the `main` merge.
 
 ## Summary
 
-|ID|Issue|Status|Severity|
-|---|---|---|---|
-|I1|Replay cache saturates under sustained heavy churn|Fixed on `main`, deployed|resolved|
-|I2|A client restart appeared to be refused as a replay|Fixed on `main`, deployed; same root cause as I1|resolved|
-|P1|Legacy/packetaddr UDP refuses flows above a fixed 64-stream pool|Fixed on `dev`; lab confirmation run pending|medium|
+|ID|Issue|Status|
+|---|---|---|
+|I1|Replay cache saturates under sustained heavy churn|Fixed on `main`, deployed|
+|I2|A client restart appeared to be refused as a replay|Fixed on `main`, deployed; same root cause as I1|
+|P1|Legacy/packetaddr UDP refuses flows above a fixed 64-stream pool|Fixed on `dev`; lab confirmation run pending; severity medium, compatibility mode only|
 
 ## I1 — replay cache saturates under sustained heavy churn (fixed)
 

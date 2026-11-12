@@ -520,6 +520,9 @@ bind.
   resolver opens one UDP socket per query, so a DNS burst is a burst of streams:
   it is admitted from this pool and, at the cap, refused as
   `TlsServerError::LegacyUdpLimited` and counted in `legacy_udp_limited`.
+  `max_xudp_sessions` also sizes the XUDP kernel buffer budget, so lowering it
+  to save memory lowers this pool as well: keep it at 200 or more when a
+  legacy/packetaddr client bursts short UDP flows.
 
 ### TLS stack, cover, and MTU
 

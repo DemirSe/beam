@@ -23,6 +23,8 @@ level = "warn"
 max_connections = 1024
 max_udp_destinations = 2048
 max_preauth_per_ip = 128
+# Also sizes the legacy/packetaddr UDP stream pool; keep it at 200 or more when
+# such a client bursts short flows.
 max_xudp_sessions = 256
 xudp_recv_buffer_bytes = 131072
 listen_backlog = 1024
