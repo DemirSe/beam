@@ -172,6 +172,12 @@ TSVs, server and target logs, qdisc JSON and per-case probes are in each run's
     was 20 PASS, 1 WARN (`h2-multiplex-16`, runner-bound), 0 FAIL, 21 cases.
     The 60 s clock therefore costs this traffic class nothing: the client
     reopened the flow by itself and its first datagram was answered.
+  - **Source-port measurement (run
+    [43270220607](https://github.com/DemirSe/beam/actions/runs/43270220607),
+    `2867f4a`):** both idle cases recovered on their first post-idle datagram
+    (753 ms, one attempt) and `source_port_changed=true` — `56889 → 47745`
+    after 70 s and `48778 → 42297` after 600 s. The target sees a new flow
+    after the teardown; that is the accepted risk below.
   - **Accepted risk, and why it is not fixed:** the legacy/packetaddr framing
     carries no flow identifier, so a reconnecting stream cannot prove it owned a
     retained socket. Keeping the client source port would need heuristic keying
