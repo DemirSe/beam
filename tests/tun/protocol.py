@@ -98,15 +98,82 @@ def tcp_unit_outcome(result: dict) -> Outcome:
 def sequence_outcomes(
     sent: dict[int, bytes], verified: set[int], corrupt: set[int]
 ) -> list[Outcome]:
-    """Per-sequence UDP outcomes: verified, corrupt, or unanswered."""
+    """Per-sequence UDP outcomes: corrupt, verified, or unanswered.
+
+    Corruption is sticky: a sequence that ever produced a wrong payload stays
+    INVALID even if a correct reply also arrives, in either order. The sets are
+    order-free, so arrival order cannot change the outcome.
+    """
     return [
-        Outcome.OK
-        if sequence in verified
-        else Outcome.INVALID
+        Outcome.INVALID
         if sequence in corrupt
+        else Outcome.OK
+        if sequence in verified
         else Outcome.INCOMPLETE
         for sequence in sent
     ]
+
+
+def note_reply(
+    sent: dict[int, bytes],
+    verified: set[int],
+    corrupt: set[int],
+    sequence: int,
+    data: bytes,
+) -> None:
+    """Record one inbound datagram for a sent sequence.
+
+    The sets are order-free, so a corrupt reply before or after a valid one
+    leaves the same evidence: the sequence is corrupt.
+    """
+    if sent.get(sequence) == data:
+        verified.add(sequence)
+    elif sequence in sent:
+        corrupt.add(sequence)
+
+
+def mixed_verdict(counts: dict, duration: int) -> tuple[bool, dict]:
+    """The mixed case's correctness gate and its derived counters.
+
+    A unit that never reported lowers the completion ratio; a unit that reported
+    wrong bytes fails correctness. The floors keep a silent path from passing on
+    an empty or partially working class.
+    """
+    planned = (
+        counts["h1_attempted"]
+        + counts["udp_sent"]
+        + counts["dns_planned"]
+        + counts["tcp_planned"]
+    )
+    completed = (
+        counts["h1_completed"]
+        + counts["udp_completed"]
+        + counts["dns_completed"]
+        + counts["tcp_completed"]
+    )
+    invalid = (
+        counts["h1_invalid"]
+        + counts["h2_invalid"]
+        + counts["udp_invalid"]
+        + counts["dns_invalid"]
+        + counts["tcp_invalid"]
+    )
+    ratio = completed / planned if planned else 1.0
+    h1_floor = 4 * duration
+    ok = (
+        invalid == 0
+        and ratio >= 0.95
+        and counts["tcp_completed"] >= 1
+        and counts["h1_completed"] >= h1_floor
+        and counts["udp_completed"] >= 0.95 * counts["udp_sent"]
+    )
+    return ok, {
+        "planned": planned,
+        "completed": completed,
+        "completion_ratio": round(ratio, 4),
+        "invalid": invalid,
+        "h1_floor": h1_floor,
+    }
 
 
 def log(message: str) -> None:
@@ -1468,6 +1535,7 @@ def case_mixed(args) -> int:
         "udp_sent": 0,
         "udp_completed": 0,
         "udp_invalid": 0,
+        "udp_stray": 0,
         "dns_planned": 5 * duration,
         "dns_completed": 0,
         "dns_invalid": 0,
@@ -1617,10 +1685,7 @@ def case_mixed(args) -> int:
                     stray += 1
                     continue
                 (sequence,) = struct.unpack("!I", data[:UDP_HEADER])
-                if sent.get(sequence) == data:
-                    verified.add(sequence)
-                elif sequence in sent:
-                    corrupt.add(sequence)
+                note_reply(sent, verified, corrupt, sequence, data)
 
         try:
             while time.monotonic() < deadline and len(sent) < 10 * duration:
@@ -1645,13 +1710,15 @@ def case_mixed(args) -> int:
             counts["udp_sent"] += len(sent)
             # One outcome per sent sequence, through the same rule as every
             # other unit: verified -> OK, wrong payload -> INVALID (completed
-            # and invalid, counted once even if the payload repeats), no reply
-            # -> INCOMPLETE (neither counter). A datagram too short to carry a
-            # sequence number is an unattributable INVALID unit.
+            # and invalid, counted once and sticky), no reply -> INCOMPLETE
+            # (neither counter). A datagram too short to carry a sequence
+            # number cannot be attributed to planned work: it is recorded as
+            # corruption evidence (invalid) without inflating `completed`, so
+            # the completion ratio can never exceed one.
             for outcome in sequence_outcomes(sent, verified, corrupt):
                 apply_outcome(counts, "udp_completed", outcome)
-            for _ in range(stray):
-                apply_outcome(counts, "udp_completed", Outcome.INVALID)
+            counts["udp_stray"] += stray
+            counts["udp_invalid"] += stray
 
     def dns_worker() -> None:
         per_worker = max(1, counts["dns_planned"] // 5)
@@ -1691,40 +1758,16 @@ def case_mixed(args) -> int:
     for worker in workers:
         worker.join(timeout=duration + 180)
 
-    planned = (
-        counts["h1_attempted"]
-        + counts["udp_sent"]
-        + counts["dns_planned"]
-        + counts["tcp_planned"]
-    )
-    completed = (
-        counts["h1_completed"]
-        + counts["udp_completed"]
-        + counts["dns_completed"]
-        + counts["tcp_completed"]
-    )
-    invalid = (
-        counts["h1_invalid"]
-        + counts["h2_invalid"]
-        + counts["udp_invalid"]
-        + counts["dns_invalid"]
-        + counts["tcp_invalid"]
-    )
+    ok, derived = mixed_verdict(counts, duration)
+    planned = derived["planned"]
+    completed = derived["completed"]
+    invalid = derived["invalid"]
+    completion_ratio = derived["completion_ratio"]
+    h1_floor = derived["h1_floor"]
     small_p95 = nearest_rank(small, 95)
-    completion_ratio = completed / planned if planned else 1.0
     warnings: list[str] = []
     if small_p95 > 2000:
         warnings.append(f"small-request p95 {small_p95:.0f}ms > 2000ms under bulk load")
-    # Liveness floors: every keep-alive connection must still complete at least
-    # one request per second, and the echo path must answer most of its sends.
-    h1_floor = 4 * duration
-    ok = (
-        invalid == 0
-        and completion_ratio >= 0.95
-        and counts["tcp_completed"] >= 1
-        and counts["h1_completed"] >= h1_floor
-        and counts["udp_completed"] >= 0.95 * counts["udp_sent"]
-    )
     metrics = {
         "planned": planned,
         "completed": completed,
@@ -1737,6 +1780,7 @@ def case_mixed(args) -> int:
         "h2_completed": counts["h2_completed"],
         "udp_planned": counts["udp_sent"],
         "udp_completed": counts["udp_completed"],
+        "udp_stray": counts["udp_stray"],
         "dns_planned": counts["dns_planned"],
         "dns_completed": counts["dns_completed"],
         "tcp_completed": counts["tcp_completed"],

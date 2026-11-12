@@ -304,6 +304,70 @@ class AccountingTests(unittest.TestCase):
         # An unanswered sequence is incomplete, not invalid.
         self.assertIs(protocol.sequence_outcomes({3: b"d"}, set(), set())[0], protocol.Outcome.INCOMPLETE)
 
+    def test_corruption_is_sticky_in_both_orders(self) -> None:
+        for first, second in ((b"bad", b"good"), (b"good", b"bad")):
+            sent = {0: b"good"}
+            verified: set[int] = set()
+            corrupt: set[int] = set()
+            protocol.note_reply(sent, verified, corrupt, 0, first)
+            protocol.note_reply(sent, verified, corrupt, 0, second)
+            self.assertEqual(
+                protocol.sequence_outcomes(sent, verified, corrupt),
+                [protocol.Outcome.INVALID],
+                f"order {first!r} then {second!r}",
+            )
+        # Repeating the corrupt reply records one invalid unit, not two.
+        sent = {0: b"good"}
+        verified = set()
+        corrupt = set()
+        protocol.note_reply(sent, verified, corrupt, 0, b"bad")
+        protocol.note_reply(sent, verified, corrupt, 0, b"bad")
+        counts = {"x_completed": 0, "x_invalid": 0}
+        for outcome in protocol.sequence_outcomes(sent, verified, corrupt):
+            protocol.apply_outcome(counts, "x_completed", outcome)
+        self.assertEqual(counts, {"x_completed": 1, "x_invalid": 1})
+
+    def _mixed(self) -> dict:
+        return {
+            "h1_attempted": 480,
+            "h1_completed": 480,
+            "h1_invalid": 0,
+            "h2_completed": 96,
+            "h2_invalid": 0,
+            "udp_sent": 600,
+            "udp_completed": 600,
+            "udp_invalid": 0,
+            "udp_stray": 0,
+            "dns_planned": 300,
+            "dns_completed": 300,
+            "dns_invalid": 0,
+            "tcp_planned": 1,
+            "tcp_completed": 1,
+            "tcp_invalid": 0,
+        }
+
+    def test_clean_mixed_counts_pass(self) -> None:
+        ok, derived = protocol.mixed_verdict(self._mixed(), 60)
+        self.assertTrue(ok)
+        self.assertEqual(derived["completed"], derived["planned"])
+        self.assertEqual(derived["completion_ratio"], 1.0)
+
+    def test_corrupt_unit_fails_the_verdict(self) -> None:
+        counts = self._mixed()
+        counts["udp_invalid"] = 1
+        ok, derived = protocol.mixed_verdict(counts, 60)
+        self.assertFalse(ok)
+        self.assertEqual(derived["invalid"], 1)
+
+    def test_stray_datagram_does_not_inflate_completion(self) -> None:
+        counts = self._mixed()
+        counts["udp_stray"] = 3
+        counts["udp_invalid"] = 3
+        ok, derived = protocol.mixed_verdict(counts, 60)
+        self.assertFalse(ok)
+        self.assertEqual(derived["completed"], derived["planned"])
+        self.assertEqual(derived["invalid"], 3)
+
 
 class LatticeTests(unittest.TestCase):
     def test_complete_truth_table(self) -> None:
