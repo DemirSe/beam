@@ -24,6 +24,14 @@ from pathlib import Path
 
 SCHEMA = 1
 
+# Case outcomes. ACCEPTED includes WARN: a quality observation is accepted, not
+# a gate failure. BLOCKED is never accepted because the workflow pins every
+# tool the suite needs.
+ACCEPTED_STATUSES = frozenset({"PASS", "WARN", "INFO"})
+FAIL_STATUS = "FAIL"
+BLOCKED_STATUS = "BLOCKED"
+KNOWN_STATUSES = ACCEPTED_STATUSES | {FAIL_STATUS, BLOCKED_STATUS}
+
 # The report's `required` field must equal this list exactly; the validator
 # compares both so a truncated manifest can never look complete.
 REQUIRED_CASES = [
@@ -143,6 +151,14 @@ def _number(value: str):
         return value
 
 
+def compute_complete(
+    missing: list[str], duplicates: list[str], harness_complete: bool
+) -> bool:
+    """A report is complete only when every required case is present once and
+    the harness itself did not fail."""
+    return not missing and not duplicates and harness_complete
+
+
 def read_environment(path: Path | None) -> dict:
     environment: dict = {}
     if path is None or not path.is_file():
@@ -214,7 +230,7 @@ def build_report(
     planned = len(REQUIRED_CASES)
     completed = sum(1 for name in REQUIRED_CASES if name in merged)
     missing = [name for name in REQUIRED_CASES if name not in merged]
-    complete = not missing and not duplicates and harness_complete
+    complete = compute_complete(missing, duplicates, harness_complete)
     return {
         "schema": SCHEMA,
         "complete": complete,
@@ -261,11 +277,11 @@ def check_report(report: dict, require_arm: str | None = None) -> list[str]:
             problems.append(f"missing case {name}")
             continue
         status = case.get("status")
-        if status == "FAIL":
+        if status == FAIL_STATUS:
             problems.append(f"{name}: FAIL: {case.get('detail') or 'no detail'}")
-        elif status == "BLOCKED":
+        elif status == BLOCKED_STATUS:
             problems.append(f"{name}: BLOCKED: {case.get('detail') or 'no detail'}")
-        elif status not in ("PASS", "WARN", "INFO"):
+        elif status not in ACCEPTED_STATUSES:
             problems.append(f"{name}: unexpected status {status!r}")
         if not str(case.get("detail") or "").strip():
             problems.append(f"{name}: empty detail")

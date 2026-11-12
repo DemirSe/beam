@@ -35,6 +35,7 @@ This is test-only code; it never reaches an external network.
 from __future__ import annotations
 
 import argparse
+import enum
 import hashlib
 import http.client
 import json
@@ -55,6 +56,19 @@ from concurrent.futures import ThreadPoolExecutor
 MARKER_H3 = b"beam-tun-h3-ok\n"
 MARKER_HTTP = b"beam-tun-ok\n"
 UDP_HEADER = 4
+
+
+class Outcome(enum.Enum):
+    """Explicit result of one unit of mixed-case work.
+
+    OK and INVALID units completed; INVALID also counts a correctness failure.
+    INCOMPLETE units (lost reply, refused flow, deadline) lower the completion
+    ratio and are never counted as invalid.
+    """
+
+    OK = "ok"
+    INVALID = "invalid"
+    INCOMPLETE = "incomplete"
 
 
 def log(message: str) -> None:
@@ -1429,8 +1443,17 @@ def case_mixed(args) -> int:
     barrier = threading.Barrier(15)
 
     def add(key: str, count: int = 1) -> None:
+        """Raw counter for attempts and sends; outcomes go through record()."""
         with lock:
             counts[key] += count
+
+    def record(key: str, outcome: Outcome = Outcome.OK) -> None:
+        with lock:
+            if outcome is Outcome.INCOMPLETE:
+                return
+            counts[key] += 1
+            if outcome is Outcome.INVALID:
+                counts[key.replace("_completed", "_invalid")] += 1
 
     def h2_worker() -> None:
         url = f"https://{args.https}/?bytes={args.h2_bytes}"
@@ -1457,6 +1480,7 @@ def case_mixed(args) -> int:
                         40.0,
                     )
                 except (OSError, subprocess.TimeoutExpired) as error:
+                    record("h2_completed", Outcome.INCOMPLETE)
                     with lock:
                         errors.append(f"h2: {type(error).__name__}: {error}")
                     continue
@@ -1466,6 +1490,7 @@ def case_mixed(args) -> int:
                 except OSError:
                     body = b""
                 if proc.returncode != 0:
+                    record("h2_completed", Outcome.INCOMPLETE)
                     with lock:
                         errors.append(
                             f"h2: curl rc={proc.returncode}: "
@@ -1473,12 +1498,11 @@ def case_mixed(args) -> int:
                         )
                     continue
                 if proc.stdout.strip() == "200" and body == expected:
-                    add("h2_completed")
+                    record("h2_completed")
                     with lock:
                         h2_throughput.append(len(expected) / (time.monotonic() - requested))
                 else:
-                    add("h2_invalid")
-                    add("h2_completed")
+                    record("h2_completed", Outcome.INVALID)
         finally:
             try:
                 os.unlink(body_path)
@@ -1503,9 +1527,13 @@ def case_mixed(args) -> int:
                 conn.request("GET", "/keepalive")
                 response = conn.getresponse()
                 body = response.read()
-                outcome = "ok" if response.status == 200 and body == MARKER_HTTP else "invalid"
+                outcome = (
+                    Outcome.OK
+                    if response.status == 200 and body == MARKER_HTTP
+                    else Outcome.INVALID
+                )
             except Exception as error:  # noqa: BLE001
-                outcome = "incomplete"
+                outcome = Outcome.INCOMPLETE
                 with lock:
                     errors.append(f"h1: {type(error).__name__}: {error}")
                 try:
@@ -1513,13 +1541,12 @@ def case_mixed(args) -> int:
                 except Exception:  # noqa: BLE001
                     pass
                 conn = http.client.HTTPConnection(host, port, timeout=10)
-            if outcome == "ok":
-                add("h1_completed")
+            if outcome is Outcome.OK:
+                record("h1_completed")
                 with lock:
                     small.append((time.monotonic() - tick) * 1000.0)
-            elif outcome == "invalid":
-                add("h1_completed")
-                add("h1_invalid")
+            elif outcome is Outcome.INVALID:
+                record("h1_completed", Outcome.INVALID)
             sleep = interval - (time.monotonic() - tick)
             if sleep > 0:
                 time.sleep(sleep)
@@ -1581,6 +1608,9 @@ def case_mixed(args) -> int:
             sock.close()
         with lock:
             counts["udp_sent"] += len(sent)
+            # Tri-state split for the echo phase: a verified sequence is OK, a
+            # wrong payload is INVALID (completed + invalid), and a sequence
+            # with no reply is INCOMPLETE (neither counter).
             counts["udp_completed"] += len(completed)
             counts["udp_invalid"] += wrong
 
@@ -1592,10 +1622,11 @@ def case_mixed(args) -> int:
             index += 1
             ok, output, _ = _dig(args, "target.test", "A", tcp=False)
             if ok and _dns_status(output) == "NOERROR" and _dns_answer(output, "A") == args.dns_expect:
-                add("dns_completed")
+                record("dns_completed")
             elif ok:
-                add("dns_completed")
-                add("dns_invalid")
+                record("dns_completed", Outcome.INVALID)
+            else:
+                record("dns_completed", Outcome.INCOMPLETE)
             time.sleep(0.2)
 
     def tcp_worker() -> None:
@@ -1604,10 +1635,8 @@ def case_mixed(args) -> int:
         payload = payload[: args.tcp_bytes]
         barrier.wait()
         outcome = _tcp_echo(payload, host, port, timeout=90.0, chunk=1 << 20)
-        if outcome["ok"]:
-            add("tcp_completed")
-        else:
-            add("tcp_invalid")
+        record("tcp_completed", Outcome.OK if outcome["ok"] else Outcome.INVALID)
+        if not outcome["ok"]:
             with lock:
                 errors.append("tcp: " + "; ".join(outcome["errors"][:2] or ["hash mismatch"]))
 

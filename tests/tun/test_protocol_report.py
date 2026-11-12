@@ -215,6 +215,23 @@ class ValidatorTests(unittest.TestCase):
         self.assertIn("beam", output)
 
 
+class LatticeTests(unittest.TestCase):
+    def test_complete_truth_table(self) -> None:
+        self.assertTrue(report.compute_complete([], [], True))
+        self.assertFalse(report.compute_complete(["h2-bulk-8m"], [], True))
+        self.assertFalse(report.compute_complete([], ["h2-bulk-8m"], True))
+        self.assertFalse(report.compute_complete([], [], False))
+
+    def test_status_sets_are_explicit(self) -> None:
+        self.assertIn("WARN", report.ACCEPTED_STATUSES)
+        self.assertNotIn(report.FAIL_STATUS, report.ACCEPTED_STATUSES)
+        self.assertNotIn(report.BLOCKED_STATUS, report.ACCEPTED_STATUSES)
+        self.assertEqual(
+            report.KNOWN_STATUSES,
+            {"PASS", "WARN", "INFO", report.FAIL_STATUS, report.BLOCKED_STATUS},
+        )
+
+
 class MergeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

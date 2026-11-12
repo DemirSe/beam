@@ -294,6 +294,11 @@ XRAY_PID=""
 SERVER_PID=""
 SERVER_LOG=""
 SERVER_KIND=""
+# Explicit server lifecycle: none -> starting -> running -> restarting ->
+# starting -> running, with stopping/stopped on teardown and failed on a start
+# error. SERVER_PID/SERVER_LOG/SERVER_KIND are only meaningful while starting,
+# running, restarting or failed.
+SERVER_STATE=none
 BASELINE_RTT_MS=0
 BASELINE_TARGET_RTT_MS=0
 NAMESPACES=(tun-client tun-server tun-target)
@@ -332,9 +337,7 @@ cleanup() {
   trap - EXIT INT TERM
   set +e
   stop_pid "$SINGBOX_PID"
-  stop_pid "$SERVER_PID"
-  stop_pid "$BEAM_PID"
-  stop_pid "$XRAY_PID"
+  server_stop
   stop_pid "$H3_ORIGIN_PID"
   stop_pid "$SERVICES_PID"
   for namespace in "${CREATED_NAMESPACES[@]}"; do
@@ -510,39 +513,95 @@ measure_baseline_rtt() {
   printf '%s\n' "${value:-0}"
 }
 
-start_beam() {
-  ip netns exec tun-server "$BEAM_BIN" --config "$CONFIG_DIR/beam.toml" \
-    >> "$BEAM_LOG" 2>&1 &
-  BEAM_PID=$!
-  SERVER_PID=$BEAM_PID
-  SERVER_LOG=$BEAM_LOG
-  SERVER_KIND=beam
-  wait_for_log "$BEAM_LOG" "beam listening" "$BEAM_PID" 15
+# ---------------------------------------------------------------------------
+# Server lifecycle
+#
+# One active server owns SERVER_PID/SERVER_LOG/SERVER_KIND. Transitions are
+# validated so a restart cannot run in the wrong phase or from a command
+# substitution that would lose the new pid: a lost-state restart was the first
+# harness defect the protocol lab found.
+# ---------------------------------------------------------------------------
+
+server_require() {
+  local expected=$1 caller=$2
+  if [ "$SERVER_STATE" != "$expected" ]; then
+    fail_harness "$caller: server is $SERVER_STATE, expected $expected"
+    return 1
+  fi
 }
 
-start_xray() {
-  ip netns exec tun-server "$XRAY_BIN" run -c "$CONFIG_DIR/xray-server.json" \
-    >> "$XRAY_LOG" 2>&1 &
-  XRAY_PID=$!
-  SERVER_PID=$XRAY_PID
-  SERVER_LOG=$XRAY_LOG
-  SERVER_KIND=xray
-  wait_for_command "$XRAY_PID" 20 \
-    ip netns exec tun-server "$PYTHON" -c 'import socket; socket.create_connection(("10.10.1.1", 443), 0.2).close()'
+# server_start beam|xray: none/stopped -> starting -> running|failed.
+server_start() {
+  local kind=$1
+  case "$SERVER_STATE" in
+    none|stopped) ;;
+    *)
+      fail_harness "server_start $kind: server is already $SERVER_STATE"
+      return 1
+      ;;
+  esac
+  SERVER_STATE=starting
+  SERVER_KIND=$kind
+  if [ "$kind" = "beam" ]; then
+    SERVER_LOG=$BEAM_LOG
+    ip netns exec tun-server "$BEAM_BIN" --config "$CONFIG_DIR/beam.toml" \
+      >> "$BEAM_LOG" 2>&1 &
+    BEAM_PID=$!
+    SERVER_PID=$BEAM_PID
+    if wait_for_log "$BEAM_LOG" "beam listening" "$BEAM_PID" 15; then
+      SERVER_STATE=running
+      return 0
+    fi
+  else
+    SERVER_LOG=$XRAY_LOG
+    ip netns exec tun-server "$XRAY_BIN" run -c "$CONFIG_DIR/xray-server.json" \
+      >> "$XRAY_LOG" 2>&1 &
+    XRAY_PID=$!
+    SERVER_PID=$XRAY_PID
+    if wait_for_command "$XRAY_PID" 20 \
+      ip netns exec tun-server "$PYTHON" -c 'import socket; socket.create_connection(("10.10.1.1", 443), 0.2).close()'; then
+      SERVER_STATE=running
+      return 0
+    fi
+  fi
+  SERVER_STATE=failed
+  SERVER_PID=""
+  return 1
 }
 
-# Kill the active server and start a fresh process with the same config.
-# Prints the kill timestamp in epoch milliseconds for the recovery driver.
-restart_server() {
+# Stop whichever server is current; safe in every state.
+server_stop() {
+  case "$SERVER_STATE" in
+    none|stopped) return 0 ;;
+  esac
+  SERVER_STATE=stopping
+  if [ "$SERVER_KIND" = "beam" ]; then
+    stop_pid "$BEAM_PID"
+    BEAM_PID=""
+  else
+    stop_pid "$XRAY_PID"
+    XRAY_PID=""
+  fi
+  SERVER_PID=""
+  SERVER_STATE=stopped
+}
+
+# Kill the running server and start a fresh process with the same config.
+# running -> restarting -> starting -> running|failed; records restart evidence
+# in <out> and the kill timestamp in RESTART_KILLED_MS.
+server_restart() {
   local out=$1
-  local old_pid=$SERVER_PID
+  server_require running server_restart || return 1
+  local kind=$SERVER_KIND old_pid=$SERVER_PID
   local old_start="" new_start="" new_pid="" reaped=0 mark killed
+  local log=$SERVER_LOG
   if [ -z "$old_pid" ] || [ ! -r "/proc/$old_pid/stat" ]; then
-    fail_harness "cannot restart the $SERVER_KIND server: no live pid"
+    fail_harness "cannot restart the $kind server: no live pid"
     return 1
   fi
   old_start=$(awk '{print $22}' "/proc/$old_pid/stat")
   killed=$("$PYTHON" -c 'import time; print(int(time.time() * 1000))')
+  SERVER_STATE=restarting
   kill -TERM "$old_pid" 2>/dev/null || true
   for _ in $(seq 1 100); do
     if ! kill -0 "$old_pid" 2>/dev/null; then
@@ -556,21 +615,17 @@ restart_server() {
     sleep 0.1
   done
   wait "$old_pid" 2>/dev/null || true
-  mark=$(wc -c < "$SERVER_LOG" 2>/dev/null || echo 0)
-  if [ "$SERVER_KIND" = "beam" ]; then
-    if ! start_beam; then
-      fail_harness "the restarted beam process did not start"
-      return 1
-    fi
-    if ! wait_for_marker_after "$SERVER_LOG" "$mark" "beam listening" "$SERVER_PID" 15; then
-      fail_harness "the restarted beam process produced no new listening line"
-      return 1
-    fi
-  else
-    if ! start_xray; then
-      fail_harness "the restarted Xray process did not listen"
-      return 1
-    fi
+  mark=$(wc -c < "$log" 2>/dev/null || echo 0)
+  SERVER_STATE=stopped
+  SERVER_PID=""
+  if ! server_start "$kind"; then
+    fail_harness "the restarted $kind process did not start"
+    return 1
+  fi
+  if [ "$kind" = "beam" ] \
+    && ! wait_for_marker_after "$log" "$mark" "beam listening" "$SERVER_PID" 15; then
+    fail_harness "the restarted beam process produced no new listening line"
+    return 1
   fi
   new_pid=$SERVER_PID
   new_start=$(awk '{print $22}' "/proc/$new_pid/stat" 2>/dev/null || echo "")
@@ -981,7 +1036,7 @@ RESOURCES
 
   RESTART_KILLED_MS=""
   killed=""
-  if restart_server "$dir/restart.json"; then
+  if server_restart "$dir/restart.json"; then
     killed="$RESTART_KILLED_MS"
   fi
   if [ -n "$killed" ]; then
@@ -1279,7 +1334,7 @@ if [ "$SUITE" = "protocols" ]; then
 fi
 
 log "starting beam on $BEAM_ADDR"
-if ! start_beam; then
+if ! server_start beam; then
   fail_harness "beam did not start listening"
   tail -n 40 "$BEAM_LOG" >&2 || true
   exit 1
@@ -1532,10 +1587,8 @@ fi
 
 if [ "$CONTROL" = "1" ]; then
   log "stopping the server under test and starting the stock Xray control"
-  stop_pid "$SERVER_PID"
-  SERVER_PID=""
-  BEAM_PID=""
-  if ! start_xray; then
+  server_stop
+  if ! server_start xray; then
     fail_harness "stock Xray control did not accept connections on $BEAM_ADDR"
     tail -n 40 "$XRAY_LOG" >&2 || true
     exit 1
