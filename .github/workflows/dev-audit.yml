@@ -37,3 +37,5 @@ jobs:
         run: python3 tests/bench/test_report.py
       - name: Protocol report contract tests
         run: python3 tests/tun/test_protocol_report.py
+      - name: Client policy tests
+        run: python3 tests/test_ipv4_only.py

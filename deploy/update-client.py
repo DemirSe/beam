@@ -35,6 +35,7 @@ def is_udp443_reject(rule: dict) -> bool:
         rule.get("action") == "reject"
         and rule.get("network") == "udp"
         and _is_exact_udp_443_port(rule.get("port"))
+        and set(rule) <= {"action", "network", "port", "method", "no_drop"}
     )
 
 
@@ -88,9 +89,10 @@ def ensure_quic_policy(config: dict) -> None:
     """Keep the stock-client H2 fallback policy canonical."""
     route = config.setdefault("route", {})
     rules = route.setdefault("rules", [])
-    private = next((r for r in rules if r.get("ip_is_private") is True), None)
-    sniff = next((r for r in rules if r.get("action") == "sniff"), None)
-    dns = next((r for r in rules if r.get("protocol") == "dns"), None)
+    private = next((r for r in rules if r in (
+        {"ip_is_private": True, "outbound": "direct"},
+        {"ip_is_private": True, "ip_version": 4, "outbound": "direct"},
+    )), None)
     reject = {
         "action": "reject",
         "network": "udp",
@@ -99,12 +101,9 @@ def ensure_quic_policy(config: dict) -> None:
         "no_drop": True,
     }
 
-    route["rules"] = [
-        r
-        for r in (private, reject, sniff, dns)
-        if r is not None
+    route["rules"] = ([private] if private is not None else []) + [reject] + [
+        r for r in rules if r is not private and not is_udp443_reject(r)
     ]
-    route["rules"].extend(r for r in rules if not is_udp443_reject(r) and r not in route["rules"])
 
 
 def stage_config(config: dict, destination: Path) -> Path:
@@ -222,16 +221,6 @@ def main() -> int:
         print("update-client: restart failed; previous config restored", file=sys.stderr)
         print(result.stderr.strip(), file=sys.stderr)
         return 1
-
-    enabled = subprocess.run(
-        ["systemctl", "enable", SERVICE], capture_output=True, text=True
-    )
-    if enabled.returncode != 0:
-        print(
-            "update-client: warning: could not enable beam-client at boot",
-            file=sys.stderr,
-        )
-        print(enabled.stderr.strip(), file=sys.stderr)
 
     print(f"update-client: updated {CONFIG}; backup={backup}")
     return 0

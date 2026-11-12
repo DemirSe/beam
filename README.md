@@ -7,15 +7,15 @@ note; the separate open stress findings live in
 
 ## Status
 
-Implemented, tested, and deployed. The current production build was verified
-on 2026-11-11 16:39 UTC:
+Implemented, tested, and deployed. The table combines the deployment report
+from 2026-11-12 with host observations from 2026-11-11; it is not a live check:
 
 | Item | Value |
 |---|---|
 | Binary | `/usr/local/bin/beam` |
-| SHA-256 | `176349b54c5de007c34d87d789a9b3bbba142f2b5e232dca2b5bd57ee9195671` |
-| Version | `0.1.0 (66494a09a092)` |
-| Source release | `66494a0` (deployed); later `main` commits are docs/test cleanup only |
+| SHA-256 | Last reported prefix `9bec4d66`; full hash unavailable here |
+| Version | Last reported `0.1.0 (c4aef3a69572)` |
+| Source release | `c4aef3a` (deployment reported 2026-11-12; live state not rechecked here) |
 | Service | `beam.service`, active, `NRestarts=0`, `RestrictAddressFamilies=AF_INET AF_UNIX` |
 | Listener | `0.0.0.0:443` (no IPv6 listener) |
 | Live limits | 1024 authenticated connections, 1024 UDP destinations, 1024 XUDP sessions, 128 KiB UDP receive buffer, 10 s handshake, `TasksMax=4096` |
@@ -35,10 +35,12 @@ has no IPv6 addresses, routes, or listeners, and `sshd` listens on
 not used in production verification.
 
 The annotated tag `v0.1.0-rc.1` remains the previous release candidate.
-Production now runs the `66494a0` build `0.1.0 (66494a09a092)` (binary
-`176349b5…`, config `d20d16…`, drop-in `f852fce5…`), which adds the
-2026-11-11 Vision Direct lazy-descriptor fix (STRESS-FINDINGS #10) to the RC
-fix set. The RC contains the current server fixes plus the IPv4-only client
+The deployment reported on 2026-11-12 used `c4aef3a` (binary SHA-256 prefix
+`9bec4d66`), after the earlier `66494a0` deployment. Recheck the live host
+before treating this historical report as its current state. The prefix is not
+a usable verifier pin; obtain the full SHA-256 from the deployed binary or the
+original deployment evidence. The RC contains
+the earlier server fixes plus the IPv4-only client
 and deployment artifacts. It includes the XUDP junk-reply
 idle-pinning fix (`2163c0a`), the mux-wide resolution/send-stall fix
 (`e0ca0bc`), the 2026-11-03 handshake/legacy-UDP/End-enqueue hardening, the
@@ -185,8 +187,9 @@ embedded Windows profile. A profile that needs H3 must explicitly opt in and
 accepts the XUDP/TCP head-of-line risk. Normalization strips IPv6 addresses
 from DNS predefined lists and TUN address arrays, sets `dns.strategy` to
 `ipv4_only`, and re-adds a single first `ip_version: 6` reject. The Python
-normalizers only replace a UDP/443 rule whose port set is exactly `443`; a rule
-that also lists another port (for example `[443, 8443]`) is preserved. The
+normalizers only replace an unscoped UDP/443 reject whose port set is exactly
+`443`; scoped rules and rules that also list another port (for example
+`[443, 8443]`) are preserved in their original relative order. The
 Windows installer's pre-existing normalization uses a broader
 `-contains 443` predicate and is unchanged by this IPv4-only work.
 
@@ -589,7 +592,8 @@ Set `SSH_KEY` and `SERVER` in the shell before using the examples below. For a
 first-time host, install Debian 13 with key-only `demir` access and
 passwordless sudo; test the `deploy/` nftables/SSH/resolver files before
 enabling them, keeping the provider console available. The local client
-rotation helper is `deploy/update-client.py` (TUN `system`, MTU 1500); the
+rotation helper is `deploy/update-client.py` (TUN `system`, MTU 1500); it
+preserves whether the client service is enabled at boot. The
 tray polkit/autostart files are in `deploy/`. Never commit or paste secrets.
 
 ### Daily checks
@@ -1065,9 +1069,9 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   required.
 - **One user, one inbound, no hot reload/stats** keeps the attack surface and
   resource model bounded.
-- **Production runs the `66494a0` build `0.1.0 (66494a09a092)` (binary
-  `176349b5…`); later `main` commits are docs/test cleanup only. The annotated
-  `v0.1.0-rc.1` tag is the previous release candidate.** Move it only with
+- **The last reported production build is `c4aef3a` (binary SHA-256 prefix
+  `9bec4d66`); verify the live host before relying on this record. The annotated
+  `v0.1.0-rc.1` tag is the previous release candidate.** Deploy only with
   `deploy/package.sh` plus
   `BEAM_KEEP_CONFIG=1 bootstrap.sh`, then re-run the hash-pinned verifier and
   update the pin here when deployed.

@@ -14,7 +14,7 @@ code and proven on the lab; each one stays listed with its proof.
 |---|---|---|
 |I1|Replay cache saturates under sustained heavy churn|Fixed on `main`, deployed|
 |I2|A client restart appeared to be refused as a replay|Fixed on `main`, deployed; same root cause as I1|
-|P1|Legacy/packetaddr UDP refuses flows above a fixed 64-stream pool|Fixed on `dev`, proven on the lab (run 43247381742)|
+|P1|Legacy/packetaddr UDP refuses flows above a fixed 64-stream pool|Fixed on `main`, proven on the lab (run 43247381742); deployment reported at `c4aef3a`|
 
 ## I1 — replay cache saturates under sustained heavy churn (fixed)
 

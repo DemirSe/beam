@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Focused regression tests for the IPv4-only client normalizers."""
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -174,8 +177,8 @@ class IPv4OnlyNormalizerTests(unittest.TestCase):
         self.assertEqual(rules[0], {"ip_version": 6, "action": "reject"})
         self.assertEqual(rules[1], {"ip_is_private": True, "outbound": "direct"})
         self.assertTrue(module.is_udp443_reject(rules[2]))
-        self.assertEqual(rules[3], {"action": "sniff"})
-        self.assertEqual(rules[4], {"protocol": "dns", "action": "hijack-dns"})
+        self.assertEqual(rules[3], {"protocol": "dns", "action": "hijack-dns"})
+        self.assertEqual(rules[4], {"action": "sniff"})
         self.assertEqual(rules[5], unrelated)
         self.assertEqual(len(rules), 6)
         self.assertEqual(
@@ -191,6 +194,63 @@ class IPv4OnlyNormalizerTests(unittest.TestCase):
             ],
             [{"ip_version": 6, "action": "reject"}],
         )
+
+    def test_custom_rules_keep_order_and_scoped_reject(self):
+        custom = {"domain_suffix": ["corp.example"], "outbound": "direct"}
+        dns = {"protocol": "dns", "action": "hijack-dns"}
+        scoped = {"action": "reject", "network": "udp", "port": 443, "domain": ["example.org"]}
+        for module in self.modules:
+            with self.subTest(module=module.__name__):
+                config = _config("172.19.0.1/30", "76.76.2.22")
+                config["route"]["rules"] += [custom, dns, scoped]
+                if hasattr(module, "normalize"):
+                    module.normalize(config)
+                    module.normalize(config)
+                else:
+                    module.ensure_quic_policy(config)
+                    module.ensure_ipv4_only(config)
+                    module.ensure_quic_policy(config)
+                    module.ensure_ipv4_only(config)
+                rules = config["route"]["rules"]
+                self.assertEqual(rules[-3:], [custom, dns, scoped])
+                self.assertEqual(sum(module.is_udp443_reject(r) for r in rules), 1)
+
+    def test_identity_update_does_not_change_service_enablement(self):
+        module = self.modules[1]
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            identity = base / "identity.json"
+            config = base / "config.json"
+            identity.write_text(json.dumps({
+                "server": "example.org", "port": 443, "user_id": "test",
+                "flow": "xtls-rprx-vision", "server_name": "example.org",
+                "public_key": "test", "short_id": "00",
+            }))
+            config.write_text(json.dumps({
+                "inbounds": [{"type": "tun", "address": "172.19.0.1/30"}],
+                "outbounds": [{"type": "vless"}],
+            }))
+            with patch.object(module, "IDENTITY", identity), patch.object(module, "CONFIG", config), \
+                 patch.object(module.os, "geteuid", return_value=0), \
+                 patch.object(module, "check_config", return_value=True), \
+                 patch.object(module.subprocess, "run") as run:
+                run.return_value.returncode = 0
+                self.assertEqual(module.main(), 0)
+                self.assertEqual([call.args[0][1] for call in run.call_args_list], ["restart", "is-active"])
+
+    def test_ipv4_private_direct_stays_before_udp_reject(self):
+        private = {"ip_is_private": True, "ip_version": 4, "outbound": "direct"}
+        for module in self.modules:
+            with self.subTest(module=module.__name__):
+                config = _config("172.19.0.1/30", "76.76.2.22")
+                config["route"]["rules"] = [private, {"action": "sniff"}]
+                if hasattr(module, "normalize"):
+                    module.normalize(config)
+                else:
+                    module.ensure_quic_policy(config)
+                    module.ensure_ipv4_only(config)
+                self.assertEqual(config["route"]["rules"][1], private)
+                self.assertTrue(module.is_udp443_reject(config["route"]["rules"][2]))
 
 
 if __name__ == "__main__":

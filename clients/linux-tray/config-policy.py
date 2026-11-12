@@ -26,6 +26,7 @@ def is_udp443_reject(rule: dict) -> bool:
         rule.get("action") == "reject"
         and rule.get("network") == "udp"
         and _is_exact_udp_443_port(rule.get("port"))
+        and set(rule) <= {"action", "network", "port", "method", "no_drop"}
     )
 
 
@@ -78,9 +79,10 @@ def ensure_ipv4_only(config: dict) -> None:
 def normalize(config: dict) -> None:
     route = config.setdefault("route", {})
     rules = route.setdefault("rules", [])
-    private = next((r for r in rules if r.get("ip_is_private") is True), None)
-    sniff = next((r for r in rules if r.get("action") == "sniff"), None)
-    dns = next((r for r in rules if r.get("protocol") == "dns"), None)
+    private = next((r for r in rules if r in (
+        {"ip_is_private": True, "outbound": "direct"},
+        {"ip_is_private": True, "ip_version": 4, "outbound": "direct"},
+    )), None)
     reject = {
         "action": "reject",
         "network": "udp",
@@ -92,11 +94,9 @@ def normalize(config: dict) -> None:
         r
         for r in rules
         if r is not private
-        and r is not sniff
-        and r is not dns
         and not is_udp443_reject(r)
     ]
-    route["rules"] = [r for r in (private, reject, sniff, dns) if r is not None] + others
+    route["rules"] = ([private] if private is not None else []) + [reject] + others
     ensure_ipv4_only(config)
 
 
