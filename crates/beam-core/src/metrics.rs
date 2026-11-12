@@ -147,7 +147,6 @@ impl Metrics {
         self.xudp_end_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Counts one XUDP request datagram dropped by the send path.
     /// Records an authenticated handshake rejected by the replay cache.
     pub fn record_replay_rejected(&self) {
         self.replay_rejected.fetch_add(1, Ordering::Relaxed);
@@ -159,6 +158,7 @@ impl Metrics {
         self.replay_cache_full.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts one XUDP request datagram dropped by the send path.
     pub fn record_xudp_send_dropped(&self) {
         self.xudp_send_dropped.fetch_add(1, Ordering::Relaxed);
     }

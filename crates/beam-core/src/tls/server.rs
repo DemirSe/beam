@@ -1997,7 +1997,7 @@ async fn relay_vision(
     let up = async move {
         let mut stop_guard = RelayStopGuard::new(&up_activity);
         let result = async {
-            let (copied_up, raw_read) = copy_direction_until_read_handoff(
+            let (copied_up, raw_read) = copy_direction_until_handoff(
                 &mut vision_read,
                 &mut target_write,
                 idle_timeout,
@@ -2090,7 +2090,7 @@ async fn relay_vision(
     let down = async move {
         let mut stop_guard = RelayStopGuard::new(&down_activity);
         let result = async {
-        let (copied_down, raw_write) = copy_direction_until_write_raw(
+        let (copied_down, raw_write) = copy_direction_until_handoff(
             &mut target_read,
             &mut vision_write,
             idle_timeout,
@@ -2180,19 +2180,15 @@ async fn relay_vision(
     Ok(())
 }
 
-/// Copies the client-to-target direction until the reader's raw handoff is
-/// safe. Returns the copied byte count and whether the read direction switched.
-///
-/// The watch is published only after the Vision reader has drained every
-/// ordered prefix byte: block content, raw block remainder, and TLS read-ahead.
-/// Those bytes are written to the target before this function returns, so the
-/// blocking upload splice can start at the raw socket without a separate
-/// prefix buffer.
-async fn copy_direction_until_read_handoff<R, W>(
+/// Copies either direction until its raw handoff is ready.
+/// Returns the copied byte count and whether the handoff occurred.
+/// Upload publishes only after ordered Vision and TLS prefixes are drained;
+/// download publishes only after pending writes are drained.
+async fn copy_direction_until_handoff<R, W>(
     reader: &mut R,
     writer: &mut W,
     idle_timeout: Duration,
-    read_handoff: &mut watch::Receiver<bool>,
+    handoff: &mut watch::Receiver<bool>,
     activity_clock: Option<&RelayActivity>,
 ) -> Result<(u64, bool), TlsServerError>
 where
@@ -2202,23 +2198,19 @@ where
     let mut buffer = [0u8; RELAY_BUFFER_LEN];
     let mut relayed = 0_u64;
     loop {
-        if *read_handoff.borrow() {
+        if *handoff.borrow() {
             return Ok((relayed, true));
         }
 
-        // Poll the read first. The handoff publish and a raw read can become
-        // ready in the same poll; if the handoff branch won, a completed read
-        // would be dropped and its bytes lost. Reading before returning is
-        // safe because the handoff only happens after every framed byte has
-        // been drained, so the bytes belong to the raw prefix.
+        // A completed read must be written before a simultaneous handoff.
         let read = tokio::select! {
             biased;
             read = timeout(idle_timeout, reader.read(&mut buffer)) => read,
-            changed = read_handoff.changed() => {
+            changed = handoff.changed() => {
                 if changed.is_err() {
                     break;
                 }
-                if *read_handoff.borrow() {
+                if *handoff.borrow() {
                     return Ok((relayed, true));
                 }
                 continue;
@@ -2264,101 +2256,7 @@ where
             Err(error) => return Err(TlsServerError::Io(error)),
         }
 
-        if *read_handoff.borrow() {
-            return Ok((relayed, true));
-        }
-    }
-
-    let shutdown = timeout(idle_timeout, writer.shutdown())
-        .await
-        .map_err(|_| TlsServerError::Timeout {
-            stage: "relay shutdown",
-        })?;
-    match shutdown {
-        Ok(()) => {}
-        Err(error) if is_peer_closed(&error) => {}
-        Err(error) => return Err(TlsServerError::Io(error)),
-    }
-    Ok((relayed, false))
-}
-
-/// Copies the target-to-client direction until the Vision writer is raw.
-/// Returns the copied byte count and whether the write direction switched.
-async fn copy_direction_until_write_raw<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    idle_timeout: Duration,
-    write_raw: &mut watch::Receiver<bool>,
-    activity_clock: Option<&RelayActivity>,
-) -> Result<(u64, bool), TlsServerError>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buffer = [0u8; RELAY_BUFFER_LEN];
-    let mut relayed = 0_u64;
-    loop {
-        if *write_raw.borrow() {
-            return Ok((relayed, true));
-        }
-
-        // As on the read side, prefer a completed read over a simultaneous
-        // raw-write handoff. The read bytes are still part of the ordered
-        // target-to-client stream and must be written before the handoff.
-        let read = tokio::select! {
-            biased;
-            read = timeout(idle_timeout, reader.read(&mut buffer)) => read,
-            changed = write_raw.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-                if *write_raw.borrow() {
-                    return Ok((relayed, true));
-                }
-                continue;
-            }
-        };
-        let count = match read {
-            Ok(Ok(count)) => count,
-            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                // A bare TCP FIN is a half-close, not a fatal relay error.
-                // Let the opposite direction finish and half-close normally.
-                break;
-            }
-            Ok(Err(error)) => return Err(TlsServerError::Io(error)),
-            Err(_) => {
-                if activity_clock
-                    .and_then(RelayActivity::elapsed)
-                    .is_some_and(|elapsed| elapsed < idle_timeout)
-                {
-                    continue;
-                }
-                return Err(TlsServerError::Timeout {
-                    stage: "relay read",
-                });
-            }
-        };
-        if count == 0 {
-            break;
-        }
-
-        let write = timeout(idle_timeout, writer.write_all(&buffer[..count]))
-            .await
-            .map_err(|_| TlsServerError::Timeout {
-                stage: "relay write",
-            })?;
-        match write {
-            Ok(()) => {
-                relayed = relayed.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-                if let Some(clock) = activity_clock {
-                    clock.touch();
-                }
-            }
-            Err(error) if is_peer_closed(&error) => break,
-            Err(error) => return Err(TlsServerError::Io(error)),
-        }
-
-        if *write_raw.borrow() {
+        if *handoff.borrow() {
             return Ok((relayed, true));
         }
     }

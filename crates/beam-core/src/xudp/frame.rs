@@ -164,7 +164,7 @@ impl TryFrom<u8> for TargetNetwork {
 /// A parsed XUDP frame borrowing its payload from the input buffer.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Frame<'a> {
-    /// Mux session id. XUDP clients write zero.
+    /// Client-assigned mux session id for a UDP flow.
     pub session_id: u16,
     /// Session status.
     pub status: SessionStatus,

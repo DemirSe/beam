@@ -1133,7 +1133,23 @@ mod tests {
                 let _ = socket.send_to(&buffer[..length], peer).await;
             }
         });
-        Some(Echo { address, task })
+        let echo = Echo { address, task };
+        let probe_bind = if address.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let probe = UdpSocket::bind(probe_bind).await.ok()?;
+        probe.send_to(b"probe", address).await.ok()?;
+        let mut reply = [0; 5];
+        let (length, peer) = timeout(Duration::from_secs(1), probe.recv_from(&mut reply))
+            .await
+            .ok()?
+            .ok()?;
+        if peer != address || &reply[..length] != b"probe" {
+            return None;
+        }
+        Some(echo)
     }
 
     async fn spawn_ipv4_echo() -> Echo {
@@ -1424,8 +1440,10 @@ mod tests {
     #[tokio::test]
     async fn fixed_ipv6_echo() {
         let Some(echo) = try_spawn_echo(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))).await else {
-            // Hosts without IPv6 loopback skip this case; the codec and the
-            // IPv4 path still cover the relay.
+            assert!(
+                std::env::var_os("BEAM_REQUIRE_IPV6_TESTS").is_none(),
+                "IPv6 loopback unavailable"
+            );
             return;
         };
         let (mut client, task) = start(net_location(echo.address), test_config(MAX_DATAGRAM_SIZE));
@@ -1585,6 +1603,10 @@ mod tests {
     #[tokio::test]
     async fn packetaddr_ipv6_echo_stamps_the_source() {
         let Some(echo) = try_spawn_echo(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))).await else {
+            assert!(
+                std::env::var_os("BEAM_REQUIRE_IPV6_TESTS").is_none(),
+                "IPv6 loopback unavailable"
+            );
             return;
         };
         let (mut client, task) = start(packetaddr_destination(), test_config(MAX_DATAGRAM_SIZE));
@@ -1603,6 +1625,10 @@ mod tests {
     async fn packetaddr_mixed_families_share_one_session() {
         let v4 = spawn_ipv4_echo().await;
         let Some(v6) = try_spawn_echo(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))).await else {
+            assert!(
+                std::env::var_os("BEAM_REQUIRE_IPV6_TESTS").is_none(),
+                "IPv6 loopback unavailable"
+            );
             return;
         };
         let (mut client, task) = start(packetaddr_destination(), test_config(MAX_DATAGRAM_SIZE));

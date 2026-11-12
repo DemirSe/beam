@@ -134,12 +134,14 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 405 tests: 371 `beam-core`,
-4 `beam` CLI, 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
+a benchmark comparison. The current workspace has 409 tests: 371 `beam-core`,
+8 `beam` CLI, 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 When the IPv4-only Linux client is active, run the workspace checks with
 `sudo systemctl stop beam-client` and restart it afterward: sing-box's
 `auto_redirect` rules reject local IPv6 loopback, so the Rust IPv6 loopback
-tests otherwise fail. The server code and lab/TUN IPv6 coverage are unchanged.
+tests otherwise fail. The IPv6 loopback tests skip when their echo probe fails;
+`BEAM_REQUIRE_IPV6_TESTS=1` makes that a failure, as in the dev-audit Actions
+job. The server code and lab/TUN IPv6 coverage are unchanged.
 The client normalizers have a focused regression test:
 `python3 tests/test_ipv4_only.py`.
 
@@ -549,6 +551,9 @@ bind.
 ## Configuration and limits
 
 Strict TOML sections: `[server]`, `[user]`, `[reality]`, `[log]`, `[limits]`.
+The required `[user].flow` value is `xtls-rprx-vision` for configuration
+compatibility; it does not enforce Vision. The client request selects Vision
+through its VLESS addons, and a request without Vision uses the plain relay.
 Secrets stay outside git. The live profile uses:
 
 | Setting | Default | Production |
