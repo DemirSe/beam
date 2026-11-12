@@ -409,7 +409,7 @@ jobs:
 
       - name: Protocol suite (root, private namespaces)
         if: inputs.suite == 'protocols'
-        timeout-minutes: 25
+        timeout-minutes: 45
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/protocol-out"

@@ -1017,6 +1017,8 @@ run_protocol_suite() {
   # The server's UDP idle clock is 60 s, so a 70 s silence proves whether a
   # client recovers on its own after the flow is torn down.
   run_case "$arm" udp-idle-resume-70s 150 --udp "$udp"
+  # A long quiet tunnel: the client keeps no state for ten minutes, then sends.
+  run_case "$arm" udp-idle-resume-600s 700 --udp "$udp"
   run_case "$arm" dns-udp-200 90 --dns "$dns"
   run_case "$arm" dns-tcp-fallback 90 --dns "$dns"
 

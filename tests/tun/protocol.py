@@ -1243,8 +1243,9 @@ def case_udp_idle_resume(args) -> int:
     retry budget is a FAIL.
 
     With `udp_mode=packetaddr` this exercises the legacy permit path; with XUDP
-    it covers the XUDP session clock. The idle default of 70 s is just past the
-    60 s clock. A cap raised above the idle default makes this case pass
+    it covers the XUDP session clock. The 70 s case sits just past the 60 s
+    clock; the 600 s case covers a long quiet tunnel, where the client has kept
+    no state for minutes. A cap raised above the idle window makes a case pass
     vacuously, so keep them in step.
     """
     started = time.time()
@@ -1325,7 +1326,7 @@ def case_udp_idle_resume(args) -> int:
     }
     return emit(
         args,
-        "udp-idle-resume-70s",
+        args.case,
         first_ok and resume_ok,
         detail,
         metrics,
@@ -1935,7 +1936,7 @@ def build_parser() -> argparse.ArgumentParser:
         item = sub.add_parser(name)
         item.add_argument("--out", default="")
         item.add_argument("--curl", default="curl")
-        item.set_defaults(handler=handler)
+        item.set_defaults(handler=handler, case=name)
         return item
 
     item = common("h2-bulk-8m", case_h2_bulk)
@@ -2003,6 +2004,14 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--idle", type=float, default=70.0)
     item.add_argument("--resume-seconds", type=float, default=15.0)
     item.add_argument("--retry", type=float, default=1.0)
+    item.add_argument("--timeout", type=float, default=2.0)
+    item.add_argument("--size", type=int, default=512)
+
+    item = common("udp-idle-resume-600s", case_udp_idle_resume)
+    item.add_argument("--udp", default="10.10.2.2:9999")
+    item.add_argument("--idle", type=float, default=600.0)
+    item.add_argument("--resume-seconds", type=float, default=30.0)
+    item.add_argument("--retry", type=float, default=2.0)
     item.add_argument("--timeout", type=float, default=2.0)
     item.add_argument("--size", type=int, default=512)
 

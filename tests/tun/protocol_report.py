@@ -49,6 +49,7 @@ REQUIRED_CASES = [
     "udp-multidest-4",
     "udp-alt-source",
     "udp-idle-resume-70s",
+    "udp-idle-resume-600s",
     "dns-udp-200",
     "dns-tcp-fallback",
     "mixed-hol-60s",
@@ -92,6 +93,14 @@ CASE_METRICS = {
     "udp-multidest-4": ("packets", "echoed", "alt_replies", "corrupt"),
     "udp-alt-source": ("packets", "replies", "alt_source", "sources"),
     "udp-idle-resume-70s": (
+        "idle_s",
+        "first_ok",
+        "resume_ok",
+        "resume_ms",
+        "lost_after_idle",
+        "attempts",
+    ),
+    "udp-idle-resume-600s": (
         "idle_s",
         "first_ok",
         "resume_ok",
