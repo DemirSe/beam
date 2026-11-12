@@ -508,6 +508,18 @@ bind.
   receive buffer; a mux holds at most half the global active slots. XUDP idle
   expiry is at most 60 seconds even when the TCP relay idle timeout is 300
   seconds.
+- Legacy/packetaddr UDP holds one stream permit per VLESS `Command::Udp`
+  connection, and the pool equals `max_xudp_sessions` (1024 in the production
+  profile, 256 with the example config); one stream owns one relay socket, or
+  two for packetaddr. The
+  legacy idle clock is capped at 60 seconds like the XUDP one, so an idle flow
+  releases its permit five times sooner than the TCP idle timeout would. The
+  effective clock is `min(idle_timeout_ms, 60 s)`, so a smaller configured
+  value shortens UDP flows too. Legacy relay sockets keep the kernel's default
+  receive buffer; only XUDP requests `xudp_recv_buffer_bytes`. A stub
+  resolver opens one UDP socket per query, so a DNS burst is a burst of streams:
+  it is admitted from this pool and, at the cap, refused as
+  `TlsServerError::LegacyUdpLimited` and counted in `legacy_udp_limited`.
 
 ### TLS stack, cover, and MTU
 

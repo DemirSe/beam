@@ -147,12 +147,19 @@ impl Config {
     /// Checks derived descriptor demand against the service's soft limit.
     ///
     /// The estimate is intentionally conservative: a Vision Direct relay can
-    /// own several duplicated descriptors, and XUDP keeps a socket per active
-    /// session. This catches configurations that pass scalar validation but
-    /// would hit EMFILE under the service's `LimitNOFILE`.
+    /// own several duplicated descriptors, XUDP keeps a socket per active
+    /// session, and a legacy/packetaddr UDP stream keeps one or two relay
+    /// sockets (`beam::legacy_udp_stream_limit` sizes that pool from
+    /// `max_xudp_sessions`). This catches configurations that pass scalar
+    /// validation but would hit EMFILE under the service's `LimitNOFILE`.
     pub fn validate_fd_budget(&self, fd_limit: u64) -> Result<(), ValidationError> {
         let estimated = u64::from(self.limits.max_connections)
             .saturating_mul(12)
+            // XUDP session sockets.
+            .saturating_add(u64::from(self.limits.max_xudp_sessions).saturating_mul(2))
+            // Legacy/packetaddr relay sockets: the pool holds
+            // `max_xudp_sessions` streams, and packetaddr binds one socket per
+            // address family.
             .saturating_add(u64::from(self.limits.max_xudp_sessions).saturating_mul(2))
             .saturating_add(128);
         let safe = fd_limit.saturating_sub(fd_limit / 4).max(1);

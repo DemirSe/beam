@@ -30,6 +30,14 @@ const REPLAY_CAPACITY_PER_CONNECTION: usize = 128;
 const REPLAY_CAPACITY_MIN: usize = 4_096;
 const REPLAY_CAPACITY_MAX: usize = 131_072;
 
+/// Upper bound for the UDP idle clock on both the XUDP and legacy paths.
+///
+/// Xray/sing-box clients close a UDP flow with the TCP stream, not with an `End`
+/// frame, so they keep the stream open for their own UDP NAT timeout (sing-box:
+/// 300 s). The TCP idle timeout therefore overstates how long a UDP flow is
+/// useful, and the permit or session slot it holds outlives the traffic.
+const MAX_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BEAM_GIT_HASH"), ")");
 
 /// Bounds the exact-replay cache for the configured connection pool.
@@ -41,6 +49,24 @@ fn replay_capacity(max_connections: u32) -> usize {
         .unwrap_or(usize::MAX)
         .saturating_mul(REPLAY_CAPACITY_PER_CONNECTION)
         .clamp(REPLAY_CAPACITY_MIN, REPLAY_CAPACITY_MAX)
+}
+
+/// Bounds the legacy/packetaddr VLESS UDP stream pool.
+///
+/// A stub resolver opens one UDP socket per query, and each socket costs one
+/// VLESS stream plus one or two relay sockets, so a burst of short DNS flows is
+/// ordinary traffic on this path. Size the pool from the configured UDP socket
+/// budget (`max_xudp_sessions`) instead of a literal, so compatibility mode is
+/// not refused while the XUDP path is idle.
+fn legacy_udp_stream_limit(max_xudp_sessions: u32) -> usize {
+    usize::try_from(max_xudp_sessions)
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
+/// Caps the UDP idle clock without changing the TCP relay idle timeout.
+fn udp_idle_clock(idle_timeout_ms: u64) -> Duration {
+    Duration::from_millis(idle_timeout_ms).min(MAX_UDP_IDLE_TIMEOUT)
 }
 
 /// High-performance VLESS + REALITY + Vision server.
@@ -163,9 +189,9 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         pipe_size = relay_pipe_size,
         "relay pipe budget"
     );
-    // Legacy/packetaddr UDP is compatibility-only; keep its socket count well
-    // below the XUDP cap because packetaddr binds two sockets per stream.
-    let legacy_udp_permits = Arc::new(Semaphore::new(64));
+    let legacy_udp_permits = Arc::new(Semaphore::new(legacy_udp_stream_limit(
+        config.limits.max_xudp_sessions,
+    )));
 
     let tls_config = Arc::new(
         build_tls_config(&config)?
@@ -185,6 +211,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         max_pending_handshakes,
         max_preauth_per_ip,
         max_xudp_sessions = config.limits.max_xudp_sessions,
+        max_legacy_udp_streams = legacy_udp_stream_limit(config.limits.max_xudp_sessions),
         listen_backlog = config.limits.listen_backlog,
         shutdown_drain_ms = config.limits.shutdown_drain_ms,
         "beam listening"
@@ -477,12 +504,7 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         .clamp(1, usize::from(u16::MAX) + 1);
     let xudp = XudpConfig {
         max_sessions,
-        // Xray/sing-box XUDP clients generally close a flow with the TCP
-        // stream, not an `End` frame. Reusing the 300 s TCP idle timeout lets
-        // stale UDP sessions consume the process-wide global session cap. Cap the UDP
-        // session idle clock independently; the TCP relay timeout is unchanged.
-        session_idle_timeout: Duration::from_millis(config.limits.idle_timeout_ms)
-            .min(Duration::from_secs(60)),
+        session_idle_timeout: udp_idle_clock(config.limits.idle_timeout_ms),
         io_timeout: Duration::from_millis(config.limits.handshake_timeout_ms),
         // A single HTTP/3 body can arrive as hundreds of UDP datagrams while
         // the outer TCP stream drains. Keep a larger bounded reply queue so a
@@ -500,7 +522,9 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         .clamp(1, 65_536);
     let udp = LegacyUdpConfig {
         io_timeout: Duration::from_millis(config.limits.handshake_timeout_ms),
-        idle_timeout: Duration::from_millis(config.limits.idle_timeout_ms),
+        // Same reasoning as XUDP: a retained idle flow must release its stream
+        // permit long before the 300 s TCP idle timeout.
+        idle_timeout: udp_idle_clock(config.limits.idle_timeout_ms),
         max_packetaddr_destinations,
         ..LegacyUdpConfig::default()
     };
@@ -571,6 +595,61 @@ mod tests {
         assert_eq!(replay_capacity(2000), REPLAY_CAPACITY_MAX);
         assert_eq!(replay_capacity(64), 8192);
         assert_eq!(replay_capacity(100), 12800);
+    }
+
+    #[test]
+    fn legacy_udp_streams_follow_the_udp_socket_budget() {
+        assert_eq!(legacy_udp_stream_limit(1024), 1024);
+        assert_eq!(legacy_udp_stream_limit(256), 256);
+        assert_eq!(legacy_udp_stream_limit(0), 1);
+    }
+
+    #[test]
+    fn legacy_pool_admits_the_p1_burst_shape() {
+        // P1 regression: 200 short packetaddr flows (10 sequential plus 190
+        // across 16 workers) were refused at 142/200 by the old literal pool
+        // of 64 permits. Every supported UDP budget must admit 200
+        // concurrently held streams.
+        for budget in [256, 1024] {
+            let pool = Arc::new(Semaphore::new(legacy_udp_stream_limit(budget)));
+            let mut held = Vec::with_capacity(200);
+            for _ in 0..200 {
+                held.push(
+                    Arc::clone(&pool)
+                        .try_acquire_owned()
+                        .expect("P1 burst must fit"),
+                );
+            }
+        }
+        // The pre-fix pool shape refuses the same burst after 64 streams.
+        let old = Arc::new(Semaphore::new(64));
+        let mut held = Vec::new();
+        let mut refused = 0;
+        for _ in 0..200 {
+            match Arc::clone(&old).try_acquire_owned() {
+                Ok(guard) => held.push(guard),
+                Err(_) => refused += 1,
+            }
+        }
+        assert_eq!(refused, 200 - 64);
+    }
+
+    #[test]
+    fn udp_idle_clock_is_capped_below_the_tcp_timeout() {
+        assert_eq!(udp_idle_clock(300_000), MAX_UDP_IDLE_TIMEOUT);
+        assert_eq!(udp_idle_clock(1_000), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_example_config_caps_only_the_udp_idle_clock() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.toml");
+        let config = Config::from_path(path).expect("the example config must load");
+        let tls = build_tls_config(&config).expect("the example config must build");
+        assert_eq!(tls.udp.idle_timeout, MAX_UDP_IDLE_TIMEOUT);
+        assert_eq!(
+            tls.relay_idle_timeout,
+            Duration::from_millis(config.limits.idle_timeout_ms)
+        );
     }
 
     #[test]

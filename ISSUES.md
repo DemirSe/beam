@@ -1,14 +1,13 @@
 # Open issues
 
-Last updated 2026-11-11. Short register; the historical hardening audit is
+Last updated 2026-11-12. Short register; the historical hardening audit is
 [`AUDIT-2026-11-11.md`](AUDIT-2026-11-11.md), and the lifecycle inventory is
 [`STATE-MACHINES.md`](STATE-MACHINES.md).
 
 Nothing here is a known-broken data path: byte integrity, admission bounds, and
-descriptor/memory stability are covered by CI gates. Both I-entries are fixed
-and merged to `main`; they remain listed with the proof and deployment evidence.
-The one open entry (P1) is a compatibility-mode admission bound found by the
-protocol lab, not a data-path or integrity defect.
+descriptor/memory stability are covered by CI gates. Every entry is fixed in
+code; each one stays listed with its proof. P1 was found by the protocol lab and
+is not yet proven there, so its lab run still gates the `main` merge.
 
 ## Summary
 
@@ -16,7 +15,7 @@ protocol lab, not a data-path or integrity defect.
 |---|---|---|---|
 |I1|Replay cache saturates under sustained heavy churn|Fixed on `main`, deployed|resolved|
 |I2|A client restart appeared to be refused as a replay|Fixed on `main`, deployed; same root cause as I1|resolved|
-|P1|Legacy/packetaddr UDP refuses flows above 64 concurrent streams|Open; found by the protocol lab, not fixed here|medium|
+|P1|Legacy/packetaddr UDP refuses flows above a fixed 64-stream pool|Fixed on `dev`; lab confirmation run pending|medium|
 
 ## I1 — replay cache saturates under sustained heavy churn (fixed)
 
@@ -117,7 +116,7 @@ TSVs, server and target logs, qdisc JSON and per-case probes are in each run's
 |[B](https://github.com/DemirSe/beam/actions/runs/43101196768)|xudp|1%|20/20 accepted (18 PASS, 2 WARN)|15 PASS, 2 WARN, 3 FAIL|
 |[C](https://github.com/DemirSe/beam/actions/runs/43103918524)|packetaddr|0%|19/20 accepted (18 PASS, 1 WARN, 1 FAIL)|9 PASS, 2 WARN, 9 FAIL|
 
-### P1 — legacy/packetaddr UDP exhausts a 64-stream permit pool (open)
+### P1 — legacy/packetaddr UDP exhausts a fixed 64-stream permit pool (fixed)
 
 - **Check:** `dns-udp-200` with `udp_mode=packetaddr`; 10 sequential plus 190
   queries across 16 workers.
@@ -138,8 +137,33 @@ TSVs, server and target logs, qdisc JSON and per-case probes are in each run's
   client) sees DNS and QUIC failures after a burst of short UDP flows even
   though each individual flow is correct; it recovers as old flows expire. The
   XUDP path, the production default, is unaffected.
-- **Attribution:** beam. Not fixed in this task (harness-only scope).
+- **Attribution:** beam. Fixed after the harness was merged; see the fix
+  below.
 - **Severity:** medium, compatibility mode only.
+- **Fix (2026-11-12, `dev`):**
+  1. The pool is no longer the literal `64`; `legacy_udp_stream_limit` derives
+     it from `limits.max_xudp_sessions`, the configured UDP socket budget
+     (1024 in the production profile, 256 with the example config). The pool
+     now holds the same number of streams as the XUDP session budget.
+  2. The legacy idle clock is capped at 60 s by `udp_idle_clock`, the same
+     value the XUDP session clock already used, so a permit whose flow has
+     answered is released five times sooner. The TCP relay idle timeout stays
+     at `idle_timeout_ms`.
+  3. `README.md` now documents the cap, the two sockets per packetaddr stream,
+     the 60 s idle clock, and `legacy_udp_limited`.
+  4. `Config::validate_fd_budget` counts the legacy relay sockets; before, it
+     counted only XUDP session sockets.
+  - Unit coverage: `legacy_udp_streams_follow_the_udp_socket_budget` and
+    `udp_idle_clock_is_capped_below_the_tcp_timeout` in
+    `crates/beam/src/main.rs`, plus
+    `the_example_config_caps_only_the_udp_idle_clock`, which pins the wiring
+    into `TlsServerConfig`.
+  - **Confirmation needed:** one `lab-hosted` run with
+    `-f suite=protocols -f udp_mode=packetaddr` must show `dns-udp-200` at
+    200/200 with `legacy_udp_limited=0`, and should add an idle-then-resume
+    flow that stays silent for more than 60 s, to show the 60 s clock does not
+    lose a compatibility flow that a client fails to reopen. Until that run
+    exists, this entry is fixed in code but not proven on the lab.
 
 ### P2 — HTTP/2 origin peak is runner-bound (WARN, no beam signal)
 

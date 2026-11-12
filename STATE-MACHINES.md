@@ -728,16 +728,19 @@ beyond `legacy_udp_limited`.
 `fuzz/fuzz_targets/legacy_udp.rs` target.
 
 **Cross-machine coupling (protocol-lab P1).** The process-wide
-`legacy_udp_permits` semaphore (`beam/src/main.rs:168`, 64 permits) is acquired
-in `tls/server.rs` (`Command::Udp`) and owned by the relay task, so a permit is
-released only when this machine reaches `Idle`/`EOF`/`Error`/`Shutdown` — and
-`Idle` defaults to 300 s. Each machine is internally consistent; the budget is
-a dependency neither one states. The protocol lab measured the consequence on
-2026-11-11: a `packetaddr` DNS burst answered 142/200 queries and recorded 120
-`legacy VLESS UDP stream limit reached` rejections (`legacy_udp_limited`),
-while the same case over XUDP answered 200/200. The budget is a design decision
-(cap, retention, or sharing the XUDP limiter), not a transition bug;
-`ISSUES.md` P1 tracks it.
+`legacy_udp_permits` semaphore is acquired in `tls/server.rs` (`Command::Udp`)
+and owned by the relay task, so a permit is released only when this machine
+reaches `Idle`/`EOF`/`Error`/`Shutdown`. Each machine is internally consistent;
+the admission budget is a dependency neither one states. The protocol lab
+measured the consequence on 2026-11-11: a `packetaddr` DNS burst answered
+142/200 queries and recorded 120 `legacy VLESS UDP stream limit reached`
+rejections (`legacy_udp_limited`), while the same case over XUDP answered
+200/200. Both halves were design decisions, not transition bugs; `ISSUES.md`
+P1 records the fix. The pool now derives from `limits.max_xudp_sessions`
+(`legacy_udp_stream_limit`) instead of a literal 64, and `Idle` is bounded by
+`udp_idle_clock` at 60 s — the same value the XUDP session clock already used —
+so the coupling survives but costs at most 60 s of retention instead of 300 s.
+The TCP relay idle timeout keeps its configured 300 s.
 
 ### 20. Config validation / derived budgets
 
@@ -861,11 +864,13 @@ D8 sub-items, all verified, with the status of each fix:
    next to the live path; the Vision wrapper's prefix composition has no
    in-checkout caller.
 8. **A permit's lifetime is another machine's idle transition.** The legacy/
-   packetaddr UDP permit is released by entry 19's `Idle` exit (300 s), so an
-   admission bound depends on a timeout in a different subsystem. Both machines
-   are correct alone; the coupling is where a burst becomes a refusal
-   (`ISSUES.md` P1). Any future retention change in either place moves the
-   effective admission budget.
+   packetaddr UDP permit is released by entry 19's `Idle` exit, so an admission
+   bound depends on a timeout in a different subsystem. Both machines are
+   correct alone; the coupling is where a burst becomes a refusal
+   (`ISSUES.md` P1, fixed). The pool size and that exit's bound are set in one
+   place but read different config keys (`max_xudp_sessions` and
+   `idle_timeout_ms`), so they are co-located, not coupled: a change to either
+   moves the effective admission budget.
 
 ## Best decision
 
