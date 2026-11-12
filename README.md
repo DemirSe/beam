@@ -571,9 +571,14 @@ headroom, not bulk capacity: the blocking pool has 120 splice permits (about
 60 fully spliced Vision pairs) and falls back to async copy above that.
 
 `--version` embeds the git commit. `--check` validates derived runtime
-configuration. Startup logs include version and configured limits. `SIGHUP`
-is logged and ignored; restart the service to reload. `SIGTERM` stops accepting,
-drains for at most `shutdown_drain_ms`, then bounds runtime shutdown.
+configuration, including a descriptor estimate of
+`max_connections × 12 + max_xudp_sessions × 4 + 128` against 75% of the fd
+limit. The estimate counts both UDP pools, so a configuration near that ceiling
+must lower a limit before it starts.
+
+Startup logs include version and configured limits. `SIGHUP` does not reload
+the service. Restart the service to reload. `SIGTERM` stops accepting, drains
+for at most `shutdown_drain_ms`, then bounds runtime shutdown.
 
 ## Operations
 
