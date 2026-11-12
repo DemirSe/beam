@@ -1298,22 +1298,22 @@ def case_udp_idle_resume(args) -> int:
 
     lost = attempts - 1 if resume_ok else attempts
     if not first_ok:
-        detail = f"the datagram before the {args.idle:.0f}s idle window was lost"
+        detail = f"the datagram before the {args.idle:g}s idle window was lost"
     elif resume_ok:
         detail = (
-            f"{args.idle:.0f}s idle, then echoed after {attempts} datagram(s) "
+            f"{args.idle:g}s idle, then echoed after {attempts} datagram(s) "
             f"in {resume_ms:.0f}ms"
         )
     else:
         detail = (
-            f"{args.idle:.0f}s idle, no echo from {attempts} datagram(s) "
-            f"within {args.resume_seconds:.0f}s"
+            f"{args.idle:g}s idle, no echo from {attempts} datagram(s) "
+            f"within {args.resume_seconds:g}s"
         )
     warnings: list[str] = []
     if first_ok and resume_ok and lost:
         warnings.append(
-            f"the flow was torn down during the idle window; recovery cost "
-            f"{lost} lost datagram(s)"
+            f"{lost} post-idle datagram(s) went unanswered before the recovery "
+            "(the server tears the flow down, or the link dropped them)"
         )
     metrics = {
         "idle_s": round(args.idle, 1),
