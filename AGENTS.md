@@ -41,6 +41,23 @@ cargo test --workspace
 Hot-path changes also require a benchmark comparison. Parser changes also
 require the relevant fuzz target to run locally.
 
+## Branch and release workflow
+
+- Do all development on `dev`. `main` holds production code.
+- Only the repository owner merges into `main`. Do not merge `dev` into `main`
+  without explicit owner approval and the required green tests.
+- Run lab, TUN, stress, bench, and protocol campaigns on GitHub Actions, not
+  locally. Dispatch them with `gh workflow run lab-hosted.yml ...`.
+- Locally, run only the short isolated checks: the three commands in
+  "Verification before every commit" and the report contract tests in
+  `make test`.
+- A check that needs root, a TUN device, netem, pinned tool binaries, or a long
+  wall-clock window belongs to Actions. Do not add it to the local loop.
+- If a local check cannot pass because of the host itself (for example, no IPv6
+  for a loopback test), record the exact failing test names in the report and
+  require the matching Actions job to pass before the merge. Do not skip a check
+  silently and do not merge a red check without that evidence.
+
 ## Architecture boundaries
 
 - `beam`: process lifecycle, CLI, config loading, logging, signal handling.
@@ -63,8 +80,8 @@ docs(scope): record the single-user constraint
 test(vision): cover padding flush
 ```
 
-Keep each commit focused on one concern. `main` must always build and pass the
-verification commands above.
+Keep each commit focused on one concern. `dev` and `main` must always build and
+pass the verification commands above.
 
 ## Security
 
