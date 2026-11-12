@@ -163,10 +163,11 @@ attached as evidence instead.
 
 - XUDP and legacy UDP travel inside the VLESS TCP stream, so 1% link loss is
   retransmitted rather than dropped: `udp-realtime-1200` still reports 0% loss
-  at 1% netem loss, while its p95 rises from ~0.65 s to ~1.06 s and DNS retries
-  raise p95 from ~0.77 s to ~1.50 s. Loss on this path shows up as latency, and
-  as slower bulk transfers (the 8 MiB HTTP/2 transfer went from ~3.5 s to
-  ~82 s at 1% loss).
+  in run B, while its p95 moves from 654 ms (run A) to 713 ms and DNS retries
+  push p95 from 791 ms to 1,506 ms. Loss on this path shows up as latency and
+  as slower bulk transfers: the 8 MiB HTTP/2 transfer took 3.3 s in run A and
+  45.6 s in run B, the 8 MiB HTTP/3 transfer 3.9 s and 58.9 s, and the 8 MiB
+  TCP echo 3.3 s and 73.8 s.
 - A multi-destination UDP burst is retarget-sensitive in sing-box: with 75
   packets to three echo ports plus 25 to an alternate-source port in one burst,
   both arms lose the tail of the last destination (64/75 echoes). The case now
