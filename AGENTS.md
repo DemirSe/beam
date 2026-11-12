@@ -30,6 +30,27 @@ supervision.
   PR description.
 - Update the relevant document when a decision or behavior changes.
 
+## Agent workflow and evidence
+
+- Before substantive work, state the intended change, verification and success
+  criteria briefly. Report each relevant check as passed, failed, pending or
+  not tested, with the tested commit and Actions run where applicable. Scale
+  the detail to the task; a small edit does not need a formal table.
+- Separate observations from assumptions and conclusions. Do not claim that
+  untested behavior is proven; state what remains unverified. Report failed
+  gates as failed even when an interpretation suggests another explanation.
+- Independent review is only started at the owner's request, using the model
+  and reasoning level specified by the owner. For risky changes, the owner may
+  request it before an implementation decision. Ask the reviewer to challenge
+  assumptions, user-visible effects and whether the tests prove the claims.
+- When work is delegated in parallel, assign non-overlapping file ownership
+  or make a task read-only. If changes overlap, designate one agent to combine
+  them and verify the result.
+- Present consequential decisions early and briefly: options, user impact,
+  tradeoffs and missing evidence. Continue already authorized routine work,
+  including Actions dispatches, without asking again; preserve the owner's
+  approval requirement for merging into `main`.
+
 ## Verification before every commit
 
 ```bash
@@ -48,6 +69,10 @@ require the relevant fuzz target to run locally.
   without explicit owner approval and the required green tests.
 - Run lab, TUN, stress, bench, and protocol campaigns on GitHub Actions, not
   locally. Dispatch them with `gh workflow run lab-hosted.yml ...`.
+- Record the commit, purpose and success criteria for each Actions run. If a
+  push cancels or supersedes a run, verify that its replacement covers the
+  same requirements. Reuse applicable evidence when later changes do not
+  affect it; do not claim that an earlier run tested a later commit.
 - Locally, run only the short isolated checks: the three commands in
   "Verification before every commit" and the report contract tests in
   `make test`.
