@@ -44,6 +44,10 @@ def _case(name: str, **overrides) -> dict:
         "warnings": [],
         "detail": f"{name} passed",
     }
+    if name == "restart-recovery":
+        case["metrics"].update(
+            old_pid=100, new_pid=200, old_reaped=True, post_restart_hash_ok=True
+        )
     case.update(overrides)
     return case
 
@@ -169,6 +173,39 @@ class ValidatorTests(unittest.TestCase):
         code, output = self._validate(self._write(payload))
         self.assertEqual(code, 0, output)
 
+    def test_unreaped_restart_fails(self) -> None:
+        payload = _valid_report()
+        index = report.REQUIRED_CASES.index("restart-recovery")
+        payload["cases"][index]["metrics"]["old_reaped"] = False
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("restart-recovery: the old process was not reaped", output)
+
+    def test_reused_pid_fails(self) -> None:
+        payload = _valid_report()
+        index = report.REQUIRED_CASES.index("restart-recovery")
+        payload["cases"][index]["metrics"]["new_pid"] = 100
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("restart-recovery: the old and new pid are identical", output)
+
+    def test_failed_post_restart_transfer_fails(self) -> None:
+        payload = _valid_report()
+        index = report.REQUIRED_CASES.index("restart-recovery")
+        payload["cases"][index]["metrics"]["post_restart_hash_ok"] = False
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("restart-recovery: the post-restart transfer did not verify", output)
+
+    def test_unknown_case_fails(self) -> None:
+        payload = _valid_report()
+        unknown = _case("h2-bulk-8m")
+        unknown["name"] = "h4-bulk-8m"
+        payload["cases"].append(unknown)
+        code, output = self._validate(self._write(payload))
+        self.assertEqual(code, 1)
+        self.assertIn("unknown case h4-bulk-8m", output)
+
     def test_missing_metric_fails(self) -> None:
         payload = _valid_report()
         case = payload["cases"][0]
@@ -213,6 +250,59 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("h2-bulk-8m", output)
         self.assertIn("beam", output)
+
+
+protocol = _load("protocol_driver", ROOT / "tests" / "tun" / "protocol.py")
+
+
+class AccountingTests(unittest.TestCase):
+    """One outcome rule for every mixed-case unit."""
+
+    def _counts(self) -> dict:
+        return {"x_completed": 0, "x_invalid": 0}
+
+    def test_outcome_rule(self) -> None:
+        counts = self._counts()
+        protocol.apply_outcome(counts, "x_completed", protocol.Outcome.OK)
+        self.assertEqual(counts, {"x_completed": 1, "x_invalid": 0})
+        protocol.apply_outcome(counts, "x_completed", protocol.Outcome.INVALID)
+        self.assertEqual(counts, {"x_completed": 2, "x_invalid": 1})
+        protocol.apply_outcome(counts, "x_completed", protocol.Outcome.INCOMPLETE)
+        self.assertEqual(counts, {"x_completed": 2, "x_invalid": 1})
+
+    def test_tcp_transfer_classification(self) -> None:
+        self.assertIs(protocol.tcp_unit_outcome({"ok": True, "errors": []}), protocol.Outcome.OK)
+        # A complete echo whose bytes differ is a correctness failure.
+        self.assertIs(
+            protocol.tcp_unit_outcome({"ok": False, "errors": []}), protocol.Outcome.INVALID
+        )
+        # An error, timeout or early close never produced a verdict.
+        self.assertIs(
+            protocol.tcp_unit_outcome({"ok": False, "errors": ["recv: timed out"]}),
+            protocol.Outcome.INCOMPLETE,
+        )
+
+    def test_aggregate_keeps_completed_invalid_incomplete_distinct(self) -> None:
+        counts = {"x_completed": 0, "x_invalid": 0}
+        outcomes = [
+            protocol.Outcome.OK,
+            protocol.Outcome.OK,
+            protocol.Outcome.INVALID,
+            protocol.Outcome.INCOMPLETE,
+        ]
+        for outcome in outcomes:
+            protocol.apply_outcome(counts, "x_completed", outcome)
+        self.assertEqual(counts, {"x_completed": 3, "x_invalid": 1})
+        self.assertEqual(len(outcomes) - counts["x_completed"], 1)
+
+    def test_udp_sequence_outcomes(self) -> None:
+        sent = {0: b"a", 1: b"b", 2: b"c"}
+        outcomes = protocol.sequence_outcomes(sent, {0, 2}, {1})
+        self.assertEqual(
+            outcomes, [protocol.Outcome.OK, protocol.Outcome.INVALID, protocol.Outcome.OK]
+        )
+        # An unanswered sequence is incomplete, not invalid.
+        self.assertIs(protocol.sequence_outcomes({3: b"d"}, set(), set())[0], protocol.Outcome.INCOMPLETE)
 
 
 class LatticeTests(unittest.TestCase):

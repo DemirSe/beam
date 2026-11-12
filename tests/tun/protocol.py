@@ -71,6 +71,44 @@ class Outcome(enum.Enum):
     INCOMPLETE = "incomplete"
 
 
+def apply_outcome(counts: dict[str, int], key: str, outcome: Outcome) -> None:
+    """Apply one unit outcome to a counter map; the caller holds the lock.
+
+    OK and INVALID units completed; INVALID also increments the matching
+    ``<class>_invalid`` counter. INCOMPLETE units are not completed.
+    """
+    if outcome is Outcome.INCOMPLETE:
+        return
+    counts[key] += 1
+    if outcome is Outcome.INVALID:
+        counts[key.replace("_completed", "_invalid")] += 1
+
+
+def tcp_unit_outcome(result: dict) -> Outcome:
+    """Classify one echo transfer.
+
+    A complete echo with wrong bytes is INVALID; an error, timeout or early
+    close is INCOMPLETE because the transfer never produced a verdict.
+    """
+    if result.get("ok"):
+        return Outcome.OK
+    return Outcome.INCOMPLETE if result.get("errors") else Outcome.INVALID
+
+
+def sequence_outcomes(
+    sent: dict[int, bytes], verified: set[int], corrupt: set[int]
+) -> list[Outcome]:
+    """Per-sequence UDP outcomes: verified, corrupt, or unanswered."""
+    return [
+        Outcome.OK
+        if sequence in verified
+        else Outcome.INVALID
+        if sequence in corrupt
+        else Outcome.INCOMPLETE
+        for sequence in sent
+    ]
+
+
 def log(message: str) -> None:
     print(f"protocol: {message}", file=sys.stderr, flush=True)
 
@@ -1449,11 +1487,7 @@ def case_mixed(args) -> int:
 
     def record(key: str, outcome: Outcome = Outcome.OK) -> None:
         with lock:
-            if outcome is Outcome.INCOMPLETE:
-                return
-            counts[key] += 1
-            if outcome is Outcome.INVALID:
-                counts[key.replace("_completed", "_invalid")] += 1
+            apply_outcome(counts, key, outcome)
 
     def h2_worker() -> None:
         url = f"https://{args.https}/?bytes={args.h2_bytes}"
@@ -1562,11 +1596,12 @@ def case_mixed(args) -> int:
         sock.setblocking(False)
         barrier.wait()
         sent: dict[int, bytes] = {}
-        completed: set[int] = set()
-        wrong = 0
+        verified: set[int] = set()
+        corrupt: set[int] = set()
+        stray = 0
 
         def drain(until: float) -> None:
-            nonlocal wrong
+            nonlocal stray
             while True:
                 remaining = until - time.monotonic()
                 if remaining <= 0:
@@ -1579,13 +1614,13 @@ def case_mixed(args) -> int:
                 except OSError:
                     return
                 if len(data) < UDP_HEADER:
-                    wrong += 1
+                    stray += 1
                     continue
                 (sequence,) = struct.unpack("!I", data[:UDP_HEADER])
                 if sent.get(sequence) == data:
-                    completed.add(sequence)
+                    verified.add(sequence)
                 elif sequence in sent:
-                    wrong += 1
+                    corrupt.add(sequence)
 
         try:
             while time.monotonic() < deadline and len(sent) < 10 * duration:
@@ -1608,11 +1643,15 @@ def case_mixed(args) -> int:
             sock.close()
         with lock:
             counts["udp_sent"] += len(sent)
-            # Tri-state split for the echo phase: a verified sequence is OK, a
-            # wrong payload is INVALID (completed + invalid), and a sequence
-            # with no reply is INCOMPLETE (neither counter).
-            counts["udp_completed"] += len(completed)
-            counts["udp_invalid"] += wrong
+            # One outcome per sent sequence, through the same rule as every
+            # other unit: verified -> OK, wrong payload -> INVALID (completed
+            # and invalid, counted once even if the payload repeats), no reply
+            # -> INCOMPLETE (neither counter). A datagram too short to carry a
+            # sequence number is an unattributable INVALID unit.
+            for outcome in sequence_outcomes(sent, verified, corrupt):
+                apply_outcome(counts, "udp_completed", outcome)
+            for _ in range(stray):
+                apply_outcome(counts, "udp_completed", Outcome.INVALID)
 
     def dns_worker() -> None:
         per_worker = max(1, counts["dns_planned"] // 5)
@@ -1635,7 +1674,7 @@ def case_mixed(args) -> int:
         payload = payload[: args.tcp_bytes]
         barrier.wait()
         outcome = _tcp_echo(payload, host, port, timeout=90.0, chunk=1 << 20)
-        record("tcp_completed", Outcome.OK if outcome["ok"] else Outcome.INVALID)
+        record("tcp_completed", tcp_unit_outcome(outcome))
         if not outcome["ok"]:
             with lock:
                 errors.append("tcp: " + "; ".join(outcome["errors"][:2] or ["hash mismatch"]))

@@ -517,9 +517,9 @@ measure_baseline_rtt() {
 # Server lifecycle
 #
 # One active server owns SERVER_PID/SERVER_LOG/SERVER_KIND. Transitions are
-# validated so a restart cannot run in the wrong phase or from a command
-# substitution that would lose the new pid: a lost-state restart was the first
-# harness defect the protocol lab found.
+# validated, and the restart is invoked directly from the main shell: a command
+# substitution forks the state, which is how the first harness defect the lab
+# found lost the new pid. The state check cannot detect a subshell by itself.
 # ---------------------------------------------------------------------------
 
 server_require() {
@@ -530,9 +530,11 @@ server_require() {
   fi
 }
 
-# server_start beam|xray: none/stopped -> starting -> running|failed.
+# server_start beam|xray [mark]: none/stopped -> starting -> running|failed.
+# A byte mark makes readiness mean "a listening line after this offset", so a
+# restarted process cannot pass on the previous process's message.
 server_start() {
-  local kind=$1
+  local kind=$1 mark=${2:-} ready=1
   case "$SERVER_STATE" in
     none|stopped) ;;
     *)
@@ -548,7 +550,12 @@ server_start() {
       >> "$BEAM_LOG" 2>&1 &
     BEAM_PID=$!
     SERVER_PID=$BEAM_PID
-    if wait_for_log "$BEAM_LOG" "beam listening" "$BEAM_PID" 15; then
+    if [ -n "$mark" ]; then
+      wait_for_marker_after "$BEAM_LOG" "$mark" "beam listening" "$BEAM_PID" 15 || ready=0
+    else
+      wait_for_log "$BEAM_LOG" "beam listening" "$BEAM_PID" 15 || ready=0
+    fi
+    if [ "$ready" = "1" ]; then
       SERVER_STATE=running
       return 0
     fi
@@ -614,17 +621,17 @@ server_restart() {
     fi
     sleep 0.1
   done
+  if [ "$reaped" != "1" ]; then
+    # SIGTERM within the window is what old_reaped reports; escalate so a
+    # server that ignores TERM cannot block the harness in wait forever.
+    kill -KILL "$old_pid" 2>/dev/null || true
+  fi
   wait "$old_pid" 2>/dev/null || true
   mark=$(wc -c < "$log" 2>/dev/null || echo 0)
   SERVER_STATE=stopped
   SERVER_PID=""
-  if ! server_start "$kind"; then
+  if ! server_start "$kind" "$mark"; then
     fail_harness "the restarted $kind process did not start"
-    return 1
-  fi
-  if [ "$kind" = "beam" ] \
-    && ! wait_for_marker_after "$log" "$mark" "beam listening" "$SERVER_PID" 15; then
-    fail_harness "the restarted beam process produced no new listening line"
     return 1
   fi
   new_pid=$SERVER_PID

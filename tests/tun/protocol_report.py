@@ -151,6 +151,26 @@ def _number(value: str):
         return value
 
 
+def restart_problems(metrics: dict) -> list[str]:
+    """Restart evidence must show a replaced, reaped process and a working path.
+
+    Presence alone is not enough: a report where the old process survived, the
+    pid was reused, or the post-restart transfer failed is not a restart pass.
+    """
+    problems: list[str] = []
+    if metrics.get("old_reaped") is not True:
+        problems.append("restart-recovery: the old process was not reaped")
+    old_pid = metrics.get("old_pid")
+    new_pid = metrics.get("new_pid")
+    if type(old_pid) is not int or type(new_pid) is not int or old_pid <= 0 or new_pid <= 0:
+        problems.append("restart-recovery: pid evidence is missing or invalid")
+    elif old_pid == new_pid:
+        problems.append("restart-recovery: the old and new pid are identical")
+    if metrics.get("post_restart_hash_ok") is not True:
+        problems.append("restart-recovery: the post-restart transfer did not verify")
+    return problems
+
+
 def compute_complete(
     missing: list[str], duplicates: list[str], harness_complete: bool
 ) -> bool:
@@ -269,6 +289,8 @@ def check_report(report: dict, require_arm: str | None = None) -> list[str]:
             continue
         if name in by_name:
             problems.append(f"duplicate case {name}")
+        if name not in REQUIRED_CASES:
+            problems.append(f"unknown case {name}")
         by_name[name] = case
 
     for name in REQUIRED_CASES:
@@ -296,6 +318,8 @@ def check_report(report: dict, require_arm: str | None = None) -> list[str]:
             problems.append(
                 f"{name}: completed {case.get('completed')} != planned {case.get('planned')}"
             )
+        if name == "restart-recovery":
+            problems.extend(restart_problems(metrics))
     return problems
 
 
@@ -321,6 +345,8 @@ def attribution(beam: dict, control: dict | None) -> list[tuple[str, str, str, s
             owner = "target/harness first"
         elif beam_status in ("WARN", "INFO") and control_status == "PASS":
             owner = "beam (quality)"
+        elif beam_status in ("WARN", "INFO") and control_status == "FAIL":
+            owner = "xray/control"
         elif beam_status in ("WARN", "INFO"):
             owner = "shared/client"
         elif beam_status == "PASS" and control_status != "PASS":
