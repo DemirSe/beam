@@ -727,6 +727,18 @@ beyond `legacy_udp_limited`.
 `dropped_packetaddr_replies_do_not_refresh_idle_clock` (1353), and the
 `fuzz/fuzz_targets/legacy_udp.rs` target.
 
+**Cross-machine coupling (protocol-lab P1).** The process-wide
+`legacy_udp_permits` semaphore (`beam/src/main.rs:168`, 64 permits) is acquired
+in `tls/server.rs` (`Command::Udp`) and owned by the relay task, so a permit is
+released only when this machine reaches `Idle`/`EOF`/`Error`/`Shutdown` — and
+`Idle` defaults to 300 s. Each machine is internally consistent; the budget is
+a dependency neither one states. The protocol lab measured the consequence on
+2026-11-11: a `packetaddr` DNS burst answered 142/200 queries and recorded 120
+`legacy VLESS UDP stream limit reached` rejections (`legacy_udp_limited`),
+while the same case over XUDP answered 200/200. The budget is a design decision
+(cap, retention, or sharing the XUDP limiter), not a transition bug;
+`ISSUES.md` P1 tracks it.
+
 ### 20. Config validation / derived budgets
 
 **States.** Read → TOML (`deny_unknown_fields`) → semantic validation →
@@ -848,6 +860,12 @@ D8 sub-items, all verified, with the status of each fix:
 7. **Dead handoff APIs are a reading trap.** Four production-dead primitives sit
    next to the live path; the Vision wrapper's prefix composition has no
    in-checkout caller.
+8. **A permit's lifetime is another machine's idle transition.** The legacy/
+   packetaddr UDP permit is released by entry 19's `Idle` exit (300 s), so an
+   admission bound depends on a timeout in a different subsystem. Both machines
+   are correct alone; the coupling is where a burst becomes a refusal
+   (`ISSUES.md` P1). Any future retention change in either place moves the
+   effective admission budget.
 
 ## Best decision
 
