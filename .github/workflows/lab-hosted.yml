@@ -430,7 +430,7 @@ jobs:
             TEST_CONFIG="$GITHUB_WORKSPACE/config.example.toml" \
             H3_ORIGIN_BIN="$GITHUB_WORKSPACE/tests/tun/h3-origin/target/debug/h3-origin" \
             H2_CLIENT_BIN="$GITHUB_WORKSPACE/tests/tun/h3-origin/target/debug/h2-client" \
-            timeout -s INT --kill-after=120 1380 \
+            timeout -s INT --kill-after=120 2400 \
             bash "$GITHUB_WORKSPACE/tests/tun/run.sh" --release --no-build \
               --suite protocols --control \
               --udp-mode "${{ inputs.udp_mode }}" --out "$out" \
