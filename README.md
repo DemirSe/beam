@@ -510,11 +510,12 @@ bind.
   seconds.
 - Legacy/packetaddr UDP holds one stream permit per VLESS `Command::Udp`
   connection, and the pool equals `max_xudp_sessions` (1024 in the production
-  profile, 256 with the example config); one stream owns one relay socket, or
-  two for packetaddr. The
-  legacy idle clock is capped at 60 seconds like the XUDP one, so an idle flow
-  releases its permit five times sooner than the TCP idle timeout would. The
-  effective clock is `min(idle_timeout_ms, 60 s)`, so a smaller configured
+  profile, 256 with the example config); a stream owns one relay socket, or up
+  to two in packetaddr mode when both address families bind. The
+  legacy idle clock is capped at 60 seconds like the XUDP one, so with the
+  documented 300 s `idle_timeout_ms` an idle flow releases its permit five times
+  sooner than the TCP relay would; a send or an admitted reply resets the clock.
+  The effective clock is `min(idle_timeout_ms, 60 s)`, so a smaller configured
   value shortens UDP flows too. Legacy relay sockets keep the kernel's default
   receive buffer; only XUDP requests `xudp_recv_buffer_bytes`. A stub
   resolver opens one UDP socket per query, so a DNS burst is a burst of streams:
@@ -572,9 +573,11 @@ headroom, not bulk capacity: the blocking pool has 120 splice permits (about
 
 `--version` embeds the git commit. `--check` validates derived runtime
 configuration, including a descriptor estimate of
-`max_connections × 12 + max_xudp_sessions × 4 + 128` against 75% of the fd
-limit. The estimate counts both UDP pools, so a configuration near that ceiling
-must lower a limit before it starts.
+`max_connections × 12 + max_xudp_sessions × 4 + 128` against 75% (integer
+division) of the larger of the process soft fd limit and 65536. The estimate
+counts both UDP pools, so a configuration near that ceiling must lower a limit
+before it starts. The example config needs 13,440 descriptors and the
+production profile 16,512, against a 49,152 threshold.
 
 Startup logs include version and configured limits. `SIGHUP` does not reload
 the service. Restart the service to reload. `SIGTERM` stops accepting, drains
@@ -991,19 +994,22 @@ UDP/XUDP, DNS over UDP and TCP, TCP echo, mixed load, idle and restart) through
 the same sing-box -> beam full-TUN path under netem. `udp-idle-resume-70s` holds
 one UDP flow silent for 70 s, past the 60 s server idle clock, and then requires
 the client to recover within 15 s; recovery after lost datagrams is a WARN, no
-recovery is a FAIL. `udp-idle-resume-600s` repeats it after ten quiet minutes.
+recovery is a FAIL. `udp-idle-resume-600s` repeats it after ten quiet minutes
+with a 30 s recovery budget.
 Both cases report the source port the target saw before and after the idle
 window, so the report says whether recovery reused the client mapping or made a
 new one. Recovery normally makes a new one: the legacy/packetaddr framing has no
-flow identifier, so the client source port a target sees cannot be preserved
-across a teardown without a wire change. It writes
+flow identifier, so a reconnecting stream cannot be reattached unambiguously to
+a retained socket. Heuristic reattachment was rejected (`ISSUES.md` P1); a
+wire-level identifier would be a protocol change. It writes
 `protocol-report-beam.json` and a stock-Xray control report; the beam report is
 the gate and the control report is diagnostic. Each report records the qdisc
 evidence, both baseline RTTs and the per-case metrics, and the acceptance step
 re-runs `tests/tun/test_protocol_report.py` so a truncated, incomplete,
 duplicated or FAIL-carrying report cannot pass. The same campaign runs locally
 with `bash tests/tun/run.sh --suite protocols` plus `TUN_RTT_MS` and
-`TUN_LOSS_PCT`; it needs root (or `TUN_ALLOW_ROOT=1`) and a prebuilt h3-origin
+`TUN_LOSS_PCT`; by default it needs an unprivileged user namespace, and
+`TUN_ALLOW_ROOT=1` needs real host root. It also needs a prebuilt h3-origin
 and h2-client helper.
 
 The runner is shared and the four vCPUs are all assigned to roles, so these are

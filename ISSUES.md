@@ -131,7 +131,7 @@ TSVs, server and target logs, qdisc JSON and per-case probes are in each run's
   300 s. glibc's stub resolver opens a new UDP socket per query, so a modest
   query rate (a few new flows per second) exhausts the 64 permits within
   seconds, and refusals continue until the older flows idle out. Neither the cap
-  nor its retention is documented in `README.md`.
+  nor its retention was documented in `README.md` before this fix.
 - **User impact:** a client using `packet_encoding=packetaddr` (or a legacy
   client) sees DNS and QUIC failures after a burst of short UDP flows even
   though each individual flow is correct; it recovers as old flows expire. The
@@ -145,9 +145,11 @@ TSVs, server and target logs, qdisc JSON and per-case probes are in each run's
      (1024 in the production profile, 256 with the example config). The pool
      now holds the same number of streams as the XUDP session budget.
   2. The legacy idle clock is capped at 60 s by `udp_idle_clock`, the same
-     value the XUDP session clock already used, so a permit whose flow has
-     answered is released five times sooner. The TCP relay idle timeout stays
-     at `idle_timeout_ms`.
+     value the XUDP session clock already used. With the documented 300 s
+     `idle_timeout_ms`, a permit is therefore released five times sooner than
+     the TCP relay would release it; a send or an admitted reply resets the
+     clock, so only a genuinely quiet flow is reclaimed. The TCP relay idle
+     timeout stays at `idle_timeout_ms`.
   3. `README.md` now documents the cap, the two sockets per packetaddr stream,
      the 60 s idle clock, and `legacy_udp_limited`.
   4. `Config::validate_fd_budget` counts the legacy relay sockets; before, it
@@ -170,8 +172,8 @@ TSVs, server and target logs, qdisc JSON and per-case probes are in each run's
     200/200, `udp-idle-resume-70s` PASS after one post-idle datagram echoed in
     753 ms, `legacy_udp_limited=0`, `max_legacy_udp_streams=256`, and the suite
     was 20 PASS, 1 WARN (`h2-multiplex-16`, runner-bound), 0 FAIL, 21 cases.
-    The 60 s clock therefore costs this traffic class nothing: the client
-    reopened the flow by itself and its first datagram was answered.
+    For this traffic class the clock cost no datagram: the client reopened the
+    flow by itself and its first post-idle datagram was answered.
   - **Source-port measurement (run
     [43270220607](https://github.com/DemirSe/beam/actions/runs/43270220607),
     `2867f4a`):** both idle cases recovered on their first post-idle datagram
@@ -188,9 +190,9 @@ TSVs, server and target logs, qdisc JSON and per-case probes are in each run's
     reviewed by Sol and the code owner): do not implement heuristic
     reattachment. A flow that pins the client source port and stays silent past
     the idle clock therefore sees a new session. WireGuard and quiet QUIC
-    sessions are expected to survive, because recovery is the same socket path
-    the XUDP clock already uses, but no lab case has tested a real WireGuard
-    endpoint: treat that as unproven, not as tested.
+    sessions are expected to survive, because the reopen rides the client's
+    next datagram and needs no server-side state, but no lab case has tested a
+    real WireGuard endpoint: treat that as unproven, not as tested.
 
 ### P2 — HTTP/2 origin peak is runner-bound (WARN, no beam signal)
 
