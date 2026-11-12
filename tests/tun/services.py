@@ -165,6 +165,25 @@ def _udp_loop(sock: socket.socket, label: str, echo: bool) -> None:
             request_log(f"{label} received {len(data)} bytes from {peer}: {data[:16].hex()}")
 
 
+def _udp_source_port_loop(sock: socket.socket, label: str) -> None:
+    """Echo each datagram and append the source port the target observed.
+
+    The idle-resume case needs the client's source port, not the target's, to
+    tell whether a torn-down flow came back as a new mapping.
+    """
+    log(f"{label} listening on {sock.getsockname()}")
+    while True:
+        try:
+            data, peer = sock.recvfrom(65535)
+        except OSError as error:
+            log(f"{label} stopped: {error}")
+            return
+        try:
+            sock.sendto(data + struct.pack("!H", peer[1]), peer)
+        except OSError as error:
+            log(f"{label} send to {peer} failed: {error}")
+
+
 def _dns_question(query: bytes):
     if len(query) < 12:
         return None
@@ -409,6 +428,11 @@ def main() -> int:
         help="optional UDP listen address that replies from another source port",
     )
     parser.add_argument(
+        "--udp-source-port",
+        default="",
+        help="optional UDP listen address that echoes the observed source port",
+    )
+    parser.add_argument(
         "--udp-extra",
         action="append",
         default=[],
@@ -464,6 +488,17 @@ def main() -> int:
 
     dns_sock = _bind_udp(dns_host, dns_port)
     threads.append(threading.Thread(target=_dns_loop, args=(dns_sock,), daemon=True))
+
+    if args.udp_source_port:
+        source_host, source_port = split(args.udp_source_port)
+        source_sock = _bind_udp(source_host, source_port)
+        threads.append(
+            threading.Thread(
+                target=_udp_source_port_loop,
+                args=(source_sock, "udp-source-port"),
+                daemon=True,
+            )
+        )
 
     if args.udp6:
         udp6_host, udp6_port = split(args.udp6)

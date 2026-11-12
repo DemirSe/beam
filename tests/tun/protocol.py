@@ -1247,6 +1247,11 @@ def case_udp_idle_resume(args) -> int:
     clock; the 600 s case covers a long quiet tunnel, where the client has kept
     no state for minutes. A cap raised above the idle window makes a case pass
     vacuously, so keep them in step.
+
+    The target appends the source port it observed, so the report says whether
+    recovery reused the mapping or made a new one. Point `--udp` at the
+    `services.py --udp-source-port` listener; a plain echo target fails this
+    case by contract.
     """
     started = time.time()
     host, port = split_addr(args.udp)
@@ -1254,12 +1259,13 @@ def case_udp_idle_resume(args) -> int:
     sock = socket.socket(family(host), socket.SOCK_DGRAM)
     sock.setblocking(False)
 
-    def await_echo(sequence: int, budget: float) -> bool:
+    def await_echo(sequence: int, budget: float) -> int | None:
+        """Return the source port the target saw, or None when no valid echo came."""
         deadline = time.monotonic() + budget
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return False
+                return None
             ready, _, _ = select.select([sock], [], [], min(remaining, 0.05))
             if not ready:
                 continue
@@ -1267,19 +1273,27 @@ def case_udp_idle_resume(args) -> int:
                 data, _ = sock.recvfrom(65535)
             except OSError:
                 continue
-            if len(data) < UDP_HEADER:
+            if len(data) < UDP_HEADER + 2:
                 continue
             (got,) = struct.unpack("!I", data[:UDP_HEADER])
-            if got == sequence and data == _payload(got, len(data)):
-                return True
+            if got != sequence:
+                continue
+            body = data[:-2]
+            if body != _payload(got, len(body)):
+                continue
+            return struct.unpack("!H", data[-2:])[0]
 
     first_ok = False
     resume_ok = False
+    first_port = 0
+    resume_port = 0
     attempts = 0
     resume_ms = 0.0
     try:
         sock.sendto(_payload(0, args.size), peer)
-        first_ok = await_echo(0, args.timeout)
+        port = await_echo(0, args.timeout)
+        first_ok = port is not None
+        first_port = port or 0
         time.sleep(args.idle)
         resume_started = time.monotonic()
         deadline = resume_started + args.resume_seconds
@@ -1287,8 +1301,10 @@ def case_udp_idle_resume(args) -> int:
         while True:
             attempts += 1
             sock.sendto(_payload(sequence, args.size), peer)
-            if await_echo(sequence, args.retry):
+            port = await_echo(sequence, args.retry)
+            if port is not None:
                 resume_ok = True
+                resume_port = port
                 resume_ms = (time.monotonic() - resume_started) * 1000.0
                 break
             sequence += 1
@@ -1298,12 +1314,13 @@ def case_udp_idle_resume(args) -> int:
         sock.close()
 
     lost = attempts - 1 if resume_ok else attempts
+    source_port_changed = bool(first_ok and resume_ok and first_port != resume_port)
     if not first_ok:
         detail = f"the datagram before the {args.idle:g}s idle window was lost"
     elif resume_ok:
         detail = (
             f"{args.idle:g}s idle, then echoed after {attempts} datagram(s) "
-            f"in {resume_ms:.0f}ms"
+            f"in {resume_ms:.0f}ms, source port {first_port} -> {resume_port}"
         )
     else:
         detail = (
@@ -1323,6 +1340,9 @@ def case_udp_idle_resume(args) -> int:
         "resume_ms": round(resume_ms, 1),
         "lost_after_idle": lost,
         "attempts": attempts,
+        "first_source_port": first_port,
+        "resume_source_port": resume_port,
+        "source_port_changed": source_port_changed,
     }
     return emit(
         args,
@@ -2000,7 +2020,9 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--expected-source", type=int, default=9995)
 
     item = common("udp-idle-resume-70s", case_udp_idle_resume)
-    item.add_argument("--udp", default="10.10.2.2:9999")
+    item.add_argument(
+        "--udp", default="10.10.2.2:9990", help="target that echoes the source port"
+    )
     item.add_argument("--idle", type=float, default=70.0)
     item.add_argument("--resume-seconds", type=float, default=15.0)
     item.add_argument("--retry", type=float, default=1.0)
@@ -2008,7 +2030,9 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--size", type=int, default=512)
 
     item = common("udp-idle-resume-600s", case_udp_idle_resume)
-    item.add_argument("--udp", default="10.10.2.2:9999")
+    item.add_argument(
+        "--udp", default="10.10.2.2:9990", help="target that echoes the source port"
+    )
     item.add_argument("--idle", type=float, default=600.0)
     item.add_argument("--resume-seconds", type=float, default=30.0)
     item.add_argument("--retry", type=float, default=2.0)

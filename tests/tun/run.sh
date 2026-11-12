@@ -1015,10 +1015,12 @@ run_protocol_suite() {
   run_case "$arm" udp-multidest-4 90 --udp "$udp" --ports 9996,9997,9998,9999
   run_case "$arm" udp-alt-source 30 --udp 10.10.2.2:9998
   # The server's UDP idle clock is 60 s, so a 70 s silence proves whether a
-  # client recovers on its own after the flow is torn down.
-  run_case "$arm" udp-idle-resume-70s 150 --udp "$udp"
+  # client recovers on its own after the flow is torn down. The target appends
+  # the source port it observed, so the report says whether recovery cost a new
+  # mapping.
+  run_case "$arm" udp-idle-resume-70s 150 --udp 10.10.2.2:9990
   # A long quiet tunnel: the client keeps no state for ten minutes, then sends.
-  run_case "$arm" udp-idle-resume-600s 700 --udp "$udp"
+  run_case "$arm" udp-idle-resume-600s 700 --udp 10.10.2.2:9990
   run_case "$arm" dns-udp-200 90 --dns "$dns"
   run_case "$arm" dns-tcp-fallback 90 --dns "$dns"
 
@@ -1328,6 +1330,7 @@ if [ "$SUITE" = "protocols" ]; then
     --tls12 10.10.2.2:8444
     --dns-tcp 10.10.2.2:53
     --udp-alt 10.10.2.2:9998
+    --udp-source-port 10.10.2.2:9990
     --udp-extra 10.10.2.2:9996
     --udp-extra 10.10.2.2:9997
   )
