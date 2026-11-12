@@ -979,7 +979,7 @@ The job is dispatch-only: no push, tag, or PR event runs it, so a shared
 runner's noise never blocks a release by itself. A green job means every
 selected suite passed: TUN 8/8 PASS, the bench cell complete
 (`--require-complete`) and unsaturated, every stress check PASS, and for
-`suite=protocols` a validated 20-case beam report with no FAIL or BLOCKED row.
+`suite=protocols` a validated 21-case beam report with no FAIL or BLOCKED row.
 A ratio outside 0.95-1.05 only emits a warning. Results land in the
 `bench-results` branch (latest bench run), a run artifact, and the step
 summary. Stress-only runs leave `bench-results` untouched; their summary is in
@@ -988,7 +988,10 @@ the artifact and the step summary. `BLOCKED` TUN rows fail the job;
 
 `suite=protocols` runs the real-protocol campaign (HTTP/1.1, HTTP/2, HTTP/3,
 UDP/XUDP, DNS over UDP and TCP, TCP echo, mixed load, idle and restart) through
-the same sing-box -> beam full-TUN path under netem. It writes
+the same sing-box -> beam full-TUN path under netem. `udp-idle-resume-70s` holds
+one UDP flow silent for 70 s, past the 60 s server idle clock, and then requires
+the client to recover within 15 s; recovery after lost datagrams is a WARN, no
+recovery is a FAIL. It writes
 `protocol-report-beam.json` and a stock-Xray control report; the beam report is
 the gate and the control report is diagnostic. Each report records the qdisc
 evidence, both baseline RTTs and the per-case metrics, and the acceptance step

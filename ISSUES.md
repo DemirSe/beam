@@ -6,8 +6,8 @@ Last updated 2026-11-12. Short register; the historical hardening audit is
 
 Nothing here is a known-broken data path: byte integrity, admission bounds, and
 descriptor/memory stability are covered by CI gates. Every entry is fixed in
-code; each one stays listed with its proof. P1 was found by the protocol lab and
-is not yet proven there, so its lab run still gates the `main` merge.
+code; each one stays listed with its proof. P1's admission half is proven on the
+lab; its 60 s idle half needs the `udp-idle-resume-70s` row before `main`.
 
 ## Summary
 
@@ -15,7 +15,7 @@ is not yet proven there, so its lab run still gates the `main` merge.
 |---|---|---|
 |I1|Replay cache saturates under sustained heavy churn|Fixed on `main`, deployed|
 |I2|A client restart appeared to be refused as a replay|Fixed on `main`, deployed; same root cause as I1|
-|P1|Legacy/packetaddr UDP refuses flows above a fixed 64-stream pool|Fixed on `dev`; lab confirmation run pending; severity medium, compatibility mode only|
+|P1|Legacy/packetaddr UDP refuses flows above a fixed 64-stream pool|Fixed on `dev`; `dns-udp-200` proven on the lab, `udp-idle-resume-70s` pending|
 
 ## I1 — replay cache saturates under sustained heavy churn (fixed)
 
@@ -158,12 +158,19 @@ TSVs, server and target logs, qdisc JSON and per-case probes are in each run's
     `crates/beam/src/main.rs`, plus
     `the_example_config_caps_only_the_udp_idle_clock`, which pins the wiring
     into `TlsServerConfig`.
-  - **Confirmation needed:** one `lab-hosted` run with
-    `-f suite=protocols -f udp_mode=packetaddr` must show `dns-udp-200` at
-    200/200 with `legacy_udp_limited=0`, and should add an idle-then-resume
-    flow that stays silent for more than 60 s, to show the 60 s clock does not
-    lose a compatibility flow that a client fails to reopen. Until that run
-    exists, this entry is fixed in code but not proven on the lab.
+  - **Lab result (run
+    [43233573450](https://github.com/DemirSe/beam/actions/runs/43233573450),
+    commit `484e7e2`, `udp_mode=packetaddr`):** `dns-udp-200` PASS at 200/200,
+    `legacy_udp_limited=0` in every metric line, no
+    `legacy VLESS UDP stream limit reached` line in `beam.log`, and the startup
+    log shows `max_legacy_udp_streams=256`. The whole suite was 19 PASS,
+    1 WARN (`h2-multiplex-16`, runner-bound), 0 FAIL.
+  - **Still needed:** `udp-idle-resume-70s` was added after that run. It holds
+    one UDP flow silent for 70 s, past the 60 s idle clock, and requires the
+    client to recover within 15 s; recovery after lost datagrams is a WARN and
+    no recovery is a FAIL. One `lab-hosted` run with
+    `-f suite=protocols -f udp_mode=packetaddr` must report that row as PASS or
+    WARN before this entry is closed and `dev` merges to `main`.
 
 ### P2 — HTTP/2 origin peak is runner-bound (WARN, no beam signal)
 

@@ -101,7 +101,11 @@ class ValidatorTests(unittest.TestCase):
     def test_valid_report_passes(self) -> None:
         code, output = self._validate(self._write(_valid_report()))
         self.assertEqual(code, 0, output)
-        self.assertIn("protocol acceptance: 20/20 cases (20 PASS, 0 WARN)", output)
+        self.assertIn(
+            f"protocol acceptance: {len(report.REQUIRED_CASES)}"
+            f"/{len(report.REQUIRED_CASES)} cases ({len(report.REQUIRED_CASES)} PASS, 0 WARN)",
+            output,
+        )
 
     def test_missing_required_case_fails(self) -> None:
         payload = _valid_report()
@@ -164,7 +168,11 @@ class ValidatorTests(unittest.TestCase):
         )
         code, output = self._validate(self._write(payload))
         self.assertEqual(code, 0, output)
-        self.assertIn("protocol acceptance: 20/20 cases (19 PASS, 1 WARN)", output)
+        total = len(report.REQUIRED_CASES)
+        self.assertIn(
+            f"protocol acceptance: {total}/{total} cases ({total - 1} PASS, 1 WARN)",
+            output,
+        )
 
     def test_partial_mixed_case_is_allowed(self) -> None:
         payload = _valid_report()

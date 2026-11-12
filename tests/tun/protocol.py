@@ -1232,6 +1232,111 @@ def case_udp_alt_source(args) -> int:
     )
 
 
+def case_udp_idle_resume(args) -> int:
+    """Send, stay silent past the server's UDP idle clock, then resume.
+
+    The server caps a legacy/packetaddr UDP stream at its UDP idle clock (60 s
+    by default, `MAX_UDP_IDLE_TIMEOUT` in `crates/beam/src/main.rs`). A client
+    keeps its own NAT mapping for longer, so the first datagram after a long
+    silence can land in a stream the server already closed. The contract is
+    recovery, not zero loss: one lost datagram is a WARN, and no echo inside the
+    retry budget is a FAIL.
+
+    With `udp_mode=packetaddr` this exercises the legacy permit path; with XUDP
+    it covers the XUDP session clock. The idle default of 70 s is just past the
+    60 s clock. A cap raised above the idle default makes this case pass
+    vacuously, so keep them in step.
+    """
+    started = time.time()
+    host, port = split_addr(args.udp)
+    peer = (host, port)
+    sock = socket.socket(family(host), socket.SOCK_DGRAM)
+    sock.setblocking(False)
+
+    def await_echo(sequence: int, budget: float) -> bool:
+        deadline = time.monotonic() + budget
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            ready, _, _ = select.select([sock], [], [], min(remaining, 0.05))
+            if not ready:
+                continue
+            try:
+                data, _ = sock.recvfrom(65535)
+            except OSError:
+                continue
+            if len(data) < UDP_HEADER:
+                continue
+            (got,) = struct.unpack("!I", data[:UDP_HEADER])
+            if got == sequence and data == _payload(got, len(data)):
+                return True
+
+    first_ok = False
+    resume_ok = False
+    attempts = 0
+    resume_ms = 0.0
+    try:
+        sock.sendto(_payload(0, args.size), peer)
+        first_ok = await_echo(0, args.timeout)
+        time.sleep(args.idle)
+        resume_started = time.monotonic()
+        deadline = resume_started + args.resume_seconds
+        sequence = 1
+        while True:
+            attempts += 1
+            sock.sendto(_payload(sequence, args.size), peer)
+            if await_echo(sequence, args.retry):
+                resume_ok = True
+                resume_ms = (time.monotonic() - resume_started) * 1000.0
+                break
+            sequence += 1
+            if time.monotonic() >= deadline:
+                break
+    finally:
+        sock.close()
+
+    lost = attempts - 1 if resume_ok else attempts
+    if not first_ok:
+        detail = f"the datagram before the {args.idle:.0f}s idle window was lost"
+    elif resume_ok:
+        detail = (
+            f"{args.idle:.0f}s idle, then echoed after {attempts} datagram(s) "
+            f"in {resume_ms:.0f}ms"
+        )
+    else:
+        detail = (
+            f"{args.idle:.0f}s idle, no echo from {attempts} datagram(s) "
+            f"within {args.resume_seconds:.0f}s"
+        )
+    warnings: list[str] = []
+    if first_ok and resume_ok and lost:
+        warnings.append(
+            f"the flow was torn down during the idle window; recovery cost "
+            f"{lost} lost datagram(s)"
+        )
+    metrics = {
+        "idle_s": round(args.idle, 1),
+        "first_ok": first_ok,
+        "resume_ok": resume_ok,
+        "resume_ms": round(resume_ms, 1),
+        "lost_after_idle": lost,
+        "attempts": attempts,
+    }
+    return emit(
+        args,
+        "udp-idle-resume-70s",
+        first_ok and resume_ok,
+        detail,
+        metrics,
+        warnings=warnings,
+        planned=1,
+        completed=1 if resume_ok else 0,
+        deadline_ms=int((args.idle + args.resume_seconds + 10) * 1000),
+        started=started,
+    )
+
+
 def _dig(args, name: str, qtype: str, *, tcp: bool) -> tuple[bool, str, float]:
     """Run one dig query.
 
@@ -1892,6 +1997,14 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--packets", type=int, default=5)
     item.add_argument("--timeout", type=float, default=1.0)
     item.add_argument("--expected-source", type=int, default=9995)
+
+    item = common("udp-idle-resume-70s", case_udp_idle_resume)
+    item.add_argument("--udp", default="10.10.2.2:9999")
+    item.add_argument("--idle", type=float, default=70.0)
+    item.add_argument("--resume-seconds", type=float, default=15.0)
+    item.add_argument("--retry", type=float, default=1.0)
+    item.add_argument("--timeout", type=float, default=2.0)
+    item.add_argument("--size", type=int, default=512)
 
     item = common("dns-udp-200", case_dns_udp)
     item.add_argument("--dns", default="10.10.2.2:53")
