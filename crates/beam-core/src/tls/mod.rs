@@ -19,4 +19,4 @@ pub use server::{
     ConnectionOutcome, ReplayStats, ReplayStream, TlsServerConfig, TlsServerError,
     handle_connection, handle_connection_admitted,
 };
-pub use stream::{RawTls, RawTlsHandoff, TlsStream, TlsStreamError};
+pub use stream::{RawTlsHandoff, TlsStream, TlsStreamError};

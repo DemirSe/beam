@@ -7,6 +7,15 @@ note; the separate open stress findings live in
 
 ## Status
 
+Production was updated on 2026-11-12 UTC to `16f604f73279` (binary SHA-256
+`9e20c86623e15a211a685a2d1cb65a249e929c173d4ba50e9ec4e0bb49a2079d`).
+The existing configuration hash was preserved, and the hash-pinned production
+verifier passed with the IPv4-only host checks. The HTTP/2 TUN check was not
+run because the local client was disconnected. The ten-repetition paired A/B
+and the workspace, interop, configuration, and TUN Actions checks passed for
+this commit; the five-hour soak was not run for this commit. The deployment was
+explicitly authorized with that limitation.
+
 Implemented, tested, and deployed. The table combines the deployment report
 from 2026-11-12 with host observations from 2026-11-11; it is not a live check:
 
@@ -134,7 +143,7 @@ cargo test --workspace
 ```
 
 Parser changes also require the relevant fuzz target. Hot-path changes require
-a benchmark comparison. The current workspace has 409 tests: 371 `beam-core`,
+a benchmark comparison. The current workspace has 403 tests: 365 `beam-core`,
 8 `beam` CLI, 2 TLS adapter, 2 stock-ClientHello fixture, and 26 `beam-sys`.
 When the IPv4-only Linux client is active, run the workspace checks with
 `sudo systemctl stop beam-client` and restart it afterward: sing-box's
@@ -1074,8 +1083,9 @@ Cover flight differences are diagnostic only by the SNI-level decision.
   required.
 - **One user, one inbound, no hot reload/stats** keeps the attack surface and
   resource model bounded.
-- **The last reported production build is `c4aef3a` (binary SHA-256 prefix
-  `9bec4d66`); verify the live host before relying on this record. The annotated
+- **The last reported production build is `16f604f` (binary SHA-256
+  `9e20c86623e15a211a685a2d1cb65a249e929c173d4ba50e9ec4e0bb49a2079d`);
+  verify the live host before relying on this record. The annotated
   `v0.1.0-rc.1` tag is the previous release candidate.** Deploy only with
   `deploy/package.sh` plus
   `BEAM_KEEP_CONFIG=1 bootstrap.sh`, then re-run the hash-pinned verifier and

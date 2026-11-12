@@ -1,28 +1,17 @@
 //! Zero-copy relay between two connected streams.
 //!
-//! [`copy_bidirectional`] moves bytes with `splice(2)` through one pipe per
-//! direction. Both descriptors must be connected, nonblocking stream sockets
-//! (TCP or Unix). The function does not take ownership of them and leaves them
-//! open on return.
+//! [`copy_one_way`] moves bytes with `splice(2)` through a single pipe. The
+//! descriptors are borrowed, connected nonblocking stream sockets. A shared
+//! [`RelayActivity`] clock coordinates the idle deadline with the other direction.
 //!
-//! [`copy_one_way`] is the asymmetric variant used when one side is still
-//! framed. It uses a single pipe and can share a [`RelayActivity`] clock with
-//! the async direction so both halves use one connection-wide idle deadline.
-//!
-//! The loop watches source readability, pipe writability when a pipe is full,
-//! and sink writability when a pipe holds bytes. It does not poll pipe
-//! readability: the relay tracks the bytes it has buffered, and polling a pipe
-//! that already holds data would spin while the sink is blocked. Work is
-//! bounded per round so one direction cannot starve the other. When a source
-//! reaches EOF the destination's write half is shut down and the other
-//! direction keeps running.
+//! The loop bounds work per round and polls the source, pipe and sink as needed.
+//! After EOF it drains buffered bytes and shuts down the sink's write half.
 //!
 //! Timeouts:
 //!
-//! - [`RelayConfig::idle_timeout`] bounds inactivity while both directions are
-//!   still open.
-//! - [`RelayConfig::shutdown_timeout`] bounds inactivity after the first
-//!   half-close or after [`RelayConfig::max_bytes`] is reached. A direction
+//! - [`RelayConfig::idle_timeout`] bounds inactivity while the source is open.
+//! - [`RelayConfig::shutdown_timeout`] bounds inactivity after the source
+//!   closes or after [`RelayConfig::max_bytes`] is reached. A direction
 //!   that is still moving bytes is not interrupted.
 //!
 //! Errors are returned to the caller; the descriptors remain owned by the
@@ -32,5 +21,5 @@ mod splice_copy;
 
 pub use splice_copy::{
     DEFAULT_PIPE_SIZE, MAX_PIPE_SIZE, MIN_PIPE_SIZE, RelayActivity, RelayConfig, RelayStats,
-    copy_bidirectional, copy_one_way, pipe_size_for_budget,
+    copy_one_way, pipe_size_for_budget,
 };

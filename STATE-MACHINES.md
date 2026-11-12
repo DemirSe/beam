@@ -325,13 +325,10 @@ a clean `close_notify`.
 - `switch_read_to_raw` / `switch_write_to_raw` are one-way setters
   (`tls/stream.rs:188-199`); the caller must drain plaintext first
   (`take_plaintext`, `201-215`).
-- `into_raw` requires both raw flags and no partial record/pending bytes, drains
-  leftover rustls plaintext, flushes `outgoing`, and returns ordered prefixes
-  (`217-252`).
 - `poll_shutdown_inner` (`504`) sends `close_notify` only when `!write_raw`, then
   flushes and shuts the socket.
 
-**Illegal / edge.** Early `into_raw` → `RawNotEnabled`; partial record →
+**Illegal / edge.** Raw read with a partial record or pending ciphertext →
 `PartialRecord`; `pending_write` prevents accepting the same bytes twice. A bare
 TCP FIN surfaces as `UnexpectedEof` from rustls and the relay treats it as a
 half-close; the direct test covers `close_notify`, not a bare FIN
@@ -449,38 +446,28 @@ One enum, one transition function, one illegal-transition error, direct tests.
 **Fields** (`vision/stream.rs:56-83`): `first_read_block`, `write_direct`,
 `pending_direct_switch`, `direct_publish_pending` (4 booleans); `read_buf`,
 `read_out`, `direct_plaintext`, `write_queue`, `write_carry` (5 buffers);
-`direct_tx`, `write_direct_tx`, `read_handoff_tx` (3 watches).
+`write_direct_tx`, `read_handoff_tx` (2 watches).
 
 **Write path.** `poll_write` (`626`) queues the planned block; a planned Direct
 sets `pending_direct_switch`; `finish_pending_write` (`351-410`) flushes, calls
 `switch_write_to_raw`, and arms `direct_publish_pending`. The carry
 tail is written only after framing stops (`poll_flush_raw_carry`, `287-305`).
 
-**Watch semantics (verified).** `publish_direct_when_drained` publishes both
-`direct_tx` and `write_direct_tx` only when `write_carry` is empty (`188-194`).
-The read path also calls `publish_direct` directly when it parses a Direct block
-(`536`), and `publish_direct` latches `read_is_raw() && write_is_raw()`
-(`178-181`) — so the ungated `direct_watch` can become true while
-`write_carry` is still pending. Production consumes the gated
-`write_direct_watch` and `read_handoff_watch` (`tls/server.rs:1723-1725`), never
-`direct_watch`.
+**Watch semantics.** `publish_direct_when_drained` publishes the write handoff
+only when `write_carry` is empty. The relay uses `write_direct_watch` and
+`read_handoff_watch` independently so it preserves ordered bytes.
 
-**Read path.** Parsing Direct switches the read to raw, takes plaintext, and
-publishes; the read handoff is published only after block content, remainder,
+**Read path.** Parsing Direct switches the read to raw and takes plaintext; the read handoff is published only after block content, remainder,
 and TLS read-ahead have been delivered (`433-560`). `poll_shutdown` handles the
 three combinations explicitly (`759-808`).
 
-**Why it is the most fragile machine.** Several booleans plus three watches plus
+**Why it is the most fragile machine.** Several booleans plus two watches plus
 five buffers must agree; a one-line change can reorder bytes. It is well tested,
 but unnamed.
 
-**Dead primitives.** `VisionStream::into_raw` and `direct_watch` have no
-in-checkout caller (tests use the watches directly);
-`TlsStream::into_raw` is exercised by tests and by the Vision wrapper only;
-`copy_bidirectional` has no production caller. Document the live path next to
-these or gate them — do not delete without adding wrapper coverage, because
-`VisionStream::into_raw` is the only composition of Vision prefixes with
-`TlsStream::into_raw` prefixes.
+**Production handoff.** Each direction uses its own gated watch, then a
+lazily cloned socket and `copy_one_way`. The former consuming raw handoff and
+combined watch were removed because the relay did not use them.
 
 **Tests.** `direct_mode_switches_to_passthrough` (1153),
 `empty_direct_flushes_coalesced_content_before_handoff` (1215),
@@ -829,10 +816,9 @@ D8 sub-items, all verified, with the status of each fix:
   `SHUTDOWN_TIMEOUT` instead of summing to three, and `MuxTeardown` releases
   every session, retained socket, and permit when the handler is cancelled or
   panics (`aborting_the_mux_handler_releases_sessions_and_permits`).
-- **f.** `copy_bidirectional`, `TlsStream::into_raw`, `VisionStream::into_raw`,
-  and `direct_watch` have no production caller; the live path is
-  `copy_one_way` + cloned sockets + the two gated watches. **Fixed:** each
-  primitive now documents the live path next to it.
+- **f.** The live Vision path uses `copy_one_way`, cloned sockets, and two
+  gated watches. The unused consuming TLS/Vision handoff and combined watch
+  were removed.
 
 ## Cross-cutting findings
 
@@ -899,7 +885,7 @@ and the next behaviour change lands on the same unlabelled states.
 behaviour and the defects: persistent read deadline, stale-sweep/concurrent-touch
 idle race, stale queued send after id reuse, post-expiry pre-sweep GlobalID
 reattach, complete oversized ServerHello, split ServerHello on the final credit,
-`VisionStream::into_raw` prefix composition, and a three-budget teardown bound.
+Vision read-ahead and raw byte ordering, and a three-budget teardown bound.
 
 *Done.* Each item above is implemented and pinned; the register names the test
 that covers it. The teardown bound was fixed to a single deadline, and the
@@ -931,8 +917,6 @@ test gaps).
    OuterFlushed,CarryDraining,Raw}` and `ReadPhase::{Framed,DirectBlock,
    ReadAheadDrained,Raw}`; derive `write_direct_watch` and `read_handoff_watch`
    from them. A single linear phase cannot represent read-raw/write-framed.
-   Keep `direct_watch` as the ungated both-raw latch unless removing it is
-   proposed as its own API change.
 7. **Client state machines. Policy where noted.** Linux:
    `TrayState::{Idle{connected},Busy{command,started_at},Failed{code,message},
    Cooldown{until}}`; bounding "working" with a timeout is **policy** — land it

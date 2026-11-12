@@ -66,10 +66,6 @@ pub enum TlsStreamError {
     #[error("outgoing TLS ciphertext exceeded its bound")]
     OutgoingOverflow,
 
-    /// Raw handoff was requested before both directions switched to raw.
-    #[error("raw handoff requires both TLS directions to be raw")]
-    RawNotEnabled,
-
     /// Raw handoff was requested while a record was partially read.
     #[error("raw handoff was requested with a partial TLS record")]
     PartialRecord,
@@ -82,16 +78,6 @@ impl From<TlsStreamError> for io::Error {
             other => io::Error::new(io::ErrorKind::InvalidData, other),
         }
     }
-}
-
-/// A raw socket plus ordered prefix buffers for a Vision direct handoff.
-pub struct RawTls {
-    /// The underlying socket.
-    pub socket: TcpStream,
-    /// Decrypted plaintext that still has to go to the plaintext peer, in order.
-    pub inbound: Vec<u8>,
-    /// Queued outer TLS ciphertext that still has to go to the TLS peer, in order.
-    pub outbound: Vec<u8>,
 }
 
 /// Capabilities Vision needs from its inner stream.
@@ -107,11 +93,6 @@ pub trait RawTlsHandoff: AsyncRead + AsyncWrite + Unpin {
     /// Implementations must first drain any plaintext still buffered inside
     /// the TLS stack; otherwise a Direct handoff can bypass those bytes.
     fn take_plaintext(&mut self) -> Result<Vec<u8>, TlsStreamError>;
-
-    /// Consume the stream and return the raw socket with ordered prefixes.
-    fn into_raw(self) -> Result<RawTls, TlsStreamError>
-    where
-        Self: Sized;
 }
 
 /// TLS stream that reads one record at a time from the socket.
@@ -179,8 +160,8 @@ impl TlsStream {
 
     /// Switches the read path to the raw socket.
     ///
-    /// The caller must have drained plaintext first. Pending ciphertext is
-    /// preserved for [`Self::into_raw`].
+    /// The caller must drain plaintext first. Reading raw with pending
+    /// ciphertext or a partial record returns an error.
     pub fn switch_read_to_raw(&mut self) {
         self.read_raw = true;
     }
@@ -203,49 +184,6 @@ impl TlsStream {
         self.plaintext.drain(..self.plaintext_offset);
         self.plaintext_offset = 0;
         Ok(std::mem::take(&mut self.plaintext))
-    }
-
-    /// Consumes the stream and returns the raw socket plus ordered prefixes.
-    ///
-    /// Called only by the test suite and `VisionStream::into_raw`. The
-    /// production Vision relay duplicates the raw sockets lazily after a
-    /// direction's handoff and uses `copy_one_way`; the non-Vision TCP relay
-    /// stays on the async `copy_direction` path.
-    pub fn into_raw(mut self) -> Result<RawTls, TlsStreamError> {
-        if !self.read_raw || !self.write_raw {
-            return Err(TlsStreamError::RawNotEnabled);
-        }
-        if self.record.is_partial() || self.pending_offset < self.pending.len() {
-            return Err(TlsStreamError::PartialRecord);
-        }
-
-        // Move any plaintext still buffered inside rustls before returning
-        // the raw socket. `into_raw` otherwise silently drops it.
-        self.drain_plaintext()?;
-        if self.outgoing_offset > 0 {
-            self.outgoing.drain(..self.outgoing_offset);
-            self.outgoing_offset = 0;
-        }
-        while self.conn.wants_write() {
-            if self.outgoing.len() >= MAX_OUTGOING {
-                return Err(TlsStreamError::OutgoingOverflow);
-            }
-            let written = self.conn.write_tls(&mut self.outgoing)?;
-            if written == 0 {
-                break;
-            }
-        }
-
-        let mut inbound = Vec::new();
-        if self.plaintext_offset < self.plaintext.len() {
-            inbound.extend_from_slice(&self.plaintext[self.plaintext_offset..]);
-        }
-
-        Ok(RawTls {
-            socket: self.socket,
-            inbound,
-            outbound: self.outgoing,
-        })
     }
 
     fn poll_handshake(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), TlsStreamError>> {
@@ -667,10 +605,6 @@ impl RawTlsHandoff for TlsStream {
     fn take_plaintext(&mut self) -> Result<Vec<u8>, TlsStreamError> {
         TlsStream::take_plaintext(self)
     }
-
-    fn into_raw(self) -> Result<RawTls, TlsStreamError> {
-        TlsStream::into_raw(self)
-    }
 }
 
 impl AsRawFd for TlsStream {
@@ -922,32 +856,26 @@ mod tests {
         let (mut client, server) = loopback_pair().await;
         let mut stream = test_stream(server);
         stream.plaintext = b"plain".to_vec();
+        assert_eq!(stream.take_plaintext().expect("drain plaintext"), b"plain");
         stream.switch_read_to_raw();
         stream.switch_write_to_raw();
-
-        let raw = stream.into_raw().expect("raw handoff");
-        assert_eq!(raw.inbound, b"plain");
-        assert!(raw.outbound.is_empty());
-
-        // The socket is still usable.
-        let mut raw_socket: TcpStream = raw.socket;
-        raw_socket.write_all(b"ok").await.expect("raw write");
+        stream.write_all(b"ok").await.expect("raw write");
         let mut received = [0u8; 2];
         client.read_exact(&mut received).await.expect("raw read");
         assert_eq!(&received, b"ok");
     }
 
     #[tokio::test]
-    async fn raw_handoff_rejects_unfed_outer_ciphertext() {
+    async fn raw_read_rejects_unfed_outer_ciphertext() {
         let (_client, server) = loopback_pair().await;
         let mut stream = test_stream(server);
         stream.pending = b"outer-ciphertext".to_vec();
         stream.switch_read_to_raw();
-        stream.switch_write_to_raw();
-        assert!(matches!(
-            stream.into_raw(),
-            Err(TlsStreamError::PartialRecord)
-        ));
+        let error = stream
+            .read(&mut [0u8; 1])
+            .await
+            .expect_err("pending TLS record must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     async fn loopback_pair() -> (TcpStream, TcpStream) {
@@ -1127,48 +1055,6 @@ mod tests {
             .expect("plaintext tail timed out")
             .expect("tail task");
         assert_eq!(tail, expected_tail);
-        drop(client);
-        server.await.expect("server task");
-    }
-
-    #[tokio::test]
-    async fn into_raw_keeps_plaintext_still_buffered_in_rustls() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("listener");
-        let address = listener.local_addr().expect("address");
-        let server_config = test_server_config();
-        let payload: Vec<u8> = (0..12_000).map(|value| (value % 251) as u8).collect();
-        let expected_tail = payload[4096..].to_vec();
-        let (tail_tx, tail_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.expect("accept");
-            let conn = ServerConnection::new(server_config).expect("server connection");
-            let mut tls = TlsStream::accept(socket, conn, Vec::new())
-                .await
-                .expect("server handshake");
-            let mut first = vec![0u8; 4096];
-            tls.read_exact(&mut first).await.expect("read prefix");
-            tls.switch_read_to_raw();
-            tls.switch_write_to_raw();
-            let raw = tls.into_raw().expect("raw handoff");
-            tail_tx.send(raw.inbound).expect("send inbound");
-        });
-
-        let socket = TcpStream::connect(address).await.expect("client connect");
-        let connector = tokio_rustls::TlsConnector::from(test_client_config());
-        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
-        let mut client = connector
-            .connect(name, socket)
-            .await
-            .expect("client handshake");
-        client.write_all(&payload).await.expect("write payload");
-        client.flush().await.expect("flush payload");
-        let inbound = timeout(Duration::from_secs(2), tail_rx)
-            .await
-            .expect("raw inbound timed out")
-            .expect("inbound task");
-        assert_eq!(inbound, expected_tail);
         drop(client);
         server.await.expect("server task");
     }

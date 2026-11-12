@@ -62,8 +62,7 @@ pub fn pipe_size_for_budget(soft_pages: u64, splice_tasks: usize, page_size: u64
 }
 
 /// Maximum bytes moved by one fill or drain phase in one loop iteration.
-/// Both directions get a fill and a drain budget before the relay polls again,
-/// so a bulk transfer cannot starve a small request in the opposite direction.
+/// Bounds the work before the relay checks cancellation and timeouts again.
 const WORK_PER_ROUND: usize = 1024 * 1024;
 
 /// Bytes after which a slow bulk direction starts batching reads.
@@ -107,16 +106,16 @@ pub struct RelayConfig {
     /// If the kernel refuses the request, the relay keeps the default pipe
     /// size and continues.
     pub pipe_size: usize,
-    /// Maximum total bytes read from both sources, or `None` for no limit.
+    /// Maximum bytes read from the source, or `None` for no limit.
     ///
     /// When the limit is reached the relay stops reading, drains what it has
-    /// already buffered, half-closes both destinations, and returns normally.
+    /// already buffered, half-closes the destination, and returns normally.
     pub max_bytes: Option<u64>,
-    /// Inactivity timeout while both directions are still open.
+    /// Inactivity timeout while the source is open.
     ///
     /// Must be non-zero.
     pub idle_timeout: Duration,
-    /// Inactivity timeout after the first half-close or after `max_bytes` is
+    /// Inactivity timeout after the source closes or after `max_bytes` is
     /// reached.
     ///
     /// A direction that is still moving bytes is not interrupted. Must be
@@ -199,21 +198,21 @@ impl RelayConfig {
     }
 }
 
-/// Counters collected by [`copy_bidirectional`].
+/// Counters collected by [`copy_one_way`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RelayStats {
-    /// Bytes delivered from `a` to `b`.
+    /// Bytes delivered from source to sink.
     pub bytes_a_to_b: u64,
-    /// Bytes delivered from `b` to `a`.
+    /// Reserved for the reverse direction; zero for a one-way relay.
     pub bytes_b_to_a: u64,
     /// `splice(2)` calls attempted, including calls that returned `EAGAIN` or
     /// observed EOF.
     pub splice_calls: u64,
     /// `poll(2)` calls attempted.
     pub polls: u64,
-    /// Source EOF observations, from zero to two.
+    /// Source EOF observations, zero or one.
     pub eofs: u64,
-    /// Successful `shutdown(SHUT_WR)` calls, from zero to two.
+    /// Successful `shutdown(SHUT_WR)` calls, zero or one.
     pub half_closes: u64,
 }
 
@@ -272,65 +271,6 @@ impl Direction {
     fn is_done(&self) -> bool {
         self.read_done && self.in_pipe == 0 && self.shutdown_sent
     }
-}
-
-/// Copies bytes in both directions between two connected, nonblocking streams.
-///
-/// Not on the server's data path: the authenticated TCP relay uses the async
-/// `copy_direction`, and the Vision splice path uses `copy_one_way` per
-/// direction when splice capacity is available. This helper is kept for the
-/// bidirectional splice contract and its tests.
-///
-/// The descriptors are borrowed, not owned: the caller closes them after this
-/// function returns, including on error. `a` and `b` must be stream sockets;
-/// the relay uses `splice(2)` and `shutdown(2)`.
-///
-/// Returns once both directions have reached EOF (or `max_bytes` has been
-/// reached), the buffered bytes have been delivered, and both write halves
-/// have been shut down. An idle connection returns
-/// [`io::ErrorKind::TimedOut`] while both directions are still open;
-/// inactivity after a half-close or after `max_bytes` ends the relay normally.
-/// If the shutdown timeout expires, any bytes still buffered in the pipes are
-/// discarded before the normal return.
-pub fn copy_bidirectional(a: RawFd, b: RawFd, config: &RelayConfig) -> io::Result<RelayStats> {
-    config.validate()?;
-
-    let (a_pipe_read, a_pipe_write) = pipe()?;
-    let (b_pipe_read, b_pipe_write) = pipe()?;
-
-    for fd in [a_pipe_write.as_raw_fd(), b_pipe_write.as_raw_fd()] {
-        match beam_sys::set_pipe_size(fd, config.pipe_size) {
-            Ok(actual) => tracing::debug!(requested = config.pipe_size, actual, "relay pipe sized"),
-            Err(error) => warn_pipe_size_once(
-                &error,
-                config.pipe_size,
-                "could not resize relay pipe; using the kernel default",
-            ),
-        }
-    }
-
-    let mut forward = Direction::new(a, b, a_pipe_read, a_pipe_write);
-    let mut backward = Direction::new(b, a, b_pipe_read, b_pipe_write);
-    let mut stats = RelayStats::default();
-    let result = run_loop(&mut forward, &mut backward, &mut stats, config);
-
-    stats.bytes_a_to_b = forward.bytes;
-    stats.bytes_b_to_a = backward.bytes;
-    let total = stats.total_bytes();
-    let bytes_per_splice = total.checked_div(stats.splice_calls).unwrap_or(0);
-    tracing::debug!(
-        pipe_size = config.pipe_size,
-        bytes_a_to_b = stats.bytes_a_to_b,
-        bytes_b_to_a = stats.bytes_b_to_a,
-        splice_calls = stats.splice_calls,
-        polls = stats.polls,
-        bytes_per_splice,
-        error = ?result.as_ref().err(),
-        "relay finished"
-    );
-
-    result?;
-    Ok(stats)
 }
 
 /// Shared activity clock for the two halves of an asymmetric Vision relay.
@@ -405,8 +345,7 @@ impl Default for RelayActivity {
 
 /// Copies one direction between two connected, nonblocking stream sockets.
 ///
-/// This is the asymmetric counterpart to [`copy_bidirectional`]. It is used
-/// when only the Vision write direction has switched to raw, so the bulk
+/// It is used when only one Vision direction has switched to raw, so the bulk
 /// download can use `splice(2)` while the framed upload continues on its async
 /// path. It shuts down the sink's write half when the source reaches EOF.
 ///
@@ -552,145 +491,6 @@ fn run_one_way(
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
-        }
-    }
-
-    Ok(())
-}
-
-fn run_loop(
-    forward: &mut Direction,
-    backward: &mut Direction,
-    stats: &mut RelayStats,
-    config: &RelayConfig,
-) -> io::Result<()> {
-    let mut committed = 0_u64;
-    let mut last_activity = Instant::now();
-    let mut shutdown_started: Option<Instant> = None;
-    let mut forward_first = true;
-
-    loop {
-        let now = Instant::now();
-        let limit = inactivity_limit(config, shutdown_started.is_some());
-        if now.saturating_duration_since(last_activity) >= limit {
-            if shutdown_started.is_some() {
-                break;
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "relay idle timeout",
-            ));
-        }
-
-        let mut activity = false;
-
-        // Fill both pipes before draining them so neither direction waits for
-        // the other to finish a full round. A source that the last poll did
-        // not report readable is skipped until it becomes readable again.
-        let forward_ready = forward.read_ready;
-        let backward_ready = backward.read_ready;
-        forward.read_ready = false;
-        backward.read_ready = false;
-        if forward_first {
-            if forward_ready {
-                activity |= fill(
-                    forward,
-                    WORK_PER_ROUND,
-                    config.max_bytes,
-                    &mut committed,
-                    stats,
-                )?;
-            }
-            if backward_ready {
-                activity |= fill(
-                    backward,
-                    WORK_PER_ROUND,
-                    config.max_bytes,
-                    &mut committed,
-                    stats,
-                )?;
-            }
-        } else {
-            if backward_ready {
-                activity |= fill(
-                    backward,
-                    WORK_PER_ROUND,
-                    config.max_bytes,
-                    &mut committed,
-                    stats,
-                )?;
-            }
-            if forward_ready {
-                activity |= fill(
-                    forward,
-                    WORK_PER_ROUND,
-                    config.max_bytes,
-                    &mut committed,
-                    stats,
-                )?;
-            }
-        }
-
-        if config.max_bytes.is_some_and(|limit| committed >= limit) {
-            forward.read_done = true;
-            backward.read_done = true;
-        }
-
-        activity |= drain(forward, WORK_PER_ROUND, stats)?;
-        activity |= drain(backward, WORK_PER_ROUND, stats)?;
-
-        maybe_shutdown(forward, stats)?;
-        maybe_shutdown(backward, stats)?;
-
-        let now = Instant::now();
-        if activity {
-            last_activity = now;
-        }
-        if shutdown_started.is_none() && (forward.read_done || backward.read_done) {
-            shutdown_started = Some(now);
-            last_activity = now;
-        }
-
-        if forward.is_done() && backward.is_done() {
-            break;
-        }
-
-        forward_first = !forward_first;
-
-        let mut fds = [
-            poll_source(forward),
-            poll_pipe_write(forward),
-            poll_sink(forward),
-            poll_source(backward),
-            poll_pipe_write(backward),
-            poll_sink(backward),
-        ];
-
-        stats.polls = stats.polls.saturating_add(1);
-        match poll(
-            &mut fds,
-            Some(inactivity_timeout(
-                config,
-                shutdown_started.is_some(),
-                last_activity,
-            )),
-        ) {
-            Ok(_) => {
-                forward.read_ready = !fds[0].revents().is_empty() || !fds[1].revents().is_empty();
-                backward.read_ready = !fds[3].revents().is_empty() || !fds[4].revents().is_empty();
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        }
-
-        let known = PollEvents::READ | PollEvents::WRITE | PollEvents::ERROR | PollEvents::HUP;
-        for entry in &fds {
-            if entry.revents().bits() & !known.bits() != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "relay poll reported an unexpected event",
-                ));
-            }
         }
     }
 
@@ -869,20 +669,11 @@ fn inactivity_limit(config: &RelayConfig, shutting_down: bool) -> Duration {
     }
 }
 
-fn inactivity_timeout(
-    config: &RelayConfig,
-    shutting_down: bool,
-    last_activity: Instant,
-) -> Duration {
-    inactivity_limit(config, shutting_down)
-        .saturating_sub(Instant::now().saturating_duration_since(last_activity))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PIPE_SIZE, MAX_PIPE_SIZE, MIN_PIPE_SIZE, RelayConfig, RelayStats,
-        copy_bidirectional, copy_one_way, pipe_size_for_budget,
+        DEFAULT_PIPE_SIZE, MAX_PIPE_SIZE, MIN_PIPE_SIZE, RelayConfig, RelayStats, copy_one_way,
+        pipe_size_for_budget,
     };
     use std::io::{self, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
@@ -929,7 +720,7 @@ mod tests {
             let result = (|| {
                 beam_sys::set_nonblocking(relay_a.as_raw_fd())?;
                 beam_sys::set_nonblocking(relay_b.as_raw_fd())?;
-                copy_bidirectional(relay_a.as_raw_fd(), relay_b.as_raw_fd(), &config)
+                copy_one_way(relay_a.as_raw_fd(), relay_b.as_raw_fd(), &config, None)
             })();
             let _ = sender.send(result);
         });
@@ -940,50 +731,6 @@ mod tests {
         receiver
             .recv_timeout(Duration::from_secs(10))
             .expect("relay did not finish within the test deadline")
-    }
-
-    #[test]
-    fn copies_large_payload_in_both_directions() {
-        let (mut client, relay_a, relay_b, mut target) = relay_pair();
-        let receiver = run_relay(relay_a, relay_b, config());
-
-        let payload_a = vec![0xa5; 2 * 1024 * 1024 + 17];
-        let payload_b = vec![0x5a; 1024 * 1024 + 3];
-        let expected_a = payload_a.clone();
-        let expected_b = payload_b.clone();
-
-        let mut client_writer = client.try_clone().unwrap();
-        let mut target_writer = target.try_clone().unwrap();
-        let client_thread = thread::spawn(move || {
-            client_writer.write_all(&payload_a).unwrap();
-            client_writer.shutdown(Shutdown::Write).unwrap();
-        });
-        let target_thread = thread::spawn(move || {
-            target_writer.write_all(&payload_b).unwrap();
-            target_writer.shutdown(Shutdown::Write).unwrap();
-        });
-
-        let mut received_a = Vec::new();
-        target.read_to_end(&mut received_a).unwrap();
-        let mut received_b = Vec::new();
-        client.read_to_end(&mut received_b).unwrap();
-
-        client_thread.join().unwrap();
-        target_thread.join().unwrap();
-
-        let stats = wait(receiver).unwrap();
-        assert_eq!(received_a, expected_a);
-        assert_eq!(received_b, expected_b);
-        assert_eq!(stats.bytes_a_to_b, expected_a.len() as u64);
-        assert_eq!(stats.bytes_b_to_a, expected_b.len() as u64);
-        assert_eq!(
-            stats.total_bytes(),
-            (expected_a.len() + expected_b.len()) as u64
-        );
-        assert_eq!(stats.eofs, 2);
-        assert_eq!(stats.half_closes, 2);
-        assert!(stats.splice_calls > 0);
-        assert!(stats.polls > 0);
     }
 
     #[test]
@@ -1155,95 +902,42 @@ mod tests {
     }
 
     #[test]
-    fn half_close_keeps_the_other_direction_alive() {
-        let (mut client, relay_a, relay_b, target) = relay_pair();
-        let receiver = run_relay(relay_a, relay_b, config());
-
-        let mut client_writer = client.try_clone().unwrap();
-        let client_thread = thread::spawn(move || {
-            client_writer.write_all(b"request").unwrap();
-            client_writer.shutdown(Shutdown::Write).unwrap();
-        });
-
-        let target_thread = thread::spawn(move || {
-            let mut target = target;
-            let mut request = Vec::new();
-            target.read_to_end(&mut request).unwrap();
-            assert_eq!(request, b"request");
-            target.write_all(b"response").unwrap();
-            target.shutdown(Shutdown::Write).unwrap();
-        });
-
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).unwrap();
-
-        client_thread.join().unwrap();
-        target_thread.join().unwrap();
-
-        let stats = wait(receiver).unwrap();
-        assert_eq!(response, b"response");
-        assert_eq!(stats.bytes_a_to_b, b"request".len() as u64);
-        assert_eq!(stats.bytes_b_to_a, b"response".len() as u64);
-        assert_eq!(stats.eofs, 2);
-        assert_eq!(stats.half_closes, 2);
-    }
-
-    #[test]
-    fn nonblocking_streams_relay_without_waiting_for_the_other_direction() {
-        let (mut client, relay_a, relay_b, mut target) = relay_pair();
-        let receiver = run_relay(relay_a, relay_b, config());
-
-        client.write_all(b"one-way").unwrap();
-        client.shutdown(Shutdown::Write).unwrap();
-
-        let mut received = Vec::new();
-        target.read_to_end(&mut received).unwrap();
-        assert_eq!(received, b"one-way");
-
-        target.shutdown(Shutdown::Write).unwrap();
-        let mut reply = Vec::new();
-        client.read_to_end(&mut reply).unwrap();
-        assert!(reply.is_empty());
-
-        let stats = wait(receiver).unwrap();
-        assert_eq!(stats.bytes_a_to_b, 7);
-        assert_eq!(stats.bytes_b_to_a, 0);
-        assert_eq!(stats.eofs, 2);
-        assert_eq!(stats.half_closes, 2);
-    }
-
-    #[test]
-    fn relays_over_tcp_loopback() {
+    fn one_way_relays_over_tcp_loopback() {
         let (mut client, relay_a) = tcp_pair();
         let (relay_b, mut target) = tcp_pair();
         let receiver = run_relay(relay_a, relay_b, config());
-
-        let mut client_writer = client.try_clone().unwrap();
-        let client_thread = thread::spawn(move || {
-            client_writer.write_all(b"hello").unwrap();
-            client_writer.shutdown(Shutdown::Write).unwrap();
-        });
-
-        let target_thread = thread::spawn(move || {
-            let mut request = Vec::new();
-            target.read_to_end(&mut request).unwrap();
-            assert_eq!(request, b"hello");
-            target.write_all(b"world").unwrap();
-            target.shutdown(Shutdown::Write).unwrap();
-        });
-
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).unwrap();
-
-        client_thread.join().unwrap();
-        target_thread.join().unwrap();
-
+        client.write_all(b"hello").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut received = Vec::new();
+        target.read_to_end(&mut received).unwrap();
         let stats = wait(receiver).unwrap();
-        assert_eq!(response, b"world");
+        assert_eq!(received, b"hello");
         assert_eq!(stats.bytes_a_to_b, 5);
-        assert_eq!(stats.bytes_b_to_a, 5);
-        assert_eq!(stats.eofs, 2);
-        assert_eq!(stats.half_closes, 2);
+        assert_eq!(stats.eofs, 1);
+        assert_eq!(stats.half_closes, 1);
+    }
+
+    #[test]
+    fn one_way_drains_after_a_slow_sink() {
+        let (mut client, relay_a, relay_b, mut target) = relay_pair();
+        let receiver = run_relay(relay_a, relay_b, config());
+        let (written_tx, written_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            client.write_all(&vec![0x33; 2 * 1024 * 1024]).unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+            written_tx.send(()).unwrap();
+        });
+
+        // A stalled sink fills the socket and pipe before reading resumes.
+        assert!(written_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        let mut received = Vec::new();
+        target.read_to_end(&mut received).unwrap();
+        writer.join().unwrap();
+        let stats = wait(receiver).unwrap();
+        assert_eq!(received.len(), 2 * 1024 * 1024);
+        assert!(received.iter().all(|&byte| byte == 0x33));
+        assert_eq!(stats.bytes_a_to_b, received.len() as u64);
+        assert_eq!(stats.half_closes, 1);
     }
 
     #[test]
@@ -1271,38 +965,6 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_timeout_bounds_a_half_closed_idle_connection() {
-        let (mut client, relay_a, relay_b, mut target) = relay_pair();
-        let started = Instant::now();
-        let receiver = run_relay(
-            relay_a,
-            relay_b,
-            RelayConfig {
-                idle_timeout: Duration::from_secs(60),
-                shutdown_timeout: Duration::from_millis(50),
-                ..config()
-            },
-        );
-
-        client.write_all(b"x").unwrap();
-        client.shutdown(Shutdown::Write).unwrap();
-
-        let mut received = Vec::new();
-        target.read_to_end(&mut received).unwrap();
-        assert_eq!(received, b"x");
-
-        let stats = wait(receiver).unwrap();
-        let elapsed = started.elapsed();
-
-        assert_eq!(stats.bytes_a_to_b, 1);
-        assert_eq!(stats.bytes_b_to_a, 0);
-        assert_eq!(stats.eofs, 1);
-        assert_eq!(stats.half_closes, 1);
-        assert!(elapsed >= Duration::from_millis(30));
-        assert!(elapsed < Duration::from_secs(2));
-    }
-
-    #[test]
     fn max_bytes_stops_the_relay_cleanly() {
         let (mut client, relay_a, relay_b, mut target) = relay_pair();
         let receiver = run_relay(
@@ -1322,83 +984,11 @@ mod tests {
         target.read_to_end(&mut received).unwrap();
         assert_eq!(received, &payload[..1024]);
 
-        let mut reply = Vec::new();
-        match client.read_to_end(&mut reply) {
-            Ok(_) => assert!(reply.is_empty()),
-            // The relay stopped reading at the cap, so its close can reset the
-            // peer while unread bytes remain in the receive queue.
-            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
-            Err(error) => panic!("unexpected client read error: {error}"),
-        }
-
         let stats = wait(receiver).unwrap();
         assert_eq!(stats.bytes_a_to_b, 1024);
         assert_eq!(stats.bytes_b_to_a, 0);
         assert_eq!(stats.total_bytes(), 1024);
-        assert_eq!(stats.half_closes, 2);
-    }
-
-    #[test]
-    fn immediate_eof_shuts_down_both_destinations() {
-        let (client, relay_a, relay_b, target) = relay_pair();
-        let receiver = run_relay(relay_a, relay_b, config());
-
-        client.shutdown(Shutdown::Write).unwrap();
-        target.shutdown(Shutdown::Write).unwrap();
-
-        let stats = wait(receiver).unwrap();
-        assert_eq!(stats.bytes_a_to_b, 0);
-        assert_eq!(stats.bytes_b_to_a, 0);
-        assert_eq!(stats.eofs, 2);
-        assert_eq!(stats.half_closes, 2);
-    }
-
-    #[test]
-    fn ping_is_not_starved_by_one_way_bulk() {
-        let (mut client, relay_a, relay_b, mut target) = relay_pair();
-        let receiver = run_relay(relay_a, relay_b, config());
-
-        let bulk = vec![0x33; 8 * 1024 * 1024];
-        let bulk_len = bulk.len();
-        let mut client_writer = client.try_clone().unwrap();
-        let mut target_writer = target.try_clone().unwrap();
-
-        let bulk_thread = thread::spawn(move || {
-            client_writer.write_all(&bulk).unwrap();
-            client_writer.shutdown(Shutdown::Write).unwrap();
-        });
-        let ping_thread = thread::spawn(move || {
-            target_writer.write_all(b"ping").unwrap();
-            target_writer.shutdown(Shutdown::Write).unwrap();
-        });
-
-        // Let the bulk direction fill the pipe and the target's receive
-        // buffer. The ping must still arrive while that direction is blocked.
-        thread::sleep(Duration::from_millis(50));
-
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut ping = [0_u8; 4];
-        client.read_exact(&mut ping).unwrap();
-        client.set_read_timeout(None).unwrap();
-        assert_eq!(&ping, b"ping");
-
-        let mut tail = Vec::new();
-        client.read_to_end(&mut tail).unwrap();
-        let mut received_bulk = Vec::new();
-        target.read_to_end(&mut received_bulk).unwrap();
-
-        bulk_thread.join().unwrap();
-        ping_thread.join().unwrap();
-
-        let stats = wait(receiver).unwrap();
-        assert_eq!(received_bulk.len(), bulk_len);
-        assert!(received_bulk.iter().all(|&byte| byte == 0x33));
-        assert_eq!(stats.bytes_a_to_b, bulk_len as u64);
-        assert_eq!(stats.bytes_b_to_a, 4);
-        assert_eq!(stats.eofs, 2);
-        assert_eq!(stats.half_closes, 2);
+        assert_eq!(stats.half_closes, 1);
     }
 
     #[test]
@@ -1410,7 +1000,7 @@ mod tests {
                 pipe_size,
                 ..RelayConfig::default()
             };
-            let error = copy_bidirectional(a.as_raw_fd(), b.as_raw_fd(), &config).unwrap_err();
+            let error = copy_one_way(a.as_raw_fd(), b.as_raw_fd(), &config, None).unwrap_err();
             assert_eq!(
                 error.kind(),
                 io::ErrorKind::InvalidInput,

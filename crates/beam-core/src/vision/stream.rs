@@ -4,8 +4,8 @@
 //! Vision blocks. The first block in each direction carries the raw VLESS user
 //! id; later blocks do not. The reader strips padding and stops framing on
 //! `End`. On `Direct`, the inner record-bounded TLS stream switches to the raw
-//! socket; the caller can continue through this wrapper or call
-//! [`VisionStream::into_raw`] once both directions have switched.
+//! socket; the relay hands off each direction only after its ordered buffers
+//! have drained.
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
@@ -17,7 +17,7 @@ use rand::rngs::SmallRng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
 
-use crate::tls::stream::{RawTls, RawTlsHandoff, TlsStreamError};
+use crate::tls::stream::RawTlsHandoff;
 
 use super::frame::{
     Command, MAX_BLOCK_LEN, MAX_CONTENT_LEN, VisionError, encode_block, parse_block,
@@ -71,7 +71,6 @@ pub struct VisionStream<S, R = SmallRng> {
     /// The raw switch is active, but the carry must finish before the relay
     /// may start writing the socket from another task.
     direct_publish_pending: bool,
-    direct_tx: watch::Sender<bool>,
     write_direct_tx: watch::Sender<bool>,
     read_handoff_tx: watch::Sender<bool>,
     rng: R,
@@ -93,7 +92,6 @@ where
     /// Vision block together with the request header. Those trailing bytes are
     /// passed here; any remaining block bytes are read from `inner`.
     pub fn new(inner: S, user_id: [u8; 16], initial_body: Vec<u8>, rng: R) -> Self {
-        let (direct_tx, _) = watch::channel(false);
         let (write_direct_tx, _) = watch::channel(false);
         let (read_handoff_tx, _) = watch::channel(false);
         Self {
@@ -111,7 +109,6 @@ where
             write_direct: false,
             pending_direct_switch: false,
             direct_publish_pending: false,
-            direct_tx,
             write_direct_tx,
             read_handoff_tx,
             rng,
@@ -147,19 +144,6 @@ where
         self.write_direct
     }
 
-    /// Watches whether both directions have switched to Direct.
-    ///
-    /// The value is `false` until both the read and write sides are raw. It is
-    /// latched: once `true`, the stream is ready for [`Self::into_raw`].
-    ///
-    /// Ungated: true as soon as both directions are raw, even while
-    /// `write_carry` is still draining. The relay consumes the gated
-    /// `write_direct_watch` and `read_handoff_watch`; do not switch without a
-    /// byte-ordering test.
-    pub fn direct_watch(&self) -> watch::Receiver<bool> {
-        self.direct_tx.subscribe()
-    }
-
     /// Watches whether the write direction has switched to the raw socket.
     pub fn write_direct_watch(&self) -> watch::Receiver<bool> {
         self.write_direct_tx.subscribe()
@@ -176,11 +160,6 @@ where
         self.read_handoff_tx.subscribe()
     }
 
-    fn publish_direct(&self) {
-        self.direct_tx
-            .send_replace(self.read_is_raw() && self.write_is_raw());
-    }
-
     fn publish_write_direct(&self) {
         self.write_direct_tx.send_replace(self.write_is_raw());
     }
@@ -188,7 +167,6 @@ where
     /// Publishes the raw-write handoff only after any carried tail is written.
     fn publish_direct_when_drained(&mut self) {
         if self.direct_publish_pending && self.write_carry.is_empty() {
-            self.publish_direct();
             self.publish_write_direct();
             self.direct_publish_pending = false;
         }
@@ -212,55 +190,6 @@ where
         let remaining = self.read_buf.len() - self.read_buf_offset;
         self.read_buf.truncate(remaining);
         self.read_buf_offset = 0;
-    }
-
-    /// Consumes the stream once both directions have switched to Direct.
-    ///
-    /// Not called by the production relay. The production Vision relay
-    /// duplicates the raw sockets lazily after each direction's handoff and
-    /// uses `copy_one_way` per direction when splice capacity is available;
-    /// the async fallback is `copy_direction`.
-    pub fn into_raw(self) -> Result<RawTls, TlsStreamError> {
-        if !self.read_is_raw() || !self.write_is_raw() {
-            return Err(TlsStreamError::RawNotEnabled);
-        }
-
-        let Self {
-            inner,
-            read_buf,
-            read_buf_offset,
-            read_out,
-            read_out_offset,
-            direct_plaintext,
-            direct_plaintext_offset,
-            write_queue,
-            write_queue_offset,
-            write_carry,
-            ..
-        } = self;
-
-        let mut inbound = Vec::new();
-        if read_out_offset < read_out.len() {
-            inbound.extend_from_slice(&read_out[read_out_offset..]);
-        }
-        inbound.extend_from_slice(&read_buf[read_buf_offset..]);
-        if direct_plaintext_offset < direct_plaintext.len() {
-            inbound.extend_from_slice(&direct_plaintext[direct_plaintext_offset..]);
-        }
-
-        let mut raw = inner.into_raw()?;
-        inbound.extend_from_slice(&raw.inbound);
-        raw.inbound = inbound;
-
-        if write_queue_offset < write_queue.len() || !write_carry.is_empty() {
-            let mut outbound = Vec::new();
-            outbound.extend_from_slice(&write_queue[write_queue_offset..]);
-            outbound.extend_from_slice(&write_carry);
-            outbound.extend_from_slice(&raw.outbound);
-            raw.outbound = outbound;
-        }
-
-        Ok(raw)
     }
 
     fn poll_flush_queue(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -552,7 +481,6 @@ where
                         this.inner.switch_read_to_raw();
                         this.direct_plaintext = this.inner.take_plaintext()?;
                         this.direct_plaintext_offset = 0;
-                        this.publish_direct();
                         tracing::debug!(content = content_len, "Vision reader switched to Direct");
                     }
                     // End and Direct stop framing. Buffered block content must
@@ -897,12 +825,8 @@ mod tests {
 
         fn switch_write_to_raw(&mut self) {}
 
-        fn take_plaintext(&mut self) -> Result<Vec<u8>, TlsStreamError> {
+        fn take_plaintext(&mut self) -> Result<Vec<u8>, crate::tls::stream::TlsStreamError> {
             Ok(Vec::new())
-        }
-
-        fn into_raw(self) -> Result<RawTls, TlsStreamError> {
-            Err(TlsStreamError::RawNotEnabled)
         }
     }
 
