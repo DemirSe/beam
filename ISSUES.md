@@ -172,9 +172,19 @@ TSVs, server and target logs, qdisc JSON and per-case probes are in each run's
     was 20 PASS, 1 WARN (`h2-multiplex-16`, runner-bound), 0 FAIL, 21 cases.
     The 60 s clock therefore costs this traffic class nothing: the client
     reopened the flow by itself and its first datagram was answered.
-  - **Not proven:** a long-lived flow whose client ignores the server close
-    (keepalive-less WireGuard, a quiet QUIC session). The mechanism is the same
-    socket reopen, but only a WireGuard-shaped case would prove that class.
+  - **Accepted risk, and why it is not fixed:** the legacy/packetaddr framing
+    carries no flow identifier, so a reconnecting stream cannot prove it owned a
+    retained socket. Keeping the client source port would need heuristic keying
+    on (user, client IP, destination, address family), which collides for two
+    clients behind one NAT and for one client opening the same destination
+    twice. XUDP solves this with a GlobalID and keeps retained sockets inside
+    one mux stream, so its design does not transfer. Decision (2026-11-12,
+    reviewed by Sol and the code owner): do not implement heuristic
+    reattachment. A flow that pins the client source port and stays silent past
+    the idle clock therefore sees a new session. WireGuard and quiet QUIC
+    sessions are expected to survive, because recovery is the same socket path
+    the XUDP clock already uses, but no lab case has tested a real WireGuard
+    endpoint: treat that as unproven, not as tested.
 
 ### P2 — HTTP/2 origin peak is runner-bound (WARN, no beam signal)
 

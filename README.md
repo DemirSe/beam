@@ -994,7 +994,9 @@ the client to recover within 15 s; recovery after lost datagrams is a WARN, no
 recovery is a FAIL. `udp-idle-resume-600s` repeats it after ten quiet minutes.
 Both cases report the source port the target saw before and after the idle
 window, so the report says whether recovery reused the client mapping or made a
-new one. It writes
+new one. Recovery normally makes a new one: the legacy/packetaddr framing has no
+flow identifier, so the client source port a target sees cannot be preserved
+across a teardown without a wire change. It writes
 `protocol-report-beam.json` and a stock-Xray control report; the beam report is
 the gate and the control report is diagnostic. Each report records the qdisc
 evidence, both baseline RTTs and the per-case metrics, and the acceptance step
