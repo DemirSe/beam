@@ -1,7 +1,14 @@
 # Client setup
 
-These steps run on the client machine, not on the server. The server runbook
-is in [`DEPLOY.md`](DEPLOY.md).
+Any standard Xray or sing-box client that speaks VLESS with `xtls-rprx-vision`
+works against beam. That is the supported path, and the TUN interop workflow
+proves it end to end against pinned sing-box and Xray.
+
+The tray clients in `clients/` are our own convenience wrapper around a stock
+sing-box core. They are optional, and the sections below that describe them do
+not apply if you already use a standard client.
+
+The server runbook is in [`DEPLOY.md`](DEPLOY.md).
 
 ## Linux tray and DNS switch
 

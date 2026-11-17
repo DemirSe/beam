@@ -230,6 +230,12 @@ process-wide session limiter.
 This section is the single source of truth for wire behavior. Update it and
 add a test when wire behavior changes. The server must stay compatible with
 stock clients that use the same UUID, public key, short ID, SNI, and flow.
+That compatibility is the supported path, and the TUN interop workflow proves
+it end to end against pinned sing-box 1.14.4 and Xray 26.3.27.
+
+The tray clients in `clients/` are optional convenience. Nothing in this
+section depends on them, and any standard Xray or sing-box client that speaks
+VLESS with `xtls-rprx-vision` is expected to work.
 
 ### REALITY
 
