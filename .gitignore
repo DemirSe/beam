@@ -11,6 +11,10 @@ __pycache__/
 /mobile-singbox.json
 /network-comparison.local.md
 
+# Local runtime and secret material created by the README quick start
+/config.toml
+/identity.txt
+
 # Windows tray launcher build artifacts and local runtime files
 /clients/windows-tray/beam-tray.exe
 /clients/windows-tray/app-res.o

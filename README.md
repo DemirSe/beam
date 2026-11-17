@@ -59,15 +59,18 @@ binds a socket. The important keys are:
 UDP stream pool and the XUDP kernel buffer budget. Keep it at 200 or more when
 a legacy or packetaddr client bursts short UDP flows.
 
-Generate a new identity under a restrictive umask and put the server fragment
+Generate a new identity under a restrictive umask, then put the server fragment
 into a copy of the example config:
 
 ```bash
-umask 077
-target/release/beam generate --host example.com --sni example.com > identity.txt
-chmod 600 config.toml
+cp config.example.toml config.toml
+(umask 077; target/release/beam generate --host example.com --sni example.com > identity.txt)
+chmod 600 config.toml identity.txt
 target/release/beam --check -c config.toml
 ```
+
+The umask applies only to the subshell, so later build and test commands keep
+their normal modes. Both files hold secrets and are git-ignored.
 
 Replace every placeholder. Keep secrets out of git, mode `0600` locally, and
 root:beam `0640` on the service host.
