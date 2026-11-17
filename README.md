@@ -223,7 +223,7 @@ process-wide session limiter.
 | `tests/` | Rootless suites, plus the TUN harness and its Rust origin in `tests/tun/`. |
 | `fuzz/` | cargo-fuzz targets, kept in a separate workspace. |
 | `clients/` | Optional tray clients for Linux and Windows. Not needed to run the server. |
-| `docs/` | Operator runbook and the historical audits. |
+| `docs/` | Server runbook, client setup, and the historical audits. |
 
 ## Compatibility
 

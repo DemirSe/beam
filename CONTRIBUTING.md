@@ -35,7 +35,7 @@ The Makefile defines the local commands:
 - `docs/AUDIT.md` is the historical 2026-11-11 hardening pass.
 - `docs/STRESS-FINDINGS.md` is the historical lab record.
 - `docs/ISSUES.md` and `docs/TODO.md` hold the open gaps.
-- `docs/DEPLOY.md` is the operator runbook.
+- `docs/DEPLOY.md` is the server runbook. `docs/CLIENT.md` covers the tray client and mobile profiles.
 
 ## Security reports
 

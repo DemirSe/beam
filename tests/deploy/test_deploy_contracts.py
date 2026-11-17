@@ -26,6 +26,7 @@ SCRIPT = DEPLOY / "post-boot-check.sh"
 UNIT = DEPLOY / "beam-post-boot-check.service"
 RULES = DEPLOY / "maintenance-rules.md"
 DEPLOY_DOC = ROOT / "docs" / "DEPLOY.md"
+CLIENT_DOC = ROOT / "docs" / "CLIENT.md"
 
 # Platform facts, not script internals. Debian 13 ships ssh.service and
 # chrony.service; AlmaLinux 10 ships sshd.service and chronyd.service.
@@ -522,8 +523,8 @@ class LinuxClientDocsTest(unittest.TestCase):
     """The Linux client inputs and DNS limits must stay documented as tested."""
 
     def section(self):
-        readme = DEPLOY_DOC.read_text()
-        return readme.split("## Linux tray and DNS switch", 1)[1].split(
+        client = CLIENT_DOC.read_text()
+        return client.split("## Linux tray and DNS switch", 1)[1].split(
             "## Mobile profile", 1
         )[0]
 
