@@ -225,7 +225,10 @@ it explicitly.
    firewall and host IPv6 files, and `deploy/sshd-60-hardening.conf` as
    `/etc/ssh/sshd_config.d/00-beam-hardening.conf`, over that verified
    connection and with the console open. Replace the `AllowUsers` account name
-   first.
+   first. Before you enable nftables, confirm that the SSH `dport` in
+   `deploy/nftables.conf` matches your `${SSH_PORT:-22}` and the `Port` in
+   `deploy/sshd-62-port.conf`. The shipped rule allows 22 only, so a host on a
+   different port is locked out the moment nftables starts.
 6. Remove the secret-bearing stage and clear the exit trap:
 
    ```bash
