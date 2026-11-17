@@ -146,6 +146,19 @@ blocking `splice(2)` fast path with a bounded async-copy fallback. XUDP uses
 one outbound UDP socket per session, a per-mux session table, and a
 process-wide session limiter.
 
+## Repository layout
+
+| Path | Holds |
+|---|---|
+| `crates/` | The Rust workspace: `beam`, `beam-core`, `beam-sys`. |
+| `deploy/` | Files installed on a host: systemd units, sysctl and nftables drops, sshd and DNS drop-ins, installers. |
+| `scripts/` | Developer tooling that runs on your machine and is never installed. |
+| `bench/` | The TUN A/B benchmark and soak harness. Its own test is `tests/bench/`. |
+| `tests/` | Rootless suites, plus the TUN harness and its Rust origin in `tests/tun/`. |
+| `fuzz/` | cargo-fuzz targets, kept in a separate workspace. |
+| `clients/` | Optional tray clients for Linux and Windows. Not needed to run the server. |
+| `docs/` | Operator runbook and the historical audits. |
+
 ## Compatibility
 
 This section is the single source of truth for wire behavior. Update it and
@@ -312,6 +325,11 @@ stock clients that use the same UUID, public key, short ID, SNI, and flow.
 - Known gaps and test gaps are tracked in [`ISSUES.md`](docs/ISSUES.md) and
   [`TODO.md`](docs/TODO.md). Report vulnerabilities privately per
   [`SECURITY.md`](SECURITY.md); contributions follow [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the build and test commands, the
+change rules, and the paths to the architecture and audit notes.
 
 ## License
 
