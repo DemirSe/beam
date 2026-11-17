@@ -21,6 +21,10 @@ jobs:
   preflight:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # A capability probe, not a gate: a failed step is the answer, not a
+    # defect. The step conclusions are the report, so this job must not turn
+    # the default runner's missing TUN/netem/cgroup support into a red build.
+    continue-on-error: true
     steps:
       - name: Image and host facts
         run: |
