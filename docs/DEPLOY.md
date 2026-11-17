@@ -13,46 +13,10 @@ package names, ports, and unit names on your own host.
 
 ## Before you deploy
 
-Read this section before you change a host. It gives the choices and checks
-that must exist before you run any command in this runbook. If you cannot meet
-a requirement, stop.
-
-### Choose the host
-
-- Use the smallest dedicated server that fits one tunnel.
-- Choose a provider that allows the traffic you intend to send and receive.
-- Choose a region that makes your cover name plausible.
-- Choose a provider console or rescue mode that you tested.
-- Do not use a shared host with other services. Other services on the host
-  increase the blast radius.
-
-### Prepare the host
-
-1. Use your own account with key-only SSH and passwordless sudo. The scripts
-   need root.
-2. Use AlmaLinux 10 for `bootstrap-alma.sh` or Debian 13 for `bootstrap.sh`.
-   Both scripts also require x86_64. `beam-install.sh` checks systemd, not a
-   distribution.
-3. Keep the provider console reachable while you work.
-4. Take a snapshot or a backup that you can restore.
-5. Install the required tools before you run a script. None of the three
-   scripts installs OS packages. `bootstrap.sh` needs `/usr/sbin/sshd`,
-   `ssh.service`, the `sshd_config.d` Include, `ip`, `ss`, `sysctl`, and
-   `runuser`. When present, it uses `modprobe` and `tc`. `bootstrap-alma.sh`
-   needs `ip`, `ss`, `sysctl`, `nft`, `chronyc`, `systemctl`, `runuser`, and
-   `restorecon`. `beam-install.sh` needs `systemctl`, `sha256sum`, `getent`,
-   `groupadd`, `useradd`, `runuser`, and `install`. It also needs `tar` with
-   `BEAM_ARTIFACT`.
-
-### Recommended minimum posture
-
-- Keep the provider console open until the last verification passes.
-- Take the snapshot before the first change.
-- Pin the release artifact by hash with `BEAM_SHA256` or its sidecar file.
-- Keep the config at 0600 and out of git.
-- Change one thing at a time.
-- Keep a rollback path for each changed file and for each host policy.
-- Watch the journal after each step.
+Read the host choices, the required preparation, the minimum posture, and the
+order of operations in the [`Deploy`](../README.md#deploy) section of the
+README first. That section decides whether you change this host at all. The
+rest of this runbook is the mechanics.
 
 ### What each script changes, and what it leaves to you
 
