@@ -413,7 +413,7 @@ command dispatch → relay/UDP/mux.
 One absolute deadline covers TLS, VLESS read, response write, and the non-Vision
 initial body write (`1253-1275,1331-1339`). Vision TCP passes `request.body`
 into `VisionStream` and is then governed by relay timing, not the handshake
-deadline (`1318-1329`) — an intentional exception, documented in README.
+deadline (`1318-1329`) — an intentional exception.
 
 Dispatch (`1302-1406`): TCP → dial → response → Vision or plain relay; UDP →
 legacy permit → response → legacy UDP; Mux → response → Vision or plain XUDP;

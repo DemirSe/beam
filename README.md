@@ -391,7 +391,8 @@ stock clients that use the same UUID, public key, short ID, SNI, and flow.
   [AGENTS.md](AGENTS.md#golden-rules).
 - Known gaps and test gaps are tracked in [`ISSUES.md`](docs/ISSUES.md) and
   [`TODO.md`](docs/TODO.md). Report vulnerabilities privately per
-  [`SECURITY.md`](SECURITY.md); contributions follow [`CONTRIBUTING.md`](CONTRIBUTING.md).
+  [`SECURITY.md`](SECURITY.md); contributions follow
+  [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Contributing
 

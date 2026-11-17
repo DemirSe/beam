@@ -13,10 +13,10 @@ package names, ports, and unit names on your own host.
 
 ## Before you deploy
 
-Read the host choices, the required preparation, the minimum posture, and the
-order of operations in the [`Deploy`](../README.md#deploy) section of the
-README first. That section decides whether you change this host at all. The
-rest of this runbook is the mechanics.
+Read the host choices, the required preparation, and the minimum posture in
+the [`Deploy`](../README.md#deploy) section of the README first. That section
+decides whether you change this host at all. The rest of this runbook is the
+mechanics, and the order of operations is [below](#order-of-operations).
 
 ### What each script changes, and what it leaves to you
 
@@ -167,11 +167,10 @@ your host.
 ### Deploy
 
 A host that needs only the beam service can use the release archive and
-`beam-install.sh`; see [Install from a release
-artifact](#install-from-a-release-artifact). That path installs the binary,
-the unit, the account, and the config, and it leaves every host policy decision
-alone. The fresh and update paths below also install the nftables, SSH, sysctl,
-and post-boot files, and they install the full host policy set.
+`beam-install.sh`. That path installs the binary, the unit, the account, and
+the config, and it leaves every host policy decision alone. The fresh and
+update paths below also install the nftables, SSH, sysctl, and post-boot
+files, and they install the full host policy set.
 
 Both paths build a bundle with `deploy/package.sh`, copy it to a private
 staging directory on the host, and unpack it there. A new host needs the
