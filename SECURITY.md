@@ -22,6 +22,6 @@ There is no bug bounty program.
 
 ## Out of scope
 
-- A misconfigured single-user deployment. beam has one user ID and one inbound.
-  It has no account system or per-user isolation. See "Security notes" in
-  `README.md`.
+- A misconfigured single-user deployment. beam has one user ID, one inbound,
+  and no account system or per-user isolation. See
+  [Security notes](README.md#security-notes).

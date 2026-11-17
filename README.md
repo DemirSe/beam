@@ -22,8 +22,9 @@ auditable server with explicit resource bounds. It is not a multi-user proxy.
 beam is for one operator who runs one Linux server and one tunnel, can read
 systemd journals, and can edit a TOML file. It is not for:
 
-- Teams, shared access, or resold access.
-- Panels, billing, or per-user limits.
+- Teams, shared access, or resold access. beam is not a shared proxy; see
+  [Security notes](#security-notes).
+- Panels, billing, or per-user limits. There is no account system.
 - Windows or macOS as the server.
 - Anyone without root, or anyone who wants a one-click client.
 
@@ -39,13 +40,12 @@ also applies. That decision is the operator's.
 
 ## Requirements
 
-- Linux x86_64 and a Rust toolchain. `rust-toolchain.toml` pins Rust 1.99.1
-  with `clippy` and `rustfmt`.
+- Linux x86_64 and a Rust toolchain. [`rust-toolchain.toml`](rust-toolchain.toml)
+  pins the version together with the `clippy` and `rustfmt` components.
 - Root to install the service, manage systemd, and bind a low port. Running
   `beam generate` and `beam --check` needs no root.
-- **Single user, one inbound.** beam has one configured user ID and no account
-  system. Do not deploy it as a multi-tenant service; see
-  [Security notes](#security-notes).
+- **Single user, one inbound.** beam supports one configured user ID. See
+  [Security notes](#security-notes) for what that rules out.
 
 ## Build
 
@@ -92,8 +92,9 @@ target/release/beam --check -c config.toml
 The umask applies only to the subshell, so later build and test commands keep
 their normal modes. Both files hold secrets and are git-ignored.
 
-Replace every placeholder. Keep secrets out of git, mode `0600` locally, and
-root:beam `0640` on the service host.
+Replace every placeholder. Keep secrets out of git. Use mode `0600` locally
+and root:beam `0640` on the service host. See
+[Security notes](#security-notes) for the full rule.
 
 ## Run
 
@@ -115,21 +116,17 @@ Before you run an installer, read the recommendations in [`DEPLOY.md`](docs/DEPL
 
 ## Verify
 
-The Makefile is the single source for the local gate:
+The Makefile is the single source for the local gate. Run it before you
+commit:
 
 ```bash
 make verify
 ```
 
-It runs `make check`: `fmt`, `clippy`, and `test`. These are the commands:
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-The `test` target runs `test-scripts` first, then `cargo test --workspace`.
-These are the rootless script suites used by CI:
+It runs `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace`. The `test` target runs these rootless script suites
+before the cargo tests:
 
 ```bash
 python3 tests/bench/test_report.py
@@ -146,7 +143,8 @@ bash tests/linux-tray/test_dns_state.sh
 
 Parser changes also require the relevant fuzz target; hot-path changes require
 a benchmark comparison. Root, TUN, netem, stress, soak, and long benchmark
-runs belong in hosted CI, not in this local loop.
+runs belong in hosted CI, not in this local loop. See
+[AGENTS.md](AGENTS.md#verification-before-every-commit) for the full rule.
 
 ## Architecture
 
@@ -156,8 +154,7 @@ runs belong in hosted CI, not in this local loop.
   legacy UDP, packetaddr, relay logic, config validation, and metrics. It stays
   testable without root or a network.
 - `beam-sys` owns the only `unsafe` code: `splice`, fd helpers, socket options,
-  and eventfd. Every unsafe block states its invariant in a `// SAFETY:`
-  comment.
+  and eventfd. See [AGENTS.md](AGENTS.md#golden-rules) for the `unsafe` rule.
 
 The TLS path pre-reads and authenticates ClientHello, then uses rustls through
 a record-bounded `TlsStream` that owns the TLS record boundary. TCP uses a
@@ -339,8 +336,9 @@ stock clients that use the same UUID, public key, short ID, SNI, and flow.
   the cover; malformed authenticated input is rejected.
 - Keep the config and private key out of git. Use mode `0600` locally and
   root:beam `0640` on the service host. Never log secrets or raw key material.
-- Authentication material uses constant-time comparison. `unsafe` is confined
-  to `beam-sys`, with a `// SAFETY:` invariant for every block.
+- Authentication material uses constant-time comparison. `unsafe` stays in
+  `beam-sys`, and each block needs a `// SAFETY:` invariant. See
+  [AGENTS.md](AGENTS.md#golden-rules).
 - Known gaps and test gaps are tracked in [`ISSUES.md`](docs/ISSUES.md) and
   [`TODO.md`](docs/TODO.md). Report vulnerabilities privately per
   [`SECURITY.md`](SECURITY.md); contributions follow [`CONTRIBUTING.md`](CONTRIBUTING.md).

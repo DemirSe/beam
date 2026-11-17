@@ -3,6 +3,14 @@
 This is the operator runbook for one Linux host. It covers service install,
 host policy, client setup, and recovery.
 
+The numbers in this runbook come from measurements on one host and one network
+path. They are historical evidence, not a guarantee for your host. Measure your
+own path before you set thresholds or expect the same results. The full lab
+record is in [`STRESS-FINDINGS.md`](STRESS-FINDINGS.md).
+
+Host details in the steps below are examples. Confirm distribution versions,
+package names, ports, and unit names on your own host.
+
 ## Before you deploy
 
 Read this section before you change a host. It gives the choices and checks
@@ -113,14 +121,16 @@ configure packages that the rollout does not manage.
 - **Firewall counters.** `deploy/nftables.conf` counts each rule. Run
   `nft list table inet filter` to see new connections per port and the bytes
   that the host drops. The counters cost no measurable throughput: 245 Mbit/s
-  without them and 271 Mbit/s with them, three runs each on the same path.
+  without them and 271 Mbit/s with them, three runs each on the same path
+  (measured on one host, 2026-11).
 - **fq at boot.** `net.core.default_qdisc` applies only to interfaces that the
   kernel creates after the sysctl. A cloud NIC exists earlier, so
   `deploy/beam-fq.service` runs `deploy/apply-fq.sh` at boot and replaces the
   qdisc on the default-route interface. The script is idempotent.
 - **Time sources.** `chrony`, configured by `deploy/chrony-beam.conf`, uses five
   explicit servers from four institutions in three countries:
-  `time.ume.tubitak.gov.tr` (stratum 1, 26 microseconds standard deviation),
+  `time.ume.tubitak.gov.tr` (stratum 1, 26 microseconds standard deviation,
+  measured on one host, 2026-11),
   `samur.ulak.net.tr` (ULAKBIM), `ntp.ripe.net`, `ptbtime1.ptb.de`, and
   `ntp.time.nl`. There is no pool entry, so the server set never rotates to an
   unknown host. `minsources 3` stops a single bad clock from moving the host.
@@ -149,7 +159,8 @@ configure packages that the rollout does not manage.
   to `/etc/fail2ban/jail.d/`, then run `systemctl enable --now fail2ban`. Keep
   the `zz-` prefix so that the file loads after the distribution defaults.
   Confirm with `fail2ban-client get sshd bantime` and
-  `fail2ban-client status sshd`.
+  `fail2ban-client status sshd`. Confirm the package name and jail path on your
+  host.
 
 Operating system updates are manual by owner decision. The host has no
 automatic update service and restarts only when the owner runs them.
@@ -185,8 +196,9 @@ Expect active/running, enabled, `NRestarts=0`, no unexpected listeners, and a
 quiet warn-level journal. `runtime pressure counters increased` is actionable;
 inspect its deltas. A healthy idle process is roughly 2 threads and 10 fds;
 RSS is normally under 20 MiB but can retain an allocator plateau after a large
-burst. Warn at RSS >128 MiB or monotonic growth, fds >256, threads >128, or
-sustained swap.
+burst (measured on one host, 2026-11). Warn at RSS >128 MiB or monotonic
+growth, fds >256, threads >128, or sustained swap. Confirm these thresholds on
+your host.
 
 ### Deploy
 
@@ -323,9 +335,10 @@ remain available for lab use only via `CHECK_H2_FAMILY=6`. The correlated
 beam-owned socket observation during the held connection is the discriminator;
 HTTPS alone can also succeed through the host's direct uplink. Override the
 hold length with `CHECK_H2_HOLD` (default 8 seconds); it must be at least 4
-seconds. The Linux profile sets `auto_redirect`, so never pin probes to the
-tunnel device: traffic bound to it is not proxied. Set `EXPECTED_BINARY_SHA`
-and `EXPECTED_CONFIG_SHA` to make the script fail on a hash mismatch.
+seconds. The Linux profile sets
+`auto_redirect`, so never pin probes to the tunnel device: traffic bound to it
+is not proxied. Set `EXPECTED_BINARY_SHA` and `EXPECTED_CONFIG_SHA` to make the
+script fail on a hash mismatch.
 
 Production uses the production-only drop-in
 `deploy/beam-ipv4-only.conf`; copy it to the host and install it as
@@ -379,7 +392,8 @@ sudo systemctl reload sshd 2>/dev/null || sudo systemctl reload ssh
 ```
 
 AlmaLinux names the SSH unit `sshd` and owns the NIC through NetworkManager;
-Debian uses `ssh` and `systemd-networkd`.
+Debian uses `ssh` and `systemd-networkd`. Confirm the unit and NIC manager on
+your host.
 
 Then verify end to end on IPv4:
 
@@ -432,7 +446,8 @@ and no autostart entry.
   `127.0.0.1:5300`, which forwards to NextDNS
   (`https://dns.nextdns.io/<PROFILE_ID>`). If ctrld is not installed, the helper
   restores the host's own `99-beam.conf` when it saved one. Other resolved
-  drop-ins are never touched.
+  drop-ins are never touched. Confirm the resolver address and port on your
+  host.
 - Connected: `beam-client.service` starts and its `ExecStartPost` calls the
   helper's `dns-on`. The helper waits for `sbtun0`, moves the ctrld resolved
   drop-in aside, writes `99-beam.conf` with `DNS=1.1.1.1`, and reloads
@@ -472,8 +487,9 @@ and no autostart entry.
   later `dns-on` refuses rather than overwrite the edit. The operator must
   reconcile the files.
 - The Linux profile sets `auto_redirect: true` on the TUN. With only
-  `auto_route`, TCP through the TUN timed out; the nftables redirect path fixes
-  TCP and is required on this host. Requires nftables and a root client service.
+  `auto_route`, TCP through the TUN timed out (observed on one host, 2026-11);
+  the nftables redirect path fixes TCP and is required on this host. Requires
+  nftables and a root client service.
   The profile has no IPv6 TUN address and uses `dns.strategy: ipv4_only`; with
   `auto_redirect`, sing-box rejects IPv6 at the host, so IPv6 (including local
   loopback) is intentionally unavailable while connected.
@@ -657,9 +673,10 @@ service installed but neither enabled nor started.
 
 DNS changes use `systemctl reload systemd-resolved`, so rapid tray toggles do not
 restart the resolver or hit its start limit. The tray also applies a three
-second cooldown after each helper action. The helper only accepts fixed
-commands, checks that its real user matches `/etc/beam/allowed-user`, clears its
-environment, redirects stdio, closes inherited descriptors, and executes
+second cooldown after each helper action.
+The helper only accepts fixed commands, checks that its real user matches
+`/etc/beam/allowed-user`, clears its environment, redirects stdio, closes
+inherited descriptors, and executes
 absolute `systemctl` paths. The TUN profile excludes the VLESS server from the
 TUN route, and uses `auto_redirect: true` for TCP.
 

@@ -1,8 +1,11 @@
 # Stress findings — historical evidence
 
 > **Historical evidence.** This file holds the lab evidence from the 2026-11-11
-> stress pass. Current status of each finding is in `ISSUES.md`. Do not add new
-> findings here; add them to `ISSUES.md` instead.
+> stress pass. Current status of each finding is in [ISSUES.md](ISSUES.md). Do
+> not add new findings here. Add them to [ISSUES.md](ISSUES.md) instead.
+>
+> The current wire contract is in the
+> [README.md Compatibility section](../README.md#compatibility).
 
 Findings 1 and 2 were fixed in `2163c0a`/`e0ca0bc`; findings 3, 6, 7, and 11
 are fixed in `fa0c0ca`; the concurrent-replay bound is in `647623b`; the four

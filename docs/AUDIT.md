@@ -1,8 +1,9 @@
 # Hardening pass, 2026-11-11
 
 > **Historical record.** This audit documents the 2026-11-11 hardening pass.
-> I1 and I2 below were later diagnosed and fixed; see `ISSUES.md`. Run IDs from
-> retired experiment workflows no longer resolve. Retained as evidence.
+> I1 and I2 below were later diagnosed and fixed. See [ISSUES.md](ISSUES.md).
+> Run IDs from retired experiment workflows no longer resolve. Retained as
+> evidence.
 
 Actions-only audit of the beam server. Every claim below came from a GitHub
 Actions run in this repository: a finding is reproduced red, documented, fixed,

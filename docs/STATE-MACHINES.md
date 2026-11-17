@@ -50,9 +50,10 @@ policy or an admission bound, it is marked **policy**.
 - No live tunnel, soak, or benchmark was run. Every claim below is code and
   in-repo test evidence. Line numbers are for this checkout; symbol names are
   the durable anchor.
-- Protocol behavior and invariants are defined in the `README.md`
-  Compatibility section. This file adds the implicit state and the lifecycle
-  risks; it does not restate the wire rules.
+- Protocol behavior and invariants are defined in the
+  [README.md Compatibility section](../README.md#compatibility). This file adds
+  the implicit state and the lifecycle risks; it does not restate the wire
+  rules.
 - Issue status is tracked in `ISSUES.md`. The defect register below holds the
   state-machine evidence only.
 - [STRESS-FINDINGS.md](STRESS-FINDINGS.md) is the historical lab record:
@@ -1079,9 +1080,8 @@ own documentation updates.
   - process: `tests/stress/loopback.py` (`shutdown_drain`);
   - clients: manual Linux (connect/disconnect/cooldown/hung helper) and Windows
     (Start/Stop/Restart/Exit) smoke, since neither has in-repo tests;
-  - before commit: `cargo fmt --all --check`,
-    `cargo clippy --workspace --all-targets -- -D warnings`,
-    `cargo test --workspace`.
+  - before commit: run the gate in
+    [AGENTS.md](../AGENTS.md#verification-before-every-commit).
 
 ## Assumptions and limits
 
