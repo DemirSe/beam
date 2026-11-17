@@ -1,0 +1,2152 @@
+//! XUDP session state, sockets, and reply tasks.
+//!
+//! One [`Session`] owns one unconnected UDP socket and one reply task. The
+//! [`SessionTable`] is scoped to a single mux stream: a GlobalID is stored and
+//! retained within that stream, but it is never looked up across mux
+//! connections. Cross-connection continuity is therefore out of scope for v1.
+//!
+//! # Socket model
+//!
+//! A session socket is bound to `0.0.0.0:0` or `[::]:0` at `New`, based on the
+//! first destination. It stays unconnected: every request uses `send_to` and
+//! every reply is stamped with the actual `recv_from` source. This matches
+//! stock Xray's freedom outbound.
+//!
+//! # Deliberate trade-offs
+//!
+//! - **No source allowlist.** The unconnected socket accepts a datagram from
+//!   any sender and forwards its source, exactly like stock Xray. A future
+//!   option could restrict replies to destinations this session contacted, or
+//!   to the same host, but neither stock Xray nor this version does.
+//! - **GlobalID is per stream.** The identifier is accepted, stored, and used
+//!   only to reattach a socket that was closed within this same stream. It is
+//!   not identity, routing, or policy, and a different authenticated client
+//!   cannot attach to it because the table dies with the stream.
+//! - **`close_expiry` retains a closed socket.** A cleanly closed session with
+//!   a nonzero GlobalID is kept for [`XudpConfig::close_expiry`] so a later
+//!   `New` with the same identifier can reattach without a new ephemeral port.
+//!   The retention still counts toward the session limit; when the limit is
+//!   reached, the oldest retained socket is evicted before an active session.
+//! - **One socket family per session.** A `Keep` whose destination has another
+//!   family is dropped; a session does not silently gain a second socket.
+//! - **Domains are resolved off the mux read loop.** A bounded per-mux
+//!   resolver queues the owning frame and its suffix by session id, caches
+//!   resolved domains for a short TTL, and drains the suffix in order. IP
+//!   frames continue immediately. All lookups are bounded by
+//!   [`XudpConfig::io_timeout`]; the resolver task is aborted on mux teardown.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
+use std::time::Duration;
+
+use tokio::net::UdpSocket;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout};
+
+use crate::address::{Address, NetLocation};
+use crate::metrics::Metrics;
+use crate::xudp::frame::{
+    self, FrameOption, FrameSpec, GLOBAL_ID_LEN, MAX_PAYLOAD_LEN, SessionStatus,
+};
+
+/// Default maximum number of sessions (active and retained) per mux stream.
+pub const DEFAULT_MAX_SESSIONS: usize = 2048;
+
+/// Process-wide maximum number of XUDP sessions (active and retained).
+///
+/// Each session owns one UDP socket. The per-stream limit is not an aggregate
+/// bound because one process can have many mux streams. Keep this below the
+/// per-stream limit and size it with the kernel receive buffer in mind; on the
+/// 1 GiB production host the socket buffers, not the Rust heap, are the
+/// dominant cost.
+pub const DEFAULT_MAX_GLOBAL_SESSIONS: usize = 256;
+
+/// Default maximum UDP payload accepted from a frame or queued for a reply.
+pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = MAX_PAYLOAD_LEN;
+
+/// Default idle timeout for a UDP session.
+pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Default retention period for a cleanly closed GlobalID socket.
+pub const DEFAULT_CLOSE_EXPIRY: Duration = Duration::from_secs(60);
+
+/// Default number of reply frames that may wait for the stream writer.
+pub const DEFAULT_MAX_QUEUED_REPLIES: usize = 64;
+
+/// Default per-session UDP receive buffer request.
+pub const DEFAULT_UDP_RECV_BUFFER: usize = 128 * 1024;
+
+/// Smallest accepted UDP receive buffer request.
+pub const MIN_UDP_RECV_BUFFER: usize = 16 * 1024;
+
+/// Largest accepted UDP receive buffer request.
+pub const MAX_UDP_RECV_BUFFER: usize = 4 * 1024 * 1024;
+
+/// Process-wide budget for reply bytes waiting in mux queues.
+///
+/// The per-stream frame count alone lets 256 streams accumulate roughly a
+/// gigabyte of 8 KiB frames. This budget bounds the aggregate Rust-side queue
+/// while still leaving room for large HTTP/3 bursts on a single stream.
+pub const DEFAULT_REPLY_QUEUE_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Per-mux share of the process-wide reply-byte budget.
+///
+/// A single stalled mux must not be able to hold the whole global budget and
+/// starve every other mux. Two MiB is 1/16 of the global cap and half of a
+/// full 512-slot queue of 8 KiB frames.
+pub(crate) const DEFAULT_STREAM_REPLY_BUDGET: usize = 2 * 1024 * 1024;
+
+/// Byte budget shared by every session of one mux stream.
+#[derive(Clone)]
+pub(crate) struct ReplyQueueBudget {
+    bytes: Arc<Semaphore>,
+}
+
+impl ReplyQueueBudget {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Arc::new(Semaphore::new(max_bytes)),
+        }
+    }
+
+    pub(crate) fn try_reserve(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes).ok()?;
+        Arc::clone(&self.bytes).try_acquire_many_owned(bytes).ok()
+    }
+}
+
+/// Process-wide budget for frames queued while a domain is resolving.
+///
+/// Pending payloads are request data, not reply bytes, so they use a separate
+/// smaller budget. This prevents many muxes from each filling their per-mux
+/// pending queue with large datagrams.
+pub const DEFAULT_RESOLUTION_QUEUE_BUDGET: usize = 4 * 1024 * 1024;
+
+/// Default timeout for one socket send, receive, or stream write.
+pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Smallest sweep interval, so a tiny configured timeout cannot busy-loop.
+const MIN_SWEEP_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Largest sweep interval, so the table is inspected at least once a second.
+const MAX_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Limits for the XUDP session layer.
+///
+/// Every value is validated by [`Self::validate`] before
+/// [`crate::xudp::handle_mux_stream`] uses it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XudpConfig {
+    /// Maximum active plus retained sessions for one mux stream.
+    pub max_sessions: usize,
+    /// Maximum UDP payload in either direction, at most
+    /// [`MAX_PAYLOAD_LEN`] (8192).
+    pub max_datagram_size: usize,
+    /// Close a session after this long without a request or reply.
+    ///
+    /// An empty mux stream is also closed after this long; an active session
+    /// keeps the stream open.
+    pub session_idle_timeout: Duration,
+    /// Retain a cleanly closed GlobalID socket for this long.
+    pub close_expiry: Duration,
+    /// Bound on reply frames waiting for the stream writer; excess replies are
+    /// dropped like packets on a congested UDP path.
+    pub max_queued_replies: usize,
+    /// Timeout for a single UDP send/receive or stream write.
+    pub io_timeout: Duration,
+    /// Best-effort per-session UDP receive buffer request.
+    pub udp_recv_buffer: usize,
+}
+
+impl Default for XudpConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl XudpConfig {
+    /// Creates the production defaults.
+    pub const fn new() -> Self {
+        Self {
+            max_sessions: DEFAULT_MAX_SESSIONS,
+            max_datagram_size: DEFAULT_MAX_DATAGRAM_SIZE,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+            close_expiry: DEFAULT_CLOSE_EXPIRY,
+            max_queued_replies: DEFAULT_MAX_QUEUED_REPLIES,
+            io_timeout: DEFAULT_IO_TIMEOUT,
+            udp_recv_buffer: DEFAULT_UDP_RECV_BUFFER,
+        }
+    }
+
+    /// Validates every limit and timeout.
+    pub fn validate(&self) -> Result<(), XudpConfigError> {
+        if self.max_sessions == 0 || self.max_sessions > usize::from(u16::MAX) + 1 {
+            return Err(XudpConfigError::MaxSessions);
+        }
+        if self.max_datagram_size == 0 || self.max_datagram_size > MAX_PAYLOAD_LEN {
+            return Err(XudpConfigError::MaxDatagramSize);
+        }
+        if self.session_idle_timeout.is_zero() {
+            return Err(XudpConfigError::SessionIdleTimeout);
+        }
+        if self.close_expiry.is_zero() {
+            return Err(XudpConfigError::CloseExpiry);
+        }
+        if self.max_queued_replies == 0 || self.max_queued_replies > usize::from(u16::MAX) + 1 {
+            return Err(XudpConfigError::MaxQueuedReplies);
+        }
+        if self.io_timeout.is_zero() {
+            return Err(XudpConfigError::IoTimeout);
+        }
+        if !(MIN_UDP_RECV_BUFFER..=MAX_UDP_RECV_BUFFER).contains(&self.udp_recv_buffer) {
+            return Err(XudpConfigError::UdpRecvBuffer);
+        }
+        Ok(())
+    }
+
+    /// Returns how often the session table is swept.
+    pub(crate) fn sweep_interval(&self) -> Duration {
+        let mut interval = MAX_SWEEP_INTERVAL;
+        if self.session_idle_timeout < interval {
+            interval = self.session_idle_timeout;
+        }
+        if self.close_expiry < interval {
+            interval = self.close_expiry;
+        }
+        interval.max(MIN_SWEEP_INTERVAL)
+    }
+}
+
+/// An invalid [`XudpConfig`] value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum XudpConfigError {
+    /// `max_sessions` was zero or too large for a 16-bit session id space.
+    #[error("XUDP max_sessions must be between 1 and 65536")]
+    MaxSessions,
+    /// `max_datagram_size` was zero or above [`MAX_PAYLOAD_LEN`].
+    #[error("XUDP max_datagram_size must be between 1 and {MAX_PAYLOAD_LEN}")]
+    MaxDatagramSize,
+    /// `session_idle_timeout` was zero.
+    #[error("XUDP session_idle_timeout must be non-zero")]
+    SessionIdleTimeout,
+    /// `close_expiry` was zero.
+    #[error("XUDP close_expiry must be non-zero")]
+    CloseExpiry,
+    /// `max_queued_replies` was zero or unreasonably large.
+    #[error("XUDP max_queued_replies must be between 1 and 65536")]
+    MaxQueuedReplies,
+    /// `io_timeout` was zero.
+    #[error("XUDP io_timeout must be non-zero")]
+    IoTimeout,
+    /// `udp_recv_buffer` was outside the accepted range.
+    #[error("XUDP udp_recv_buffer must be between {MIN_UDP_RECV_BUFFER} and {MAX_UDP_RECV_BUFFER}")]
+    UdpRecvBuffer,
+}
+
+/// Process-wide XUDP session limiter.
+///
+/// A permit is held by each active session and by each retained GlobalID
+/// socket. Permits therefore cover both the live and the close-expiry states,
+/// which are the states that keep a kernel UDP socket alive.
+#[derive(Clone)]
+pub struct XudpSessionLimiter {
+    max: usize,
+    permits: Arc<Semaphore>,
+    /// Weak references to every mux-stream session table that may retain a
+    /// closed GlobalID socket. Retained sockets hold a global permit; the
+    /// registry lets a new active session evict that optional state before it
+    /// is rejected for a global-limit condition.
+    retained_tables: Arc<Mutex<Vec<Weak<Mutex<SessionTable>>>>>,
+    /// Process-wide byte budget for reply frames waiting on stream writers.
+    reply_budget: Arc<Semaphore>,
+    /// Process-wide byte budget for frames waiting on domain resolution.
+    resolution_budget: Arc<Semaphore>,
+    /// Process-wide counters for XUDP decisions.
+    metrics: Arc<Metrics>,
+    /// Highest number of global permits observed in use.
+    high_water: Arc<AtomicUsize>,
+    /// Number of live mux handlers holding this limiter.
+    live_handlers: Arc<AtomicUsize>,
+    /// Last time a pressure snapshot was emitted.
+    pressure_log: Arc<Mutex<Option<Instant>>>,
+}
+
+/// A point-in-time XUDP capacity snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XudpStats {
+    /// Configured global cap.
+    pub max: usize,
+    /// Available global permits.
+    pub available: usize,
+    /// Used global permits (`max - available`).
+    pub used: usize,
+    /// Highest observed used permits.
+    pub high_water: usize,
+    /// Sessions in active tables.
+    pub active: usize,
+    /// Sockets retained in active tables.
+    pub retained: usize,
+    /// Number of live mux tables with this limiter.
+    pub live_tables: usize,
+    /// Number of live mux handlers.
+    pub live_handlers: usize,
+    /// Used permits not represented by active or retained table entries.
+    pub unattributed: usize,
+}
+
+impl fmt::Debug for XudpSessionLimiter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XudpSessionLimiter")
+            .field("max", &self.max)
+            .field("available", &self.permits.available_permits())
+            .finish()
+    }
+}
+
+impl XudpSessionLimiter {
+    /// Creates a limiter with at least one permit.
+    #[must_use]
+    pub fn new(max: usize) -> Self {
+        let max = max.max(1);
+        Self {
+            max,
+            permits: Arc::new(Semaphore::new(max)),
+            retained_tables: Arc::new(Mutex::new(Vec::new())),
+            reply_budget: Arc::new(Semaphore::new(DEFAULT_REPLY_QUEUE_BUDGET)),
+            resolution_budget: Arc::new(Semaphore::new(DEFAULT_RESOLUTION_QUEUE_BUDGET)),
+            metrics: Arc::new(Metrics::default()),
+            high_water: Arc::new(AtomicUsize::new(0)),
+            live_handlers: Arc::new(AtomicUsize::new(0)),
+            pressure_log: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Uses the process-wide metrics instance.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Returns the process-wide metrics instance.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Returns the configured global session limit.
+    #[must_use]
+    pub const fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Leaves half of the global slots for other mux streams.
+    #[must_use]
+    pub(crate) fn stream_active_limit(&self) -> usize {
+        (self.max / 2).max(1)
+    }
+
+    /// Registers one mux stream's session table for global retained eviction.
+    pub(crate) fn register_table(&self, table: &Arc<Mutex<SessionTable>>) {
+        let mut tables = lock(&self.retained_tables);
+        tables.retain(|table| table.strong_count() > 0);
+        tables.push(Arc::downgrade(table));
+    }
+
+    /// Registers one live mux handler for the lifetime of `handle_mux_stream`.
+    pub(crate) fn handler_guard(&self) -> LiveHandlerGuard {
+        self.live_handlers.fetch_add(1, Ordering::Relaxed);
+        LiveHandlerGuard {
+            live_handlers: Arc::clone(&self.live_handlers),
+        }
+    }
+
+    /// Returns a point-in-time capacity snapshot.
+    pub fn stats(&self) -> XudpStats {
+        let tables: Vec<Arc<Mutex<SessionTable>>> = {
+            let mut registry = lock(&self.retained_tables);
+            registry.retain(|table| table.strong_count() > 0);
+            registry.iter().filter_map(Weak::upgrade).collect()
+        };
+        let (active, retained) = tables.iter().fold((0usize, 0usize), |(a, r), table| {
+            let table = lock(table);
+            (a + table.active_len(), r + table.retained_len())
+        });
+        let available = self.permits.available_permits();
+        let used = self.max.saturating_sub(available);
+        XudpStats {
+            max: self.max,
+            available,
+            used,
+            high_water: self.high_water.load(Ordering::Relaxed),
+            active,
+            retained,
+            live_tables: tables.len(),
+            live_handlers: self.live_handlers.load(Ordering::Relaxed),
+            unattributed: used.saturating_sub(active.saturating_add(retained)),
+        }
+    }
+
+    /// Returns true at most once per 30 seconds for pressure diagnostics.
+    pub(crate) fn pressure_log_due(&self) -> bool {
+        let now = Instant::now();
+        let mut last = lock(&self.pressure_log);
+        if last.is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(30)) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
+    fn note_permit_used(&self) {
+        let used = self.max.saturating_sub(self.permits.available_permits());
+        self.high_water.fetch_max(used, Ordering::Relaxed);
+    }
+
+    /// Tries to reserve one global session slot without waiting.
+    #[cfg(test)]
+    pub(crate) fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok();
+        if permit.is_some() {
+            self.note_permit_used();
+        }
+        permit
+    }
+
+    /// Reserves a slot, evicting optional retained sockets when the limit is
+    /// full.
+    ///
+    /// Active sessions are never evicted. Retained GlobalID sockets are
+    /// optional reattachment state, so a new live flow wins over them. If the
+    /// limit consists only of active sessions, this returns `None` and the
+    /// caller must reject the new flow.
+    pub(crate) fn try_acquire_or_evict(&self) -> Option<OwnedSemaphorePermit> {
+        loop {
+            if let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() {
+                self.note_permit_used();
+                return Some(permit);
+            }
+            if !self.evict_one_retained() {
+                return None;
+            }
+        }
+    }
+
+    /// Reserves aggregate queue bytes for one reply frame.
+    pub(crate) fn try_reserve_reply(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes).ok()?;
+        Arc::clone(&self.reply_budget)
+            .try_acquire_many_owned(bytes)
+            .ok()
+    }
+
+    /// Returns the configured aggregate reply-byte budget.
+    #[must_use]
+    pub const fn reply_budget_bytes(&self) -> usize {
+        DEFAULT_REPLY_QUEUE_BUDGET
+    }
+
+    /// Reserves aggregate bytes for one frame queued behind a DNS lookup.
+    pub(crate) fn try_reserve_resolution(
+        &self,
+        bytes: usize,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes).ok()?;
+        Arc::clone(&self.resolution_budget)
+            .try_acquire_many_owned(bytes)
+            .ok()
+    }
+
+    /// Evicts the globally oldest retained socket from any registered stream.
+    fn evict_one_retained(&self) -> bool {
+        // Retry a few times if a concurrent reattach removes the inspected
+        // entry. The table locks are not held across the selection scan.
+        for _ in 0..8 {
+            let tables: Vec<Arc<Mutex<SessionTable>>> = {
+                let mut tables = lock(&self.retained_tables);
+                tables.retain(|table| table.strong_count() > 0);
+                tables.iter().filter_map(Weak::upgrade).collect()
+            };
+
+            let mut victim: Option<(Instant, Arc<Mutex<SessionTable>>)> = None;
+            for table in tables {
+                let Some(expiry) = lock(&table).oldest_expiring_at() else {
+                    continue;
+                };
+                let replace = match &victim {
+                    None => true,
+                    Some((best, _)) => expiry < *best,
+                };
+                if replace {
+                    victim = Some((expiry, table));
+                }
+            }
+
+            let Some((expiry, table)) = victim else {
+                return false;
+            };
+            if lock(&table).evict_oldest_expiring_at(expiry) {
+                self.metrics.record_xudp_retained_evicted();
+                return true;
+            }
+            // The selected entry was reattached or replaced; rescan.
+        }
+        false
+    }
+}
+
+impl Default for XudpSessionLimiter {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_GLOBAL_SESSIONS)
+    }
+}
+
+/// Decrements the live-handler gauge when a mux handler returns.
+pub(crate) struct LiveHandlerGuard {
+    live_handlers: Arc<AtomicUsize>,
+}
+
+impl Drop for LiveHandlerGuard {
+    fn drop(&mut self) {
+        self.live_handlers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Address family of a session socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SocketFamily {
+    /// IPv4 socket.
+    V4,
+    /// IPv6 socket.
+    V6,
+}
+
+impl SocketFamily {
+    /// Returns the family of `address`.
+    pub(crate) fn of(address: SocketAddr) -> Self {
+        if address.is_ipv4() {
+            Self::V4
+        } else {
+            Self::V6
+        }
+    }
+
+    /// Returns `true` when `address` belongs to this family.
+    pub(crate) fn matches(self, address: SocketAddr) -> bool {
+        match self {
+            Self::V4 => address.is_ipv4(),
+            Self::V6 => address.is_ipv6(),
+        }
+    }
+
+    /// Returns the wildcard bind address for this family.
+    pub(crate) fn bind_address(self) -> SocketAddr {
+        match self {
+            Self::V4 => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            Self::V6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        }
+    }
+}
+
+/// Errors returned while resolving a destination.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ResolveError {
+    /// Port zero is never a valid UDP destination.
+    #[error("XUDP destination port must be non-zero")]
+    Port,
+    /// Domain resolution exceeded the configured I/O timeout.
+    #[error("XUDP destination resolution timed out")]
+    Timeout,
+    /// The platform resolver failed.
+    #[error("XUDP destination resolution failed: {0}")]
+    Io(#[from] io::Error),
+    /// No result matched the session socket family.
+    #[error("XUDP destination has no address for this session socket family")]
+    FamilyMismatch,
+}
+
+/// Resolves `destination` to a single socket address.
+///
+/// `family` is `None` for a `New` frame, where the socket family is chosen by
+/// the destination. Otherwise it is the existing session's family and a
+/// mismatching result is rejected. Domains prefer an IPv4 result when no
+/// family is given, then fall back to IPv6; this keeps `localhost` test
+/// fixtures deterministic without preferring one family at the socket level.
+pub(crate) async fn resolve_destination(
+    destination: &NetLocation,
+    family: Option<SocketFamily>,
+    resolve_timeout: Duration,
+) -> Result<SocketAddr, ResolveError> {
+    if destination.port == 0 {
+        return Err(ResolveError::Port);
+    }
+
+    match &destination.address {
+        Address::Ipv4(address) => {
+            let resolved = SocketAddr::from((*address, destination.port));
+            if family.is_some_and(|family| !family.matches(resolved)) {
+                return Err(ResolveError::FamilyMismatch);
+            }
+            Ok(resolved)
+        }
+        Address::Ipv6(address) => {
+            let resolved = SocketAddr::from((*address, destination.port));
+            if family.is_some_and(|family| !family.matches(resolved)) {
+                return Err(ResolveError::FamilyMismatch);
+            }
+            Ok(resolved)
+        }
+        Address::Domain(domain) => {
+            #[cfg(test)]
+            if domain == "slow.test" {
+                // Deterministic slow-failure fixture for the mux HOL tests.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                return Err(ResolveError::Timeout);
+            }
+            #[cfg(test)]
+            if domain == "slow-ok.test" {
+                // Deterministic slow successful resolution for GlobalID
+                // supersession tests.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                return Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, destination.port)));
+            }
+            let addresses = timeout(
+                resolve_timeout,
+                tokio::net::lookup_host((domain.as_str(), destination.port)),
+            )
+            .await
+            .map_err(|_| ResolveError::Timeout)??;
+
+            let mut chosen = None;
+            for address in addresses {
+                match family {
+                    Some(family) if family.matches(address) => {
+                        chosen = Some(address);
+                        break;
+                    }
+                    Some(_) => {}
+                    None if address.is_ipv4() => {
+                        chosen = Some(address);
+                        break;
+                    }
+                    None => {
+                        chosen.get_or_insert(address);
+                    }
+                }
+            }
+            chosen.ok_or(ResolveError::FamilyMismatch)
+        }
+    }
+}
+
+/// One reserved slot in a mux reply queue.
+///
+/// The slot is counted before the frame enters the channel, so a per-class
+/// limit holds even when several tasks reserve at the same time. The guard
+/// releases the slot when the frame is written or dropped.
+pub(crate) struct SlotGuard {
+    queued: Arc<AtomicUsize>,
+}
+
+impl SlotGuard {
+    /// Reserves one slot while the counter stays below `limit`.
+    pub(crate) fn try_acquire(queued: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let mut current = queued.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match queued.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        queued: Arc::clone(queued),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One encoded frame waiting for the mux writer.
+///
+/// `budget` is held until the writer has written (or dropped) the frame, so
+/// aggregate queued bytes stay bounded even when many streams are slow.
+/// `_slot` releases the counted queue reservation when the frame leaves the
+/// queue.
+pub(crate) struct QueuedFrame {
+    pub(crate) bytes: Vec<u8>,
+    /// Set for a data reply; the writer encodes it into its reusable batch.
+    pub(crate) reply: Option<ReplyPayload>,
+    _budget: Option<OwnedSemaphorePermit>,
+    _stream_budget: Option<OwnedSemaphorePermit>,
+    _slot: Option<SlotGuard>,
+}
+
+/// Owned reply payload waiting for the mux writer.
+pub(crate) struct ReplyPayload {
+    pub(crate) session_id: u16,
+    pub(crate) destination: NetLocation,
+    pub(crate) payload: Vec<u8>,
+}
+
+impl QueuedFrame {
+    pub(crate) fn new(
+        bytes: Vec<u8>,
+        budget: Option<OwnedSemaphorePermit>,
+        slot: Option<SlotGuard>,
+    ) -> Self {
+        Self {
+            bytes,
+            reply: None,
+            _budget: budget,
+            _stream_budget: None,
+            _slot: slot,
+        }
+    }
+
+    /// Queues one owned data reply for writer-side encoding.
+    pub(crate) fn reply(
+        session_id: u16,
+        destination: NetLocation,
+        payload: Vec<u8>,
+        budget: Option<OwnedSemaphorePermit>,
+        slot: Option<SlotGuard>,
+    ) -> Self {
+        Self {
+            bytes: Vec::new(),
+            reply: Some(ReplyPayload {
+                session_id,
+                destination,
+                payload,
+            }),
+            _budget: budget,
+            _stream_budget: None,
+            _slot: slot,
+        }
+    }
+
+    pub(crate) fn with_stream_budget(
+        mut self,
+        stream_budget: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        self._stream_budget = stream_budget;
+        self
+    }
+
+    /// Encodes the queued frame exactly as the writer would.
+    #[cfg(test)]
+    pub(crate) fn encoded(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match &self.reply {
+            Some(reply) => {
+                let spec = FrameSpec {
+                    session_id: reply.session_id,
+                    status: SessionStatus::Keep,
+                    option: FrameOption::DATA,
+                    network: Some(crate::xudp::frame::TargetNetwork::Udp),
+                    destination: Some(&reply.destination),
+                    global_id: None,
+                    payload: &reply.payload,
+                };
+                frame::encode_frame(&mut out, spec).expect("test reply encoding");
+            }
+            None => out.extend_from_slice(&self.bytes),
+        }
+        out
+    }
+}
+
+/// Process-wide monotonic epoch used by the atomic idle clock.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn epoch() -> Instant {
+    *EPOCH
+}
+
+/// Milliseconds since the process epoch.
+fn now_ms() -> u64 {
+    epoch().elapsed().as_millis() as u64
+}
+
+/// One UDP relay session.
+pub(crate) struct Session {
+    /// Mux session id.
+    pub(crate) id: u16,
+    /// Optional GlobalID from `New`.
+    pub(crate) global_id: Option<[u8; GLOBAL_ID_LEN]>,
+    /// The unconnected UDP socket shared with a reattached session.
+    pub(crate) socket: Arc<UdpSocket>,
+    /// Socket family selected at creation.
+    pub(crate) family: SocketFamily,
+    destination: Mutex<SocketAddr>,
+    last_activity_ms: AtomicU64,
+    /// Serializes reply admission with close so an old reply cannot be queued
+    /// after its End.
+    enqueue_gate: Mutex<()>,
+    stop: watch::Sender<bool>,
+    closed: AtomicBool,
+    failed: AtomicBool,
+    /// Global session slot, released when the socket is finally dropped.
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
+}
+
+impl Session {
+    /// Creates a session and starts its idle clock.
+    pub(crate) fn new(
+        id: u16,
+        global_id: Option<[u8; GLOBAL_ID_LEN]>,
+        socket: Arc<UdpSocket>,
+        family: SocketFamily,
+        destination: SocketAddr,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        let (stop, _) = watch::channel(false);
+        Self {
+            id,
+            global_id,
+            socket,
+            family,
+            destination: Mutex::new(destination),
+            last_activity_ms: AtomicU64::new(now_ms()),
+            enqueue_gate: Mutex::new(()),
+            stop,
+            closed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            permit: Mutex::new(permit),
+        }
+    }
+
+    /// Takes the global session slot so it can move to a retained socket.
+    pub(crate) fn take_permit(&self) -> Option<OwnedSemaphorePermit> {
+        lock(&self.permit).take()
+    }
+
+    /// Marks request or reply activity.
+    pub(crate) fn touch(&self) {
+        self.last_activity_ms.store(now_ms(), Ordering::Release);
+    }
+
+    /// Serializes a reply enqueue with session close.
+    pub(crate) fn enqueue_guard(&self) -> MutexGuard<'_, ()> {
+        lock(&self.enqueue_gate)
+    }
+
+    /// Returns how long the session has been idle at `now`.
+    ///
+    /// The subtraction saturates: a `touch` that lands after a caller captured
+    /// `now` makes the last activity newer than the snapshot, which reads as
+    /// zero idle time instead of an enormous wrapped duration. Such a touch
+    /// delays expiry by at most one sweep; it can never make `take_idle`
+    /// select a session that was active at the snapshot.
+    pub(crate) fn idle_for(&self, now: Instant) -> Duration {
+        let now_ms = now.saturating_duration_since(epoch()).as_millis() as u64;
+        let last = self.last_activity_ms.load(Ordering::Acquire);
+        Duration::from_millis(now_ms.saturating_sub(last))
+    }
+
+    /// Returns the last destination used for a datagram.
+    pub(crate) fn destination(&self) -> SocketAddr {
+        *lock(&self.destination)
+    }
+
+    /// Records the last destination used for a datagram.
+    pub(crate) fn set_destination(&self, destination: SocketAddr) {
+        *lock(&self.destination) = destination;
+    }
+
+    /// Stops the reply task. Sending is idempotent.
+    ///
+    /// `send_replace` stores the value even when the reply task has not yet
+    /// subscribed. `send` returns an error in that window and leaves the
+    /// value at `false`, so a task spawned just before mux shutdown would
+    /// miss the stop and keep its socket and global permit forever.
+    pub(crate) fn stop(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// Returns a receiver that observes [`Self::stop`].
+    pub(crate) fn stop_receiver(&self) -> watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
+    /// Returns `true` when a closer already claimed this session.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Claims the close responsibility. Returns `true` for the first caller.
+    pub(crate) fn mark_closed(&self) -> bool {
+        !self.closed.swap(true, Ordering::AcqRel)
+    }
+
+    /// Records that the UDP relay failed.
+    pub(crate) fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    /// Returns `true` when the UDP relay failed.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+}
+
+/// An active session plus the handle of its reply task.
+pub(crate) struct ActiveSession {
+    /// Session state.
+    pub(crate) session: Arc<Session>,
+    /// Reply task, if it has been attached.
+    pub(crate) reply_task: Option<JoinHandle<()>>,
+}
+
+/// A cleanly closed GlobalID socket waiting for a same-stream reattach.
+pub(crate) struct ExpiringSession {
+    /// Retained socket.
+    pub(crate) socket: Arc<UdpSocket>,
+    /// Socket family, checked before a reattach.
+    pub(crate) family: SocketFamily,
+    /// Absolute expiry instant.
+    pub(crate) expires_at: Instant,
+    /// Global session slot held while the socket is retained.
+    pub(crate) permit: Option<OwnedSemaphorePermit>,
+}
+
+/// Result of looking up a retained GlobalID socket.
+pub(crate) enum RetainedLookup {
+    /// Still within `close_expiry`; the caller may reattach it.
+    Live(ExpiringSession),
+    /// Past `close_expiry`; the entry was removed and its permit released.
+    Expired,
+}
+
+/// Per-mux-stream session table.
+#[derive(Default)]
+pub(crate) struct SessionTable {
+    active: HashMap<u16, ActiveSession>,
+    expiring: HashMap<[u8; GLOBAL_ID_LEN], ExpiringSession>,
+}
+
+impl SessionTable {
+    /// Returns active plus retained sessions.
+    pub(crate) fn total(&self) -> usize {
+        self.active.len() + self.expiring.len()
+    }
+
+    /// Returns retained sessions.
+    pub(crate) fn retained_len(&self) -> usize {
+        self.expiring.len()
+    }
+
+    /// Returns the number of active sessions.
+    pub(crate) fn active_len(&self) -> usize {
+        self.active.len()
+    }
+
+    /// Looks up an active session without removing it.
+    pub(crate) fn active(&self, id: u16) -> Option<&ActiveSession> {
+        self.active.get(&id)
+    }
+
+    /// Removes and returns an active session.
+    pub(crate) fn take(&mut self, id: u16) -> Option<ActiveSession> {
+        self.active.remove(&id)
+    }
+
+    /// Removes and returns the active session attached to `global_id`.
+    ///
+    /// Xray treats a GlobalID as one logical UDP flow and migrates it when a
+    /// new `New` arrives on another session id. Keeping both attachments would
+    /// duplicate replies and leak a socket.
+    pub(crate) fn take_by_global_id(
+        &mut self,
+        global_id: [u8; GLOBAL_ID_LEN],
+    ) -> Option<ActiveSession> {
+        let id = self
+            .active
+            .iter()
+            .find_map(|(id, entry)| (entry.session.global_id == Some(global_id)).then_some(*id))?;
+        self.active.remove(&id)
+    }
+
+    /// Removes `id` only when it still holds `session`.
+    ///
+    /// A reply task uses this so a stale task cannot remove a newer session
+    /// that reused the same 16-bit id.
+    pub(crate) fn take_if_same(
+        &mut self,
+        id: u16,
+        session: &Arc<Session>,
+    ) -> Option<ActiveSession> {
+        match self.active.get(&id) {
+            Some(entry) if Arc::ptr_eq(&entry.session, session) => self.active.remove(&id),
+            _ => None,
+        }
+    }
+
+    /// Inserts an active session, returning any previous entry.
+    pub(crate) fn insert(&mut self, active: ActiveSession) -> Option<ActiveSession> {
+        self.active.insert(active.session.id, active)
+    }
+
+    /// Removes a retained GlobalID socket for reattachment.
+    ///
+    /// An entry at or past its deadline is dropped (releasing its permit) and
+    /// reported as [`RetainedLookup::Expired`], so a `New` can never reattach
+    /// a socket the sweep would have expired. The boundary matches
+    /// [`Self::expire_retained`], which keeps only `expires_at > now`.
+    pub(crate) fn take_expiring(
+        &mut self,
+        global_id: [u8; GLOBAL_ID_LEN],
+        now: Instant,
+    ) -> Option<RetainedLookup> {
+        let entry = self.expiring.remove(&global_id)?;
+        if now >= entry.expires_at {
+            Some(RetainedLookup::Expired)
+        } else {
+            Some(RetainedLookup::Live(entry))
+        }
+    }
+
+    /// Retains a closed GlobalID socket, returning any previous entry.
+    pub(crate) fn insert_expiring(
+        &mut self,
+        global_id: [u8; GLOBAL_ID_LEN],
+        session: ExpiringSession,
+    ) -> Option<ExpiringSession> {
+        self.expiring.insert(global_id, session)
+    }
+
+    /// Removes every retained entry whose deadline has passed.
+    pub(crate) fn expire_retained(&mut self, now: Instant) -> usize {
+        let before = self.expiring.len();
+        self.expiring.retain(|_, entry| entry.expires_at > now);
+        before - self.expiring.len()
+    }
+
+    /// Returns the earliest retained expiry in this table.
+    pub(crate) fn oldest_expiring_at(&self) -> Option<Instant> {
+        self.expiring.values().map(|entry| entry.expires_at).min()
+    }
+
+    /// Evicts the retained entry that expires first.
+    ///
+    /// Retained sockets are optional state; an active session must never be
+    /// rejected while one can be dropped instead.
+    pub(crate) fn evict_oldest_expiring_at(&mut self, expected: Instant) -> bool {
+        let Some((global_id, expiry)) = self
+            .expiring
+            .iter()
+            .map(|(global_id, entry)| (*global_id, entry.expires_at))
+            .min_by_key(|(_, expiry)| *expiry)
+        else {
+            return false;
+        };
+        // A concurrent reattach may have removed the selected entry. Do not
+        // evict a younger entry than the one inspected by the caller.
+        if expiry > expected {
+            return false;
+        }
+        self.expiring.remove(&global_id).is_some()
+    }
+
+    /// Evicts the retained entry that expires first.
+    ///
+    /// Retained sockets are optional state; an active session must never be
+    /// rejected while one can be dropped instead.
+    pub(crate) fn evict_oldest_expiring(&mut self) -> bool {
+        let Some(global_id) = self
+            .expiring
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires_at)
+            .map(|(global_id, _)| *global_id)
+        else {
+            return false;
+        };
+        self.expiring.remove(&global_id).is_some()
+    }
+
+    /// Removes every active session idle for at least `idle_timeout`.
+    pub(crate) fn take_idle(&mut self, now: Instant, idle_timeout: Duration) -> Vec<ActiveSession> {
+        let ids: Vec<u16> = self
+            .active
+            .iter()
+            .filter(|(_, entry)| entry.session.idle_for(now) >= idle_timeout)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.active.remove(&id))
+            .collect()
+    }
+
+    /// Removes and returns every active session.
+    pub(crate) fn drain_active(&mut self) -> Vec<ActiveSession> {
+        self.active.drain().map(|(_, entry)| entry).collect()
+    }
+
+    /// Drops every retained socket.
+    pub(crate) fn clear_expiring(&mut self) -> usize {
+        let count = self.expiring.len();
+        self.expiring.clear();
+        count
+    }
+}
+
+/// Spawns the task that reads replies from one session socket.
+pub(crate) fn spawn_reply_task(
+    session: Arc<Session>,
+    outbound: mpsc::Sender<QueuedFrame>,
+    queued: Arc<AtomicUsize>,
+    table: Arc<Mutex<SessionTable>>,
+    config: Arc<XudpConfig>,
+    limiter: XudpSessionLimiter,
+    stream_budget: ReplyQueueBudget,
+) -> JoinHandle<()> {
+    tokio::spawn(reply_loop(
+        session,
+        outbound,
+        queued,
+        table,
+        config,
+        limiter,
+        stream_budget,
+    ))
+}
+
+/// Largest number of reply-queue slots held back for control frames.
+const MAX_CONTROL_QUEUE_RESERVE: usize = 8;
+
+/// Slots data replies must leave free for `End` frames.
+pub(crate) fn control_queue_reserve(max_queued_replies: usize) -> usize {
+    max_queued_replies
+        .saturating_sub(1)
+        .min(MAX_CONTROL_QUEUE_RESERVE)
+}
+
+/// Reads datagrams until the session stops or the socket fails.
+///
+/// Replies are `Keep + Data` frames carrying the actual source address. They
+/// are queued with `try_send`: a full bounded queue drops the datagram rather
+/// than applying backpressure to the socket, which matches UDP semantics and
+/// keeps the reply task unblockable.
+async fn reply_loop(
+    session: Arc<Session>,
+    outbound: mpsc::Sender<QueuedFrame>,
+    queued: Arc<AtomicUsize>,
+    table: Arc<Mutex<SessionTable>>,
+    config: Arc<XudpConfig>,
+    limiter: XudpSessionLimiter,
+    stream_budget: ReplyQueueBudget,
+) {
+    let mut stop = session.stop_receiver();
+    if *stop.borrow() || session.is_closed() {
+        return;
+    }
+
+    // One byte above the limit lets `recv_from` reveal an oversize datagram
+    // instead of silently truncating it to the configured maximum.
+    let mut buffer = vec![0u8; config.max_datagram_size.saturating_add(1)];
+    let mut failed = false;
+    let metrics = limiter.metrics();
+    // Data replies may only raise the queue counter to this limit. The
+    // difference up to `max_queued_replies` is held for End control frames.
+    let data_limit = config
+        .max_queued_replies
+        .saturating_sub(control_queue_reserve(config.max_queued_replies));
+
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                match changed {
+                    Ok(()) if *stop.borrow() => break,
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+            received = session.socket.recv_from(&mut buffer) => {
+                match received {
+                    Ok((len, source)) => {
+                        if len == 0 {
+                            // Stock XUDP writers drop zero-length datagrams.
+                            metrics.record_xudp_reply_dropped();
+                            continue;
+                        }
+                        if len > config.max_datagram_size {
+                            tracing::trace!(
+                                session_id = session.id,
+                                length = len,
+                                "XUDP reply exceeds the configured limit; dropping a datagram"
+                            );
+                            metrics.record_xudp_reply_dropped();
+                            continue;
+                        }
+                        let Some(frame_len) = reply_frame_len(source, len) else {
+                            tracing::trace!(
+                                session_id = session.id,
+                                length = len,
+                                "XUDP reply size overflows; dropping a datagram"
+                            );
+                            metrics.record_xudp_reply_dropped();
+                            continue;
+                        };
+
+                        // Count the slot before reserving the channel permit.
+                        // Data stops at `data_limit`, so concurrent reply
+                        // tasks can never take the slots kept free for End
+                        // control frames.
+                        let Some(slot) = SlotGuard::try_acquire(&queued, data_limit) else {
+                            tracing::trace!(
+                                session_id = session.id,
+                                "XUDP reply queue is reserving control capacity; dropping a datagram"
+                            );
+                            metrics.record_xudp_reply_dropped();
+                            continue;
+                        };
+
+                        // Reserve the queue slot and the aggregate byte budget
+                        // before allocating or encoding. A reply that cannot be
+                        // admitted is dropped without paying for its frame.
+                        let permit = match outbound.try_reserve() {
+                            Ok(permit) => permit,
+                            Err(mpsc::error::TrySendError::Full(())) => {
+                                tracing::trace!(
+                                    session_id = session.id,
+                                    "XUDP reply queue is full; dropping a datagram"
+                                );
+                                metrics.record_xudp_reply_dropped();
+                                continue;
+                            }
+                            // The stream writer is gone; the main loop is
+                            // shutting the mux stream down.
+                            Err(mpsc::error::TrySendError::Closed(())) => break,
+                        };
+                        let Some(stream_budget) = stream_budget.try_reserve(frame_len) else {
+                            tracing::trace!(
+                                session_id = session.id,
+                                "XUDP per-stream reply budget is full; dropping a datagram"
+                            );
+                            metrics.record_xudp_reply_dropped();
+                            continue;
+                        };
+                        let Some(budget) = limiter.try_reserve_reply(frame_len) else {
+                            tracing::trace!(
+                                session_id = session.id,
+                                "XUDP aggregate reply budget is full; dropping a datagram"
+                            );
+                            metrics.record_xudp_reply_dropped();
+                            continue;
+                        };
+
+                        // Only a reply that is actually handed to the writer
+                        // counts as session activity. Zero-length, oversize,
+                        // queue-pressure, and allocation drops must not keep
+                        // an otherwise idle session (and its global permit)
+                        // alive.
+                        let payload = buffer[..len].to_vec();
+                        let destination = socket_addr_to_location(source);
+                        let _gate = session.enqueue_guard();
+                        if session.is_closed() {
+                            break;
+                        }
+                        permit.send(
+                            QueuedFrame::reply(
+                                session.id,
+                                destination,
+                                payload,
+                                Some(budget),
+                                Some(slot),
+                            )
+                            .with_stream_budget(Some(stream_budget)),
+                        );
+                        session.touch();
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            session_id = session.id,
+                            %error,
+                            "XUDP reply receive failed"
+                        );
+                        session.mark_failed();
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if failed && session.mark_closed() {
+        queue_failed_session_end(
+            &table,
+            &outbound,
+            &queued,
+            config.max_queued_replies,
+            &session,
+            &metrics,
+        );
+    }
+}
+
+/// Removes a failed reply task's session and queues its error `End`.
+///
+/// The removal and enqueue happen under the table lock. If the read loop
+/// already replaced this 16-bit id, `take_if_same` returns `None` and no stale
+/// `End` may kill the replacement. Holding the lock until the `End` is queued
+/// also prevents a replacement from being ordered before the stale `End` on
+/// the shared FIFO.
+fn queue_failed_session_end(
+    table: &Mutex<SessionTable>,
+    outbound: &mpsc::Sender<QueuedFrame>,
+    queued: &Arc<AtomicUsize>,
+    max_queued: usize,
+    session: &Arc<Session>,
+    metrics: &Metrics,
+) -> bool {
+    let mut table = lock(table);
+    let removed = table.take_if_same(session.id, session);
+    if removed.is_none() {
+        return false;
+    }
+    metrics.record_xudp_closed_error();
+    let end = encode_end_frame(session.id, true);
+    if !end.is_empty() {
+        // Control frames may use the whole queue, including the slots data
+        // replies left free. A failure here still releases the session.
+        let Some(slot) = SlotGuard::try_acquire(queued, max_queued) else {
+            metrics.record_xudp_end_dropped();
+            return true;
+        };
+        if outbound
+            .try_send(QueuedFrame::new(end, None, Some(slot)))
+            .is_err()
+        {
+            metrics.record_xudp_end_dropped();
+        }
+    }
+    drop(table);
+    drop(removed);
+    true
+}
+
+/// Returns the exact encoded size of a UDP reply frame.
+///
+/// A reply always carries a `Keep + Data` frame with an IP source address, so
+/// the metadata size is fixed for a given address family. Reserving this exact
+/// size avoids a hidden growth when an IPv6 source needs 28 overhead bytes
+/// rather than the 24 that fit an IPv4 source.
+pub(crate) fn reply_frame_len(source: SocketAddr, payload_len: usize) -> Option<usize> {
+    let address_len = match source {
+        SocketAddr::V4(_) => 4,
+        SocketAddr::V6(_) => 16,
+    };
+    let overhead = frame::METADATA_PREFIX_LEN
+        + 2 // session id
+        + 1 // status
+        + 1 // option
+        + 1 // network
+        + 2 // port
+        + 1 // address type
+        + address_len
+        + 2; // payload length
+    payload_len.checked_add(overhead)
+}
+
+/// Encodes an `End` frame. An empty vector means encoding failed, which cannot
+/// happen for a metadata-only frame with a 16-bit session id.
+pub(crate) fn encode_end_frame(session_id: u16, error: bool) -> Vec<u8> {
+    let option = if error {
+        FrameOption::ERROR
+    } else {
+        FrameOption(0)
+    };
+    let mut out = Vec::with_capacity(8);
+    match frame::encode_frame(
+        &mut out,
+        FrameSpec::new(session_id, SessionStatus::End).with_option(option),
+    ) {
+        Ok(()) => out,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Converts a socket address to the address form used in a reply frame.
+pub(crate) fn socket_addr_to_location(address: SocketAddr) -> NetLocation {
+    match address {
+        SocketAddr::V4(address) => NetLocation {
+            address: Address::Ipv4(*address.ip()),
+            port: address.port(),
+        },
+        SocketAddr::V6(address) => NetLocation {
+            address: Address::Ipv6(*address.ip()),
+            port: address.port(),
+        },
+    }
+}
+
+/// Locks a mutex, recovering the value if a previous holder panicked.
+///
+/// A poisoned lock means another task panicked; continuing to release sockets
+/// is safer than panicking a second time on a network path.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_MAX_GLOBAL_SESSIONS, DEFAULT_RESOLUTION_QUEUE_BUDGET, DEFAULT_STREAM_REPLY_BUDGET,
+        ExpiringSession, ReplyQueueBudget, ResolveError, Session, SessionTable, SocketFamily,
+        XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
+        queue_failed_session_end, reply_frame_len, reply_loop, resolve_destination,
+        socket_addr_to_location,
+    };
+    use crate::address::{Address, NetLocation};
+    use crate::xudp::frame::{
+        FrameOption, FrameSpec, SessionStatus, TargetNetwork, encode_frame, parse_frame,
+    };
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+    use tokio::time::{Instant, timeout};
+
+    async fn wait_for_reply_drops(limiter: &XudpSessionLimiter, expected: u64) {
+        for _ in 0..100 {
+            if limiter.metrics().snapshot().xudp_replies_dropped >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("reply drop counter did not reach {expected}");
+    }
+
+    fn ipv4(port: u16) -> NetLocation {
+        NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port,
+        }
+    }
+
+    #[test]
+    fn stream_reply_budget_rejects_before_the_global_budget() {
+        let budget = ReplyQueueBudget::new(100);
+        let first = budget.try_reserve(60).expect("first reservation");
+        assert!(budget.try_reserve(60).is_none());
+        drop(first);
+        assert!(budget.try_reserve(60).is_some());
+    }
+
+    #[tokio::test]
+    async fn dropped_replies_do_not_refresh_idle_clock() {
+        let limiter = XudpSessionLimiter::new(4);
+        let table = Arc::new(std::sync::Mutex::new(SessionTable::default()));
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let address = socket.local_addr().expect("test address");
+        let session = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            None,
+        ));
+        // Measure the untouched clock instead of backdating it: a backdated
+        // value can land in the future during the first seconds after the
+        // process epoch starts, which the saturating idle comparison reads as
+        // zero and would hide a refresh. The equality assertions below still
+        // fail if a dropped reply calls `touch`.
+        let untouched = session.last_activity_ms.load(Ordering::Acquire);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let config = Arc::new(XudpConfig {
+            max_datagram_size: 64,
+            max_queued_replies: 4,
+            io_timeout: Duration::from_secs(1),
+            ..XudpConfig::default()
+        });
+        let (outbound, mut inbound) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(reply_loop(
+            Arc::clone(&session),
+            outbound,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&table),
+            Arc::clone(&config),
+            limiter.clone(),
+            ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
+        ));
+        let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender socket");
+
+        sender
+            .send_to(&[], address)
+            .await
+            .expect("zero-length send");
+        wait_for_reply_drops(&limiter, 1).await;
+        assert_eq!(
+            session.last_activity_ms.load(Ordering::Acquire),
+            untouched,
+            "a zero-length junk reply refreshed the idle clock"
+        );
+
+        let oversize = [0_u8; 65];
+        sender
+            .send_to(&oversize, address)
+            .await
+            .expect("oversize send");
+        wait_for_reply_drops(&limiter, 2).await;
+        assert_eq!(
+            session.last_activity_ms.load(Ordering::Acquire),
+            untouched,
+            "an oversize junk reply refreshed the idle clock"
+        );
+
+        sender.send_to(b"ok", address).await.expect("valid send");
+        let queued = timeout(Duration::from_secs(1), inbound.recv())
+            .await
+            .expect("valid reply did not arrive")
+            .expect("reply channel closed");
+        let encoded = queued.encoded();
+        let (frame, used) = parse_frame(&encoded)
+            .expect("valid reply frame")
+            .expect("complete reply frame");
+        assert_eq!(used, encoded.len());
+        assert_eq!(frame.payload, b"ok");
+        assert!(
+            session.last_activity_ms.load(Ordering::Acquire) > untouched,
+            "an accepted reply must refresh the idle clock"
+        );
+        assert!(
+            session.idle_for(Instant::now()) < Duration::from_secs(1),
+            "accepted reply must refresh the idle clock"
+        );
+
+        session.stop();
+        let _ = timeout(Duration::from_secs(1), task).await;
+    }
+
+    #[tokio::test]
+    async fn idle_clock_never_wraps_after_a_concurrent_touch() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let address = socket.local_addr().expect("test address");
+        let session = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            None,
+        ));
+        // `Session::new` initializes the process epoch. Age it by more than a
+        // millisecond so the stale snapshot is observably older than the touch
+        // even when this test is the first `now_ms` caller; otherwise both
+        // millisecond values are 0 and the old wrapping subtraction
+        // coincidentally yields 0, hiding the regression.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        session.touch();
+
+        // The snapshot predates the touch, as the sweep's pre-lock `now` does.
+        let snapshot = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            session.idle_for(snapshot),
+            Duration::ZERO,
+            "a touch after the snapshot must saturate to zero idle"
+        );
+
+        let mut table = SessionTable::default();
+        table.insert(super::ActiveSession {
+            session,
+            reply_task: None,
+        });
+        let idle = table.take_idle(snapshot, Duration::from_secs(60));
+        assert!(
+            idle.is_empty(),
+            "a session touched after the sweep snapshot must not be selected"
+        );
+        assert_eq!(table.total(), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_socket_is_not_reattached_after_expiry() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let limiter = XudpSessionLimiter::new(1);
+        let permit = limiter.try_acquire().expect("global session permit");
+        assert_eq!(limiter.stats().available, 0);
+        let now = tokio::time::Instant::now();
+        let mut table = SessionTable::default();
+
+        table.insert_expiring(
+            [9; 8],
+            ExpiringSession {
+                socket: Arc::clone(&socket),
+                family: SocketFamily::V4,
+                expires_at: now,
+                permit: Some(permit),
+            },
+        );
+        // The deadline itself is expired, matching `expire_retained`.
+        let expired = table.take_expiring([9; 8], now);
+        assert!(matches!(expired, Some(super::RetainedLookup::Expired)));
+        assert!(table.retained_len() == 0);
+        assert_eq!(
+            limiter.stats().available,
+            1,
+            "an expired retained socket must release its global permit"
+        );
+
+        table.insert_expiring(
+            [9; 8],
+            ExpiringSession {
+                socket,
+                family: SocketFamily::V4,
+                expires_at: now + Duration::from_secs(60),
+                permit: None,
+            },
+        );
+        let live = table.take_expiring([9; 8], now + Duration::from_millis(1));
+        assert!(matches!(live, Some(super::RetainedLookup::Live(_))));
+    }
+
+    #[test]
+    fn defaults_are_valid() {
+        let config = XudpConfig::default();
+        assert_eq!(config.max_sessions, 2048);
+        assert_eq!(config.max_datagram_size, 8192);
+        assert_eq!(config.session_idle_timeout, Duration::from_secs(300));
+        assert_eq!(config.close_expiry, Duration::from_secs(60));
+        assert!(config.max_queued_replies > 0);
+        assert_eq!(config.udp_recv_buffer, 128 * 1024);
+        config.validate().expect("defaults must be valid");
+    }
+
+    #[test]
+    fn rejects_invalid_limits() {
+        let cases = [
+            (
+                XudpConfig {
+                    max_sessions: 0,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::MaxSessions,
+            ),
+            (
+                XudpConfig {
+                    max_sessions: usize::from(u16::MAX) + 2,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::MaxSessions,
+            ),
+            (
+                XudpConfig {
+                    max_datagram_size: 0,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::MaxDatagramSize,
+            ),
+            (
+                XudpConfig {
+                    max_datagram_size: 8193,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::MaxDatagramSize,
+            ),
+            (
+                XudpConfig {
+                    session_idle_timeout: Duration::ZERO,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::SessionIdleTimeout,
+            ),
+            (
+                XudpConfig {
+                    close_expiry: Duration::ZERO,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::CloseExpiry,
+            ),
+            (
+                XudpConfig {
+                    max_queued_replies: 0,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::MaxQueuedReplies,
+            ),
+            (
+                XudpConfig {
+                    io_timeout: Duration::ZERO,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::IoTimeout,
+            ),
+            (
+                XudpConfig {
+                    udp_recv_buffer: 0,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::UdpRecvBuffer,
+            ),
+            (
+                XudpConfig {
+                    udp_recv_buffer: 4 * 1024 * 1024 + 1,
+                    ..XudpConfig::default()
+                },
+                XudpConfigError::UdpRecvBuffer,
+            ),
+        ];
+
+        for (config, expected) in cases {
+            assert_eq!(config.validate(), Err(expected));
+        }
+    }
+
+    #[test]
+    fn global_session_limiter_is_bounded() {
+        let limiter = XudpSessionLimiter::new(1);
+        let permit = limiter.try_acquire().expect("first slot must be available");
+        assert!(
+            limiter.try_acquire().is_none(),
+            "the limit must reject a second slot"
+        );
+        drop(permit);
+        assert!(
+            limiter.try_acquire().is_some(),
+            "a released slot must be reusable"
+        );
+        assert_eq!(limiter.max(), 1);
+        assert_eq!(
+            XudpSessionLimiter::default().max(),
+            DEFAULT_MAX_GLOBAL_SESSIONS
+        );
+    }
+
+    #[test]
+    fn reply_frame_len_is_exact_for_both_families() {
+        let sources = [
+            SocketAddr::from(([127, 0, 0, 1], 1234)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 1234)),
+        ];
+
+        for source in sources {
+            for payload_len in [0, 1, 64, 1200, 8192] {
+                let frame_len = reply_frame_len(source, payload_len)
+                    .expect("a bounded payload must have a frame length");
+                let mut frame = Vec::new();
+                frame
+                    .try_reserve_exact(frame_len)
+                    .expect("the test frame must fit in memory");
+                let capacity = frame.capacity();
+                let payload = vec![0_u8; payload_len];
+                let source = socket_addr_to_location(source);
+                let spec = FrameSpec {
+                    session_id: 7,
+                    status: SessionStatus::Keep,
+                    option: FrameOption::DATA,
+                    network: Some(TargetNetwork::Udp),
+                    destination: Some(&source),
+                    global_id: None,
+                    payload: &payload,
+                };
+
+                encode_frame(&mut frame, spec).expect("a reply frame must encode");
+                assert_eq!(
+                    frame.len(),
+                    frame_len,
+                    "reply_frame_len must match encode_frame for {source:?} and {payload_len} bytes"
+                );
+                assert_eq!(
+                    frame.capacity(),
+                    capacity,
+                    "an exact reservation must not grow while encoding"
+                );
+            }
+        }
+
+        assert!(reply_frame_len(SocketAddr::from(([127, 0, 0, 1], 1)), usize::MAX).is_none());
+    }
+
+    #[test]
+    fn resolution_queue_budget_is_process_wide() {
+        let limiter = XudpSessionLimiter::new(1);
+        let permit = limiter
+            .try_reserve_resolution(DEFAULT_RESOLUTION_QUEUE_BUDGET)
+            .expect("the whole resolution budget must be reservable");
+        assert!(
+            limiter.try_reserve_resolution(1).is_none(),
+            "the resolution budget must reject one more byte"
+        );
+        drop(permit);
+        assert!(limiter.try_reserve_resolution(1).is_some());
+    }
+
+    #[test]
+    fn reply_queue_budget_is_process_wide() {
+        let limiter = XudpSessionLimiter::new(1);
+        let budget = limiter.reply_budget_bytes();
+        let permit = limiter
+            .try_reserve_reply(budget)
+            .expect("the whole budget must be reservable");
+        assert!(
+            limiter.try_reserve_reply(1).is_none(),
+            "the byte budget must reject one more byte"
+        );
+        drop(permit);
+        assert!(
+            limiter.try_reserve_reply(1).is_some(),
+            "released reply bytes must be reusable"
+        );
+    }
+
+    #[test]
+    fn sweep_interval_is_bounded() {
+        let config = XudpConfig {
+            session_idle_timeout: Duration::from_micros(1),
+            close_expiry: Duration::from_micros(1),
+            ..XudpConfig::default()
+        };
+        assert!(config.sweep_interval() >= Duration::from_millis(10));
+
+        let config = XudpConfig::default();
+        assert_eq!(config.sweep_interval(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn socket_family_binds_the_wildcard() {
+        assert!(SocketFamily::V4.bind_address().is_ipv4());
+        assert!(SocketFamily::V6.bind_address().is_ipv6());
+        assert_eq!(SocketFamily::V4.bind_address().port(), 0);
+        assert_eq!(SocketFamily::V6.bind_address().port(), 0);
+        assert!(
+            SocketFamily::of(SocketAddr::from((Ipv6Addr::LOCALHOST, 1)))
+                .matches(SocketAddr::from((Ipv6Addr::LOCALHOST, 2)))
+        );
+    }
+
+    #[test]
+    fn converts_both_socket_families() {
+        let v4 = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 53));
+        assert_eq!(
+            socket_addr_to_location(v4),
+            NetLocation {
+                address: Address::Ipv4(Ipv4Addr::new(192, 0, 2, 1)),
+                port: 53,
+            }
+        );
+
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 443));
+        assert_eq!(
+            socket_addr_to_location(v6),
+            NetLocation {
+                address: Address::Ipv6(Ipv6Addr::LOCALHOST),
+                port: 443,
+            }
+        );
+    }
+
+    #[test]
+    fn end_frame_layout_is_clean_or_error() {
+        let clean = encode_end_frame(7, false);
+        assert_eq!(clean, [0x00, 0x04, 0x00, 0x07, 0x03, 0x00]);
+        let (frame, used) = parse_frame(&clean)
+            .expect("clean End must parse")
+            .expect("clean End must be complete");
+        assert_eq!(used, clean.len());
+        assert_eq!(frame.status, SessionStatus::End);
+        assert_eq!(frame.option, FrameOption(0));
+
+        let error = encode_end_frame(7, true);
+        assert_eq!(error, [0x00, 0x04, 0x00, 0x07, 0x03, 0x02]);
+        let (frame, used) = parse_frame(&error)
+            .expect("error End must parse")
+            .expect("error End must be complete");
+        assert_eq!(used, error.len());
+        assert!(frame.option.has_error());
+    }
+
+    #[tokio::test]
+    async fn resolves_ip_literals_and_rejects_port_zero() {
+        assert_eq!(
+            resolve_destination(&ipv4(53), None, Duration::from_secs(1))
+                .await
+                .expect("IPv4 literal"),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 53))
+        );
+
+        assert!(matches!(
+            resolve_destination(&ipv4(0), None, Duration::from_secs(1)).await,
+            Err(ResolveError::Port)
+        ));
+        assert!(matches!(
+            resolve_destination(&ipv4(53), Some(SocketFamily::V6), Duration::from_secs(1)).await,
+            Err(ResolveError::FamilyMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolves_localhost_to_a_matching_family() {
+        let any = resolve_destination(
+            &NetLocation {
+                address: Address::Domain("localhost".to_owned()),
+                port: 9,
+            },
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("localhost must resolve");
+        assert_eq!(any.port(), 9);
+
+        // The same domain can be resolved for an explicit family when the
+        // system has an address of that family.
+        let v4 = resolve_destination(
+            &NetLocation {
+                address: Address::Domain("localhost".to_owned()),
+                port: 9,
+            },
+            Some(SocketFamily::V4),
+            Duration::from_secs(5),
+        )
+        .await;
+        if let Ok(address) = v4 {
+            assert!(address.is_ipv4());
+        }
+    }
+
+    #[tokio::test]
+    async fn table_counts_active_and_retained_sessions() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let address = socket.local_addr().expect("test address");
+        let session = Arc::new(Session::new(
+            1,
+            Some([7; 8]),
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            None,
+        ));
+        let mut table = SessionTable::default();
+        assert_eq!(table.total(), 0);
+
+        table.insert(super::ActiveSession {
+            session: Arc::clone(&session),
+            reply_task: None,
+        });
+        assert_eq!(table.total(), 1);
+        assert!(!table.evict_oldest_expiring());
+
+        let entry = super::ExpiringSession {
+            socket,
+            family: SocketFamily::V4,
+            expires_at: tokio::time::Instant::now() + Duration::from_secs(1),
+            permit: None,
+        };
+        table.insert_expiring([7; 8], entry);
+        assert_eq!(table.total(), 2);
+        assert!(matches!(
+            table.take_expiring([7; 8], tokio::time::Instant::now()),
+            Some(super::RetainedLookup::Live(_))
+        ));
+        assert_eq!(table.total(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_reply_end_is_not_queued_after_id_reuse() {
+        let limiter = XudpSessionLimiter::new(4);
+        let table = Arc::new(std::sync::Mutex::new(SessionTable::default()));
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let address = socket.local_addr().expect("test address");
+        let old = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            limiter.try_acquire(),
+        ));
+        let replacement = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            limiter.try_acquire(),
+        ));
+        table.lock().expect("table").insert(super::ActiveSession {
+            session: Arc::clone(&old),
+            reply_task: None,
+        });
+        let replaced = table
+            .lock()
+            .expect("table")
+            .insert(super::ActiveSession {
+                session: Arc::clone(&replacement),
+                reply_task: None,
+            })
+            .expect("same id must replace");
+        drop(replaced);
+        assert!(old.mark_closed());
+
+        let (outbound, mut inbound) = tokio::sync::mpsc::channel(4);
+        let queued = Arc::new(AtomicUsize::new(0));
+        assert!(!queue_failed_session_end(
+            &table,
+            &outbound,
+            &queued,
+            4,
+            &old,
+            &limiter.metrics()
+        ));
+        assert!(
+            inbound.try_recv().is_err(),
+            "a stale failure End must not follow the replacement"
+        );
+        assert_eq!(table.lock().expect("table").total(), 1);
+        assert_eq!(limiter.metrics().snapshot().xudp_closed_error, 0);
+
+        assert!(replacement.mark_closed());
+        assert!(queue_failed_session_end(
+            &table,
+            &outbound,
+            &queued,
+            4,
+            &replacement,
+            &limiter.metrics()
+        ));
+        let queued = inbound.recv().await.expect("current failure End");
+        let encoded = queued.encoded();
+        let (frame, used) = parse_frame(&encoded)
+            .expect("valid End")
+            .expect("complete End");
+        assert_eq!(used, encoded.len());
+        assert_eq!(frame.status, SessionStatus::End);
+        assert_eq!(frame.option, FrameOption::ERROR);
+        assert_eq!(table.lock().expect("table").total(), 0);
+        assert_eq!(limiter.metrics().snapshot().xudp_closed_error, 1);
+    }
+
+    #[tokio::test]
+    async fn stats_track_active_retained_tables_and_handlers() {
+        let limiter = XudpSessionLimiter::new(2);
+        let table = Arc::new(std::sync::Mutex::new(SessionTable::default()));
+        limiter.register_table(&table);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let address = socket.local_addr().expect("test address");
+        let active = Arc::new(Session::new(
+            1,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            limiter.try_acquire(),
+        ));
+        table.lock().expect("table").insert(super::ActiveSession {
+            session: active,
+            reply_task: None,
+        });
+        table.lock().expect("table").insert_expiring(
+            [9; 8],
+            ExpiringSession {
+                socket,
+                family: SocketFamily::V4,
+                expires_at: Instant::now() + Duration::from_secs(10),
+                permit: limiter.try_acquire(),
+            },
+        );
+        let stats = limiter.stats();
+        assert_eq!(stats.max, 2);
+        assert_eq!(stats.available, 0);
+        assert_eq!(stats.used, 2);
+        assert_eq!(stats.active, 1);
+        assert_eq!(stats.retained, 1);
+        assert_eq!(stats.live_tables, 1);
+        let guard = limiter.handler_guard();
+        assert_eq!(limiter.stats().live_handlers, 1);
+        drop(guard);
+        assert_eq!(limiter.stats().live_handlers, 0);
+    }
+
+    #[tokio::test]
+    async fn global_eviction_picks_the_oldest_retained_socket_across_streams() {
+        let limiter = XudpSessionLimiter::new(2);
+        let first = Arc::new(std::sync::Mutex::new(SessionTable::default()));
+        let second = Arc::new(std::sync::Mutex::new(SessionTable::default()));
+        limiter.register_table(&first);
+        limiter.register_table(&second);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let now = Instant::now();
+        first.lock().expect("first table").insert_expiring(
+            [1; 8],
+            ExpiringSession {
+                socket: Arc::clone(&socket),
+                family: SocketFamily::V4,
+                expires_at: now + Duration::from_secs(20),
+                permit: limiter.try_acquire(),
+            },
+        );
+        second.lock().expect("second table").insert_expiring(
+            [2; 8],
+            ExpiringSession {
+                socket,
+                family: SocketFamily::V4,
+                expires_at: now + Duration::from_secs(5),
+                permit: limiter.try_acquire(),
+            },
+        );
+        let permit = limiter
+            .try_acquire_or_evict()
+            .expect("evicting retained state must admit a live slot");
+        drop(permit);
+        assert_eq!(first.lock().expect("first table").total(), 1);
+        assert_eq!(second.lock().expect("second table").total(), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_and_retained_sessions_expire() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"));
+        let address = socket.local_addr().expect("test address");
+        let session = Arc::new(Session::new(
+            3,
+            None,
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            address,
+            None,
+        ));
+        let mut table = SessionTable::default();
+        table.insert(super::ActiveSession {
+            session: Arc::clone(&session),
+            reply_task: None,
+        });
+
+        let now = tokio::time::Instant::now() + Duration::from_secs(10);
+        let idle = table.take_idle(now, Duration::from_secs(5));
+        assert_eq!(idle.len(), 1);
+        assert_eq!(table.total(), 0);
+
+        let entry = super::ExpiringSession {
+            socket,
+            family: SocketFamily::V4,
+            expires_at: now,
+            permit: None,
+        };
+        table.insert_expiring([9; 8], entry);
+        assert_eq!(table.expire_retained(now), 1);
+        assert_eq!(table.total(), 0);
+    }
+}

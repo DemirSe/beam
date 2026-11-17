@@ -1,0 +1,190 @@
+# Hardening pass, 2026-11-11
+
+> **Historical record.** This audit documents the 2026-11-11 hardening pass.
+> I1 and I2 below were later diagnosed and fixed; see `ISSUES.md`. Run IDs from
+> retired experiment workflows no longer resolve. Retained as evidence.
+
+Actions-only audit of the beam server. Every claim below came from a GitHub
+Actions run in this repository: a finding is reproduced red, documented, fixed,
+then proven green. Nothing ran on a deployed server and no local binary was
+executed. Branch: `dev`; deployment untouched.
+
+## Method
+
+- Each experiment lived on a throwaway branch with its own workflow and probe
+  script, so any run is reproducible from its commit alone.
+- `dev-audit` runs format, clippy, the debug suite, and the release suite on every
+  push, with `pipefail`, so a failing suite cannot report a green step.
+- Probes use the real client: `tests/stress/vless_client.py` starts beam plus a
+  checksum-pinned sing-box (v1.14.4) and derives the REALITY public key from the
+  example fixture with a pure-Python X25519 that carries the RFC 7748
+  known-answer test. It speaks SOCKS5 with IPv4, IPv6, and domain destinations.
+
+## F1 — mux teardown skipped on cancellation (fixed)
+
+**Proven red** (run 42926928710). `aborting_the_mux_handler_releases_sessions_and_permits`
+aborts a live mux handler owning three sessions:
+
+```
+assertion `left == right` failed: aborted mux left sessions registered:
+XudpStats { max: 8, available: 5, used: 3, high_water: 3, active: 3, retained: 0,
+            live_tables: 1, live_handlers: 0, unattributed: 0 }
+  left: 3
+ right: 0
+```
+
+`live_handlers: 0` proves the handler was gone; `active: 3` and `used: 3` prove
+the sessions, sockets, and three global permits outlived it. The drain/stop/join
+teardown ran only when `read_loop` returned, so a cancelled task (runtime
+shutdown, panic) skipped it while reply tasks kept everything alive.
+
+**Fix.** `MuxTeardown` is registered for the handler's whole lifetime and, on
+drop, drains the table, clears retained sockets, claims and stops each session,
+releases its permit, and aborts its reply task. The return path is unchanged and
+idempotent.
+
+**Proven green** (run 42927245182): the same test passes, `dev-audit` success.
+
+Documented in `STATE-MACHINES.md` (register, one-page summary, machine 14,
+cross-cutting notes).
+
+## I1 — replay rejections are counted
+
+`STATE-MACHINES.md` called the missing replay-rejection counter the clearest
+missing operator signal. `replay_rejected` now increments where `replay_insert`
+fails, appears in the pressure warning and the periodic counter line, and the
+counter tuple's new index is pinned by a test.
+
+**Wiring evidence** (run 42930995433): the line is observed in the log as
+`xudp_send_dropped=0`. The value was zero because a loopback sink absorbs the blast
+before beam's 128-entry queue fills, so a non-zero increment was **not** exercised.
+Only the field's end-to-end visibility is measured.
+
+## Withdrawn finding
+
+An empty-payload `Keep` carrying a destination does not retarget the session. A
+first report called this a defect; an independent review checked it against upstream Xray
+(`handleStatusKeep` passes that frame's target to a new packet reader, with no
+persistent update) and sing-vmess (the writer repeats the destination on every
+packet) and returned **NOT A BUG**. The behaviour is now documented in `README.md`
+and pinned by four tests.
+
+## Negative results
+
+|Probe|Run(s)|Result|
+|---|---|---|
+|Scanner descriptors: 300 empty probes, 200 non-TLS prefixes, 100 truncated records, 64-way burst, 16 half-open, 200-probe rejection flood, three legs|42910458312|Descriptors flat at 10 across 2040 probes per leg; old code identical|
+|Seeded chaos storm (384 and 960 probes, mixed junk), permit/fd recovery, mid-storm SIGTERM|42911333814, 42911759204|No fd growth, 32/32 cover dials, 8/8 pre-auth recovery, exit 0|
+|Authenticated interop: 1 KiB / 64 KiB / 1 MiB TCP, 30-flow churn, 120 datagrams, client-exit teardown, xudp and packetaddr|42927578630|Byte-exact, fds 10→10, 120/120 datagrams, teardown to baseline|
+|Config matrix: 57 boundary and malformed configurations through `--check`|42928125593|`PASS (57/57)`, no panic, no hang|
+|Fragmented ClientHello exactness (seeded splits, 4-way burst) and the oversized first-record bound|42917309045, 42917608813|Byte-exact 1807 B and 1791 B; 10 B oversized forwarded in 20 ms|
+|Concurrency: six interleaved datagram flows, three parallel 2 MiB transfers, SIGTERM under load|42928438830|240/240 datagrams kept their own flow tag, transfers byte-exact, exit 0|
+|Edge cases: 1400/1472/4000/8000 B datagrams, 9000 B oversize, wrong REALITY short id, SIGTERM mid-transfer|42929206495|All sizes echoed exactly, oversize dropped with the server alive, bad short id rejected through the cover, exit 0 in 2.07 s|
+|Domain destinations (`localhost` for TCP and UDP)|42929377685|Both relayed; the v4 session picked the matching address|
+|Target-initiated half-close|42929579569|Client got the data and EOF and could still write; destination got the later bytes|
+|Transport matrix: Vision/plain flow × xudp/packetaddr/legacy UDP|42930039966|512 KiB TCP and 40 datagrams byte-exact in all four combinations|
+|IPv6 destinations (`::1`) for TCP and both datagram encodings|42930484874|65 536 B TCP and 30/30 datagrams byte-exact|
+|Session-limit saturation (3 sessions, 8 flows), 4000 × 8 KiB blast, recovery|42930667851, 42930995433|Survived the limit, a fresh flow worked after it, descriptors 10→12, tunnel still serving|
+|Admission saturation (max_connections = 1, three concurrent dials), SIGKILL, immediate restart|42931924765|One admitted, two rejected, recovery after release, port rebound in 50 ms|
+|Real HTTPS through the tunnel (2 MiB, self-signed server)|42932496207, 42932725508|Every fetch byte-exact and six raw-handoff lines, so Vision Direct engaged|
+|Fuzz: seven targets, ten minutes each, ASAN|42928333509|All seven completed with no crash|
+|Fuzz round two: xudp, legacy_udp, vless, client_hello for twenty minutes each|42932207100|All four completed with no crash|
+
+## Historical: a stall seen in the soak (later diagnosed)
+
+Later diagnosed as replay-cache capacity saturation at 65,536 handshakes; see
+`ISSUES.md` for the fix and proof.
+
+Soak runs that last long enough lose their transfer integrity after roughly seven
+thousand rounds, and the first explanation (a fixed connection or round count)
+does not survive closer probes:
+
+|Run|Shape|Outcome|
+|---|---|---|
+|42930317510|8 x 64 KiB TCP + 20 datagrams, restarts|stalls at ~7 282 rounds / ~390 s|
+|42937823294|same, no restarts|stalls at ~7 282 rounds / ~390 s|
+|42940524407|same, no restarts, 420 s|**passes**: 6 953 rounds, every counter zero, `PASS`|
+|42942423567|8 x 1 KiB TCP + short timeouts|7 800 rounds in 165 s, no slowdown|
+|42943941476|soak shape with a consecutive-failure detector|fails from round 1 and takes 961 s for 12 rounds; client and server restarts do not help; the counters show `authenticated_active=0`, `xudp_used=0`, `xudp_available=256`, one closed mux per round|
+
+So the stall tracks neither time nor a clean connection count, and the last probe
+never established a working baseline, which makes its "no restart helps" result
+uninformative. What the server does show, in every run including the failing ones:
+descriptors at 10-12, five threads, RSS plateaued near 18 MB, no replay, cover,
+admission, parse, or reset log lines, and every XUDP counter back to zero once the
+traffic stops. No beam defect is demonstrated here.
+
+Before this is filed as anything, the probe needs one property the current ones
+lack: it must prove a working baseline (a fixed number of successful rounds)
+before it starts counting failures, and it must print the server's counters
+before and after the transition. That is the next step, not a conclusion.
+
+## Historical: replay rejections after a client restart (later resolved)
+
+Later diagnosed as the same replay-cache saturation, not client ClientHello
+reuse; see `ISSUES.md`.
+
+The soak, which restarted the client every five minutes, logged
+`authenticated ClientHello replay` at each restart and lost transfers in the one
+to two minutes that followed (runs 42930317510, 42933254782, 42935430888). Two
+dedicated repros then failed to reproduce it:
+
+- idle restart (run 42937037698): service back in 0.06 s, zero replay rejections;
+- restart under eight concurrent transfers (run 42937485208): service back in
+  0.06 s, zero replay rejections.
+
+So the trigger is unidentified and the "restart reuses ClientHello" explanation
+is withdrawn rather than shipped. What did come out of it: the replay counter now
+also counts reservation-level rejections (`d08bc8e`), because those were the only
+signal the soak produced, and the soak no longer restarts the client by default
+(`e15bf92`) - restart behaviour is covered by the admission campaign, which kills
+the server rather than the client.
+
+## Not a defect: client-initiated FIN through sing-box
+
+A client that sends a payload and half-closes is reset rather than served:
+sing-box does not propagate the FIN, and beam then reports `Connection reset by
+peer`. The relay's own half-close handling is exercised with a target-initiated
+FIN instead, which passes. Recorded so the next reader does not file it.
+
+## Soak (run 42930317510, twenty minutes, 14 574 rounds)
+
+|Metric|Start|End|
+|---|---|---|
+|Descriptors|10|10 (samples 10–12 during churn)|
+|Threads|5|5|
+|RSS|7 672 KiB|18 296 KiB, plateaued at ~18 200 KiB from minute six|
+|TCP transfers|—|116 592 attempted, 82 failed|
+|UDP datagrams|—|291 480 attempted, 240 lost|
+
+Every TCP and UDP failure fell inside a client-restart window: a transfer in
+flight when the client was terminated, plus the one to two minutes the restarted
+client needs before it forwards again. Across roughly 145 000 TCP flows and
+291 000 datagrams, descriptors returned to baseline, threads never moved, and RSS
+stabilised, which is the shape a slow leak would break.
+
+The harness needed two corrections before it could say that cleanly: it first
+counted restart-induced failures as integrity failures (`97a0740`), and it then
+still counted the client's own recovery phase, where every datagram times out
+(`c146bbc`). It now waits for a successful round trip after each restart and only
+counts from there.
+
+## New permanent gates on dev
+
+- `dev-audit.yml` — fmt, clippy, debug suite, release suite, `pipefail`.
+- `interop.yml` — real HTTPS through the tunnel with Vision Direct assertion,
+  IPv6 destinations, target-initiated half-close, and the interop campaign for
+  xudp and packetaddr.
+- `config-matrix.yml` — 57 boundary and malformed configurations, no panic, no hang.
+- `pressure.yml` (main and dispatch) — session-limit saturation, datagram blast,
+  admission saturation, crash restart.
+- `soak.yml` (dispatch) — twenty minutes of mixed traffic with client restarts.
+
+## Open items after this pass
+
+- Non-zero `xudp_send_dropped` was not exercised end-to-end; the field's visibility
+  is proven, its increment is covered only by the unit test.
+- Client-initiated FIN is unverifiable through the current client harness.
+- XUDP oversize frames close the mux by design (8192-byte client contract); not a
+  defect, but a buggy client can drop its own multiplexed stream.
+- Replay in-flight peaks and cache occupancy are still not exported.

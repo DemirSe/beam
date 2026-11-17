@@ -1,0 +1,62 @@
+[package]
+name = "beam-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+beam-core = { path = "../crates/beam-core", features = ["fuzz"] }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "client_hello"
+path = "fuzz_targets/client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reality_auth"
+path = "fuzz_targets/reality_auth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vless"
+path = "fuzz_targets/vless.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vision"
+path = "fuzz_targets/vision.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xudp"
+path = "fuzz_targets/xudp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "legacy_udp"
+path = "fuzz_targets/legacy_udp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false

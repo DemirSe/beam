@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply the fq qdisc to the Beam network interface
+Documentation=file:/etc/sysctl.d/99-beam.conf
+After=network-online.target
+Wants=network-online.target
+Before=beam.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/beam/apply-fq.sh
+
+[Install]
+WantedBy=multi-user.target

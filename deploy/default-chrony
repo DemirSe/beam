@@ -1,0 +1,7 @@
+# Options for /usr/sbin/chronyd, read by chrony.service.
+#
+# -F 1 keeps the daemon in the foreground, which the unit type needs.
+# -4 keeps every socket on IPv4. Without it chronyd opens its control socket on
+# [::1]:323 even when the host has IPv6 disabled, and the production verifier
+# requires zero IPv6 listeners.
+DAEMON_OPTS="-F 1 -4"

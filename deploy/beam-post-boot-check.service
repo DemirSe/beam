@@ -1,0 +1,16 @@
+[Unit]
+Description=Read-only post-boot health check
+# Both platform names are listed: Debian ships ssh.service and chrony.service,
+# AlmaLinux ships sshd.service and chronyd.service. systemd ignores the names
+# that do not exist, so one file orders correctly on either host.
+After=beam.service chrony.service chronyd.service fail2ban.service nftables.service ssh.service sshd.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/beam/config.toml
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 30
+ExecStart=/usr/local/lib/beam/post-boot-check.sh
+
+[Install]
+WantedBy=multi-user.target

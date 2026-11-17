@@ -1,0 +1,1212 @@
+#!/usr/bin/env bash
+# Local performance benchmark: stock Xray v26.3.27 vs beam.
+#
+# Topology (one private user + mount + network namespace):
+#
+#   client ns                         server ns                     target ns
+#   10.10.1.2/24 -- vc | sc -- 10.10.1.1
+#                                     10.10.2.1/24 -- vs | ts -- 10.10.2.2/24
+#   sing-box TUN 198.18.0.1/15        VLESS+REALITY+Vision :443   HTTP :8080
+#   routes 10.10.2.0/24 to tun0                                   HTTPS :4443
+#                                                                 UDP echo :9999
+#                                                                 DNS :53
+#                                                                 HTTP/3 UDP :4443
+#                                                                 iperf3 :5201
+#
+# The measured path never leaves the host. The client config, target services,
+# REALITY fixture, payload and CPU masks are identical for both arms; only the
+# server binary and its semantically equivalent config change.
+#
+# Usage:
+#   bash bench/run.sh [--reps N] [--duration SEC] [--arms stock,beam]
+#                     [--out DIR] [--quick] [--no-build]
+#
+# Defaults: 3 repetitions, 10 s per bulk scenario, both arms, release beam
+# build, results under bench/results/<UTC timestamp>/.
+#
+# Environment:
+#   SING_BOX      sing-box binary (default: sing-box from PATH)
+#   XRAY_BIN      stock Xray (default: xray from PATH)
+#   IPERF3        iperf3 binary (default: iperf3 from PATH)
+#   IPERF3_LIB    optional LD_LIBRARY_PATH for iperf3
+#   TEST_CONFIG   REALITY fixture (default: config.example.toml)
+#   H3_ORIGIN_BIN prebuilt tests/tun/h3-origin binary
+#   SKIP_BUILD=1  reuse target/release/beam and the H3 origin binary
+#   BENCH_RTT_MS        injected one-way delay per side (total RTT = 2x)
+#   BENCH_LOSS          packet loss percentage applied with netem to the
+#                       client-server links (default 0)
+#   BENCH_MAX_LOAD      host load average accepted as quiet (default 0.3)
+#   BENCH_SERVER_CPU_QUOTA  server cgroup CPU quota, e.g. 50% (needs root)
+#   BENCH_SERVER_MEMORY_MAX server cgroup memory ceiling, e.g. 1G (needs root)
+#   BENCH_RATIO_ONLY=1  report ratios without strict gate verdicts
+#   BENCH_REQUIRE_COMPLETE=1  invalidate a cell with missing repetitions
+#   BENCH_CLIENT_CPUS   client CPU list; one core per thread of the client proxy
+#   BENCH_DRIVER_CPU    CPU for the measurement driver (defaults to the first client CPU)
+#   BENCH_PERF=1  root only: attach `perf stat` to the server for each scenario
+#   BENCH_PERF_EVENTS   event list for BENCH_PERF
+#   BENCH_HTTPS_PARALLEL concurrent HTTPS requests (default 1)
+#   BENCH_LOG_LEVEL     rendered config log level (default warn)
+#   BENCH_SCENARIOS=all comma list to measure a subset (warm-ups always run)
+#   BENCH_REPORT=0      skip report.py (perf probes only)
+#
+# The script re-execs itself under `unshare --user --map-root-user --mount --net`.
+# Every process is killed and every namespace is removed in the exit trap.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+SELF="$HERE/run.sh"
+INNER="${BENCH_INNER:-0}"
+ORIGINAL_ARGS=("$@")
+
+REPS="${BENCH_REPS:-3}"
+DURATION="${BENCH_DURATION:-10}"
+ARMS="${BENCH_ARMS:-stock,beam}"
+BASELINE_BIN="${BEAM_BASELINE_BIN:-}"
+UDP_WINDOW="${BENCH_UDP_WINDOW:-32}"
+OUT=""
+QUICK=0
+REPS_SET=0
+DURATION_SET=0
+SKIP_BUILD="${SKIP_BUILD:-0}"
+SERVER_CPU="${BENCH_SERVER_CPU:-2}"
+CLIENT_CPU="${BENCH_CLIENT_CPU:-1}"
+TARGET_CPU="${BENCH_TARGET_CPU:-3}"
+DRIVER_CPU="${BENCH_DRIVER_CPU:-}"
+CLIENT_CPUS="${BENCH_CLIENT_CPUS:-1}"
+RTT_MS="${BENCH_RTT_MS:-0}"
+LOSS="${BENCH_LOSS:-0}"
+MAX_LOAD="${BENCH_MAX_LOAD:-0.3}"
+SERVER_CPU_QUOTA="${BENCH_SERVER_CPU_QUOTA:-}"
+SERVER_MEMORY_MAX="${BENCH_SERVER_MEMORY_MAX:-}"
+SERVER_CPU_MAX=""
+SERVER_MEMORY_MAX_ACTUAL=""
+SERVER_CGROUP=""
+RATIO_ONLY="${BENCH_RATIO_ONLY:-0}"
+REQUIRE_COMPLETE="${BENCH_REQUIRE_COMPLETE:-0}"
+PERF="${BENCH_PERF:-0}"
+PERF_EVENTS="${BENCH_PERF_EVENTS:-task-clock,context-switches,cpu-migrations,page-faults,syscalls:sys_enter_read,syscalls:sys_enter_write,syscalls:sys_enter_recvfrom,syscalls:sys_enter_sendto,syscalls:sys_enter_splice,sched:sched_wakeup,sched:sched_switch}"
+HTTPS_PARALLEL="${BENCH_HTTPS_PARALLEL:-1}"
+LOG_LEVEL="${BENCH_LOG_LEVEL:-warn}"
+SCENARIOS="${BENCH_SCENARIOS:-all}"
+REPORT="${BENCH_REPORT:-1}"
+
+PYTHON="${PYTHON:-python3}"
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/beam"
+SING_BOX="${SING_BOX:-sing-box}"
+XRAY_BIN="${XRAY_BIN:-xray}"
+TEST_CONFIG="${TEST_CONFIG:-$ROOT/config.example.toml}"
+IPERF3="${IPERF3:-iperf3}"
+IPERF3_LIB="${IPERF3_LIB:-}"
+TC="${TC:-tc}"
+H3_ORIGIN_BIN="${H3_ORIGIN_BIN:-${BENCH_H3_BIN:-$HERE/../tests/tun/h3-origin/target/debug/h3-origin}}"
+
+usage() {
+  sed -n '2,45p' "$SELF" | sed 's/^# \{0,1\}//'
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --reps)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --reps needs a number" >&2; exit 2; }
+      REPS="$1"
+      REPS_SET=1
+      ;;
+    --duration)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --duration needs seconds" >&2; exit 2; }
+      DURATION="$1"
+      DURATION_SET=1
+      ;;
+    --arms)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --arms needs a list" >&2; exit 2; }
+      ARMS="$1"
+      ;;
+    --out)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --out needs a directory" >&2; exit 2; }
+      OUT="$1"
+      ;;
+    --server-cpu)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --server-cpu needs a CPU" >&2; exit 2; }
+      SERVER_CPU="$1"
+      ;;
+    --client-cpu)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --client-cpu needs a CPU" >&2; exit 2; }
+      CLIENT_CPU="$1"
+      ;;
+    --target-cpu)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --target-cpu needs a CPU" >&2; exit 2; }
+      TARGET_CPU="$1"
+      ;;
+    --client-cpus)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --client-cpus needs a list" >&2; exit 2; }
+      CLIENT_CPUS="$1"
+      CLIENT_CPU="${CLIENT_CPUS%%,*}"
+      ;;
+    --driver-cpu)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --driver-cpu needs a CPU" >&2; exit 2; }
+      DRIVER_CPU="$1"
+      ;;
+    --max-load)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --max-load needs a number" >&2; exit 2; }
+      MAX_LOAD="$1"
+      ;;
+    --rtt-ms)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --rtt-ms needs milliseconds" >&2; exit 2; }
+      RTT_MS="$1"
+      ;;
+    --loss)
+      shift
+      [ $# -gt 0 ] || { echo "bench: --loss needs a percentage" >&2; exit 2; }
+      LOSS="$1"
+      ;;
+    --quick)
+      QUICK=1
+      ;;
+    --no-build)
+      SKIP_BUILD=1
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "bench: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if [ "$QUICK" = "1" ]; then
+  [ "$REPS_SET" = "1" ] || REPS=1
+  [ "$DURATION_SET" = "1" ] || DURATION=3
+fi
+
+case "$REPS" in
+  ''|*[!0-9]*) echo "bench: --reps must be a positive integer" >&2; exit 2 ;;
+esac
+case "$DURATION" in
+  ''|*[!0-9]*) echo "bench: --duration must be a positive integer" >&2; exit 2 ;;
+esac
+case "$RTT_MS" in
+  ''|*[!0-9]*) echo "bench: --rtt-ms must be a non-negative integer" >&2; exit 2 ;;
+esac
+case "$LOSS" in
+  ''|*[!0-9.]*|*.*.*|*.) echo "bench: --loss must be a percentage between 0 and 100" >&2; exit 2 ;;
+esac
+awk -v loss="$LOSS" 'BEGIN { exit !(loss >= 0 && loss <= 100) }' \
+  || { echo "bench: --loss must be a percentage between 0 and 100" >&2; exit 2; }
+NEEDS_SCOPE=0
+if [ -n "$SERVER_CPU_QUOTA" ] || [ -n "$SERVER_MEMORY_MAX" ]; then
+  NEEDS_SCOPE=1
+fi
+IMPAIRED=0
+if awk -v rtt="$RTT_MS" -v loss="$LOSS" 'BEGIN { exit !(rtt > 0 || loss > 0) }'; then
+  IMPAIRED=1
+fi
+[ "$REPS" -ge 1 ] || { echo "bench: --reps must be >= 1" >&2; exit 2; }
+[ "$DURATION" -ge 2 ] || { echo "bench: --duration must be >= 2" >&2; exit 2; }
+case "$PERF" in 0|1) ;; *) echo "bench: BENCH_PERF must be 0 or 1" >&2; exit 2 ;; esac
+case "$HTTPS_PARALLEL" in
+  ''|*[!0-9]*) echo "bench: BENCH_HTTPS_PARALLEL must be a positive integer" >&2; exit 2 ;;
+esac
+[ "$HTTPS_PARALLEL" -ge 1 ] || { echo "bench: BENCH_HTTPS_PARALLEL must be >= 1" >&2; exit 2; }
+case "$REPORT" in 0|1) ;; *) echo "bench: BENCH_REPORT must be 0 or 1" >&2; exit 2 ;; esac
+if [ -n "$SERVER_CPU_QUOTA" ]; then
+  case "$SERVER_CPU_QUOTA" in
+    *[!0-9%]*|'') echo "bench: BENCH_SERVER_CPU_QUOTA must look like 50%" >&2; exit 2 ;;
+  esac
+fi
+KNOWN_SCENARIOS="tcp-dl-1,tcp-dl-4,tcp-ul-1,tcp-ul-4,https-bulk,udp-echo,dns-a,h3-latency"
+if [ "$SCENARIOS" != "all" ]; then
+  IFS=',' read -r -a SCENARIO_FILTER <<< "$SCENARIOS"
+  [ "${#SCENARIO_FILTER[@]}" -ge 1 ] || { echo "bench: BENCH_SCENARIOS is empty" >&2; exit 2; }
+  for scenario in "${SCENARIO_FILTER[@]}"; do
+    if [[ ",$KNOWN_SCENARIOS," != *",$scenario,"* ]]; then
+      echo "bench: unknown scenario '$scenario' (known: $KNOWN_SCENARIOS)" >&2
+      exit 2
+    fi
+  done
+fi
+
+# The documented vps-1c model runs the driver on the client core. A caller can
+# still separate it with --driver-cpu (useful for client-bound sensitivity runs).
+if [ -z "$DRIVER_CPU" ]; then
+  DRIVER_CPU="$CLIENT_CPU"
+fi
+
+NPROC="$(nproc)"
+for core in "$SERVER_CPU" "$CLIENT_CPU" "$TARGET_CPU" "$DRIVER_CPU"; do
+  case "$core" in
+    ''|*[!0-9]*) echo "bench: CPU ids must be integers" >&2; exit 2 ;;
+  esac
+  [ "$core" -ge 0 ] && [ "$core" -lt "$NPROC" ] \
+    || { echo "bench: CPU $core is outside 0..$((NPROC - 1))" >&2; exit 2; }
+done
+CLIENT_CPU_LIST=()
+IFS=',' read -r -a CLIENT_CPU_LIST <<< "$CLIENT_CPUS"
+[ "${#CLIENT_CPU_LIST[@]}" -ge 1 ] || { echo "bench: --client-cpus is empty" >&2; exit 2; }
+for core in "${CLIENT_CPU_LIST[@]}"; do
+  case "$core" in
+    ''|*[!0-9]*) echo "bench: client CPU ids must be integers" >&2; exit 2 ;;
+  esac
+  [ "$core" -ge 0 ] && [ "$core" -lt "$NPROC" ] \
+    || { echo "bench: client CPU $core is outside 0..$((NPROC - 1))" >&2; exit 2; }
+  [ "$core" != "$SERVER_CPU" ] && [ "$core" != "$TARGET_CPU" ] \
+    || { echo "bench: client CPU $core conflicts with another role" >&2; exit 2; }
+done
+[ "$SERVER_CPU" != "$TARGET_CPU" ] && [ "$SERVER_CPU" != "$DRIVER_CPU" ] \
+  && [ "$TARGET_CPU" != "$DRIVER_CPU" ] \
+  || { echo "bench: server/target/driver CPUs must be distinct" >&2; exit 2; }
+GOMAXPROCS_CLIENT="${BENCH_CLIENT_GOMAXPROCS:-${#CLIENT_CPU_LIST[@]}}"
+CLIENT_MASK_SPEC="$(IFS=','; echo "${CLIENT_CPU_LIST[*]}")"
+
+IFS=',' read -r -a ARM_LIST <<< "$ARMS"
+for arm in "${ARM_LIST[@]}"; do
+  case "$arm" in
+    stock|beam|baseline) ;;
+    *) echo "bench: unknown arm '$arm' (use stock,beam,baseline)" >&2; exit 2 ;;
+  esac
+done
+case "$UDP_WINDOW" in
+  ''|*[!0-9]*) echo "bench: BENCH_UDP_WINDOW must be an integer" >&2; exit 2 ;;
+esac
+[ "$UDP_WINDOW" -ge 1 ] && [ "$UDP_WINDOW" -le 1024 ] \
+  || { echo "bench: BENCH_UDP_WINDOW must be 1..1024" >&2; exit 2; }
+
+if [ "$INNER" != "1" ]; then
+  if ! command -v unshare >/dev/null 2>&1; then
+    echo "bench: unshare is required" >&2
+    exit 1
+  fi
+  if ! unshare --user --map-root-user --net true 2>/dev/null; then
+    echo "bench: unprivileged user+network namespaces are unavailable" >&2
+    exit 1
+  fi
+
+  BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/beam-bench-build.XXXXXX.log")"
+  H3_BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/beam-bench-h3-build.XXXXXX.log")"
+  # shellcheck source=../scripts/dev-env.sh
+  source "$ROOT/scripts/dev-env.sh"
+
+  if [ "$SKIP_BUILD" != "1" ]; then
+    echo "bench: building beam release" >&2
+    if ! (cd "$ROOT" && cargo build --locked --release -p beam) > "$BUILD_LOG" 2>&1; then
+      echo "bench: cargo build failed; see $BUILD_LOG" >&2
+      tail -n 20 "$BUILD_LOG" >&2 || true
+      exit 1
+    fi
+  else
+    : > "$BUILD_LOG"
+  fi
+
+  H3_BLOCKED=""
+  if [ -n "${H3_ORIGIN_BIN:-}" ] && [ -x "$H3_ORIGIN_BIN" ]; then
+    :
+  elif [ "$SKIP_BUILD" = "1" ]; then
+    H3_BLOCKED="H3 origin was not built (--no-build/SKIP_BUILD=1) and $H3_ORIGIN_BIN is missing"
+  else
+    echo "bench: building the local HTTP/3 origin" >&2
+    if cargo build --locked --manifest-path "$HERE/../tests/tun/h3-origin/Cargo.toml" \
+        > "$H3_BUILD_LOG" 2>&1; then
+      H3_ORIGIN_BIN="$HERE/../tests/tun/h3-origin/target/debug/h3-origin"
+    else
+      H3_BLOCKED="cargo build for tests/tun/h3-origin failed: $(tail -n 1 "$H3_BUILD_LOG" | tr '\t\n' '  ')"
+    fi
+  fi
+  if [ -z "$H3_BLOCKED" ] && [ ! -x "$H3_ORIGIN_BIN" ]; then
+    H3_BLOCKED="H3 origin binary is missing: $H3_ORIGIN_BIN"
+  fi
+
+  exec unshare --user --map-root-user --mount --net --fork \
+    env BENCH_INNER=1 BENCH_ROOT="$ROOT" BENCH_SELF="$SELF" \
+    BENCH_H3_BIN="$H3_ORIGIN_BIN" BENCH_H3_BLOCKED="$H3_BLOCKED" \
+    BENCH_BUILD_LOG="$BUILD_LOG" BENCH_H3_BUILD_LOG="$H3_BUILD_LOG" \
+    BENCH_REPS="$REPS" BENCH_DURATION="$DURATION" BENCH_ARMS="$ARMS" \
+    BENCH_SERVER_CPU="$SERVER_CPU" BENCH_CLIENT_CPU="$CLIENT_CPU" \
+    BENCH_TARGET_CPU="$TARGET_CPU" BENCH_DRIVER_CPU="$DRIVER_CPU" BENCH_CLIENT_CPUS="$CLIENT_CPUS" BENCH_RTT_MS="$RTT_MS" BENCH_MAX_LOAD="$MAX_LOAD" \
+    BENCH_LOSS="$LOSS" BENCH_SERVER_MEMORY_MAX="$SERVER_MEMORY_MAX" \
+    BENCH_REQUIRE_COMPLETE="$REQUIRE_COMPLETE" BENCH_RATIO_ONLY="$RATIO_ONLY" \
+    BENCH_PERF="$PERF" BENCH_PERF_EVENTS="$PERF_EVENTS" \
+    BENCH_SERVER_CPU_QUOTA="$SERVER_CPU_QUOTA" \
+    BENCH_HTTPS_PARALLEL="$HTTPS_PARALLEL" BENCH_LOG_LEVEL="$LOG_LEVEL" \
+    BENCH_SCENARIOS="$SCENARIOS" BENCH_REPORT="$REPORT" \
+    BEAM_BASELINE_BIN="$BASELINE_BIN" BENCH_UDP_WINDOW="$UDP_WINDOW" \
+    SING_BOX="$SING_BOX" XRAY_BIN="$XRAY_BIN" TEST_CONFIG="$TEST_CONFIG" \
+    IPERF3="$IPERF3" IPERF3_LIB="$IPERF3_LIB" TC="$TC" H3_ORIGIN_BIN="$H3_ORIGIN_BIN" \
+    bash "$SELF" "${ORIGINAL_ARGS[@]}"
+fi
+
+ROOT="${BENCH_ROOT:-$ROOT}"
+SELF="${BENCH_SELF:-$SELF}"
+# shellcheck source=../scripts/dev-env.sh
+source "$ROOT/scripts/dev-env.sh"
+
+H3_ORIGIN_BIN="${BENCH_H3_BIN:-$H3_ORIGIN_BIN}"
+H3_BLOCKED="${BENCH_H3_BLOCKED:-}"
+H3_BUILD_LOG="${BENCH_H3_BUILD_LOG:-}"
+BUILD_LOG="${BENCH_BUILD_LOG:-}"
+
+BEAM_ADDR="10.10.1.1:443"
+CLIENT_ADDR="10.10.1.2/24"
+SERVER_ADDR="10.10.1.1/24"
+TARGET_ADDR="10.10.2.2/24"
+SERVER_TARGET_ADDR="10.10.2.1/24"
+TARGET_V6="fd00:2::2/64"
+SERVER_TARGET_V6="fd00:2::1/64"
+COVER="10.10.2.2:4443"
+TARGET_HOST="10.10.2.2"
+IPERF3_PORT=5201
+UDP_PORT=9999
+DNS_PORT=53
+
+HTTPS_MIB="${BENCH_HTTPS_MIB:-64}"
+H3_REQUESTS="${BENCH_H3_REQUESTS:-20}"
+DNS_COUNT="${BENCH_DNS_COUNT:-200}"
+UDP_COUNT="${BENCH_UDP_COUNT:-5000}"
+UDP_LATENCY_COUNT="${BENCH_UDP_LATENCY_COUNT:-200}"
+if [ "$QUICK" = "1" ]; then
+  HTTPS_MIB="${BENCH_HTTPS_MIB:-16}"
+  H3_REQUESTS="${BENCH_H3_REQUESTS:-5}"
+  DNS_COUNT="${BENCH_DNS_COUNT:-50}"
+  UDP_COUNT="${BENCH_UDP_COUNT:-1000}"
+  UDP_LATENCY_COUNT="${BENCH_UDP_LATENCY_COUNT:-50}"
+fi
+
+NAMESPACES=(tun-client tun-server tun-target)
+
+log() { printf 'bench: %s\n' "$*"; }
+die() {
+  printf 'bench: HARNESS FAILURE: %s\n' "$*" >&2
+  exit 1
+}
+
+if [ "$NEEDS_SCOPE" = "1" ]; then
+  [ "$(id -u)" -eq 0 ] \
+    || die "BENCH_SERVER_CPU_QUOTA/BENCH_SERVER_MEMORY_MAX need root; run with BENCH_INNER=1"
+  if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]+4294967295' /proc/self/uid_map; then
+    die "server resource limits need real host root, not a mapped user namespace"
+  fi
+  command -v systemd-run >/dev/null 2>&1 || die "server resource limits need systemd-run"
+fi
+
+if [ "$PERF" = "1" ]; then
+  [ "$(id -u)" -eq 0 ] || die "BENCH_PERF=1 requires root; run with BENCH_INNER=1"
+  if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]+4294967295' /proc/self/uid_map; then
+    die "BENCH_PERF=1 needs real host root, not a mapped user namespace"
+  fi
+fi
+
+# `<not counted>` rows prove perf attached but never collected; an empty or
+# unparsable file must fail the run instead of shipping zero evidence.
+perf_require_counters() {
+  local csv=$1 scenario=$2
+  if ! awk -F, '
+    $3 ~ /^syscalls:sys_enter_splice(:|$)/ && $1 ~ /^[0-9]+$/ { splice = 1 }
+    $3 ~ /^sched:sched_wakeup(:|$)/ && $1 ~ /^[0-9]+$/ { wakeup = 1 }
+    END { exit !(splice && wakeup) }
+  ' "$csv" 2>/dev/null; then
+    die "perf collected no splice/wakeup counters for $scenario (see $csv)"
+  fi
+}
+
+scenario_enabled() {
+  [ "$SCENARIOS" = "all" ] && return 0
+  case ",$SCENARIOS," in
+    *",$1,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_bin() {
+  if [ -x "$1" ]; then
+    printf '%s\n' "$1"
+  else
+    command -v "$1" 2>/dev/null
+  fi
+}
+
+for command in "$PYTHON" ip curl taskset timeout sha256sum; do
+  command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
+done
+[ -f "$TEST_CONFIG" ] || die "REALITY fixture not found: $TEST_CONFIG (set TEST_CONFIG)"
+SING_BOX="$(resolve_bin "$SING_BOX")" || die "sing-box not found: $SING_BOX (set SING_BOX)"
+[ -c /dev/net/tun ] || die "/dev/net/tun is unavailable"
+IPERF3="$(resolve_bin "$IPERF3")" || die "iperf3 not found: $IPERF3 (set IPERF3)"
+if [ "$RTT_MS" != "0" ]; then
+  TC="$(resolve_bin "$TC")" || die "tc not found: $TC (set TC)"
+fi
+export LD_LIBRARY_PATH="$IPERF3_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+"$IPERF3" --version >/dev/null 2>&1 || die "iperf3 cannot run (check IPERF3_LIB)"
+if [[ " ${ARM_LIST[*]} " == *" stock "* ]]; then
+  XRAY_BIN="$(resolve_bin "$XRAY_BIN")" || die "stock Xray not found: $XRAY_BIN (set XRAY_BIN)"
+fi
+if [[ " ${ARM_LIST[*]} " == *" baseline "* ]]; then
+  [ -n "$BASELINE_BIN" ] || die "baseline arm needs BEAM_BASELINE_BIN"
+  BASELINE_BIN="$(resolve_bin "$BASELINE_BIN")" \
+    || die "baseline beam not found: $BASELINE_BIN (set BEAM_BASELINE_BIN)"
+fi
+if ! curl --version 2>/dev/null | grep -qi 'HTTP3'; then
+  H3_BLOCKED="${H3_BLOCKED:-the local curl has no HTTP/3 support; cannot send a QUIC Initial}"
+fi
+
+umask 077
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_ID="$STAMP-$$"
+if [ -n "$OUT" ]; then
+  RUN_DIR="$OUT"
+else
+  RUN_DIR="$ROOT/bench/results/$STAMP"
+fi
+mkdir -p "$RUN_DIR/logs" "$RUN_DIR/raw" "$RUN_DIR/config"
+chmod 700 "$RUN_DIR"
+RUN_DIR="$(cd "$RUN_DIR" && pwd)"
+LOG_DIR="$RUN_DIR/logs"
+CONFIG_DIR="$RUN_DIR/config"
+RAW_DIR="$RUN_DIR/raw"
+: > "$RUN_DIR/masks.tsv"
+if [ -n "$BUILD_LOG" ] && [ -s "$BUILD_LOG" ]; then
+  cp "$BUILD_LOG" "$LOG_DIR/build.log" 2>/dev/null || true
+fi
+if [ -n "$H3_BUILD_LOG" ] && [ -s "$H3_BUILD_LOG" ]; then
+  cp "$H3_BUILD_LOG" "$LOG_DIR/h3-origin-build.log" 2>/dev/null || true
+fi
+
+SINGBOX_PID=""
+SERVER_PID=""
+SERVICES_PID=""
+IPERF3_PID=""
+H3_PID=""
+H3_READY=0
+IPV6_AVAILABLE=0
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+LOAD_BEFORE="$(awk '{print $1}' /proc/loadavg)"
+YELLOW=''
+if awk -v host_load="$LOAD_BEFORE" -v max_load="$MAX_LOAD" 'BEGIN { exit !(host_load > max_load) }'; then
+  log "WARNING: host load $LOAD_BEFORE exceeds $MAX_LOAD; results may be noisy"
+  YELLOW="host load $LOAD_BEFORE exceeds $MAX_LOAD"
+fi
+
+stop_pid() {
+  local pid="${1:-}"
+  [ -n "$pid" ] || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 40); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  set +e
+  stop_pid "$SINGBOX_PID"
+  stop_pid "$SERVER_PID"
+  stop_pid "$H3_PID"
+  stop_pid "$IPERF3_PID"
+  stop_pid "$SERVICES_PID"
+  for namespace in "${NAMESPACES[@]}"; do
+    ip netns del "$namespace" >/dev/null 2>&1
+  done
+  printf 'bench: run directory: %s\n' "$RUN_DIR" >&2
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+wait_for_log() {
+  local file=$1 pattern=$2 pid=${3:-} timeout=${4:-15}
+  local steps=$((timeout * 10))
+  for _ in $(seq 1 "$steps"); do
+    if grep -qF -- "$pattern" "$file" 2>/dev/null; then
+      return 0
+    fi
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_for_port() {
+  local namespace=$1 host=$2 port=$3 pid=${4:-} timeout=${5:-15}
+  local steps=$((timeout * 10))
+  for _ in $(seq 1 "$steps"); do
+    if ip netns exec "$namespace" "$PYTHON" - "$host" "$port" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+sock = socket.create_connection((sys.argv[1], int(sys.argv[2])), 0.3)
+sock.close()
+PY
+    then
+      return 0
+    fi
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+mask_of() {
+  local pid=$1
+  taskset -pc "$pid" 2>/dev/null | sed 's/^.*: //' | tr -d ' ' || true
+}
+
+# ---------------------------------------------------------------------------
+# Namespace topology
+# ---------------------------------------------------------------------------
+
+# Shadow only the netns directory: masking all of /run hides the system bus
+# socket, which breaks anything that talks to systemd (for example a CPU quota
+# scope) while the harness runs.
+mkdir -p /run/netns
+mount -t tmpfs tmpfs /run/netns >/dev/null 2>&1 || die "could not mount tmpfs on /run/netns"
+mkdir -p /run/netns
+for namespace in "${NAMESPACES[@]}"; do
+  ip netns add "$namespace" || die "could not create network namespace $namespace"
+  ip netns exec "$namespace" ip link set lo up || die "could not bring up lo in $namespace"
+done
+
+ip link add vc type veth peer name sc || die "could not create the client/server veth pair"
+ip link set vc netns tun-client
+ip link set sc netns tun-server
+ip netns exec tun-client ip addr add "$CLIENT_ADDR" dev vc
+ip netns exec tun-client ip link set vc txqueuelen 10000
+ip netns exec tun-client ip link set vc up
+ip netns exec tun-server ip addr add "$SERVER_ADDR" dev sc
+ip netns exec tun-server ip link set sc txqueuelen 10000
+ip netns exec tun-server ip link set sc up
+
+ip link add vs type veth peer name ts || die "could not create the server/target veth pair"
+ip link set vs netns tun-server
+ip link set ts netns tun-target
+ip netns exec tun-server ip addr add "$SERVER_TARGET_ADDR" dev vs
+ip netns exec tun-server ip link set vs txqueuelen 10000
+ip netns exec tun-server ip link set vs up
+ip netns exec tun-target ip addr add "$TARGET_ADDR" dev ts
+ip netns exec tun-target ip link set ts txqueuelen 10000
+ip netns exec tun-target ip link set ts up
+
+# The harness must prove the requested impairment is actually on the wire;
+# qdisc evidence is captured as JSON and validated with tight tolerances.
+verify_netem() {
+  local role=$1 path=$2 rc=0
+  "$PYTHON" - "$role" "$path" "$RTT_MS" "$LOSS" <<'PY' || rc=$?
+import json
+import sys
+
+role, path, rtt, loss = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    qdisc = data[0] if isinstance(data, list) else data
+    options = qdisc["options"]
+except (OSError, ValueError, KeyError, IndexError) as exc:
+    raise SystemExit(f"could not read qdisc evidence {path}: {exc}")
+if rtt > 0:
+    delay = options.get("delay", {}).get("delay")
+    if delay is None:
+        raise SystemExit(f"{role}: netem has no delay")
+    want = rtt / 2
+    if abs(delay * 1000 - want) > 0.5:
+        raise SystemExit(
+            f"{role}: netem delay {delay * 1000:.3f}ms, wanted {want:.3f}ms"
+        )
+if loss > 0:
+    rate = options.get("loss-random", {}).get("loss")
+    if rate is None:
+        raise SystemExit(f"{role}: netem has no loss")
+    if abs(rate * 100 - loss) > 0.05:
+        raise SystemExit(f"{role}: netem loss {rate * 100:.3f}%, wanted {loss:.3f}%")
+PY
+  [ "$rc" = "0" ] \
+    || die "netem did not apply the requested impairment on the $role side"
+}
+
+if [ "$IMPAIRED" = "1" ]; then
+  netem_args=(limit 20000)
+  if [ "$RTT_MS" -gt 0 ]; then
+    HALF_MS="$(awk -v rtt="$RTT_MS" 'BEGIN { printf "%.3f", rtt / 2 }')"
+    netem_args+=(delay "${HALF_MS}ms")
+  fi
+  if awk -v loss="$LOSS" 'BEGIN { exit !(loss > 0) }'; then
+    netem_args+=(loss "${LOSS}%")
+  fi
+  log "applying netem on each side: ${netem_args[*]} (RTT ${RTT_MS}ms, loss ${LOSS}%)"
+  ip netns exec tun-client "$TC" qdisc add dev vc root netem "${netem_args[@]}" \
+    || die "could not add netem on vc"
+  ip netns exec tun-server "$TC" qdisc add dev sc root netem "${netem_args[@]}" \
+    || die "could not add netem on sc"
+  ip netns exec tun-client "$TC" -j -s qdisc show dev vc \
+    > "$LOG_DIR/tc-client-initial.json" \
+    || die "could not capture the client qdisc state"
+  ip netns exec tun-server "$TC" -j -s qdisc show dev sc \
+    > "$LOG_DIR/tc-server-initial.json" \
+    || die "could not capture the server qdisc state"
+  ip netns exec tun-client "$TC" -s qdisc show > "$LOG_DIR/tc-client.txt" 2>&1
+  ip netns exec tun-server "$TC" -s qdisc show > "$LOG_DIR/tc-server.txt" 2>&1
+  verify_netem client "$LOG_DIR/tc-client-initial.json"
+  verify_netem server "$LOG_DIR/tc-server-initial.json"
+fi
+# The lab uses one peer per veth; DAD adds no value and delays IPv6 binds.
+ip netns exec tun-server sysctl -qw net.ipv6.conf.vs.accept_dad=0 2>/dev/null || true
+ip netns exec tun-target sysctl -qw net.ipv6.conf.ts.accept_dad=0 2>/dev/null || true
+
+IPV6_AVAILABLE=1
+if ! ip netns exec tun-server ip -6 addr add "$SERVER_TARGET_V6" dev vs 2>"$LOG_DIR/ipv6-server.err"; then
+  IPV6_AVAILABLE=0
+fi
+if [ "$IPV6_AVAILABLE" = "1" ] \
+  && ! ip netns exec tun-target ip -6 addr add "$TARGET_V6" dev ts 2>"$LOG_DIR/ipv6-target.err"; then
+  IPV6_AVAILABLE=0
+fi
+if [ "$IPV6_AVAILABLE" = "1" ]; then
+  ip netns exec tun-server ip link set vs up
+  ip netns exec tun-target ip link set ts up
+  if ! ip netns exec tun-target ip -6 addr show dev ts | grep -q 'fd00:2::2'; then
+    IPV6_AVAILABLE=0
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Configs and target services
+# ---------------------------------------------------------------------------
+
+log "generating the test certificate"
+"$SING_BOX" generate tls-keypair "$TARGET_HOST" > "$CONFIG_DIR/tls.pem" 2> "$LOG_DIR/keygen.err" \
+  || die "sing-box could not generate a TLS test key pair"
+"$PYTHON" - "$CONFIG_DIR/tls.pem" "$CONFIG_DIR/target.key" "$CONFIG_DIR/target.crt" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+blocks = re.findall(r"-----BEGIN [A-Z ]+-----.*?-----END [A-Z ]+-----", text, re.S)
+if len(blocks) < 2 or "PRIVATE KEY" not in blocks[0] or "CERTIFICATE" not in blocks[1]:
+    raise SystemExit("unexpected tls-keypair output")
+open(sys.argv[2], "w", encoding="utf-8").write(blocks[0].strip() + "\n")
+open(sys.argv[3], "w", encoding="utf-8").write(blocks[1].strip() + "\n")
+PY
+
+XRAY_FLAG=()
+if [[ " ${ARM_LIST[*]} " == *" stock "* ]]; then
+  XRAY_FLAG=(--xray)
+fi
+"$PYTHON" "$HERE/../tests/tun/config.py" \
+  --test-config "$TEST_CONFIG" \
+  --out-dir "$CONFIG_DIR" \
+  --listen "$BEAM_ADDR" \
+  --cover "$COVER" \
+  --singbox \
+  "${XRAY_FLAG[@]}" \
+  --log-level "$LOG_LEVEL" \
+  || die "could not render the beam/sing-box/Xray configs"
+
+log "generating $HTTPS_MIB MiB HTTPS payload"
+dd if=/dev/urandom of="$CONFIG_DIR/large.bin" bs=1M count="$HTTPS_MIB" status=none \
+  || die "could not create the HTTPS payload"
+HTTPS_BYTES=$((HTTPS_MIB * 1024 * 1024))
+HTTPS_SHA="$(sha256sum "$CONFIG_DIR/large.bin" | awk '{print $1}')"
+
+if [ -z "$H3_BLOCKED" ]; then
+  log "starting local HTTP/3 origin on $TARGET_HOST:4443 (UDP)"
+  # The origin is deliberately not pinned: pinning it to the target core
+  # introduced sporadic HTTP/3 stream resets after the response was sent.
+  ip netns exec tun-target "$H3_ORIGIN_BIN" --listen "$TARGET_HOST:4443" \
+    > "$LOG_DIR/h3-origin.log" 2>&1 &
+  H3_PID=$!
+  if wait_for_log "$LOG_DIR/h3-origin.log" "h3-origin: READY" "$H3_PID" 15; then
+    H3_READY=1
+  else
+    H3_BLOCKED="local HTTP/3 origin did not become ready: $(tail -n 2 "$LOG_DIR/h3-origin.log" | tr '\n' ' ')"
+    stop_pid "$H3_PID"
+    H3_PID=""
+    log "$H3_BLOCKED"
+  fi
+else
+  log "HTTP/3 origin unavailable: $H3_BLOCKED"
+fi
+
+log "starting target services"
+TARGET_ARGS=(
+  --http "$TARGET_HOST:8080"
+  --tls "$TARGET_HOST:4443"
+  --udp "$TARGET_HOST:$UDP_PORT"
+  --dns "$TARGET_HOST:$DNS_PORT"
+  --large-file "$CONFIG_DIR/large.bin"
+  --quiet
+  --cert "$CONFIG_DIR/target.crt"
+  --key "$CONFIG_DIR/target.key"
+)
+if [ "$IPV6_AVAILABLE" = "1" ]; then
+  TARGET_ARGS+=(--http6 "[fd00:2::2]:8080" --udp6 "[fd00:2::2]:$UDP_PORT" --dns6 "[fd00:2::2]:$DNS_PORT")
+fi
+ip netns exec tun-target taskset -c "$TARGET_CPU" "$PYTHON" "$HERE/../tests/tun/services.py" \
+  "${TARGET_ARGS[@]}" > "$LOG_DIR/target.log" 2>&1 &
+SERVICES_PID=$!
+wait_for_log "$LOG_DIR/target.log" "target: READY" "$SERVICES_PID" 15 \
+  || die "target services did not become ready"
+
+log "starting iperf3 server on $TARGET_HOST:$IPERF3_PORT"
+ip netns exec tun-target taskset -c "$TARGET_CPU" "$IPERF3" -s -p "$IPERF3_PORT" \
+  > "$LOG_DIR/iperf3-server.log" 2>&1 &
+IPERF3_PID=$!
+wait_for_port tun-target "$TARGET_HOST" "$IPERF3_PORT" "$IPERF3_PID" 10 \
+  || die "iperf3 server did not start"
+
+{
+  echo "== client =="
+  ip netns exec tun-client ip addr show
+  ip netns exec tun-client ip route show
+  ip netns exec tun-client ip -6 route show
+  echo "== server =="
+  ip netns exec tun-server ip addr show
+  ip netns exec tun-server ip route show
+  echo "== target =="
+  ip netns exec tun-target ip addr show
+  ip netns exec tun-target ip route show
+} > "$RUN_DIR/network.txt" 2>&1
+{
+  echo "run_id=$RUN_ID"
+  echo "worktree=$ROOT"
+  echo "reps=$REPS"
+  echo "duration_s=$DURATION"
+  echo "arms=$ARMS"
+  echo "udp_window=$UDP_WINDOW"
+  [ -n "$BASELINE_BIN" ] && echo "baseline_bin=$BASELINE_BIN"
+  echo "server_cpu=$SERVER_CPU client_cpus=$CLIENT_MASK_SPEC target_cpu=$TARGET_CPU driver_cpu=$DRIVER_CPU server_cpu_quota=${SERVER_CPU_QUOTA:-none}"
+echo "rtt_ms=$RTT_MS"
+  echo "singbox=$SING_BOX"
+  echo "xray=$XRAY_BIN"
+  echo "beam=$ROOT/target/release/beam"
+  echo "iperf3=$IPERF3"
+  echo "iperf3_lib=$IPERF3_LIB"
+  echo "h3_origin=$H3_ORIGIN_BIN"
+  echo "h3_ready=$H3_READY"
+  echo "https_mib=$HTTPS_MIB"
+  echo "https_sha256=$HTTPS_SHA"
+  echo "host_load_before=$LOAD_BEFORE"
+  echo "loss_pct=$LOSS"
+} > "$RUN_DIR/environment.txt"
+
+# ---------------------------------------------------------------------------
+# Arm lifecycle
+# ---------------------------------------------------------------------------
+
+SERVER_MASK=""
+CLIENT_MASK=""
+TARGET_MASK=""
+
+start_arm() {
+  local arm=$1 rep=$2
+  local server_log="$LOG_DIR/$arm-r$rep-server.log"
+  local client_log="$LOG_DIR/$arm-r$rep-client.log"
+  : > "$server_log"
+  : > "$client_log"
+
+  local -a server_cmd
+  if [ "$arm" = "baseline" ]; then
+    server_cmd=(ip netns exec tun-server taskset -c "$SERVER_CPU" \
+      "$BASELINE_BIN" --config "$CONFIG_DIR/beam.toml")
+  elif [ "$arm" = "beam" ]; then
+    server_cmd=(ip netns exec tun-server taskset -c "$SERVER_CPU" \
+      "$ROOT/target/release/beam" --config "$CONFIG_DIR/beam.toml")
+  else
+    server_cmd=(ip netns exec tun-server taskset -c "$SERVER_CPU" \
+      env GOMAXPROCS=1 "$XRAY_BIN" run -c "$CONFIG_DIR/xray-server.json")
+  fi
+  SERVER_SCOPE=""
+  SERVER_CPU_MAX=""
+  SERVER_MEMORY_MAX_ACTUAL=""
+  SERVER_CGROUP=""
+  if [ "$NEEDS_SCOPE" = "1" ]; then
+    # The ceiling makes the server, not the harness, the bottleneck: both arms
+    # get the same limits, so ratios stay comparable while absolute numbers
+    # describe a fraction of a vCPU and a fixed memory budget.
+    SERVER_SCOPE="beam-bench-$arm-$rep-$$"
+    SERVER_PID_FILE="$RUN_DIR/.server-$arm-$rep-$$.pid"
+    SERVER_WRAPPER="$RUN_DIR/.server-pid-$arm-$rep-$$.sh"
+    rm -f "$SERVER_PID_FILE"
+    # `systemd-run` rewrites `$$` in inline shell, and it exposes no usable
+    # MainPID for scopes, so a tiny wrapper reports the PID and then becomes the
+    # server. The PID therefore stays valid for the whole arm.
+    cat > "$SERVER_WRAPPER" <<'WRAPPER'
+#!/bin/sh
+echo $$ > "$1"
+shift
+exec "$@"
+WRAPPER
+    chmod 0755 "$SERVER_WRAPPER"
+    local -a scope_props=()
+    if [ -n "$SERVER_CPU_QUOTA" ]; then
+      scope_props+=(-p "CPUQuota=$SERVER_CPU_QUOTA")
+    fi
+    if [ -n "$SERVER_MEMORY_MAX" ]; then
+      scope_props+=(-p "MemoryMax=$SERVER_MEMORY_MAX")
+    fi
+    systemd-run --scope --quiet --unit="$SERVER_SCOPE" \
+      "${scope_props[@]}" -- \
+      "$SERVER_WRAPPER" "$SERVER_PID_FILE" \
+      "${server_cmd[@]}" > "$server_log" 2>&1 &
+    SERVER_PID=""
+    for _ in $(seq 1 100); do
+      if [ -s "$SERVER_PID_FILE" ]; then
+        SERVER_PID="$(cat "$SERVER_PID_FILE")"
+        if [ -n "$SERVER_PID" ]; then break; fi
+      fi
+      sleep 0.1
+    done
+    if [ -z "$SERVER_PID" ]; then
+      tail -n 20 "$server_log" >&2 || true
+      die "the server never reported its PID inside $SERVER_SCOPE"
+    fi
+    local cg_rel
+    cg_rel="$(sed -n 's/^0:://p' "/proc/$SERVER_PID/cgroup" 2>/dev/null || true)"
+    SERVER_CGROUP="$cg_rel"
+    SERVER_CPU_MAX="$(cat "/sys/fs/cgroup$cg_rel/cpu.max" 2>/dev/null || echo unknown)"
+    SERVER_MEMORY_MAX_ACTUAL="$(cat "/sys/fs/cgroup$cg_rel/memory.max" 2>/dev/null || echo unknown)"
+    log "scope: scope=$SERVER_SCOPE cgroup=$cg_rel cpu.max=$SERVER_CPU_MAX memory.max=$SERVER_MEMORY_MAX_ACTUAL requested_cpu=$SERVER_CPU_QUOTA requested_memory=$SERVER_MEMORY_MAX"
+    if [ -n "$SERVER_CPU_QUOTA" ]; then
+      case "$SERVER_CPU_MAX" in
+        unknown|''|max*)
+          die "CPU quota did not apply to the server (cpu.max='$SERVER_CPU_MAX' in ${cg_rel:-?})" ;;
+      esac
+    fi
+    if [ -n "$SERVER_MEMORY_MAX" ]; then
+      case "$SERVER_MEMORY_MAX_ACTUAL" in
+        unknown|''|max*)
+          die "server memory limit did not apply (memory.max='$SERVER_MEMORY_MAX_ACTUAL' in ${cg_rel:-?})" ;;
+      esac
+    fi
+    printf 'server_cpu_max=%s server_memory_max=%s scope=%s cgroup=%s\n' \
+      "$SERVER_CPU_MAX" "$SERVER_MEMORY_MAX_ACTUAL" "$SERVER_SCOPE" "$cg_rel" \
+      >> "$RUN_DIR/masks.tsv"
+  else
+    "${server_cmd[@]}" > "$server_log" 2>&1 &
+    SERVER_PID=$!
+  fi
+  if ! wait_for_port tun-server 10.10.1.1 443 "$SERVER_PID" 20; then
+    tail -n 40 "$server_log" >&2 || true
+    die "$arm did not start listening on $BEAM_ADDR"
+  fi
+  SERVER_MASK="$(mask_of "$SERVER_PID")"
+  taskset -c "$CLIENT_MASK_SPEC" ip netns exec tun-client \
+    env GOMAXPROCS="$GOMAXPROCS_CLIENT" "$SING_BOX" run -c "$CONFIG_DIR/singbox.json" \
+    > "$client_log" 2>&1 &
+  SINGBOX_PID=$!
+  local ready=0
+  for _ in $(seq 1 200); do
+    if ip netns exec tun-client ip link show tun0 >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    kill -0 "$SINGBOX_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ "$ready" != "1" ]; then
+    tail -n 60 "$client_log" >&2 || true
+    die "sing-box did not create tun0"
+  fi
+  ip netns exec tun-client ip link set tun0 up 2>/dev/null || true
+  ip netns exec tun-client ip link set tun0 txqueuelen 10000 2>/dev/null || true
+  ip netns exec tun-client ip route replace 10.10.2.0/24 dev tun0 \
+    || die "could not route 10.10.2.0/24 into tun0"
+  if [ "$IPV6_AVAILABLE" = "1" ]; then
+    ip netns exec tun-client ip -6 route replace fd00:2::/64 dev tun0 2>/dev/null || IPV6_AVAILABLE=0
+  fi
+  if ! ip netns exec tun-client ip route get "$TARGET_HOST" 2>/dev/null | grep -q 'dev tun0'; then
+    die "$TARGET_HOST does not resolve to tun0"
+  fi
+  CLIENT_MASK="$(mask_of "$SINGBOX_PID")"
+  TARGET_MASK="$(mask_of "$SERVICES_PID")"
+  printf '%s\t%s\tserver\t%s\t%s\n' "$arm" "$rep" "$SERVER_CPU" "$SERVER_MASK" >> "$RUN_DIR/masks.tsv"
+  printf '%s\t%s\tclient\t%s\t%s\n' "$arm" "$rep" "$CLIENT_CPU" "$CLIENT_MASK" >> "$RUN_DIR/masks.tsv"
+  printf '%s\t%s\ttarget\t%s\t%s\n' "$arm" "$rep" "$TARGET_CPU" "$TARGET_MASK" >> "$RUN_DIR/masks.tsv"
+  sleep 0.5
+}
+
+stop_arm() {
+  local arm=$1 rep=$2
+  stop_pid "$SINGBOX_PID"
+  SINGBOX_PID=""
+  # Read the server cgroup before the process is reaped: /proc/$pid/cgroup and
+  # the scope's memory.peak both vanish with the last process in the scope.
+  # Unavailable is recorded as `unavailable`, never as a fake zero.
+  local peak=unavailable oom=unavailable oom_kill=unavailable cg_rel=""
+  local memory_max="${SERVER_MEMORY_MAX_ACTUAL:-unavailable}"
+  if [ -n "${SERVER_SCOPE:-}" ] && [ -n "${SERVER_PID:-}" ]; then
+    cg_rel="$(sed -n 's/^0:://p' "/proc/$SERVER_PID/cgroup" 2>/dev/null || true)"
+  fi
+  if [ -n "$cg_rel" ]; then
+    peak="$(cat "/sys/fs/cgroup$cg_rel/memory.peak" 2>/dev/null || echo unavailable)"
+    local events
+    events="$(cat "/sys/fs/cgroup$cg_rel/memory.events" 2>/dev/null || true)"
+    if [ -n "$events" ]; then
+      oom="$(awk '$1 == "oom" { print $2 }' <<<"$events")"
+      oom_kill="$(awk '$1 == "oom_kill" { print $2 }' <<<"$events")"
+      oom="${oom:-unavailable}"
+      oom_kill="${oom_kill:-unavailable}"
+    fi
+  fi
+  printf '%s\t%s\tserver-resources\t-\tmemory_peak=%s oom=%s oom_kill=%s memory_max=%s cgroup=%s\n' \
+    "$arm" "$rep" "$peak" "$oom" "$oom_kill" "$memory_max" \
+    "${cg_rel:-unavailable}" >> "$RUN_DIR/masks.tsv"
+  if [ -n "${SERVER_PID:-}" ]; then
+    stop_pid "$SERVER_PID"
+  fi
+  SERVER_PID=""
+  if [ -n "${SERVER_SCOPE:-}" ]; then
+    systemctl stop "$SERVER_SCOPE" >/dev/null 2>&1 || true
+    SERVER_SCOPE=""
+  fi
+  ip netns exec tun-client ip link del tun0 >/dev/null 2>&1 || true
+}
+
+# One invocation of measure.py inside the client namespace. The measurement
+# process and every client tool inherit the client core mask.
+measure() {
+  local arm=$1 rep=$2 scenario=$3 kind=$4 out=$5
+  shift 5
+  if [[ "$scenario" != warmup-* ]] && ! scenario_enabled "$scenario"; then
+    return 0
+  fi
+  local perf_pid=""
+  local rc=0
+  if [ "$PERF" = "1" ]; then
+    perf stat -x, -e "$PERF_EVENTS" -p "$SERVER_PID" -o "$out.perf.csv" &
+    perf_pid=$!
+    sleep 0.5
+    if ! kill -0 "$perf_pid" 2>/dev/null; then
+      wait "$perf_pid" 2>/dev/null || true
+      die "perf stat failed for $scenario"
+    fi
+  fi
+  local server_peak=""
+  if [ -n "${SERVER_CGROUP:-}" ]; then
+    server_peak="$(cat "/sys/fs/cgroup$SERVER_CGROUP/memory.peak" 2>/dev/null || true)"
+  fi
+  local target_pid="$SERVICES_PID"
+  if [ "$kind" = "iperf3" ] && [ -n "${IPERF3_PID:-}" ]; then
+    target_pid="$IPERF3_PID"
+  fi
+  ip netns exec tun-client taskset -c "$DRIVER_CPU" \
+    env LD_LIBRARY_PATH="$IPERF3_LIB" BENCH_SERVER_CPU_MAX="$SERVER_CPU_MAX" \
+    BENCH_SERVER_MEMORY_MAX="$SERVER_MEMORY_MAX_ACTUAL" \
+    BENCH_SERVER_MEMORY_PEAK="$server_peak" \
+    "$PYTHON" "$HERE/measure.py" \
+      --run-id "$RUN_ID" --arm "$arm" --rep "$rep" \
+      --scenario "$scenario" --kind "$kind" \
+      --out "$out" \
+      --server-pid "$SERVER_PID" --client-pid "$SINGBOX_PID" \
+      --target-pid "$target_pid" \
+      --server-core "$SERVER_CPU" --client-core "$CLIENT_CPU" \
+      --target-core "$TARGET_CPU" --driver-core "$DRIVER_CPU" \
+      --client-cores "$CLIENT_MASK_SPEC" --all-cores "$NPROC" \
+      --iperf3-bin "$IPERF3" \
+      "$@" || rc=$?
+  if [ -n "$perf_pid" ]; then
+    kill -INT "$perf_pid" 2>/dev/null || true
+    wait "$perf_pid" 2>/dev/null || true
+    perf_require_counters "$out.perf.csv" "$scenario"
+  fi
+  return "$rc"
+}
+
+run_warmup() {
+  local arm=$1 rep=$2
+  local base="$LOG_DIR/warmup-$arm-r$rep"
+  local rc=0
+  local iperf_rc=0
+  ip netns exec tun-client taskset -c "$DRIVER_CPU" \
+    "$IPERF3" -c "$TARGET_HOST" -p "$IPERF3_PORT" -t 2 -P 1 -l 128K -4 \
+    > "$base-iperf3.log" 2>&1 || iperf_rc=1
+  if [ "$iperf_rc" != "0" ]; then
+    # The first iperf3 connection can race the freshly started tunnel.
+    sleep 1
+    ip netns exec tun-client taskset -c "$DRIVER_CPU" \
+      "$IPERF3" -c "$TARGET_HOST" -p "$IPERF3_PORT" -t 2 -P 1 -l 128K -4 \
+      > "$base-iperf3.log" 2>&1 || rc=1
+  fi
+  ip netns exec tun-client taskset -c "$DRIVER_CPU" \
+    curl --noproxy '*' -k -sS --http1.1 --max-time 60 \
+    -o /dev/null "https://$TARGET_HOST:4443/large.bin" \
+    > "$base-https.log" 2>&1 || rc=1
+  if [ "$H3_READY" = "1" ]; then
+    measure "$arm" "$rep" warmup-h3 h3 "$base-h3.json" --url "https://$TARGET_HOST:4443/" \
+      --count 2 --max-time 10 > "$base-h3.log" 2>&1 || rc=1
+  fi
+  measure "$arm" "$rep" warmup-udp udp "$base-udp.json" --host "$TARGET_HOST" --port "$UDP_PORT" \
+    --payload 1200 --packet-count 50 --window 8 --latency-count 10 \
+    --timeout 1 > "$base-udp.log" 2>&1 || rc=1
+  measure "$arm" "$rep" warmup-dns dns "$base-dns.json" --dns-server "$TARGET_HOST" \
+    --dns-count 10 --timeout 1 > "$base-dns.log" 2>&1 || rc=1
+  if [ "$rc" != "0" ]; then
+    log "WARNING: warm-up for $arm r$rep had a failure; see $base-*.log"
+  fi
+  sleep 0.5
+}
+
+run_scenarios() {
+  local arm=$1 rep=$2
+  local raw="$RAW_DIR"
+  log "measuring $arm r$rep"
+  measure "$arm" "$rep" tcp-dl-1 iperf3 "$raw/$arm-tcp-dl-1-r$rep.json" \
+    --direction download --flows 1 --duration "$DURATION" \
+    --target-host "$TARGET_HOST" --iperf3-port "$IPERF3_PORT" \
+    || die "measure.py failed for tcp-dl-1/$arm"
+  measure "$arm" "$rep" tcp-dl-4 iperf3 "$raw/$arm-tcp-dl-4-r$rep.json" \
+    --direction download --flows 4 --duration "$DURATION" \
+    --target-host "$TARGET_HOST" --iperf3-port "$IPERF3_PORT" \
+    || die "measure.py failed for tcp-dl-4/$arm"
+  measure "$arm" "$rep" tcp-ul-1 iperf3 "$raw/$arm-tcp-ul-1-r$rep.json" \
+    --direction upload --flows 1 --duration "$DURATION" \
+    --target-host "$TARGET_HOST" --iperf3-port "$IPERF3_PORT" \
+    || die "measure.py failed for tcp-ul-1/$arm"
+  measure "$arm" "$rep" tcp-ul-4 iperf3 "$raw/$arm-tcp-ul-4-r$rep.json" \
+    --direction upload --flows 4 --duration "$DURATION" \
+    --target-host "$TARGET_HOST" --iperf3-port "$IPERF3_PORT" \
+    || die "measure.py failed for tcp-ul-4/$arm"
+  measure "$arm" "$rep" https-bulk https "$raw/$arm-https-bulk-r$rep.json" \
+    --url "https://$TARGET_HOST:4443/large.bin" --count 3 --https-parallel "$HTTPS_PARALLEL" \
+    --expected-size "$HTTPS_BYTES" --max-time 120 \
+    || die "measure.py failed for https-bulk/$arm"
+  measure "$arm" "$rep" udp-echo udp "$raw/$arm-udp-echo-r$rep.json" \
+    --host "$TARGET_HOST" --port "$UDP_PORT" --payload 1200 \
+    --packet-count "$UDP_COUNT" --window "$UDP_WINDOW" --latency-count "$UDP_LATENCY_COUNT" \
+    --timeout 2 || die "measure.py failed for udp-echo/$arm"
+  measure "$arm" "$rep" dns-a dns "$raw/$arm-dns-a-r$rep.json" \
+    --dns-server "$TARGET_HOST" --dns-count "$DNS_COUNT" --timeout 2 \
+    || die "measure.py failed for dns-a/$arm"
+  if [ "$H3_READY" = "1" ]; then
+    measure "$arm" "$rep" h3-latency h3 "$raw/$arm-h3-latency-r$rep.json" \
+      --url "https://$TARGET_HOST:4443/" --count "$H3_REQUESTS" --max-time 10 \
+      || die "measure.py failed for h3-latency/$arm"
+  else
+    measure "$arm" "$rep" h3-latency h3 "$raw/$arm-h3-latency-r$rep.json" \
+      --blocked-reason "$H3_BLOCKED" \
+      || die "measure.py failed to record blocked h3-latency/$arm"
+  fi
+}
+
+for rep in $(seq 1 "$REPS"); do
+  ORDER=("${ARM_LIST[@]}")
+  rotate=$(( (rep - 1) % ${#ORDER[@]} ))
+  if [ "$rotate" -gt 0 ]; then
+    ORDER=("${ORDER[@]:$rotate}" "${ORDER[@]:0:$rotate}")
+  fi
+  for arm in "${ORDER[@]}"; do
+    if [[ ! " ${ARM_LIST[*]} " == *" $arm "* ]]; then
+      continue
+    fi
+    start_arm "$arm" "$rep"
+    run_warmup "$arm" "$rep"
+    run_scenarios "$arm" "$rep"
+    stop_arm "$arm" "$rep"
+  done
+done
+
+# ---------------------------------------------------------------------------
+# Manifest and report
+# ---------------------------------------------------------------------------
+
+FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# The 1-minute load average still carries the run itself (the harness keeps one
+# thread per role and per client core busy), so sampling it immediately would
+# report the benchmark as host noise. Let it decay first, bounded; if the host
+# never settles the warning below is kept.
+LOAD_AFTER="$(awk '{print $1}' /proc/loadavg)"
+for _ in $(seq 1 180); do
+  if awk -v host_load="$LOAD_AFTER" -v max_load="$MAX_LOAD" \
+      'BEGIN { exit !(host_load <= max_load) }'; then
+    break
+  fi
+  sleep 1
+  LOAD_AFTER="$(awk '{print $1}' /proc/loadavg)"
+done
+if [ "$IMPAIRED" = "1" ]; then
+  ip netns exec tun-client "$TC" -j -s qdisc show dev vc \
+    > "$LOG_DIR/tc-client-final.json" 2>&1 || true
+  ip netns exec tun-server "$TC" -j -s qdisc show dev sc \
+    > "$LOG_DIR/tc-server-final.json" 2>&1 || true
+  ip netns exec tun-client "$TC" -s qdisc show > "$LOG_DIR/tc-client-final.txt" 2>&1 || true
+  ip netns exec tun-server "$TC" -s qdisc show > "$LOG_DIR/tc-server-final.txt" 2>&1 || true
+fi
+WARNINGS=()
+[ -n "$YELLOW" ] && WARNINGS+=(--warning "$YELLOW")
+if awk -v host_load="$LOAD_AFTER" -v max_load="$MAX_LOAD" 'BEGIN { exit !(host_load > max_load) }'; then
+  WARNINGS+=(--warning "host load after run $LOAD_AFTER exceeds $MAX_LOAD")
+fi
+if [ "$H3_READY" != "1" ] && [ -z "$H3_BLOCKED" ]; then
+  H3_BLOCKED="HTTP/3 origin did not become ready"
+fi
+
+META_ARGS=(
+  --out "$RUN_DIR/meta.json"
+  --run-id "$RUN_ID"
+  --started-at "$STARTED_AT"
+  --finished-at "$FINISHED_AT"
+  --arms "$ARMS"
+  --reps "$REPS"
+  --duration "$DURATION"
+  --server-cpu "$SERVER_CPU"
+  --client-cpu "$CLIENT_CPU"
+  --client-cpus "$CLIENT_MASK_SPEC"
+  --target-cpu "$TARGET_CPU"
+  --driver-cpu "$DRIVER_CPU"
+  --rtt-ms "$RTT_MS"
+  --loss "$LOSS"
+  --max-load "$MAX_LOAD"
+  --qdisc-logs "$LOG_DIR"
+  --server-mask "$SERVER_MASK"
+  --client-mask "$CLIENT_MASK"
+  --target-mask "$TARGET_MASK"
+  --beam-bin "$ROOT/target/release/beam"
+  --singbox "$SING_BOX"
+  --iperf3 "$IPERF3"
+  --host-load-before "$LOAD_BEFORE"
+  --host-load-after "$LOAD_AFTER"
+)
+[ -x "$XRAY_BIN" ] && META_ARGS+=(--stock-bin "$XRAY_BIN")
+[ -n "$BASELINE_BIN" ] && [ -x "$BASELINE_BIN" ] \
+  && META_ARGS+=(--baseline-bin "$BASELINE_BIN")
+[ -x "$H3_ORIGIN_BIN" ] && META_ARGS+=(--h3-origin "$H3_ORIGIN_BIN")
+META_ARGS+=(--large-file "$CONFIG_DIR/large.bin")
+[ -n "$H3_BLOCKED" ] && META_ARGS+=(--h3-blocked-reason "$H3_BLOCKED")
+META_ARGS+=("${WARNINGS[@]}")
+
+# GIT_OPTIONAL_LOCKS=0 keeps `git status` from refreshing the index: a root-run
+# harness would otherwise leave .git/index owned by root and break the worktree
+# for the invoking user.
+GIT_OPTIONAL_LOCKS=0 "$PYTHON" "$HERE/meta.py" "${META_ARGS[@]}" || die "could not write meta.json"
+if [ "$REPORT" = "1" ]; then
+  REPORT_ARGS=(--run "$RUN_DIR" --scenarios "$SCENARIOS")
+  if [ "$RATIO_ONLY" = "1" ]; then
+    REPORT_ARGS+=(--ratio-only)
+  fi
+  if [ "$REQUIRE_COMPLETE" = "1" ]; then
+    REPORT_ARGS+=(--require-complete)
+  fi
+  "$PYTHON" "$HERE/report.py" "${REPORT_ARGS[@]}" || die "could not write the summary"
+fi
+printf '\nbench: run directory: %s\n' "$RUN_DIR"

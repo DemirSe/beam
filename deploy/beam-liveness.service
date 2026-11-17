@@ -1,0 +1,14 @@
+[Unit]
+Description=Liveness check for beam
+After=beam.service
+
+[Service]
+Type=oneshot
+# The probe waits up to 60 s for a handshake, and a restart of a hung beam can
+# add the 20 s TimeoutStopSec of beam.service. The systemd default of 90 s
+# leaves no margin for that case.
+TimeoutStartSec=150
+ExecStart=/usr/local/lib/beam/liveness-check.py
+
+[Install]
+WantedBy=multi-user.target

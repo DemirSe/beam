@@ -1,0 +1,3634 @@
+//! REALITY TLS server adapter.
+//!
+//! One TLS record is read before rustls is involved. The record is parsed and
+//! authenticated as a REALITY ClientHello. Authenticated connections are handed
+//! to rustls through a [`ReplayStream`] that replays the original record.
+//! Unauthenticated connections are forwarded byte-for-byte to the configured
+//! cover. The adapter implements the TLS handshake, a minimal TCP VLESS path,
+//! and XTLS Vision framing, including the raw inner-TLS handoff on Vision
+//! Direct. XUDP mux streams are relayed through [`crate::xudp`], legacy VLESS
+//! UDP and packetaddr through [`crate::udp`], and reverse streams remain out
+//! of scope.
+
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::fmt;
+use std::io;
+use std::net::SocketAddr;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use hmac::{Hmac, Mac};
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer};
+use rustls::sign::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
+use rustls::{SignatureAlgorithm, SignatureScheme};
+use sha2::Sha512;
+use subtle::ConstantTimeEq;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpSocket, TcpStream, lookup_host};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::time::{timeout, timeout_at};
+use zeroize::Zeroizing;
+
+use crate::address::{Address, NetLocation};
+use crate::admission::{IpLimiter, IpPermit};
+use crate::metrics::Metrics;
+use crate::prepend_stream::PrependStream;
+use crate::reality::auth::decode_short_id;
+use crate::reality::{Auth, RealityAuthConfig, authenticate};
+use crate::relay::{DEFAULT_PIPE_SIZE, RelayActivity, RelayConfig, copy_one_way};
+use crate::tls::stream::{TlsStream, TlsStreamError};
+use crate::tls::{
+    ClientHello, MAX_CLIENT_HELLO_RECORDS, MAX_RECORD_LEN, TLS_HANDSHAKE_HEADER_LEN,
+    TLS_RECORD_HEADER_LEN, client_hello_message_len,
+};
+use crate::udp::{LegacyUdpConfig, UdpError, handle_udp_stream};
+use crate::vision::VisionStream;
+use crate::vless::{Command, MAX_REQUEST_HEADER_LEN, RequestHeader, ResponseHeader, VlessError};
+use crate::xudp::{
+    DEFAULT_MAX_GLOBAL_SESSIONS, MuxError, XudpConfig, XudpSessionLimiter, handle_mux_stream,
+};
+
+/// Idle timeout for each relay read, write, and shutdown.
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Idle timeout for unauthenticated cover relays.
+///
+/// Cover connections are not authenticated and must not pin a blocking splice
+/// thread for the full VPN idle timeout. A slow cover handshake or an idle
+/// probe is closed after this bound.
+const COVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of unauthenticated cover relays in flight at once.
+///
+/// Cover relays and authenticated Vision Direct relays share the process
+/// blocking pool. A cover flood must not be able to occupy that pool and
+/// starve the VPN data path. The limit is global rather than per-IP because
+/// the deployment intentionally does not filter by client address.
+const COVER_MAX_CONCURRENCY: usize = 32;
+
+/// Maximum unauthenticated cover relays from one source address.
+///
+/// The global cap bounds the shared blocking pool; the per-source cap prevents
+/// one scanner from consuming every cover slot during a probe burst.
+const COVER_MAX_PER_IP: u32 = 8;
+
+/// Maximum time a connection may hold a pre-auth slot for its ClientHello.
+///
+/// This is intentionally shorter than the full TLS/VLESS handshake timeout: an
+/// unauthenticated peer should not be able to pin admission capacity for the
+/// deployment's 10 s handshake budget.
+const PREAUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on a destination TCP dial. The server is normally a datacenter
+/// hop away from the target; a blackholed address should not hold a permit for
+/// the full client handshake budget.
+const MAX_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Clamps a cover dial/write to the same bound as an authenticated dial.
+fn cover_timeout(configured: Duration) -> Duration {
+    configured.min(MAX_DIAL_TIMEOUT)
+}
+
+/// TCP maximum segment size used for destination connections.
+///
+/// The production path to some CDN prefixes has a 1460-byte PMTU but
+/// advertises a 1500-byte MSS and drops larger packets without returning ICMP
+/// fragmentation-needed. Setting this before connect limits both the MSS
+/// advertised in our SYN and the local send size, so downloads and uploads
+/// stay below that path MTU. 1400 leaves room for TCP timestamps and the
+/// IP/TCP headers.
+const TARGET_MSS: u16 = 1400;
+
+/// Bound on remembered authenticated ClientHello session ids before the
+/// production capacity override.
+const REPLAY_CACHE_CAPACITY: usize = 4_096;
+
+/// Retention for one replay-cache entry when no timestamp window is configured.
+const REPLAY_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Extra retention beyond the timestamp window to cover the accepted boundary.
+const REPLAY_RETENTION_SLACK: Duration = Duration::from_secs(1);
+
+/// Maximum possible retention. With a window, a timestamp up to `window` in the
+/// future is accepted, so the worst case is `2 * window + slack`.
+fn replay_max_retention(window: Option<Duration>) -> Duration {
+    window.map_or(REPLAY_CACHE_TTL, |window| {
+        window
+            .saturating_mul(2)
+            .saturating_add(REPLAY_RETENTION_SLACK)
+    })
+}
+
+/// Hard upper bound for a caller-supplied timestamp window. Production uses
+/// 300 s; this keeps retention arithmetic and the fail-closed cache bounded.
+const MAX_TIMESTAMP_WINDOW: Duration = Duration::from_secs(86_400);
+
+/// Maximum concurrent handshakes allowed for one exact replay id. The
+/// completion cache still rejects all later copies; this only prevents one
+/// captured ClientHello from occupying the global connection permit pool
+/// before the TLS Finished insert happens.
+const REPLAY_MAX_IN_FLIGHT_PER_ID: usize = 4;
+
+/// One exact-replay id's phase. `states` stores only `InFlight` and `Settled`;
+/// `Unseen` and `Expired` are read results, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayPhase {
+    Unseen,
+    InFlight { reservations: u8 },
+    Settled { deadline: Instant, reservations: u8 },
+    Expired,
+}
+
+/// Result of recording a completed handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayInsert {
+    Inserted,
+    Duplicate,
+    Full,
+}
+
+/// Snapshot of the replay cache for the periodic counter line.
+///
+/// `entries` is the number of settled ids after sweeping expiry; `in_flight` is
+/// the number of distinct ids currently holding at least one reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayStats {
+    pub entries: usize,
+    pub in_flight: usize,
+    pub capacity: usize,
+}
+
+fn wall_clock_seconds() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+/// Retain until a replay of this envelope would be rejected by
+/// `reality::auth::check_timestamp`, i.e. real time > timestamp + window.
+/// `check_timestamp` accepts `difference == window`, hence the +1 s slack.
+fn replay_deadline(
+    timestamp: u32,
+    now: Instant,
+    now_wall: Option<u64>,
+    window: Option<Duration>,
+) -> Instant {
+    let Some(window) = window else {
+        return now + REPLAY_CACHE_TTL;
+    };
+    let max = replay_max_retention(Some(window));
+    let Some(now_wall) = now_wall else {
+        return now
+            .checked_add(max)
+            .unwrap_or_else(|| now + REPLAY_CACHE_TTL);
+    };
+    let timestamp = u64::from(timestamp);
+    let seconds = if timestamp >= now_wall {
+        timestamp
+            .saturating_sub(now_wall)
+            .saturating_add(window.as_secs())
+            .saturating_add(REPLAY_RETENTION_SLACK.as_secs())
+    } else {
+        window
+            .as_secs()
+            .saturating_sub(now_wall - timestamp)
+            .saturating_add(REPLAY_RETENTION_SLACK.as_secs())
+    };
+    let retention = Duration::from_secs(seconds.min(max.as_secs()));
+    now.checked_add(retention)
+        .unwrap_or_else(|| now + REPLAY_CACHE_TTL)
+}
+
+/// Bounded exact-replay filter for authenticated ClientHellos.
+///
+/// The key is the encrypted 32-byte REALITY session id. It is not a secret and
+/// is not logged; the cache never stores a ClientHello, key share, or auth key.
+///
+/// Phase transitions:
+/// `Unseen -> InFlight(1)` on reserve; `InFlight(n) -> InFlight(n+1)` below the
+/// in-flight cap; `InFlight -> Unseen` when the last reservation is released;
+/// `InFlight -> Settled(deadline)` on the first completed handshake; `Settled`
+/// stays `Settled` and rejects duplicates; `Settled -> Expired -> Unseen` when
+/// the deadline passes. A full cache rejects a new id without changing its
+/// `InFlight` phase, so the reservation drop can release it.
+struct ReplayCache {
+    states: HashMap<[u8; 32], ReplayPhase>,
+    deadlines: BinaryHeap<Reverse<(Instant, [u8; 32])>>,
+    settled: usize,
+    in_flight: usize,
+    window: Option<Duration>,
+    capacity: usize,
+}
+
+impl ReplayCache {
+    #[cfg(test)]
+    fn new(window: Option<Duration>) -> Self {
+        Self::with_capacity(window, REPLAY_CACHE_CAPACITY)
+    }
+
+    fn with_capacity(window: Option<Duration>, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            states: HashMap::with_capacity(capacity),
+            deadlines: BinaryHeap::with_capacity(capacity),
+            settled: 0,
+            in_flight: 0,
+            window,
+            capacity,
+        }
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while let Some(&Reverse((deadline, id))) = self.deadlines.peek() {
+            if deadline > now {
+                break;
+            }
+            self.deadlines.pop();
+            let current = match self.states.get(&id) {
+                Some(ReplayPhase::Settled {
+                    deadline: stored,
+                    reservations,
+                }) => Some((*stored, *reservations)),
+                _ => None,
+            };
+            if let Some((stored, reservations)) = current
+                && stored == deadline
+                && reservations == 0
+            {
+                self.states.remove(&id);
+                self.settled = self.settled.saturating_sub(1);
+            }
+            // A settled entry with outstanding reservations stays until the
+            // last reservation is released, even after its timestamp
+            // deadline; that preserves first-wins for copies already
+            // admitted. Its heap entry is consumed here.
+        }
+    }
+
+    fn expire_one(&mut self, id: [u8; 32]) {
+        if matches!(
+            self.states.get(&id),
+            Some(ReplayPhase::Settled {
+                reservations: 0,
+                ..
+            })
+        ) {
+            self.states.remove(&id);
+            self.settled = self.settled.saturating_sub(1);
+        }
+    }
+
+    fn phase(&self, id: [u8; 32], now: Instant) -> ReplayPhase {
+        match self.states.get(&id) {
+            Some(ReplayPhase::Settled {
+                deadline,
+                reservations: 0,
+            }) if *deadline <= now => ReplayPhase::Expired,
+            Some(phase) => *phase,
+            None => ReplayPhase::Unseen,
+        }
+    }
+
+    /// Reserves one in-flight handshake for an authenticated ClientHello.
+    fn try_reserve(&mut self, id: [u8; 32]) -> bool {
+        self.try_reserve_at(id, Instant::now())
+    }
+
+    fn try_reserve_at(&mut self, id: [u8; 32], now: Instant) -> bool {
+        self.expire(now);
+        match self.phase(id, now) {
+            ReplayPhase::Settled { .. } => false,
+            ReplayPhase::InFlight { reservations } => {
+                if usize::from(reservations) >= REPLAY_MAX_IN_FLIGHT_PER_ID {
+                    false
+                } else {
+                    if let Some(ReplayPhase::InFlight { reservations }) = self.states.get_mut(&id) {
+                        *reservations = reservations.saturating_add(1);
+                    }
+                    true
+                }
+            }
+            ReplayPhase::Unseen => {
+                self.states
+                    .insert(id, ReplayPhase::InFlight { reservations: 1 });
+                self.in_flight = self.in_flight.saturating_add(1);
+                true
+            }
+            ReplayPhase::Expired => {
+                self.expire_one(id);
+                self.states
+                    .insert(id, ReplayPhase::InFlight { reservations: 1 });
+                self.in_flight = self.in_flight.saturating_add(1);
+                true
+            }
+        }
+    }
+
+    fn release(&mut self, id: [u8; 32]) {
+        self.release_at(id, Instant::now());
+    }
+
+    fn release_at(&mut self, id: [u8; 32], now: Instant) {
+        match self.states.get(&id).copied() {
+            Some(ReplayPhase::InFlight { reservations }) if reservations > 1 => {
+                if let Some(ReplayPhase::InFlight { reservations }) = self.states.get_mut(&id) {
+                    *reservations = reservations.saturating_sub(1);
+                }
+            }
+            Some(ReplayPhase::InFlight { .. }) => {
+                self.states.remove(&id);
+                self.in_flight = self.in_flight.saturating_sub(1);
+            }
+            Some(ReplayPhase::Settled { reservations, .. }) if reservations > 1 => {
+                if let Some(ReplayPhase::Settled { reservations, .. }) = self.states.get_mut(&id) {
+                    *reservations = reservations.saturating_sub(1);
+                }
+            }
+            Some(ReplayPhase::Settled {
+                deadline,
+                reservations: 1,
+            }) => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                if deadline <= now {
+                    self.states.remove(&id);
+                    self.settled = self.settled.saturating_sub(1);
+                } else if let Some(ReplayPhase::Settled { reservations, .. }) =
+                    self.states.get_mut(&id)
+                {
+                    *reservations = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Records the first completed handshake for an id.
+    ///
+    /// A duplicate returns `Duplicate`; a full cache returns `Full`. Both leave
+    /// any `InFlight` phase and count unchanged so the caller's
+    /// `ReplayReservation::drop` releases exactly the reservation it holds.
+    fn insert(&mut self, id: [u8; 32], timestamp: u32) -> ReplayInsert {
+        self.insert_at(id, timestamp, Instant::now(), wall_clock_seconds())
+    }
+
+    fn insert_at(
+        &mut self,
+        id: [u8; 32],
+        timestamp: u32,
+        now: Instant,
+        now_wall: Option<u64>,
+    ) -> ReplayInsert {
+        self.expire(now);
+        let phase = self.phase(id, now);
+        let remaining = match phase {
+            ReplayPhase::Settled { .. } => return ReplayInsert::Duplicate,
+            ReplayPhase::InFlight { reservations } => reservations.saturating_sub(1),
+            ReplayPhase::Unseen => 0,
+            ReplayPhase::Expired => {
+                self.expire_one(id);
+                0
+            }
+        };
+        if self.settled >= self.capacity {
+            return ReplayInsert::Full;
+        }
+        let deadline = replay_deadline(timestamp, now, now_wall, self.window);
+        if matches!(phase, ReplayPhase::InFlight { .. }) && remaining == 0 {
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
+        self.states.insert(
+            id,
+            ReplayPhase::Settled {
+                deadline,
+                reservations: remaining,
+            },
+        );
+        self.deadlines.push(Reverse((deadline, id)));
+        self.settled = self.settled.saturating_add(1);
+        ReplayInsert::Inserted
+    }
+
+    fn stats(&mut self, now: Instant) -> ReplayStats {
+        self.expire(now);
+        ReplayStats {
+            entries: self.settled,
+            in_flight: self.in_flight,
+            capacity: self.capacity,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReservationState {
+    Pending,
+    Committed,
+}
+
+struct ReplayReservation<'a> {
+    cache: &'a Mutex<ReplayCache>,
+    id: [u8; 32],
+    state: ReservationState,
+}
+
+impl ReplayReservation<'_> {
+    fn commit(mut self) {
+        self.state = ReservationState::Committed;
+    }
+}
+
+impl Drop for ReplayReservation<'_> {
+    fn drop(&mut self) {
+        if matches!(self.state, ReservationState::Committed) {
+            return;
+        }
+        match self.cache.lock() {
+            Ok(mut cache) => cache.release(self.id),
+            Err(poisoned) => poisoned.into_inner().release(self.id),
+        }
+    }
+}
+
+/// Relay buffer large enough for one maximum-size inner TLS record, including
+/// its five-byte header.
+const RELAY_BUFFER_LEN: usize = 16_384 + 256 + 5;
+
+/// Result of one accepted connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionOutcome {
+    /// The connection was not authenticated and was forwarded to the cover.
+    CoverForwarded,
+    /// The peer closed or sent nothing before a plausible ClientHello.
+    /// No cover connection was dialed.
+    ClosedBeforeHello,
+    /// The connection was not authenticated and was closed because the cover
+    /// concurrency limit was reached.
+    CoverLimited,
+    /// The REALITY handshake succeeded but the authenticated connection limit
+    /// was already in use.
+    ConnectionLimited,
+    /// The REALITY handshake succeeded and the VLESS command was observed.
+    Authenticated {
+        /// The VLESS command from the request.
+        command: Command,
+    },
+}
+
+/// Errors returned by the TLS server adapter.
+#[derive(Debug, thiserror::Error)]
+pub enum TlsServerError {
+    /// The server configuration is invalid.
+    #[error("invalid TLS server configuration: {reason}")]
+    InvalidConfig {
+        /// Why the configuration was rejected.
+        reason: &'static str,
+    },
+
+    /// A bounded buffer could not be allocated.
+    #[error("TLS server buffer allocation failed")]
+    Allocation,
+
+    /// The temporary Ed25519 certificate could not be generated or parsed.
+    #[error("temporary REALITY certificate generation failed")]
+    Certificate,
+
+    /// HMAC initialization or output conversion failed.
+    #[error("REALITY certificate HMAC failed")]
+    Hmac,
+
+    /// A network operation timed out.
+    #[error("{stage} timed out")]
+    Timeout {
+        /// The operation that timed out.
+        stage: &'static str,
+    },
+
+    /// An authenticated TCP request had no destination.
+    #[error("authenticated VLESS TCP request has no destination")]
+    MissingDestination,
+
+    /// The VLESS user id did not match the configured user.
+    #[error("VLESS user id is not authorized")]
+    UnauthorizedUser,
+
+    /// Another handshake with the same ClientHello completed first.
+    #[error("authenticated ClientHello replay")]
+    ReplayRejected,
+
+    /// rustls rejected a configuration or handshake.
+    #[error("rustls error: {0}")]
+    Rustls(#[from] rustls::Error),
+
+    /// The record-bounded TLS stream failed.
+    #[error("TLS stream error: {0}")]
+    TlsStream(#[from] TlsStreamError),
+
+    /// A network or TLS stream I/O operation failed.
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
+    /// The VLESS request was malformed or truncated.
+    #[error("VLESS request error: {0}")]
+    Vless(#[from] VlessError),
+
+    /// The legacy UDP or packetaddr stream failed.
+    #[error("VLESS UDP error: {0}")]
+    Udp(#[from] UdpError),
+
+    /// The process-wide legacy UDP stream limit is already in use.
+    #[error("legacy VLESS UDP stream limit reached")]
+    LegacyUdpLimited,
+
+    /// A Vision request asked for legacy UDP.
+    #[error("VLESS UDP with the Vision flow is not supported; clients must use XUDP")]
+    VisionUdpUnsupported,
+
+    /// The XUDP mux stream failed.
+    #[error("XUDP mux error: {0}")]
+    Xudp(#[from] MuxError),
+}
+
+/// Process-lifetime REALITY TLS server configuration.
+pub struct TlsServerConfig {
+    /// REALITY static X25519 private key.
+    pub private_key: Zeroizing<[u8; 32]>,
+    /// Configured REALITY short ids, decoded and zero-padded to 8 bytes.
+    pub short_ids: Vec<[u8; 8]>,
+    /// Accepted REALITY server names.
+    pub server_names: Vec<String>,
+    /// Minimum accepted client version.
+    pub min_client_version: [u8; 3],
+    /// Maximum accepted client version.
+    pub max_client_version: [u8; 3],
+    /// Optional client timestamp window.
+    pub max_time_diff: Option<Duration>,
+    /// Cover destination for unauthenticated connections.
+    pub cover: NetLocation,
+    /// Timeout for ClientHello reads, cover setup, and the TLS handshake.
+    pub handshake_timeout: Duration,
+    /// Inactivity timeout for authenticated TCP relays.
+    pub relay_idle_timeout: Duration,
+    /// Kernel pipe capacity for each Vision splice direction.
+    pub relay_pipe_size: usize,
+    /// Maximum total ClientHello record size, including its five-byte header.
+    pub max_client_hello_bytes: usize,
+    /// The only authorized VLESS user id.
+    pub user_id: [u8; 16],
+    /// XUDP mux/UDP relay limits.
+    pub xudp: XudpConfig,
+    /// Process-wide XUDP session limiter shared by every mux stream.
+    xudp_limiter: XudpSessionLimiter,
+    /// Legacy VLESS UDP and packetaddr limits.
+    pub udp: LegacyUdpConfig,
+    provider: Arc<CryptoProvider>,
+    certificate: TemporaryCertificate,
+    /// Global cap on authenticated connections. The accept loop bounds
+    /// unauthenticated handshakes separately, so a pre-auth flood cannot
+    /// exhaust this permit pool.
+    connection_permits: Arc<Semaphore>,
+    /// Process-wide cap on blocking Vision splice tasks.
+    ///
+    /// `spawn_blocking` has no queue deadline; once Tokio's blocking pool is
+    /// full, a handoff waits forever and the connection silently stops
+    /// forwarding. Keep a reserve for cover relays and DNS, and fall back to
+    /// the async copy path when this cap is reached.
+    splice_permits: Arc<Semaphore>,
+    /// Global cap on legacy VLESS UDP / packetaddr streams.
+    legacy_udp_permits: Arc<Semaphore>,
+    /// Global and per-source cap on unauthenticated cover relays.
+    cover_limiter: Arc<IpLimiter>,
+    /// Process-wide admission counters.
+    metrics: Arc<Metrics>,
+    /// Bounded exact-replay filter for authenticated ClientHellos.
+    replay_cache: Mutex<ReplayCache>,
+}
+
+impl TlsServerConfig {
+    /// Builds a server configuration and generates the process-lifetime
+    /// Ed25519 certificate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        private_key: [u8; 32],
+        short_ids: Vec<String>,
+        server_names: Vec<String>,
+        min_client_version: [u8; 3],
+        max_client_version: [u8; 3],
+        max_time_diff: Option<Duration>,
+        cover: NetLocation,
+        handshake_timeout: Duration,
+        max_client_hello_bytes: usize,
+        user_id: [u8; 16],
+    ) -> Result<Self, TlsServerError> {
+        if handshake_timeout.is_zero() {
+            return Err(TlsServerError::InvalidConfig {
+                reason: "handshake timeout must be non-zero",
+            });
+        }
+        if max_time_diff.is_some_and(|window| window > MAX_TIMESTAMP_WINDOW) {
+            return Err(TlsServerError::InvalidConfig {
+                reason: "timestamp window exceeds the supported bound",
+            });
+        }
+        if !(TLS_RECORD_HEADER_LEN..=TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN)
+            .contains(&max_client_hello_bytes)
+        {
+            return Err(TlsServerError::InvalidConfig {
+                reason: "max ClientHello size is outside the TLS record bounds",
+            });
+        }
+        if cover.port == 0 {
+            return Err(TlsServerError::InvalidConfig {
+                reason: "cover port must be non-zero",
+            });
+        }
+
+        // Short ids are decoded once here so a malformed entry cannot make
+        // every handshake fail after the process has started.
+        let short_ids = short_ids
+            .iter()
+            .map(|short_id| decode_short_id(short_id.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| TlsServerError::InvalidConfig {
+                reason: "short ids must be 2 to 16 hexadecimal characters",
+            })?;
+
+        Ok(Self {
+            private_key: Zeroizing::new(private_key),
+            short_ids,
+            server_names,
+            min_client_version,
+            max_client_version,
+            max_time_diff,
+            cover,
+            handshake_timeout,
+            relay_idle_timeout: RELAY_IDLE_TIMEOUT,
+            relay_pipe_size: DEFAULT_PIPE_SIZE,
+            max_client_hello_bytes,
+            user_id,
+            xudp: XudpConfig::default(),
+            xudp_limiter: XudpSessionLimiter::new(DEFAULT_MAX_GLOBAL_SESSIONS),
+            udp: LegacyUdpConfig::default(),
+            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            certificate: TemporaryCertificate::generate()?,
+            connection_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+            splice_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+            legacy_udp_permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+            cover_limiter: Arc::new(IpLimiter::new(COVER_MAX_CONCURRENCY, COVER_MAX_PER_IP)),
+            metrics: Arc::new(Metrics::default()),
+            replay_cache: Mutex::new(ReplayCache::with_capacity(
+                max_time_diff,
+                REPLAY_CACHE_CAPACITY,
+            )),
+        })
+    }
+
+    /// Overrides the XUDP mux limits used for `Command::Mux` connections.
+    #[must_use]
+    pub fn with_xudp(mut self, xudp: XudpConfig) -> Self {
+        self.xudp = xudp;
+        self
+    }
+
+    /// Returns the process-wide admission counters.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Returns the process-wide XUDP limiter for diagnostics.
+    #[must_use]
+    pub fn xudp_limiter(&self) -> XudpSessionLimiter {
+        self.xudp_limiter.clone()
+    }
+
+    /// Overrides the authenticated connection limiter.
+    ///
+    /// The accept loop holds a separate, smaller pre-auth permit until the
+    /// REALITY ClientHello is classified. This semaphore is acquired only
+    /// after authentication, so unauthenticated half-open connections cannot
+    /// consume the VPN's data-path capacity.
+    #[must_use]
+    pub fn with_connection_limiter(mut self, permits: Arc<Semaphore>) -> Self {
+        self.connection_permits = permits;
+        self
+    }
+
+    /// Overrides the process-wide blocking splice task limit.
+    #[must_use]
+    pub fn with_splice_limiter(mut self, permits: Arc<Semaphore>) -> Self {
+        self.splice_permits = permits;
+        self
+    }
+
+    /// Overrides the bounded exact-replay cache capacity.
+    #[must_use]
+    pub fn with_replay_capacity(mut self, capacity: usize) -> Self {
+        self.replay_cache = Mutex::new(ReplayCache::with_capacity(self.max_time_diff, capacity));
+        self
+    }
+
+    /// Overrides the process-wide legacy UDP stream limit.
+    #[must_use]
+    pub fn with_legacy_udp_limiter(mut self, permits: Arc<Semaphore>) -> Self {
+        self.legacy_udp_permits = permits;
+        self
+    }
+
+    /// Overrides the process-wide XUDP session limiter.
+    #[must_use]
+    pub fn with_xudp_limiter(mut self, limiter: XudpSessionLimiter) -> Self {
+        self.xudp_limiter = limiter;
+        self
+    }
+
+    /// Overrides the legacy UDP limits used for `Command::Udp` connections.
+    #[must_use]
+    pub fn with_udp(mut self, udp: LegacyUdpConfig) -> Self {
+        self.udp = udp;
+        self
+    }
+
+    /// Overrides the inactivity timeout for authenticated TCP relays.
+    #[must_use]
+    pub fn with_relay_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.relay_idle_timeout = timeout;
+        self
+    }
+
+    /// Overrides the kernel pipe capacity for Vision splice directions.
+    #[must_use]
+    pub fn with_relay_pipe_size(mut self, pipe_size: usize) -> Self {
+        self.relay_pipe_size = pipe_size;
+        self
+    }
+
+    fn reality_config(&self) -> RealityAuthConfig<'_> {
+        RealityAuthConfig {
+            private_key: &self.private_key,
+            short_ids: &self.short_ids,
+            server_names: &self.server_names,
+            min_client_version: self.min_client_version,
+            max_client_version: self.max_client_version,
+            max_time_diff: self.max_time_diff,
+        }
+    }
+
+    /// Returns the number of unauthenticated cover relays still in flight.
+    #[must_use]
+    pub fn cover_inflight(&self) -> usize {
+        COVER_MAX_CONCURRENCY.saturating_sub(self.cover_limiter.available_permits())
+    }
+
+    fn replay_reserve(&self, id: [u8; 32]) -> Option<ReplayReservation<'_>> {
+        let mut cache = match self.replay_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !cache.try_reserve(id) {
+            return None;
+        }
+        Some(ReplayReservation {
+            cache: &self.replay_cache,
+            id,
+            state: ReservationState::Pending,
+        })
+    }
+
+    /// Returns the outcome of recording this completed ClientHello.
+    fn replay_insert(&self, id: [u8; 32], timestamp: u32) -> ReplayInsert {
+        match self.replay_cache.lock() {
+            Ok(mut cache) => cache.insert(id, timestamp),
+            Err(poisoned) => poisoned.into_inner().insert(id, timestamp),
+        }
+    }
+
+    /// Returns a consistent snapshot of the replay cache for the counter line.
+    #[must_use]
+    pub fn replay_stats(&self) -> ReplayStats {
+        match self.replay_cache.lock() {
+            Ok(mut cache) => cache.stats(Instant::now()),
+            Err(poisoned) => poisoned.into_inner().stats(Instant::now()),
+        }
+    }
+
+    fn signed_certificate(&self, auth_key: &[u8]) -> Result<Vec<u8>, TlsServerError> {
+        let mut certificate = self.certificate.certificate_der.clone();
+        let signature_offset = certificate
+            .len()
+            .checked_sub(64)
+            .ok_or(TlsServerError::Certificate)?;
+        let signature = hmac_signature(auth_key, &self.certificate.public_key)?;
+        certificate[signature_offset..].copy_from_slice(&signature);
+        Ok(certificate)
+    }
+
+    fn build_server_config(&self, auth_key: &[u8]) -> Result<rustls::ServerConfig, TlsServerError> {
+        let certificate = self.signed_certificate(auth_key)?;
+        let chain = vec![CertificateDer::from(certificate)];
+        // The Ed25519 key and certificate are generated together once at
+        // startup. Only the certificate signature changes per connection, so
+        // reusing the parsed signing key avoids a private-key parse and an
+        // Ed25519 sign/verify `keys_match` on every handshake.
+        let certified = CertifiedKey::new(chain, Arc::clone(&self.certificate.signing_key));
+
+        let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(TlsServerError::Rustls)?
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified)));
+        // Stock REALITY does not issue TLS 1.3 session tickets. Disabling them
+        // avoids extra post-handshake records and keeps the authenticated
+        // flight closer to the cover.
+        config.send_tls13_tickets = 0;
+        Ok(config)
+    }
+}
+
+/// Ed25519 signing key that ignores the client's `signature_algorithms` list.
+///
+/// The stock Xray Chrome fingerprint does not offer Ed25519, but REALITY still
+/// sends an Ed25519 temporary certificate and the stock client accepts its
+/// CertificateVerify signature. Rustls normally rejects this with
+/// `NoSignatureSchemesInCommon`, so force the scheme to match stock behavior.
+#[derive(Debug)]
+struct RealitySigningKey {
+    inner: Arc<dyn SigningKey>,
+}
+
+impl SigningKey for RealitySigningKey {
+    fn choose_scheme(&self, _offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+        self.inner.choose_scheme(&[SignatureScheme::ED25519])
+    }
+
+    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+        self.inner.public_key()
+    }
+
+    fn algorithm(&self) -> SignatureAlgorithm {
+        self.inner.algorithm()
+    }
+}
+
+impl fmt::Debug for TlsServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsServerConfig")
+            .field("private_key", &"<redacted>")
+            .field("short_ids", &"<redacted>")
+            .field("server_names", &self.server_names)
+            .field("min_client_version", &self.min_client_version)
+            .field("max_client_version", &self.max_client_version)
+            .field("max_time_diff", &self.max_time_diff)
+            .field("cover", &self.cover)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("relay_idle_timeout", &self.relay_idle_timeout)
+            .field("relay_pipe_size", &self.relay_pipe_size)
+            .field("max_client_hello_bytes", &self.max_client_hello_bytes)
+            .field("xudp", &self.xudp)
+            .field("xudp_limiter", &self.xudp_limiter)
+            .field("udp", &self.udp)
+            .field("cover_max_concurrency", &COVER_MAX_CONCURRENCY)
+            .field("cover_max_per_ip", &COVER_MAX_PER_IP)
+            .field("splice_available", &self.splice_permits.available_permits())
+            .field(
+                "legacy_udp_available",
+                &self.legacy_udp_permits.available_permits(),
+            )
+            .finish()
+    }
+}
+
+struct TemporaryCertificate {
+    certificate_der: Vec<u8>,
+    public_key: [u8; 32],
+    signing_key: Arc<dyn SigningKey>,
+}
+
+impl TemporaryCertificate {
+    fn generate() -> Result<Self, TlsServerError> {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+            .map_err(|_| TlsServerError::Certificate)?;
+        let params = rcgen::CertificateParams::new(Vec::<String>::new())
+            .map_err(|_| TlsServerError::Certificate)?;
+        let certificate = params
+            .self_signed(&key_pair)
+            .map_err(|_| TlsServerError::Certificate)?;
+        let public_key = key_pair
+            .public_key_raw()
+            .try_into()
+            .map_err(|_| TlsServerError::Certificate)?;
+        let private_key_der = Zeroizing::new(key_pair.serialize_der());
+        let parsed = PrivatePkcs8KeyDer::from(private_key_der.to_vec());
+        let inner = rustls::crypto::aws_lc_rs::sign::any_eddsa_type(&parsed)
+            .map_err(TlsServerError::Rustls)?;
+
+        Ok(Self {
+            certificate_der: certificate.der().to_vec(),
+            public_key,
+            signing_key: Arc::new(RealitySigningKey { inner }),
+        })
+    }
+}
+
+fn hmac_signature(auth_key: &[u8], public_key: &[u8; 32]) -> Result<[u8; 64], TlsServerError> {
+    let mut mac = Hmac::<Sha512>::new_from_slice(auth_key).map_err(|_| TlsServerError::Hmac)?;
+    mac.update(public_key);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+/// A stream that serves a prefix buffer before reading from the underlying
+/// socket. Used to replay the already-consumed ClientHello record to rustls.
+pub struct ReplayStream {
+    prefix: Vec<u8>,
+    offset: usize,
+    stream: TcpStream,
+}
+
+impl ReplayStream {
+    /// Wraps `stream` and serves `prefix` before any bytes read from the socket.
+    pub fn new(stream: TcpStream, prefix: Vec<u8>) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            stream,
+        }
+    }
+}
+
+impl AsyncRead for ReplayStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        if this.offset < this.prefix.len() {
+            let remaining = &this.prefix[this.offset..];
+            let count = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..count]);
+            this.offset += count;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ReplayStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.as_mut().get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.as_mut().get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.as_mut().get_mut().stream).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.as_mut().get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+}
+
+/// Handles one accepted TCP connection without a pre-auth permit.
+///
+/// This is the compatibility entry point used by tests and embedders. The
+/// production accept loop uses [`handle_connection_admitted`] so a pre-auth
+/// flood is bounded separately from authenticated capacity.
+pub async fn handle_connection(
+    stream: TcpStream,
+    config: Arc<TlsServerConfig>,
+) -> Result<ConnectionOutcome, TlsServerError> {
+    handle_connection_admitted(stream, config, None).await
+}
+
+/// Handles one accepted TCP connection.
+///
+/// `preauth` is held until the ClientHello is classified *and* the next permit
+/// is acquired: an authenticated connection takes a connection permit first, an
+/// unauthenticated probe takes the cover permit before releasing `preauth`, and
+/// a probe that closed before sending anything releases it without a dial. The
+/// drain loop can therefore never observe the pre-auth count at zero while a
+/// cover relay is about to start.
+pub async fn handle_connection_admitted(
+    mut stream: TcpStream,
+    config: Arc<TlsServerConfig>,
+    preauth: Option<IpPermit>,
+) -> Result<ConnectionOutcome, TlsServerError> {
+    let read = read_client_hello_record(&mut stream, &config).await?;
+    let (record, wire) = match read {
+        ClientHelloRead::Complete { record, wire } => (record, wire),
+        ClientHelloRead::Forward(prefix) => {
+            if prefix.is_empty() {
+                drop(preauth);
+                return Ok(ConnectionOutcome::ClosedBeforeHello);
+            }
+            return forward_to_cover(stream, &prefix, preauth, &config).await;
+        }
+    };
+    let auth = match ClientHello::parse(&record) {
+        Ok(hello) => match authenticate(&hello, &config.reality_config()) {
+            Ok(auth) => match config.replay_reserve(auth.session_id) {
+                Some(reservation) => Some((auth, reservation)),
+                None => {
+                    // A client that reuses ClientHello material lands here, and
+                    // it is the case an operator needs to see: the tunnel looks
+                    // down while the server only logs that the probe went to the
+                    // cover. Guessing a valid session id is infeasible, so this
+                    // is not scanning noise.
+                    config.metrics.record_replay_rejected();
+                    tracing::debug!("authenticated ClientHello replay; forwarding to cover");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::debug!(%error, "REALITY authentication failed; forwarding to cover");
+                None
+            }
+        },
+        Err(error) => {
+            tracing::debug!(%error, "ClientHello parse failed; forwarding to cover");
+            None
+        }
+    };
+
+    match auth {
+        Some((auth, reservation)) => {
+            let permit = match Arc::clone(&config.connection_permits).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    config.metrics.record_connection_limit();
+                    tracing::debug!("authenticated connection limit reached; closing");
+                    return Ok(ConnectionOutcome::ConnectionLimited);
+                }
+            };
+            drop(preauth);
+            handle_authenticated(stream, record, auth, &config, permit, reservation).await
+        }
+        None => forward_to_cover(stream, &wire, preauth, &config).await,
+    }
+}
+
+/// Result of reading the initial bytes from a connection.
+enum ClientHelloRead {
+    /// A complete ClientHello was assembled. `record` is a normalized
+    /// single-record form for the parser/rustls; `wire` is the original bytes
+    /// to forward byte-for-byte if authentication fails.
+    Complete { record: Vec<u8>, wire: Vec<u8> },
+    /// The peer did not send a plausible, complete ClientHello. Forward the
+    /// bytes already read (possibly only the five-byte header) to the cover,
+    /// then relay the rest byte-for-byte.
+    ///
+    /// The prefix may be empty, which means the peer closed or sent nothing
+    /// before a plausible ClientHello; the caller then returns
+    /// [`ConnectionOutcome::ClosedBeforeHello`] without dialing the cover.
+    Forward(Vec<u8>),
+}
+
+fn is_plausible_tls_record_header(header: &[u8; TLS_RECORD_HEADER_LEN]) -> bool {
+    header[0] == 0x16 && header[1] == 0x03 && matches!(header[2], 0x01 | 0x03)
+}
+
+/// Reads the initial TLS record.
+///
+/// A non-TLS prefix or an over-limit record is returned immediately so a
+/// prober sees the cover respond instead of beam waiting for a body that will
+/// never arrive. If the peer stalls or closes mid-record, the bytes already
+/// received are forwarded to the cover too.
+enum NextRecordRead {
+    Complete(Vec<u8>),
+    Partial(Vec<u8>),
+}
+
+/// Reads one complete TLS record under the shared pre-auth deadline.
+///
+/// A timeout, EOF, invalid header, or over-limit record returns the bytes read
+/// so far as `Partial`; the caller forwards them to the cover.
+async fn read_next_record<R>(
+    stream: &mut R,
+    deadline: Instant,
+    max_total: usize,
+) -> Result<NextRecordRead, TlsServerError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0u8; TLS_RECORD_HEADER_LEN];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(NextRecordRead::Partial(header[..filled].to_vec()));
+        }
+        let read = match timeout(remaining, stream.read(&mut header[filled..])).await {
+            Err(_) => return Ok(NextRecordRead::Partial(header[..filled].to_vec())),
+            Ok(read) => read,
+        };
+        match read {
+            Ok(0) => return Ok(NextRecordRead::Partial(header[..filled].to_vec())),
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+    }
+
+    let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+    let total = TLS_RECORD_HEADER_LEN.saturating_add(record_len);
+    if !is_plausible_tls_record_header(&header) || record_len > MAX_RECORD_LEN || total > max_total
+    {
+        return Ok(NextRecordRead::Partial(header.to_vec()));
+    }
+
+    let mut record = Vec::new();
+    record
+        .try_reserve_exact(total)
+        .map_err(|_| TlsServerError::Allocation)?;
+    record.extend_from_slice(&header);
+    record.resize(total, 0);
+    let mut filled = TLS_RECORD_HEADER_LEN;
+    while filled < total {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            record.truncate(filled);
+            return Ok(NextRecordRead::Partial(record));
+        }
+        let read = match timeout(remaining, stream.read(&mut record[filled..])).await {
+            Err(_) => {
+                record.truncate(filled);
+                return Ok(NextRecordRead::Partial(record));
+            }
+            Ok(read) => read,
+        };
+        match read {
+            Ok(0) => {
+                record.truncate(filled);
+                return Ok(NextRecordRead::Partial(record));
+            }
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+    }
+    Ok(NextRecordRead::Complete(record))
+}
+
+async fn read_client_hello_record<R>(
+    stream: &mut R,
+    config: &TlsServerConfig,
+) -> Result<ClientHelloRead, TlsServerError>
+where
+    R: AsyncRead + Unpin,
+{
+    // One absolute deadline covers both the five-byte header and the declared
+    // body. Per-read timeouts would let a patient peer hold a pre-auth slot for
+    // twice the configured handshake budget.
+    let deadline = Instant::now() + config.handshake_timeout.min(PREAUTH_HANDSHAKE_TIMEOUT);
+    read_client_hello_record_with_limits(stream, deadline, config.max_client_hello_bytes).await
+}
+
+async fn read_client_hello_record_with_limits<R>(
+    stream: &mut R,
+    deadline: Instant,
+    max_client_hello_bytes: usize,
+) -> Result<ClientHelloRead, TlsServerError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0u8; TLS_RECORD_HEADER_LEN];
+    let mut filled = 0usize;
+
+    while filled < header.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(ClientHelloRead::Forward(header[..filled].to_vec()));
+        }
+        let read = match timeout(remaining, stream.read(&mut header[filled..])).await {
+            Err(_) => return Ok(ClientHelloRead::Forward(header[..filled].to_vec())),
+            Ok(read) => read,
+        };
+        match read {
+            Ok(0) => return Ok(ClientHelloRead::Forward(header[..filled].to_vec())),
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+    }
+
+    // HTTP, SSH, random junk, and records too large for the configured bound
+    // are not ClientHellos. Give the cover the header now; the client may
+    // already have sent more bytes and the splice will carry them.
+    let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+    let total = TLS_RECORD_HEADER_LEN.saturating_add(record_len);
+    if !is_plausible_tls_record_header(&header) || total > max_client_hello_bytes {
+        return Ok(ClientHelloRead::Forward(header.to_vec()));
+    }
+
+    let mut record = Vec::new();
+    record
+        .try_reserve_exact(total)
+        .map_err(|_| TlsServerError::Allocation)?;
+    record.extend_from_slice(&header);
+    record.resize(total, 0);
+    filled = TLS_RECORD_HEADER_LEN;
+
+    while filled < total {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            record.truncate(filled);
+            return Ok(ClientHelloRead::Forward(record));
+        }
+        let read = match timeout(remaining, stream.read(&mut record[filled..])).await {
+            Err(_) => {
+                record.truncate(filled);
+                return Ok(ClientHelloRead::Forward(record));
+            }
+            Ok(read) => read,
+        };
+        match read {
+            Ok(0) => {
+                record.truncate(filled);
+                return Ok(ClientHelloRead::Forward(record));
+            }
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+    }
+
+    let first_body_len = record.len() - TLS_RECORD_HEADER_LEN;
+    // Fast path: the common one-record ClientHello needs no assembly.
+    if first_body_len >= TLS_HANDSHAKE_HEADER_LEN
+        && let Ok(message_len) = client_hello_message_len(&record[TLS_RECORD_HEADER_LEN..])
+        && first_body_len >= message_len
+    {
+        return Ok(ClientHelloRead::Complete {
+            record: record.clone(),
+            wire: record,
+        });
+    }
+
+    // A ClientHello may span several TLS records, and even its four-byte
+    // handshake header may be split. Assemble under the same absolute
+    // deadline, with independent logical-message and wire bounds.
+    let wire_limit = max_client_hello_bytes
+        .saturating_add(MAX_CLIENT_HELLO_RECORDS.saturating_sub(1) * TLS_RECORD_HEADER_LEN);
+    let mut wire = record;
+    let mut handshake = wire[TLS_RECORD_HEADER_LEN..].to_vec();
+    let mut records_seen = 1usize;
+    let mut target_len = TLS_HANDSHAKE_HEADER_LEN;
+
+    loop {
+        while handshake.len() < target_len {
+            if records_seen >= MAX_CLIENT_HELLO_RECORDS {
+                return Ok(ClientHelloRead::Forward(wire));
+            }
+            let max_total = wire_limit.saturating_sub(wire.len());
+            match read_next_record(stream, deadline, max_total).await? {
+                NextRecordRead::Complete(next) => {
+                    handshake.extend_from_slice(&next[TLS_RECORD_HEADER_LEN..]);
+                    wire.extend_from_slice(&next);
+                    records_seen += 1;
+                }
+                NextRecordRead::Partial(partial) => {
+                    wire.extend_from_slice(&partial);
+                    return Ok(ClientHelloRead::Forward(wire));
+                }
+            }
+        }
+
+        if target_len == TLS_HANDSHAKE_HEADER_LEN {
+            let Ok(message_len) = client_hello_message_len(&handshake) else {
+                return Ok(ClientHelloRead::Complete {
+                    record: wire.clone(),
+                    wire,
+                });
+            };
+            // The normalized record must fit the configured logical bound.
+            if TLS_RECORD_HEADER_LEN.saturating_add(message_len) > max_client_hello_bytes {
+                return Ok(ClientHelloRead::Forward(wire));
+            }
+            target_len = message_len;
+        }
+
+        if handshake.len() > target_len {
+            // Extra bytes after the ClientHello are not silently discarded.
+            return Ok(ClientHelloRead::Forward(wire));
+        }
+        if handshake.len() == target_len {
+            break;
+        }
+    }
+
+    let mut normalized = Vec::new();
+    normalized
+        .try_reserve_exact(TLS_RECORD_HEADER_LEN.saturating_add(target_len))
+        .map_err(|_| TlsServerError::Allocation)?;
+    normalized.extend_from_slice(&wire[..3]);
+    normalized.extend_from_slice(&(target_len as u16).to_be_bytes());
+    normalized.extend_from_slice(&handshake[..target_len]);
+
+    Ok(ClientHelloRead::Complete {
+        record: normalized,
+        wire,
+    })
+}
+
+/// Slice-backed reader used by the ClientHello assembler fuzz target.
+#[cfg(feature = "fuzz")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FuzzReadMode {
+    Slice,
+    StallHeader,
+    StallBody,
+}
+
+#[cfg(feature = "fuzz")]
+struct FuzzReader<'a> {
+    data: &'a [u8],
+    offset: usize,
+    mode: FuzzReadMode,
+}
+
+#[cfg(feature = "fuzz")]
+impl AsyncRead for FuzzReader<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.mode {
+            FuzzReadMode::StallHeader if this.offset == 0 => Poll::Pending,
+            FuzzReadMode::StallBody if this.offset == TLS_RECORD_HEADER_LEN => Poll::Pending,
+            _ => {
+                let remaining = this.data.len().saturating_sub(this.offset);
+                let count = remaining.min(buf.remaining());
+                buf.put_slice(&this.data[this.offset..this.offset + count]);
+                this.offset += count;
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+/// Test-only entry point for the ClientHello assembler fuzz target.
+///
+/// This is compiled only with the `fuzz` feature and is not part of the
+/// production API. It exercises multi-record assembly, the cover-prefix
+/// invariants, and both header and body read timeouts without opening a
+/// socket.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub fn fuzz_client_hello_assembler(data: &[u8]) {
+    thread_local! {
+        static RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("fuzz runtime");
+    }
+
+    let mode = if data.first() == Some(&0xfe) {
+        FuzzReadMode::StallHeader
+    } else if data.len() >= 6
+        && data[0] == 0x16
+        && data[1] == 0x03
+        && matches!(data[2], 0x01 | 0x03)
+        && u16::from_be_bytes([data[3], data[4]]) > 0
+        && data[5] == 0xfe
+    {
+        FuzzReadMode::StallBody
+    } else {
+        FuzzReadMode::Slice
+    };
+
+    let declared = data.get(..2).map_or(0, |bytes| {
+        usize::from(u16::from_be_bytes([bytes[0], bytes[1]]))
+    });
+    let max_client_hello_bytes = TLS_RECORD_HEADER_LEN + declared % (MAX_RECORD_LEN + 1);
+    let deadline = if mode == FuzzReadMode::Slice {
+        Instant::now() + PREAUTH_HANDSHAKE_TIMEOUT
+    } else {
+        // One millisecond is enough for the tokio timer to fire; the fuzz
+        // target spends this time only for inputs carrying a stall marker.
+        Instant::now() + Duration::from_millis(1)
+    };
+
+    RUNTIME.with(|runtime| {
+        let mut reader = FuzzReader {
+            data,
+            offset: 0,
+            mode,
+        };
+        let result = runtime.block_on(read_client_hello_record_with_limits(
+            &mut reader,
+            deadline,
+            max_client_hello_bytes,
+        ));
+        match result {
+            Ok(ClientHelloRead::Complete { wire, .. }) => {
+                assert!(
+                    data.starts_with(&wire),
+                    "complete wire must be an input prefix"
+                );
+            }
+            Ok(ClientHelloRead::Forward(prefix)) => {
+                assert!(
+                    data.starts_with(&prefix),
+                    "forward prefix must be an input prefix"
+                );
+            }
+            Err(_) => {}
+        }
+    });
+}
+
+/// Returns whether a VLESS flow value is supported.
+///
+/// Stock accepts an absent or explicitly empty flow (no Vision) and rejects
+/// unknown non-empty values.
+fn is_supported_flow(flow: Option<&str>) -> bool {
+    flow.is_none_or(|flow| flow.is_empty() || flow == crate::vless::VISION_FLOW)
+}
+
+/// Returns the account UUID used for lookup.
+///
+/// Stock Xray zeroes bytes 6-7 of the wire UUID before matching the account;
+/// those bytes carry `vlessRoute` and are not part of the identity. The raw
+/// bytes are still used as the Vision request prefix.
+fn account_id(user_id: &[u8; 16]) -> [u8; 16] {
+    let mut account = *user_id;
+    account[6] = 0;
+    account[7] = 0;
+    account
+}
+
+async fn handle_authenticated(
+    stream: TcpStream,
+    record: Vec<u8>,
+    auth: Auth,
+    config: &TlsServerConfig,
+    _connection_permit: OwnedSemaphorePermit,
+    reservation: ReplayReservation<'_>,
+) -> Result<ConnectionOutcome, TlsServerError> {
+    // One absolute deadline covers TLS, VLESS request parsing, response
+    // writes, the initial body write, and the destination dial. Per-stage
+    // timeouts let a slow client hold a connection permit for several times
+    // the configured handshake budget.
+    let deadline = tokio::time::Instant::now() + config.handshake_timeout;
+    let server_config = Arc::new(config.build_server_config(&auth.auth_key[..])?);
+    let connection =
+        rustls::ServerConnection::new(server_config).map_err(TlsServerError::Rustls)?;
+    let mut tls = timeout_at(deadline, TlsStream::accept(stream, connection, record))
+        .await
+        .map_err(|_| TlsServerError::Timeout {
+            stage: "TLS handshake",
+        })??;
+
+    // Record the replay only after the TLS Finished proves the peer holds the
+    // client's keys. Insertion is first-wins: concurrent copies may pass the
+    // reservation gate, but only the handshake that reaches Finished first is
+    // served. This preserves the legitimate client's race while rejecting a
+    // duplicate that also completed before the cache insert.
+    match config.replay_insert(auth.session_id, auth.timestamp) {
+        ReplayInsert::Inserted => {
+            reservation.commit();
+        }
+        ReplayInsert::Duplicate => {
+            // The only post-handshake duplicate signal an operator can act on:
+            // a ClientHello that completed TLS but lost the first-wins race.
+            // Pre-reservation duplicates are forwarded to the cover and are not
+            // counted here.
+            config.metrics.record_replay_rejected();
+            tracing::debug!("authenticated ClientHello replay after handshake");
+            return Err(TlsServerError::ReplayRejected);
+        }
+        ReplayInsert::Full => {
+            // The cache is at its configured bound. This is a capacity event,
+            // not evidence that the client reused a handshake; count it
+            // separately so an operator can tell the two apart.
+            config.metrics.record_replay_rejected();
+            config.metrics.record_replay_cache_full();
+            tracing::debug!("replay cache full; closing authenticated connection");
+            return Err(TlsServerError::ReplayRejected);
+        }
+    }
+
+    let request = timeout_at(
+        deadline,
+        read_vless_request(&mut tls, config.handshake_timeout),
+    )
+    .await
+    .map_err(|_| TlsServerError::Timeout {
+        stage: "VLESS request read",
+    })??;
+    if !bool::from(account_id(&request.user_id).ct_eq(&account_id(&config.user_id))) {
+        return Err(TlsServerError::UnauthorizedUser);
+    }
+    // Stock rejects an unknown flow instead of silently treating the body as
+    // unframed bytes. A typo would otherwise corrupt every destination read.
+    if !is_supported_flow(request.flow.as_deref()) {
+        return Err(VlessError::UnsupportedFlow.into());
+    }
+
+    match request.command {
+        Command::Tcp => {
+            let destination = request
+                .destination
+                .ok_or(TlsServerError::MissingDestination)?;
+            let dial_budget = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(MAX_DIAL_TIMEOUT);
+            let target = dial(&destination, dial_budget).await?;
+
+            timeout_at(deadline, tls.write_all(&ResponseHeader::new().to_bytes()))
+                .await
+                .map_err(|_| TlsServerError::Timeout {
+                    stage: "VLESS response write",
+                })??;
+
+            if request.vision {
+                let rng = SmallRng::seed_from_u64(vision_seed());
+                let vision = VisionStream::new(tls, request.user_id, request.body, rng);
+                relay_vision(
+                    vision,
+                    target,
+                    config.relay_idle_timeout,
+                    config.relay_pipe_size,
+                    Arc::clone(&config.splice_permits),
+                    Arc::clone(&config.metrics),
+                )
+                .await?;
+            } else {
+                let mut target = target;
+                if !request.body.is_empty() {
+                    timeout_at(deadline, target.write_all(&request.body))
+                        .await
+                        .map_err(|_| TlsServerError::Timeout {
+                            stage: "initial VLESS body write",
+                        })??;
+                }
+                relay_bidirectional(tls, target, config.relay_idle_timeout).await?;
+            }
+
+            Ok(ConnectionOutcome::Authenticated {
+                command: Command::Tcp,
+            })
+        }
+        Command::Udp => {
+            // Stock rejects Vision UDP before writing a response. Clients that
+            // select the Vision flow convert UDP to XUDP instead.
+            if request.vision {
+                return Err(TlsServerError::VisionUdpUnsupported);
+            }
+            // Legacy UDP/packetaddr binds one or two sockets per VLESS stream
+            // and is outside the XUDP session limiter. Bound it separately so
+            // compatibility mode cannot consume the whole memory budget.
+            let _legacy_permit = match Arc::clone(&config.legacy_udp_permits).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    config.metrics.record_legacy_udp_limit();
+                    return Err(TlsServerError::LegacyUdpLimited);
+                }
+            };
+            let destination = request
+                .destination
+                .ok_or(TlsServerError::MissingDestination)?;
+
+            timeout_at(deadline, tls.write_all(&ResponseHeader::new().to_bytes()))
+                .await
+                .map_err(|_| TlsServerError::Timeout {
+                    stage: "VLESS response write",
+                })??;
+
+            let stream = PrependStream::new(tls, request.body);
+            handle_udp_stream(stream, destination, &config.udp).await?;
+            Ok(ConnectionOutcome::Authenticated {
+                command: Command::Udp,
+            })
+        }
+        Command::Mux => {
+            timeout_at(deadline, tls.write_all(&ResponseHeader::new().to_bytes()))
+                .await
+                .map_err(|_| TlsServerError::Timeout {
+                    stage: "VLESS response write",
+                })??;
+
+            let xudp = Arc::new(config.xudp.clone());
+            if request.vision {
+                let rng = SmallRng::seed_from_u64(vision_seed());
+                let vision = VisionStream::new(tls, request.user_id, request.body, rng);
+                handle_mux_stream(vision, xudp, config.xudp_limiter.clone()).await?;
+            } else {
+                let stream = PrependStream::new(tls, request.body);
+                handle_mux_stream(stream, xudp, config.xudp_limiter.clone()).await?;
+            }
+
+            Ok(ConnectionOutcome::Authenticated {
+                command: Command::Mux,
+            })
+        }
+        command => {
+            tracing::warn!(
+                command = ?command,
+                "authenticated VLESS command is not implemented yet; closing"
+            );
+            Ok(ConnectionOutcome::Authenticated { command })
+        }
+    }
+}
+
+/// Returns a per-connection seed for Vision padding.
+///
+/// Padding lengths are traffic shaping, not authentication material. The seed
+/// mixes the wall clock with a process counter so two connections do not share
+/// the same padding sequence.
+fn vision_seed() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    now ^ count.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+async fn forward_to_cover(
+    client: TcpStream,
+    record: &[u8],
+    preauth: Option<IpPermit>,
+    config: &TlsServerConfig,
+) -> Result<ConnectionOutcome, TlsServerError> {
+    // Fail fast rather than queueing an unbounded number of cover relays in
+    // the shared blocking pool. The permit is held through the relay so a
+    // cover connection cannot outlive the cap, and the per-source bound keeps
+    // one scanner from consuming every global cover slot.
+    let peer = client.peer_addr().map_err(TlsServerError::Io)?;
+    let _cover_permit = match config.cover_limiter.try_acquire(peer.ip()) {
+        Ok(permit) => permit,
+        Err(reject) => {
+            config.metrics.record_cover_limit();
+            tracing::debug!(%peer, ?reject, "cover limit reached; closing probe");
+            return Ok(ConnectionOutcome::CoverLimited);
+        }
+    };
+    // Keep pre-auth until the cover permit is held: on this path the cover
+    // permit is held through the dial and relay, so the shutdown drain cannot
+    // observe pre-auth released with no cover relay in flight. The rejection
+    // arm above starts no relay and drops pre-auth on return.
+    drop(preauth);
+
+    let mut cover = dial(&config.cover, cover_timeout(config.handshake_timeout)).await?;
+    timeout(
+        cover_timeout(config.handshake_timeout),
+        cover.write_all(record),
+    )
+    .await
+    .map_err(|_| TlsServerError::Timeout {
+        stage: "cover ClientHello write",
+    })??;
+    // Cover is deliberately async: an unauthenticated probe must not hold a
+    // detached blocking splice task or a splice permit for up to 30 seconds.
+    // Dropping this future on shutdown cancels the relay promptly, and the
+    // relay ends on the first half-close so a disconnected probe cannot pin a
+    // cover slot until the idle timeout.
+    relay_cover_bidirectional(client, cover, COVER_IDLE_TIMEOUT).await?;
+    Ok(ConnectionOutcome::CoverForwarded)
+}
+
+struct OwnedRequest {
+    user_id: [u8; 16],
+    command: Command,
+    destination: Option<NetLocation>,
+    vision: bool,
+    flow: Option<String>,
+    body: Vec<u8>,
+}
+
+async fn read_vless_request<R>(
+    stream: &mut R,
+    read_timeout: Duration,
+) -> Result<OwnedRequest, TlsServerError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0u8; MAX_REQUEST_HEADER_LEN];
+    let mut filled = 0usize;
+
+    loop {
+        let count = timeout(read_timeout, stream.read(&mut buffer[filled..]))
+            .await
+            .map_err(|_| TlsServerError::Timeout {
+                stage: "VLESS request read",
+            })??;
+        if count == 0 {
+            return Err(VlessError::Truncated {
+                offset: filled,
+                needed: 1,
+                remaining: 0,
+            }
+            .into());
+        }
+        filled += count;
+
+        match RequestHeader::parse(&buffer[..filled]) {
+            Ok((header, body)) => {
+                return Ok(OwnedRequest {
+                    user_id: header.user_id,
+                    command: header.command,
+                    destination: header.destination,
+                    vision: header.addons.is_vision(),
+                    flow: header.addons.flow.map(str::to_owned),
+                    body: body.to_vec(),
+                });
+            }
+            Err(error) if error.is_truncated() && filled < MAX_REQUEST_HEADER_LEN => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+async fn dial(
+    destination: &NetLocation,
+    dial_timeout: Duration,
+) -> Result<TcpStream, TlsServerError> {
+    let host = match &destination.address {
+        Address::Ipv4(address) => address.to_string(),
+        Address::Ipv6(address) => address.to_string(),
+        Address::Domain(domain) => domain.clone(),
+    };
+    let deadline = tokio::time::Instant::now() + dial_timeout;
+    let addresses =
+        tokio::time::timeout_at(deadline, lookup_host((host.as_str(), destination.port)))
+            .await
+            .map_err(|_| TlsServerError::Timeout {
+                stage: "destination dial",
+            })?
+            .map_err(TlsServerError::Io)?
+            .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(TlsServerError::Io(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "destination resolved to no addresses",
+        )));
+    }
+
+    dial_addresses(&addresses, deadline).await
+}
+
+/// Per-address connect budget when more than one resolved address remains.
+///
+/// A blackholed first address must not consume the whole dial deadline and
+/// prevent trying the other family. The final address gets the remaining
+/// budget so a single-address destination keeps the full timeout.
+const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn dial_attempt_timeout(remaining: Duration, last: bool) -> Duration {
+    if last {
+        remaining
+    } else {
+        remaining.min(DIAL_ATTEMPT_TIMEOUT)
+    }
+}
+
+async fn dial_addresses(
+    addresses: &[SocketAddr],
+    deadline: tokio::time::Instant,
+) -> Result<TcpStream, TlsServerError> {
+    let mut last_error = None;
+    for (index, address) in addresses.iter().copied().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(TlsServerError::Timeout {
+                stage: "destination dial",
+            });
+        }
+        let last = index + 1 == addresses.len();
+        let attempt = dial_attempt_timeout(remaining, last);
+        let socket = match address.is_ipv4() {
+            true => TcpSocket::new_v4(),
+            false => TcpSocket::new_v6(),
+        };
+        let socket = match socket {
+            Ok(socket) => socket,
+            Err(error) => {
+                // A family may be unavailable (for example IPv6 disabled);
+                // that must not prevent trying the other resolved address.
+                last_error = Some(error);
+                continue;
+            }
+        };
+        // This must happen before connect: Linux uses TCP_MAXSEG for both the
+        // MSS option in the SYN and the local send limit only when it is set
+        // while the socket is still unconnected.
+        if let Err(error) = beam_sys::set_tcp_maxseg(socket.as_raw_fd(), TARGET_MSS) {
+            tracing::debug!(%error, "could not set TCP_MAXSEG on the destination");
+        }
+        match timeout(attempt, socket.connect(address)).await {
+            Ok(Ok(stream)) => {
+                // Small request headers and interactive replies must not wait
+                // for Nagle/delayed-ACK interaction on the outbound socket.
+                // The accepted client socket already sets this in `main`.
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::debug!(%error, "could not set TCP_NODELAY on the destination");
+                }
+                if let Err(error) = beam_sys::set_tcp_keepalive(
+                    stream.as_raw_fd(),
+                    Duration::from_secs(60),
+                    Duration::from_secs(15),
+                ) {
+                    tracing::debug!(%error, "could not set TCP keepalive on the destination");
+                }
+                return Ok(stream);
+            }
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                last_error = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "destination connect attempt timed out",
+                ));
+                if last {
+                    return Err(TlsServerError::Timeout {
+                        stage: "destination dial",
+                    });
+                }
+            }
+        }
+    }
+
+    Err(TlsServerError::Io(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AddrNotAvailable, "no destination address")
+    })))
+}
+
+async fn relay_bidirectional<A, B>(
+    left: A,
+    right: B,
+    idle_timeout: Duration,
+) -> Result<(), TlsServerError>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut left_read, mut left_write) = tokio::io::split(left);
+    let (mut right_read, mut right_write) = tokio::io::split(right);
+    let activity = Arc::new(RelayActivity::new());
+
+    // Idle is a property of the whole connection, not of each direction. A
+    // download-only or upload-only transfer must not be torn down because the
+    // opposite direction has nothing to send.
+    let left_to_right = copy_direction(
+        &mut left_read,
+        &mut right_write,
+        idle_timeout,
+        Some(&activity),
+    );
+    let right_to_left = copy_direction(
+        &mut right_read,
+        &mut left_write,
+        idle_timeout,
+        Some(&activity),
+    );
+    tokio::try_join!(left_to_right, right_to_left)?;
+    Ok(())
+}
+
+/// Relays an unauthenticated cover connection.
+///
+/// Unlike an authenticated relay, a cover probe is over as soon as either
+/// peer half-closes. Waiting for the opposite direction would let a probe
+/// that already disconnected pin a cover permit and its two sockets for the
+/// full cover idle timeout, which makes slot saturation observable by a
+/// scanner with a handful of source addresses.
+///
+/// This is a deliberate parity tradeoff: a response the cover would send
+/// after the probe's FIN is not forwarded, and a cover-first close cancels
+/// the remaining upload. FIN is not proof that the peer stopped reading, but
+/// an unauthenticated peer must not pin cover capacity after it is gone. The
+/// authenticated relay keeps its half-close semantics unchanged.
+async fn relay_cover_bidirectional<A, B>(
+    left: A,
+    right: B,
+    idle_timeout: Duration,
+) -> Result<(), TlsServerError>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut left_read, mut left_write) = tokio::io::split(left);
+    let (mut right_read, mut right_write) = tokio::io::split(right);
+    let activity = Arc::new(RelayActivity::new());
+
+    tokio::select! {
+        result = copy_direction(
+            &mut left_read,
+            &mut right_write,
+            idle_timeout,
+            Some(&activity),
+        ) => result.map(|_| ()),
+        result = copy_direction(
+            &mut right_read,
+            &mut left_write,
+            idle_timeout,
+            Some(&activity),
+        ) => result.map(|_| ()),
+    }
+}
+
+/// Relays a Vision stream, handing each raw direction to its own one-way
+/// splice as soon as that direction is ready.
+///
+/// The upload and download halves are independent. A client can receive the
+/// server's Direct block without having more upload data (download-only), or
+/// send Direct upload data while the server writer is still framed. Waiting for
+/// both directions before using `splice(2)` leaves one bulk direction on the
+/// copy path in either case.
+///
+/// When both directions are raw, beam keeps two independent one-way relays
+/// with one shared [`RelayActivity`] deadline. It does not switch to a single
+/// bidirectional relay, so neither direction has to wait for the other to
+/// finish.
+///
+/// The client and target descriptors are duplicated only after a direction's
+/// raw handoff is published and its splice permit is held. A connection that
+/// never reaches Vision Direct therefore keeps no duplicate descriptors.
+async fn relay_vision(
+    vision: VisionStream<TlsStream>,
+    target: TcpStream,
+    idle_timeout: Duration,
+    pipe_size: usize,
+    splice_permits: Arc<Semaphore>,
+    metrics: Arc<Metrics>,
+) -> Result<(), TlsServerError> {
+    let activity = Arc::new(RelayActivity::new());
+    let mut write_direct = vision.write_direct_watch();
+    let mut read_handoff = vision.read_handoff_watch();
+    // The split halves own the originals until both direction futures finish.
+    // Each direction duplicates these descriptors only at its raw handoff.
+    let client_fd = vision.raw_fd();
+    let target_fd = target.as_raw_fd();
+
+    let (mut vision_read, mut vision_write) = tokio::io::split(vision);
+    let (mut target_read, mut target_write) = tokio::io::split(target);
+
+    let up_activity = Arc::clone(&activity);
+    let up_splice_permits = Arc::clone(&splice_permits);
+    let up_metrics = Arc::clone(&metrics);
+    let up = async move {
+        let mut stop_guard = RelayStopGuard::new(&up_activity);
+        let result = async {
+            let (copied_up, raw_read) = copy_direction_until_handoff(
+                &mut vision_read,
+                &mut target_write,
+                idle_timeout,
+                &mut read_handoff,
+                Some(&up_activity),
+            )
+            .await?;
+            if !raw_read {
+                tracing::debug!(copied_up, "Vision relay finished without a raw read");
+                return Ok(());
+            }
+
+            let Some(splice_permit) = up_splice_permits.try_acquire_owned().ok() else {
+                up_metrics.record_splice_fallback();
+                tracing::debug!(
+                    copied_up,
+                    "Vision splice task limit reached; using async upload copy"
+                );
+                copy_direction(
+                    &mut vision_read,
+                    &mut target_write,
+                    idle_timeout,
+                    Some(&up_activity),
+                )
+                .await?;
+                return Ok(());
+            };
+
+            let (client_dup, target_dup) = match clone_splice_fds(client_fd, target_fd) {
+                Ok(descriptors) => descriptors,
+                Err(error) => {
+                    drop(splice_permit);
+                    up_metrics.record_splice_fallback();
+                    tracing::debug!(
+                        %error,
+                        copied_up,
+                        "could not duplicate raw Vision sockets; using async upload copy"
+                    );
+                    copy_direction(
+                        &mut vision_read,
+                        &mut target_write,
+                        idle_timeout,
+                        Some(&up_activity),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            tracing::debug!(
+                copied_up,
+                "Vision read switched to raw; starting one-way upload splice"
+            );
+            let config = splice_config(idle_timeout, pipe_size);
+            let relay_activity = Arc::clone(&up_activity);
+            let result = tokio::task::spawn_blocking(move || {
+                let _splice_permit = splice_permit;
+                copy_one_way(
+                    client_dup.as_raw_fd(),
+                    target_dup.as_raw_fd(),
+                    &config,
+                    Some(&relay_activity),
+                )
+            })
+            .await
+            .map_err(join_error)?;
+            match result {
+                Ok(stats) => tracing::debug!(
+                    copied_up,
+                    bytes = stats.bytes_a_to_b,
+                    splice_calls = stats.splice_calls,
+                    polls = stats.polls,
+                    "one-way Vision upload splice finished"
+                ),
+                Err(error) if is_peer_closed(&error) => {
+                    tracing::debug!(%error, copied_up, "one-way Vision upload splice peer closed");
+                }
+                Err(error) => return Err(TlsServerError::Io(error)),
+            }
+            Ok(())
+        }
+        .await;
+        stop_guard.disarm();
+        result
+    };
+
+    let down_activity = Arc::clone(&activity);
+    let down_splice_permits = Arc::clone(&splice_permits);
+    let down_metrics = Arc::clone(&metrics);
+    let down = async move {
+        let mut stop_guard = RelayStopGuard::new(&down_activity);
+        let result = async {
+        let (copied_down, raw_write) = copy_direction_until_handoff(
+            &mut target_read,
+            &mut vision_write,
+            idle_timeout,
+            &mut write_direct,
+            Some(&down_activity),
+        )
+        .await?;
+        if !raw_write {
+            tracing::debug!(copied_down, "Vision relay finished without a raw write");
+            return Ok(());
+        }
+
+        let Some(splice_permit) = down_splice_permits.try_acquire_owned().ok() else {
+            down_metrics.record_splice_fallback();
+            tracing::debug!(
+                copied_down,
+                "Vision splice task limit reached; using async download copy"
+            );
+            copy_direction(
+                &mut target_read,
+                &mut vision_write,
+                idle_timeout,
+                Some(&down_activity),
+            )
+            .await?;
+            return Ok(());
+        };
+
+        let (target_dup, client_dup) = match clone_splice_fds(target_fd, client_fd) {
+            Ok(descriptors) => descriptors,
+            Err(error) => {
+                drop(splice_permit);
+                down_metrics.record_splice_fallback();
+                tracing::debug!(
+                    %error,
+                    copied_down,
+                    "could not duplicate raw Vision sockets; using async download copy"
+                );
+                copy_direction(
+                    &mut target_read,
+                    &mut vision_write,
+                    idle_timeout,
+                    Some(&down_activity),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        tracing::debug!(
+            copied_down,
+            "Vision write switched to raw; starting one-way download splice"
+        );
+        let config = splice_config(idle_timeout, pipe_size);
+        let relay_activity = Arc::clone(&down_activity);
+        let result = tokio::task::spawn_blocking(move || {
+            let _splice_permit = splice_permit;
+            copy_one_way(
+                target_dup.as_raw_fd(),
+                client_dup.as_raw_fd(),
+                &config,
+                Some(&relay_activity),
+            )
+        })
+        .await
+        .map_err(join_error)?;
+        match result {
+            Ok(stats) => tracing::debug!(
+                copied_down,
+                bytes = stats.bytes_a_to_b,
+                splice_calls = stats.splice_calls,
+                polls = stats.polls,
+                "one-way Vision download splice finished"
+            ),
+            Err(error) if is_peer_closed(&error) => {
+                tracing::debug!(%error, copied_down, "one-way Vision download splice peer closed");
+            }
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+        Ok(())
+        }.await;
+        stop_guard.disarm();
+        result
+    };
+
+    tokio::try_join!(up, down)?;
+    Ok(())
+}
+
+/// Copies either direction until its raw handoff is ready.
+/// Returns the copied byte count and whether the handoff occurred.
+/// Upload publishes only after ordered Vision and TLS prefixes are drained;
+/// download publishes only after pending writes are drained.
+async fn copy_direction_until_handoff<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle_timeout: Duration,
+    handoff: &mut watch::Receiver<bool>,
+    activity_clock: Option<&RelayActivity>,
+) -> Result<(u64, bool), TlsServerError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0u8; RELAY_BUFFER_LEN];
+    let mut relayed = 0_u64;
+    loop {
+        if *handoff.borrow() {
+            return Ok((relayed, true));
+        }
+
+        // A completed read must be written before a simultaneous handoff.
+        let read = tokio::select! {
+            biased;
+            read = timeout(idle_timeout, reader.read(&mut buffer)) => read,
+            changed = handoff.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                if *handoff.borrow() {
+                    return Ok((relayed, true));
+                }
+                continue;
+            }
+        };
+        let count = match read {
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                // A bare TCP FIN is a half-close, not a fatal relay error.
+                // Let the opposite direction finish and half-close normally.
+                break;
+            }
+            Ok(Err(error)) => return Err(TlsServerError::Io(error)),
+            Err(_) => {
+                if activity_clock
+                    .and_then(RelayActivity::elapsed)
+                    .is_some_and(|elapsed| elapsed < idle_timeout)
+                {
+                    continue;
+                }
+                return Err(TlsServerError::Timeout {
+                    stage: "relay read",
+                });
+            }
+        };
+        if count == 0 {
+            break;
+        }
+
+        let write = timeout(idle_timeout, writer.write_all(&buffer[..count]))
+            .await
+            .map_err(|_| TlsServerError::Timeout {
+                stage: "relay write",
+            })?;
+        match write {
+            Ok(()) => {
+                relayed = relayed.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                if let Some(clock) = activity_clock {
+                    clock.touch();
+                }
+            }
+            Err(error) if is_peer_closed(&error) => break,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+
+        if *handoff.borrow() {
+            return Ok((relayed, true));
+        }
+    }
+
+    let shutdown = timeout(idle_timeout, writer.shutdown())
+        .await
+        .map_err(|_| TlsServerError::Timeout {
+            stage: "relay shutdown",
+        })?;
+    match shutdown {
+        Ok(()) => {}
+        Err(error) if is_peer_closed(&error) => {}
+        Err(error) => return Err(TlsServerError::Io(error)),
+    }
+    Ok((relayed, false))
+}
+
+/// Duplicates the client and target descriptors for one blocking splice.
+///
+/// The returned descriptors are owned so they stay open for `copy_one_way`
+/// after the split halves that own the originals drop. Callers duplicate only
+/// after a direction's raw handoff is published and a splice permit is held.
+fn clone_splice_fds(client_fd: RawFd, target_fd: RawFd) -> io::Result<(OwnedFd, OwnedFd)> {
+    let client = beam_sys::try_clone_fd(client_fd)?;
+    let target = beam_sys::try_clone_fd(target_fd)?;
+    Ok((client, target))
+}
+
+fn splice_config(idle_timeout: Duration, pipe_size: usize) -> RelayConfig {
+    RelayConfig::new()
+        .with_idle_timeout(idle_timeout)
+        .with_pipe_size(pipe_size)
+        // A half-closed direction no longer needs the full VPN idle budget.
+        // Bound it so a finished mobile flow releases its blocking thread and
+        // kernel pipe promptly instead of lingering for five minutes.
+        .with_shutdown_timeout(Duration::from_secs(30))
+}
+
+fn join_error(error: tokio::task::JoinError) -> TlsServerError {
+    TlsServerError::Io(io::Error::other(error))
+}
+
+/// Stops the sibling relay if this future is dropped or fails.
+///
+/// A `spawn_blocking` join handle cannot be aborted after the task starts, and
+/// dropping it detaches the task. The guard therefore publishes a cooperative
+/// stop flag before the handle is lost; the shared eventfd wakes a blocked
+/// relay immediately, with the older 250 ms check as a fallback when the
+/// descriptor cannot be created. Both directions disarm before returning. When
+/// one direction fails, `try_join!` drops the other future while its guard is
+/// still armed, and that drop stops the shared activity.
+struct RelayStopGuard<'a> {
+    activity: &'a RelayActivity,
+    armed: bool,
+}
+
+impl<'a> RelayStopGuard<'a> {
+    fn new(activity: &'a RelayActivity) -> Self {
+        Self {
+            activity,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RelayStopGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.activity.stop();
+        }
+    }
+}
+
+async fn copy_direction<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle_timeout: Duration,
+    activity_clock: Option<&RelayActivity>,
+) -> Result<u64, TlsServerError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0u8; RELAY_BUFFER_LEN];
+    let mut relayed = 0_u64;
+    loop {
+        if activity_clock.is_some_and(RelayActivity::is_stopped) {
+            break;
+        }
+        let read = timeout(idle_timeout, reader.read(&mut buffer)).await;
+        let count = match read {
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                // A bare TCP FIN is a half-close, not a fatal relay error.
+                // Let the opposite direction finish and half-close normally.
+                break;
+            }
+            Ok(Err(error)) => return Err(TlsServerError::Io(error)),
+            Err(_) => {
+                if activity_clock.is_some_and(RelayActivity::is_stopped) {
+                    break;
+                }
+                if activity_clock
+                    .and_then(RelayActivity::elapsed)
+                    .is_some_and(|elapsed| elapsed < idle_timeout)
+                {
+                    continue;
+                }
+                return Err(TlsServerError::Timeout {
+                    stage: "relay read",
+                });
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        let write = timeout(idle_timeout, writer.write_all(&buffer[..count]))
+            .await
+            .map_err(|_| TlsServerError::Timeout {
+                stage: "relay write",
+            })?;
+        match write {
+            Ok(()) => {
+                relayed = relayed.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                if let Some(clock) = activity_clock {
+                    clock.touch();
+                }
+            }
+            Err(error) if is_peer_closed(&error) => break,
+            Err(error) => return Err(TlsServerError::Io(error)),
+        }
+    }
+    let shutdown = timeout(idle_timeout, writer.shutdown())
+        .await
+        .map_err(|_| TlsServerError::Timeout {
+            stage: "relay shutdown",
+        })?;
+    match shutdown {
+        Ok(()) => {}
+        Err(error) if is_peer_closed(&error) => {}
+        Err(error) => return Err(TlsServerError::Io(error)),
+    }
+    Ok(relayed)
+}
+
+fn is_peer_closed(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    struct UnexpectedEofReader;
+
+    impl AsyncRead for UnexpectedEofReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)))
+        }
+    }
+
+    #[test]
+    fn empty_and_vision_flows_are_supported_but_unknown_ones_are_not() {
+        assert!(is_supported_flow(None));
+        assert!(is_supported_flow(Some("")));
+        assert!(is_supported_flow(Some(crate::vless::VISION_FLOW)));
+        assert!(!is_supported_flow(Some("xtls-rprx-vision-typo")));
+    }
+
+    #[test]
+    fn cover_timeout_is_capped_like_an_authenticated_dial() {
+        assert_eq!(cover_timeout(Duration::from_secs(60)), MAX_DIAL_TIMEOUT);
+        assert_eq!(
+            cover_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn reassembles_a_client_hello_split_across_records() {
+        const HELLO: &[u8] = include_bytes!("../../tests/fixtures/stock-client-hello.bin");
+        let body = &HELLO[TLS_RECORD_HEADER_LEN..];
+        let split = 100;
+        assert!(split > 4 && split < body.len());
+
+        let mut first = Vec::new();
+        first.extend_from_slice(&HELLO[..3]);
+        first.extend_from_slice(&(split as u16).to_be_bytes());
+        first.extend_from_slice(&body[..split]);
+
+        let rest = &body[split..];
+        let mut second = Vec::new();
+        second.extend_from_slice(&HELLO[..3]);
+        second.extend_from_slice(&(rest.len() as u16).to_be_bytes());
+        second.extend_from_slice(rest);
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let write = async move {
+            writer.write_all(&first).await.expect("first record");
+            writer.write_all(&second).await.expect("second record");
+            writer.shutdown().await.expect("shutdown");
+        };
+        let read = async {
+            read_client_hello_record(&mut reader, &test_config())
+                .await
+                .expect("fragmented ClientHello read")
+        };
+        let (_, read) = tokio::join!(write, read);
+
+        let ClientHelloRead::Complete { record, wire } = read else {
+            panic!("fragmented ClientHello must be reassembled");
+        };
+        assert_eq!(
+            record, HELLO,
+            "normalized record must match the single-record form"
+        );
+        assert_eq!(
+            wire.len(),
+            HELLO.len() + TLS_RECORD_HEADER_LEN,
+            "both original records must be preserved for cover fallback"
+        );
+        let hello = ClientHello::parse(&record).expect("reassembled ClientHello must parse");
+        assert_eq!(hello.server_name, Some("whatsapp.net"));
+    }
+
+    #[tokio::test]
+    async fn reassembles_a_client_hello_split_inside_the_handshake_header() {
+        const HELLO: &[u8] = include_bytes!("../../tests/fixtures/stock-client-hello.bin");
+        let body = &HELLO[TLS_RECORD_HEADER_LEN..];
+        let split = 2;
+        assert!(split < 4 && split < body.len());
+
+        let mut first = Vec::new();
+        first.extend_from_slice(&HELLO[..3]);
+        first.extend_from_slice(&(split as u16).to_be_bytes());
+        first.extend_from_slice(&body[..split]);
+
+        let rest = &body[split..];
+        let mut second = Vec::new();
+        second.extend_from_slice(&HELLO[..3]);
+        second.extend_from_slice(&(rest.len() as u16).to_be_bytes());
+        second.extend_from_slice(rest);
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let write = async move {
+            writer.write_all(&first).await.expect("first record");
+            writer.write_all(&second).await.expect("second record");
+            writer.shutdown().await.expect("shutdown");
+        };
+        let read = async {
+            read_client_hello_record(&mut reader, &test_config())
+                .await
+                .expect("header-split ClientHello read")
+        };
+        let (_, read) = tokio::join!(write, read);
+        let ClientHelloRead::Complete { record, wire } = read else {
+            panic!("header-split ClientHello must be reassembled");
+        };
+        assert_eq!(record, HELLO);
+        assert_eq!(wire.len(), HELLO.len() + TLS_RECORD_HEADER_LEN);
+        ClientHello::parse(&record).expect("reassembled header must parse");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_hello_read_times_out_on_a_stalled_header() {
+        struct Stall;
+        impl AsyncRead for Stall {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        let mut reader = Stall;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let task = tokio::spawn(async move {
+            read_client_hello_record_with_limits(
+                &mut reader,
+                deadline,
+                TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let read = task.await.expect("task").expect("read");
+        assert!(matches!(read, ClientHelloRead::Forward(prefix) if prefix.is_empty()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_hello_read_times_out_on_a_stalled_body() {
+        struct StallAfterHeader {
+            sent: usize,
+        }
+        impl AsyncRead for StallAfterHeader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                if this.sent == 0 {
+                    let header = [0x16, 0x03, 0x01, 0x00, 0x01];
+                    buf.put_slice(&header);
+                    this.sent = header.len();
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        let mut reader = StallAfterHeader { sent: 0 };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let task = tokio::spawn(async move {
+            read_client_hello_record_with_limits(
+                &mut reader,
+                deadline,
+                TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let read = task.await.expect("task").expect("read");
+        assert!(matches!(
+            read,
+            ClientHelloRead::Forward(prefix)
+                if prefix == [0x16, 0x03, 0x01, 0x00, 0x01]
+        ));
+    }
+
+    #[tokio::test]
+    async fn fragmented_client_hello_authenticates_like_a_single_record() {
+        use base64::Engine as _;
+
+        const HELLO: &[u8] = include_bytes!("../../tests/fixtures/stock-client-hello.bin");
+        let body = &HELLO[TLS_RECORD_HEADER_LEN..];
+        let split = 100;
+        let mut first = Vec::new();
+        first.extend_from_slice(&HELLO[..3]);
+        first.extend_from_slice(&(split as u16).to_be_bytes());
+        first.extend_from_slice(&body[..split]);
+        let rest = &body[split..];
+        let mut second = Vec::new();
+        second.extend_from_slice(&HELLO[..3]);
+        second.extend_from_slice(&(rest.len() as u16).to_be_bytes());
+        second.extend_from_slice(rest);
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let write = async move {
+            writer.write_all(&first).await.expect("first record");
+            writer.write_all(&second).await.expect("second record");
+            writer.shutdown().await.expect("shutdown");
+        };
+        let read = async {
+            read_client_hello_record(&mut reader, &test_config())
+                .await
+                .expect("fragmented ClientHello read")
+        };
+        let (_, read) = tokio::join!(write, read);
+        let ClientHelloRead::Complete { record, .. } = read else {
+            panic!("fragmented ClientHello must be reassembled");
+        };
+
+        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode("YLxrYleugiQ4iDDvCtbKHw3SNGAlEHJO6PR-BN6ypH4")
+            .expect("test key");
+        let key: [u8; 32] = key.try_into().expect("32-byte test key");
+        let short_ids = [[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]];
+        let server_names = vec!["whatsapp.net".to_owned()];
+        let config = RealityAuthConfig {
+            private_key: &key,
+            short_ids: &short_ids,
+            server_names: &server_names,
+            min_client_version: [0, 0, 0],
+            max_client_version: [255, 255, 255],
+            max_time_diff: None,
+        };
+
+        let single = ClientHello::parse(HELLO).expect("single ClientHello");
+        let fragmented = ClientHello::parse(&record).expect("fragmented ClientHello");
+        let single_auth = authenticate(&single, &config).expect("single authentication");
+        let fragmented_auth =
+            authenticate(&fragmented, &config).expect("fragmented authentication");
+        assert_eq!(single_auth.session_id, fragmented_auth.session_id);
+        assert_eq!(single_auth.short_id, fragmented_auth.short_id);
+        assert_eq!(single_auth.timestamp, fragmented_auth.timestamp);
+        assert_eq!(&single_auth.auth_key[..], &fragmented_auth.auth_key[..]);
+    }
+
+    #[tokio::test]
+    async fn dial_limits_target_mss_and_connects() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(stream);
+        });
+        let destination = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: address.port(),
+        };
+
+        let stream = dial(&destination, Duration::from_secs(2))
+            .await
+            .expect("dial");
+        let mss = beam_sys::get_tcp_maxseg(stream.as_raw_fd()).expect("target MSS");
+        assert!(
+            mss <= TARGET_MSS,
+            "target MSS {mss} exceeded the configured {TARGET_MSS}"
+        );
+        server.await.expect("server task");
+    }
+
+    #[test]
+    fn dial_gives_a_nonfinal_address_only_a_bounded_attempt() {
+        assert_eq!(
+            dial_attempt_timeout(Duration::from_secs(5), false),
+            DIAL_ATTEMPT_TIMEOUT
+        );
+        assert_eq!(
+            dial_attempt_timeout(Duration::from_secs(1), false),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            dial_attempt_timeout(Duration::from_secs(5), true),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_fails_over_to_the_next_address() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        // Port 1 is normally refused immediately; the second address must
+        // still be attempted.
+        let addresses = [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 1)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        ];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let stream = dial_addresses(&addresses, deadline)
+            .await
+            .expect("second address must be attempted");
+        assert_eq!(
+            stream.peer_addr().expect("peer address").ip(),
+            IpAddr::from(Ipv4Addr::LOCALHOST)
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn bare_fin_is_a_half_close_not_a_fatal_relay_error() {
+        let mut reader = UnexpectedEofReader;
+        let mut writer = tokio::io::sink();
+        let copied = copy_direction(&mut reader, &mut writer, Duration::from_secs(1), None)
+            .await
+            .expect("bare FIN must be a clean half-close");
+        assert_eq!(copied, 0);
+    }
+
+    fn test_config() -> TlsServerConfig {
+        TlsServerConfig::new(
+            [0x11; 32],
+            vec!["0123456789abcdef".to_string()],
+            vec!["whatsapp.net".to_string()],
+            [0, 0, 0],
+            [255, 255, 255],
+            None,
+            NetLocation {
+                address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                port: 9,
+            },
+            Duration::from_secs(5),
+            TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            [0x22; 16],
+        )
+        .expect("test configuration")
+    }
+
+    #[test]
+    fn replay_cache_rejects_duplicates_and_stays_bounded() {
+        let window = Some(Duration::from_secs(60));
+        let mut cache = ReplayCache::new(window);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        let id = [7u8; 32];
+        assert_eq!(cache.phase(id, now), ReplayPhase::Unseen);
+        assert!(cache.try_reserve_at(id, now));
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::InFlight { reservations: 1 }
+        );
+        assert_eq!(
+            cache.insert_at(id, wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::Settled {
+                deadline: replay_deadline(wall, now, Some(u64::from(wall)), window),
+                reservations: 0,
+            }
+        );
+        assert!(!cache.try_reserve_at(id, now));
+        let mut oldest = [0u8; 32];
+        for index in 0..REPLAY_CACHE_CAPACITY - 1 {
+            let mut next = [0u8; 32];
+            next[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            assert_eq!(
+                cache.insert_at(next, wall, now, Some(u64::from(wall))),
+                ReplayInsert::Inserted,
+                "entry {index} must fit the cache"
+            );
+            if index == 0 {
+                oldest = next;
+            }
+        }
+        let mut extra = [0xffu8; 32];
+        extra[..8].copy_from_slice(&(REPLAY_CACHE_CAPACITY as u64).to_be_bytes());
+        assert_eq!(
+            cache.insert_at(extra, wall, now, Some(u64::from(wall))),
+            ReplayInsert::Full,
+            "a full cache must reject, not evict"
+        );
+        let stats = cache.stats(now);
+        assert_eq!(stats.entries, REPLAY_CACHE_CAPACITY);
+        assert_eq!(stats.in_flight, 0);
+        assert_eq!(cache.deadlines.len(), REPLAY_CACHE_CAPACITY);
+        assert!(
+            !cache.try_reserve_at(oldest, now),
+            "the oldest live id must not be evicted"
+        );
+    }
+
+    #[test]
+    fn replay_cache_uses_the_configured_capacity() {
+        let mut cache = ReplayCache::with_capacity(Some(Duration::from_secs(60)), 2);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        assert_eq!(
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert_eq!(
+            cache.insert_at([2; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert_eq!(
+            cache.insert_at([3; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Full
+        );
+        assert_eq!(cache.stats(now).entries, 2);
+        assert_eq!(cache.deadlines.len(), 2);
+    }
+
+    #[test]
+    fn replay_entry_expires_at_timestamp_plus_window() {
+        let window = Duration::from_secs(300);
+        let mut cache = ReplayCache::with_capacity(Some(window), 2);
+        let now = Instant::now();
+        let base: u32 = 1_000_000;
+        let wall = u64::from(base);
+        assert_eq!(
+            cache.insert_at([4; 32], base, now, Some(wall)),
+            ReplayInsert::Inserted
+        );
+        // difference == window is still accepted by check_timestamp.
+        cache.expire(now + window);
+        assert_ne!(
+            cache.phase([4; 32], now + window),
+            ReplayPhase::Unseen,
+            "the boundary second must stay cached"
+        );
+        cache.expire(now + window + REPLAY_RETENTION_SLACK);
+        assert_eq!(
+            cache.phase([4; 32], now + window + REPLAY_RETENTION_SLACK),
+            ReplayPhase::Unseen
+        );
+        let next_timestamp =
+            base + u32::try_from(window.as_secs()).expect("test window fits u32") + 1;
+        let next_wall = u64::from(next_timestamp);
+        assert_eq!(
+            cache.insert_at(
+                [4; 32],
+                next_timestamp,
+                now + window + REPLAY_RETENTION_SLACK,
+                Some(next_wall)
+            ),
+            ReplayInsert::Inserted
+        );
+    }
+
+    #[test]
+    fn replay_deadline_covers_the_timestamp_window() {
+        let now = Instant::now();
+        let window = Some(Duration::from_secs(300));
+        let base: u32 = 1_000_000;
+        let wall = u64::from(base);
+        let retention = |timestamp: u32| {
+            replay_deadline(timestamp, now, Some(wall), window).saturating_duration_since(now)
+        };
+        assert_eq!(retention(base), Duration::from_secs(301));
+        assert_eq!(retention(base + 300), Duration::from_secs(601));
+        assert_eq!(retention(base - 300), Duration::from_secs(1));
+        assert_eq!(retention(base - 301), Duration::from_secs(1));
+        assert_eq!(
+            replay_deadline(base, now, None, window).saturating_duration_since(now),
+            Duration::from_secs(601)
+        );
+        assert_eq!(
+            replay_deadline(base, now, Some(wall), None).saturating_duration_since(now),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn replay_deadline_handles_an_unrepresentable_window() {
+        let now = Instant::now();
+        let base: u32 = 1_000_000;
+        let deadline = replay_deadline(base, now, Some(u64::from(base)), Some(Duration::MAX));
+        assert!(deadline >= now, "an extreme window must not panic");
+        let without_wall = replay_deadline(base, now, None, Some(Duration::MAX));
+        assert!(
+            without_wall >= now,
+            "an extreme window without wall time must not panic"
+        );
+    }
+
+    #[test]
+    fn replay_cache_limits_in_flight_duplicates() {
+        let mut cache = ReplayCache::new(Some(Duration::from_secs(60)));
+        let now = Instant::now();
+        let id = [9u8; 32];
+        for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID {
+            assert!(cache.try_reserve_at(id, now));
+        }
+        assert!(!cache.try_reserve_at(id, now));
+        cache.release(id);
+        assert!(cache.try_reserve_at(id, now));
+        assert_eq!(cache.stats(now).in_flight, 1);
+        assert_eq!(
+            cache.insert_at(id, 1_000_000, now, Some(1_000_000)),
+            ReplayInsert::Inserted
+        );
+        assert_eq!(
+            cache.stats(now).in_flight,
+            1,
+            "the other reservations remain outstanding after settlement"
+        );
+        assert!(!cache.try_reserve_at(id, now));
+        for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID - 1 {
+            cache.release(id);
+        }
+        assert_eq!(cache.stats(now).in_flight, 0);
+    }
+
+    #[test]
+    fn failed_replay_insert_keeps_the_in_flight_bound() {
+        let mut cache = ReplayCache::with_capacity(Some(Duration::from_secs(60)), 1);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        assert_eq!(
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert!(cache.try_reserve_at([9; 32], now));
+        assert_eq!(
+            cache.insert_at([9; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Full,
+            "a full cache must reject"
+        );
+        assert_eq!(
+            cache.phase([9; 32], now),
+            ReplayPhase::InFlight { reservations: 1 },
+            "a rejected insert must not erase another copy's reservation"
+        );
+        for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID - 1 {
+            assert!(cache.try_reserve_at([9; 32], now));
+        }
+        assert!(
+            !cache.try_reserve_at([9; 32], now),
+            "the fifth copy must be rejected"
+        );
+        assert_eq!(
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Duplicate,
+            "a settled id must still reject"
+        );
+        assert_eq!(cache.stats(now).entries, 1);
+        for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID {
+            cache.release([9; 32]);
+        }
+        assert_eq!(cache.phase([9; 32], now), ReplayPhase::Unseen);
+        assert_eq!(cache.stats(now).in_flight, 0);
+    }
+
+    #[test]
+    fn replay_phase_transitions_are_explicit() {
+        let window = Some(Duration::from_secs(60));
+        let mut cache = ReplayCache::new(window);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        let id = [5u8; 32];
+        assert_eq!(cache.phase(id, now), ReplayPhase::Unseen);
+        assert!(cache.try_reserve_at(id, now));
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::InFlight { reservations: 1 }
+        );
+        assert!(cache.try_reserve_at(id, now));
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::InFlight { reservations: 2 }
+        );
+        cache.release(id);
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::InFlight { reservations: 1 }
+        );
+        let deadline = replay_deadline(wall, now, Some(u64::from(wall)), window);
+        assert_eq!(
+            cache.insert_at(id, wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert_eq!(
+            cache.phase(id, now),
+            ReplayPhase::Settled {
+                deadline,
+                reservations: 0
+            }
+        );
+        assert!(!cache.try_reserve_at(id, now));
+        assert_eq!(
+            cache.insert_at(id, wall, now, Some(u64::from(wall))),
+            ReplayInsert::Duplicate
+        );
+        cache.expire(now + Duration::from_secs(61));
+        assert_eq!(
+            cache.phase(id, now + Duration::from_secs(61)),
+            ReplayPhase::Unseen
+        );
+    }
+
+    #[test]
+    fn replay_first_wins_survives_timestamp_deadline_expiry() {
+        let window = Some(Duration::from_secs(300));
+        let mut cache = ReplayCache::with_capacity(window, 2);
+        let now = Instant::now();
+        let base: u32 = 1_000_000;
+        let wall = u64::from(base);
+        let id = [6u8; 32];
+        // Two copies of a ClientHello aged to the last accepted second.
+        assert!(cache.try_reserve_at(id, now));
+        assert!(cache.try_reserve_at(id, now));
+        let aged = base - 300;
+        assert_eq!(
+            cache.insert_at(id, aged, now, Some(wall)),
+            ReplayInsert::Inserted
+        );
+        // The timestamp deadline is one second, but the second copy is still
+        // in flight. The settled marker must outlive it.
+        let later = now + Duration::from_secs(2);
+        assert_eq!(
+            cache.insert_at(id, aged, later, Some(wall + 2)),
+            ReplayInsert::Duplicate
+        );
+        cache.release_at(id, later);
+        assert_eq!(
+            cache.phase(id, later),
+            ReplayPhase::Unseen,
+            "the last release removes the drained marker after expiry"
+        );
+    }
+
+    #[test]
+    fn replay_stats_track_settled_and_in_flight() {
+        let mut cache = ReplayCache::with_capacity(Some(Duration::from_secs(60)), 2);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        assert!(cache.try_reserve_at([1; 32], now));
+        assert_eq!(
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert!(cache.try_reserve_at([2; 32], now));
+        let stats = cache.stats(now);
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.in_flight, 1);
+        assert_eq!(stats.capacity, 2);
+        cache.release([2; 32]);
+        assert_eq!(cache.stats(now).in_flight, 0);
+    }
+
+    #[test]
+    fn replay_counters_match_states() {
+        let mut cache = ReplayCache::with_capacity(Some(Duration::from_secs(60)), 4);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        assert!(cache.try_reserve_at([1; 32], now));
+        assert_eq!(
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert!(cache.try_reserve_at([2; 32], now));
+        assert!(cache.try_reserve_at([2; 32], now));
+        assert!(cache.try_reserve_at([3; 32], now));
+        let stats = cache.stats(now);
+        let in_flight_states = cache
+            .states
+            .values()
+            .filter(|phase| matches!(phase, ReplayPhase::InFlight { .. }))
+            .count();
+        assert_eq!(stats.in_flight, in_flight_states);
+        assert_eq!(stats.entries, cache.deadlines.len());
+        cache.release([2; 32]);
+        cache.release([2; 32]);
+        cache.release([3; 32]);
+        let after = now + Duration::from_secs(61);
+        let stats = cache.stats(after);
+        assert_eq!(stats.entries, 0);
+        assert_eq!(cache.deadlines.len(), 0);
+        assert_eq!(stats.in_flight, 0);
+    }
+
+    #[test]
+    fn replay_insert_full_does_not_drop_a_reservation() {
+        let mut cache = ReplayCache::with_capacity(Some(Duration::from_secs(60)), 1);
+        let now = Instant::now();
+        let wall = 1_000_000;
+        assert_eq!(
+            cache.insert_at([1; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Inserted
+        );
+        assert!(cache.try_reserve_at([2; 32], now));
+        assert_eq!(
+            cache.insert_at([2; 32], wall, now, Some(u64::from(wall))),
+            ReplayInsert::Full
+        );
+        assert_eq!(
+            cache.phase([2; 32], now),
+            ReplayPhase::InFlight { reservations: 1 }
+        );
+        assert_eq!(cache.stats(now).in_flight, 1);
+        cache.release([2; 32]);
+        assert_eq!(cache.phase([2; 32], now), ReplayPhase::Unseen);
+    }
+
+    #[tokio::test]
+    async fn bidirectional_relay_keeps_a_one_way_transfer_alive() {
+        let (left, mut left_peer) = tokio::io::duplex(1024);
+        let (right, mut right_peer) = tokio::io::duplex(1024);
+        let task = tokio::spawn(relay_bidirectional(left, right, Duration::from_millis(100)));
+
+        for _ in 0..5 {
+            left_peer.write_all(b"x").await.expect("left write");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the idle download direction must not cancel an active upload"
+        );
+        left_peer.shutdown().await.expect("left shutdown");
+        right_peer.shutdown().await.expect("right shutdown");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("relay did not finish")
+            .expect("relay task panicked");
+        assert!(result.is_ok(), "relay failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn cover_relays_with_async_copy() {
+        let cover_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("cover listener");
+        let cover_port = cover_listener.local_addr().expect("cover address").port();
+        let cover_task = tokio::spawn(async move {
+            let (mut cover, _) = cover_listener.accept().await.expect("cover accept");
+            let mut record = [0u8; 5];
+            cover.read_exact(&mut record).await.expect("cover read");
+            assert_eq!(&record, b"hello");
+            cover.write_all(b"world").await.expect("cover write");
+            cover.shutdown().await.expect("cover shutdown");
+        });
+
+        let mut config = test_config();
+        config.cover = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: cover_port,
+        };
+        let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("front listener");
+        let front_port = front_listener.local_addr().expect("front address").port();
+        let connect = tokio::spawn(async move {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("client connect")
+        });
+        let (client, _) = front_listener.accept().await.expect("front accept");
+        let proxy =
+            tokio::spawn(async move { forward_to_cover(client, b"hello", None, &config).await });
+        let mut peer = connect.await.expect("connect task");
+
+        let mut response = [0u8; 5];
+        timeout(Duration::from_secs(2), peer.read_exact(&mut response))
+            .await
+            .expect("fallback relay response")
+            .expect("fallback relay read");
+        assert_eq!(&response, b"world");
+        peer.shutdown().await.expect("peer shutdown");
+
+        let outcome = timeout(Duration::from_secs(2), proxy)
+            .await
+            .expect("fallback relay did not finish")
+            .expect("fallback relay task");
+        assert!(matches!(outcome, Ok(ConnectionOutcome::CoverForwarded)));
+        cover_task.await.expect("cover task");
+    }
+
+    #[tokio::test]
+    async fn cover_relay_ends_when_the_probe_half_closes() {
+        // The cover peer accepts the forwarded record but never answers and
+        // never closes. Before the fix the relay waited for the 30 s cover
+        // idle timeout after the client was gone, pinning a cover permit.
+        let cover_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("cover listener");
+        let cover_port = cover_listener.local_addr().expect("cover address").port();
+        let cover_task = tokio::spawn(async move {
+            let (mut cover, _) = cover_listener.accept().await.expect("cover accept");
+            let mut record = [0u8; 5];
+            cover.read_exact(&mut record).await.expect("cover read");
+            assert_eq!(&record, b"hello");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut config = test_config();
+        config.cover = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: cover_port,
+        };
+        let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("front listener");
+        let front_port = front_listener.local_addr().expect("front address").port();
+        let connect = tokio::spawn(async move {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("client connect")
+        });
+        let (client, _) = front_listener.accept().await.expect("front accept");
+        let proxy =
+            tokio::spawn(async move { forward_to_cover(client, b"hello", None, &config).await });
+        let mut peer = connect.await.expect("connect task");
+
+        // The probe disconnects without waiting for a cover reply. This is
+        // the documented parity tradeoff: a response sent after this FIN is
+        // dropped; a half-closed probe must not pin a cover slot.
+        peer.shutdown().await.expect("peer shutdown");
+
+        let outcome = timeout(Duration::from_secs(2), proxy)
+            .await
+            .expect("cover relay must not wait for the cover idle timeout")
+            .expect("cover relay task");
+        assert!(matches!(outcome, Ok(ConnectionOutcome::CoverForwarded)));
+        cover_task.abort();
+    }
+
+    #[tokio::test]
+    async fn cover_relay_ends_when_the_cover_closes_first() {
+        // Symmetric case: the cover peer closes while the probe keeps its
+        // write side open. Waiting for the client direction would hold the
+        // slot until the idle timeout; the relay must end on the cover EOF.
+        let cover_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("cover listener");
+        let cover_port = cover_listener.local_addr().expect("cover address").port();
+        let cover_task = tokio::spawn(async move {
+            let (mut cover, _) = cover_listener.accept().await.expect("cover accept");
+            let mut record = [0u8; 5];
+            cover.read_exact(&mut record).await.expect("cover read");
+            cover.shutdown().await.expect("cover shutdown");
+        });
+
+        let mut config = test_config();
+        config.cover = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: cover_port,
+        };
+        let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("front listener");
+        let front_port = front_listener.local_addr().expect("front address").port();
+        let connect = tokio::spawn(async move {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("client connect")
+        });
+        let (client, _) = front_listener.accept().await.expect("front accept");
+        let proxy =
+            tokio::spawn(async move { forward_to_cover(client, b"hello", None, &config).await });
+        let mut peer = connect.await.expect("connect task");
+
+        // The client stays open; only the cover closes.
+        let outcome = timeout(Duration::from_secs(2), proxy)
+            .await
+            .expect("cover EOF must end the relay without waiting for the client")
+            .expect("cover relay task");
+        assert!(matches!(outcome, Ok(ConnectionOutcome::CoverForwarded)));
+        peer.shutdown().await.expect("peer shutdown");
+        cover_task.await.expect("cover task");
+    }
+
+    #[tokio::test]
+    async fn empty_probe_reports_closed_before_hello() {
+        let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("front listener");
+        let front_port = front_listener.local_addr().expect("front address").port();
+        let connect = tokio::spawn(async move {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("client connect")
+        });
+        let (server, _) = front_listener.accept().await.expect("front accept");
+        // Drop the peer without writing anything: the next read returns EOF
+        // before a single plausible ClientHello byte arrives.
+        let peer = connect.await.expect("connect task");
+        drop(peer);
+
+        let config = Arc::new(test_config());
+        let before = config.cover_limiter.available_permits();
+        let outcome = timeout(
+            Duration::from_secs(2),
+            handle_connection_admitted(server, Arc::clone(&config), None),
+        )
+        .await
+        .expect("handler timed out")
+        .expect("handler failed");
+        assert_eq!(outcome, ConnectionOutcome::ClosedBeforeHello);
+        assert_eq!(
+            config.cover_limiter.available_permits(),
+            before,
+            "an empty probe must not dial the cover"
+        );
+    }
+
+    #[tokio::test]
+    async fn cover_forward_releases_the_preauth_permit_on_failure() {
+        let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("front listener");
+        let front_port = front_listener.local_addr().expect("front address").port();
+        let connect = tokio::spawn(async move {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("client connect")
+        });
+        let (client, _) = front_listener.accept().await.expect("front accept");
+        let _peer = connect.await.expect("connect task");
+
+        // A bound but unlistening socket refuses the dial immediately and
+        // cannot be taken over by another process while the test runs.
+        let closed_cover = TcpSocket::new_v4().expect("cover socket");
+        closed_cover
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("cover bind");
+        let mut config = test_config();
+        config.cover = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: closed_cover.local_addr().expect("cover address").port(),
+        };
+
+        let preauth_limiter = Arc::new(IpLimiter::new(4, 4));
+        let permit = preauth_limiter
+            .try_acquire(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("preauth permit");
+        assert_eq!(preauth_limiter.available_permits(), 3);
+        let result = timeout(
+            Duration::from_secs(2),
+            forward_to_cover(client, b"hello", Some(permit), &config),
+        )
+        .await
+        .expect("cover forward did not finish");
+        assert!(
+            result.is_err(),
+            "an unlistening cover port must fail the dial"
+        );
+        assert_eq!(
+            preauth_limiter.available_permits(),
+            4,
+            "the pre-auth permit must be released after the failed cover dial"
+        );
+        assert_eq!(config.cover_inflight(), 0);
+        drop(closed_cover);
+    }
+
+    #[tokio::test]
+    async fn cover_limit_is_global_and_bounded() {
+        let config = test_config();
+        let mut permits = Vec::new();
+        for index in 0..COVER_MAX_CONCURRENCY {
+            let ip = std::net::IpAddr::from([10, 0, 0, index as u8]);
+            permits.push(
+                config
+                    .cover_limiter
+                    .try_acquire(ip)
+                    .expect("cover permit must be available below the limit"),
+            );
+        }
+        assert!(
+            config
+                .cover_limiter
+                .try_acquire(std::net::IpAddr::from([10, 0, 1, 1]))
+                .is_err(),
+            "the cover limit must reject one more relay"
+        );
+        permits.pop();
+        assert!(
+            config
+                .cover_limiter
+                .try_acquire(std::net::IpAddr::from([10, 0, 1, 1]))
+                .is_ok(),
+            "a released cover permit must be reusable"
+        );
+    }
+
+    #[test]
+    fn cover_limit_is_bounded_per_source() {
+        let config = test_config();
+        let ip = std::net::IpAddr::from([10, 0, 0, 1]);
+        let mut permits = Vec::new();
+        for _ in 0..COVER_MAX_PER_IP {
+            permits.push(
+                config
+                    .cover_limiter
+                    .try_acquire(ip)
+                    .expect("per-source cover permit must be available"),
+            );
+        }
+        assert_eq!(
+            config
+                .cover_limiter
+                .try_acquire(ip)
+                .expect_err("per-IP cap"),
+            crate::admission::IpLimitReject::PerIp
+        );
+        permits.pop();
+        assert!(config.cover_limiter.try_acquire(ip).is_ok());
+    }
+
+    #[test]
+    fn temporary_certificate_is_ed25519_and_hmac_signed() {
+        let config = test_config();
+        let original = config.certificate.certificate_der.clone();
+        assert!(
+            original
+                .windows(5)
+                .any(|window| window == [0x06, 0x03, 0x2b, 0x65, 0x70]),
+            "certificate must use the Ed25519 OID 1.3.101.112"
+        );
+
+        let auth_key = [0x42u8; 32];
+        let signed = config
+            .signed_certificate(&auth_key)
+            .expect("HMAC-signed certificate");
+        assert_eq!(signed.len(), original.len());
+        let signature_offset = signed.len() - 64;
+        assert_eq!(
+            &signed[..signature_offset],
+            &original[..original.len() - 64]
+        );
+        assert_ne!(
+            &signed[signature_offset..],
+            &original[original.len() - 64..]
+        );
+        assert_eq!(
+            &signed[signature_offset..],
+            &hmac_signature(&auth_key, &config.certificate.public_key).expect("expected HMAC")
+        );
+
+        config
+            .build_server_config(&auth_key)
+            .expect("modified certificate must load into rustls");
+    }
+
+    #[test]
+    fn reality_signing_key_forces_ed25519() {
+        let config = test_config();
+        let signer = config
+            .certificate
+            .signing_key
+            .choose_scheme(&[])
+            .expect("the stock Chrome fingerprint offers no Ed25519 scheme");
+        assert_eq!(signer.scheme(), SignatureScheme::ED25519);
+    }
+
+    #[test]
+    fn xudp_config_can_be_overridden() {
+        let xudp = XudpConfig {
+            max_sessions: 7,
+            ..XudpConfig::default()
+        };
+        let config = test_config().with_xudp(xudp.clone());
+        assert_eq!(config.xudp, xudp);
+    }
+
+    #[test]
+    fn account_id_ignores_vless_route_bytes() {
+        let mut configured = [0x11; 16];
+        configured[6] = 6;
+        configured[7] = 7;
+        let mut routed = configured;
+        routed[6] = 0xaa;
+        routed[7] = 0xbb;
+        assert_eq!(account_id(&configured), account_id(&routed));
+        assert_ne!(account_id(&configured), configured);
+    }
+
+    #[test]
+    fn relay_idle_timeout_can_be_overridden() {
+        let config = test_config().with_relay_idle_timeout(Duration::from_secs(7));
+        assert_eq!(config.relay_idle_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn udp_config_can_be_overridden() {
+        let udp = LegacyUdpConfig {
+            max_packetaddr_destinations: 7,
+            ..LegacyUdpConfig::default()
+        };
+        let config = test_config().with_udp(udp.clone());
+        assert_eq!(config.udp, udp);
+    }
+
+    #[test]
+    fn rejects_invalid_record_bounds() {
+        let result = TlsServerConfig::new(
+            [0x11; 32],
+            Vec::new(),
+            Vec::new(),
+            [0, 0, 0],
+            [255, 255, 255],
+            None,
+            NetLocation {
+                address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                port: 9,
+            },
+            Duration::from_secs(5),
+            TLS_RECORD_HEADER_LEN - 1,
+            [0x22; 16],
+        );
+        assert!(matches!(result, Err(TlsServerError::InvalidConfig { .. })));
+    }
+
+    #[test]
+    fn rejects_an_oversized_timestamp_window() {
+        let result = TlsServerConfig::new(
+            [0x11; 32],
+            vec!["0123456789abcdef".to_string()],
+            vec!["whatsapp.net".to_string()],
+            [0, 0, 0],
+            [255, 255, 255],
+            Some(MAX_TIMESTAMP_WINDOW + Duration::from_secs(1)),
+            NetLocation {
+                address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                port: 9,
+            },
+            Duration::from_secs(5),
+            TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            [0x22; 16],
+        );
+        assert!(matches!(result, Err(TlsServerError::InvalidConfig { .. })));
+    }
+
+    #[test]
+    fn rejects_malformed_short_id_at_config_time() {
+        for short_id in ["", "0", "123", "zz", "0g", "0123456789abcdef00"] {
+            let result = TlsServerConfig::new(
+                [0x11; 32],
+                vec![short_id.to_string()],
+                vec!["whatsapp.net".to_string()],
+                [0, 0, 0],
+                [255, 255, 255],
+                None,
+                NetLocation {
+                    address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    port: 9,
+                },
+                Duration::from_secs(5),
+                TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+                [0x22; 16],
+            );
+            assert!(
+                matches!(result, Err(TlsServerError::InvalidConfig { .. })),
+                "short id {short_id:?} must be rejected at config time"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_and_zero_pads_short_ids_at_config_time() {
+        let config = TlsServerConfig::new(
+            [0x11; 32],
+            vec!["0123".to_string(), "0123456789abcdef".to_string()],
+            vec!["whatsapp.net".to_string()],
+            [0, 0, 0],
+            [255, 255, 255],
+            None,
+            NetLocation {
+                address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                port: 9,
+            },
+            Duration::from_secs(5),
+            TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+            [0x22; 16],
+        )
+        .expect("valid short ids must be accepted");
+
+        assert_eq!(
+            config.short_ids,
+            vec![
+                [0x01, 0x23, 0, 0, 0, 0, 0, 0],
+                [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_stream_serves_prefix_then_socket() {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            stream.write_all(b"socket").await.expect("server write");
+        });
+
+        let stream = TcpStream::connect(address).await.expect("client connect");
+        let mut replay = ReplayStream::new(stream, b"prefix".to_vec());
+        let mut buffer = [0u8; 10];
+        replay.read_exact(&mut buffer).await.expect("replay read");
+        assert_eq!(&buffer, b"prefixsock");
+        server.await.expect("server task");
+    }
+}

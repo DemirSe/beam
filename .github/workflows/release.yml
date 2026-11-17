@@ -1,0 +1,207 @@
+name: release
+
+# Permanent release for one `prod` commit or a `v*` tag.
+#
+# `prod` is the single permanent release line: it points only at the commit the
+# production host runs. `main` is the development line and is never a release
+# source; this workflow refuses it. A push to `prod`, or a push of a `v*` tag,
+# verifies the tree, builds the archive, and stops there. A tag names any
+# commit, so the build also requires the checked-out commit to be the tip of
+# `prod`. Publishing needs a manual dispatch with `publish` set on
+# `refs/heads/prod`, so no release appears without the owner's approval. The tag
+# this workflow creates comes from its own token, and GitHub does not start
+# workflows from that token, so a published release cannot trigger this
+# workflow again.
+#
+# The GitHub Release is the permanent download: the archive and its SHA-256 pin
+# are attached as release assets and kept. There is no Actions artifact and no
+# expiry. The archive carries the binary, the unit, the installer, and the
+# example config, so one downloaded file installs a host.
+#
+# Publishing creates a draft, downloads its own assets, checks them against the
+# pin, and only then makes the release public.
+#
+# This gate is `make verify`, which already runs the artifact contract tests
+# through `make test-scripts`. The hosted lab is dispatch-only and separate, so
+# a green release run does not prove lab coverage.
+on:
+  push:
+    branches: [prod]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub Release from this run (prod only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BEAM_REQUIRE_IPV6_TESTS: "1"
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # The publish step creates the release; the checkout keeps no credentials.
+    permissions:
+      contents: write
+    steps:
+      - name: Require the prod branch or a v* tag
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/heads/prod|refs/tags/v*) ;;
+            refs/heads/main)
+              echo "release: main is the development line, not the deployed commit; use prod" >&2
+              exit 1 ;;
+            *)
+              echo "release: build from prod or a v* tag, not $GITHUB_REF" >&2
+              exit 1 ;;
+          esac
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require the prod tip
+        # A `v*` tag, or a dispatch on a tag ref, names any commit. Only the
+        # commit `prod` points at is the deployed source.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          die() { echo "release: $*" >&2; exit 1; }
+          head="$(git rev-parse HEAD)"
+          tip="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/prod" \
+            --jq .object.sha 2>/dev/null)" ||
+            die "cannot read the prod branch; build only from prod"
+          [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || die "bad prod tip '$tip'"
+          [ "$head" = "$tip" ] ||
+            die "$GITHUB_REF is at $head; prod is at $tip"
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Verify
+        run: make verify
+      - name: Build and package
+        # Outside target/: a restored build cache must not make a rerun refuse
+        # to replace a stale archive.
+        env:
+          BEAM_RELEASE_OUT: ${{ runner.temp }}/release-artifact
+        run: |
+          set -euo pipefail
+          bash scripts/release-artifact.sh | tee "$RUNNER_TEMP/release-artifact.txt"
+      - name: Record the artifact
+        run: |
+          set -euo pipefail
+          {
+            echo '### beam release artifact'
+            echo ''
+            echo '```'
+            cat "$RUNNER_TEMP/release-artifact.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish the GitHub Release
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          die() { echo "release: $*" >&2; exit 1; }
+          # A tag or a dispatch elsewhere names a commit, not the deployed
+          # source. Publish only from the prod branch.
+          [ "$GITHUB_REF" = "refs/heads/prod" ] ||
+            die "publish only from refs/heads/prod, not '$GITHUB_REF'"
+          report="$RUNNER_TEMP/release-artifact.txt"
+          [ -f "$report" ] || die "no artifact report; the build step did not run"
+          field() { sed -n "s/^$1=//p" "$report" | tail -n 1; }
+          version="$(field version)"
+          commit="$(field commit)"
+          target="$(field target)"
+          artifact="$(field artifact)"
+          archive_sha="$(field artifact_sha256)"
+          # These values become a tag, asset names, and a path. Accept only the
+          # shape scripts/release-artifact.sh emits, and only after checking the
+          # file against its own pin.
+          [[ "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+_-]*$ ]] ||
+            die "bad version '$version'"
+          [[ "$commit" =~ ^[0-9a-f]{7,40}$ ]] || die "bad commit '$commit'"
+          [[ "$target" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+            die "bad target '$target'"
+          [ -f "$artifact" ] && [ ! -L "$artifact" ] ||
+            die "artifact not found: '$artifact'"
+          archive="$(basename "$artifact")"
+          [ "$archive" = "beam-$version-$commit-$target.tar.gz" ] ||
+            die "artifact '$archive' is not beam-$version-$commit-$target.tar.gz"
+          [ "$archive_sha" = "$(sha256sum "$artifact" | cut -d' ' -f1)" ] ||
+            die "$archive does not match the reported SHA-256"
+          case "$GITHUB_SHA" in
+            "$commit"*) ;;
+            *) die "report commit $commit is not the checked-out $GITHUB_SHA" ;;
+          esac
+          pin="$artifact.sha256"
+          [ -f "$pin" ] || die "no checksum pin next to $archive"
+          tag="v$version-$commit"
+          # A release or tag is never replaced. A failed run leaves a draft, so
+          # the owner removes it before a retry.
+          ! gh release view "$tag" >/dev/null 2>&1 ||
+            die "release $tag already exists"
+          ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1 ||
+            die "tag $tag already exists"
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "beam \`$version\` from \`$commit\` for \`$target\`."
+            echo
+            echo 'The archive holds `beam`, `beam.service`, `beam-install.sh`,'
+            echo '`config.example.toml`, and `SHA256SUMS`.'
+            echo
+            echo '```'
+            sed "s|^artifact=.*|artifact=$archive|" "$report"
+            echo '```'
+            echo
+            echo '## Install'
+            echo
+            echo 'Download the archive and its `.sha256` pin into one directory, then:'
+            echo
+            echo '```sh'
+            echo "sha256sum -c $archive.sha256"
+            echo "tar -xzf $archive"
+            echo '# Replace the sample key, user id, server name, and dest.'
+            echo 'chmod 600 config.example.toml'
+            echo "sudo env BEAM_ARTIFACT=$archive BEAM_CONFIG=config.example.toml \\"
+            echo '  bash beam-install.sh install'
+            echo '```'
+          } > "$notes"
+          # Draft first: the release becomes public only after the downloaded
+          # bytes match the pin.
+          gh release create "$tag" --draft --target "$GITHUB_SHA" \
+            --title "beam $version ($commit)" --notes-file "$notes" \
+            "$artifact" "$pin"
+          download="$RUNNER_TEMP/release-download"
+          mkdir -p "$download"
+          gh release download "$tag" --dir "$download"
+          if ! ( cd "$download" && sha256sum -c "$(basename "$pin")" ); then
+            gh release delete "$tag" --yes >/dev/null 2>&1 ||
+              echo "release: delete the draft $tag by hand" >&2
+            die "downloaded asset does not match $archive"
+          fi
+          gh release edit "$tag" --draft=false
+          {
+            echo ''
+            echo "Published $(gh release view "$tag" --json url --jq .url)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Note the publish gate
+        if: github.event_name != 'workflow_dispatch' || inputs.publish != true
+        run: |
+          {
+            echo ''
+            echo 'No release published: dispatch this workflow with `publish` set.'
+          } >> "$GITHUB_STEP_SUMMARY"

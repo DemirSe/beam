@@ -1,0 +1,319 @@
+//! `beam generate`: REALITY and VLESS identity generation for a new deployment.
+
+use std::io::Write as _;
+use std::net::IpAddr;
+
+use anyhow::Result;
+use beam_core::config::is_plausible_dns_name;
+use beam_core::identity::{
+    ClientLink, RealityKeyPair, client_link, generate_short_id, generate_uuid,
+};
+use clap::Args;
+
+/// Message used for every rejected `--host` value.
+const HOST_HINT: &str = "host must be a DNS name or an IP address; pass the TCP \
+                        port with --port and omit any scheme or path";
+
+/// Generates a UUID, REALITY keypair, short id, and client VLESS link.
+#[derive(Debug, Args)]
+pub struct GenerateArgs {
+    /// Host or IP address the client connects to.
+    #[arg(long, value_parser = parse_host)]
+    host: String,
+
+    /// TCP port the client connects to.
+    #[arg(long, default_value_t = 443, value_parser = clap::value_parser!(u16).range(1..))]
+    port: u16,
+
+    /// REALITY server name (SNI) for the link and `reality.server_names`.
+    #[arg(long, value_parser = parse_server_name)]
+    sni: String,
+
+    /// Display name shown by the client.
+    #[arg(long, default_value = "beam")]
+    remark: String,
+}
+
+/// Generates the identity and writes it to standard output.
+pub fn run(args: &GenerateArgs) -> Result<()> {
+    let keys = RealityKeyPair::generate()?;
+    let user_id = generate_uuid()?;
+    let short_id = generate_short_id()?;
+    let public_key = keys.public_key();
+    let private_key = keys.private_key();
+    let link = client_link(&ClientLink {
+        user_id,
+        host: &args.host,
+        port: args.port,
+        server_name: &args.sni,
+        public_key: &public_key,
+        short_id: &short_id,
+        remark: &args.remark,
+    });
+
+    let rendered = render(
+        &user_id.to_string(),
+        private_key.as_str(),
+        &short_id,
+        &args.sni,
+        &link,
+    );
+    // Propagate a closed or full stdout as an error instead of panicking.
+    std::io::stdout().lock().write_all(rendered.as_bytes())?;
+    eprintln!(
+        "warning: this output contains the REALITY private key; set umask 077, \
+         keep the config mode 0600, and never commit or paste it"
+    );
+    Ok(())
+}
+
+/// Accepts a DNS name or an IP literal, and returns it in link form.
+///
+/// An IPv6 literal may be bracketed on input; the link renderer adds exactly
+/// one pair of brackets. A value with a scheme, path, or `host:port` is
+/// rejected instead of producing a link the client cannot parse.
+fn parse_host(value: &str) -> Result<String, String> {
+    if let Some(inner) = value.strip_prefix('[') {
+        let Some(inner) = inner.strip_suffix(']') else {
+            return Err(HOST_HINT.to_owned());
+        };
+        return match inner.parse::<std::net::Ipv6Addr>() {
+            Ok(address) if address.is_unspecified() => {
+                Err("host must be an address a client can reach, not 0.0.0.0 or ::".to_owned())
+            }
+            Ok(address) => Ok(address.to_string()),
+            Err(_) => Err(HOST_HINT.to_owned()),
+        };
+    }
+
+    if let Ok(address) = value.parse::<IpAddr>() {
+        if address.is_unspecified() {
+            return Err("host must be an address a client can reach, not 0.0.0.0 or ::".to_owned());
+        }
+        return Ok(address.to_string());
+    }
+
+    if is_plausible_dns_name(value) {
+        return Ok(value.to_owned());
+    }
+    Err(HOST_HINT.to_owned())
+}
+
+/// Accepts the same DNS names as `reality.server_names`.
+fn parse_server_name(value: &str) -> Result<String, String> {
+    if is_plausible_dns_name(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(
+            "sni must be a DNS name such as whatsapp.net, without a scheme, port, or path"
+                .to_owned(),
+        )
+    }
+}
+
+/// Formats the server configuration fragment and the client link.
+fn render(
+    user_id: &str,
+    private_key: &str,
+    short_id: &str,
+    server_name: &str,
+    link: &str,
+) -> String {
+    format!(
+        "# Generated identity. Keep it secret and never commit it.\n\
+         \n[user]\n\
+         id = \"{user_id}\"\n\
+         flow = \"xtls-rprx-vision\"\n\
+         \n[reality]\n\
+         private_key = \"{private_key}\"\n\
+         short_ids = [\"{short_id}\"]\n\
+         server_names = [\"{server_name}\"]\n\
+         \n# Xray-compatible client link, public key only:\n\
+         {link}\n"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generate() -> (RealityKeyPair, String, String, String) {
+        let keys = RealityKeyPair::generate().expect("keypair generation");
+        let user_id = generate_uuid().expect("uuid generation").to_string();
+        let short_id = generate_short_id().expect("short id generation");
+        let public_key = keys.public_key();
+        (keys, user_id, short_id, public_key)
+    }
+
+    #[test]
+    fn render_keeps_the_private_key_out_of_the_link() {
+        let (keys, user_id, short_id, public_key) = generate();
+        let private_key = keys.private_key();
+        let link = client_link(&ClientLink {
+            user_id: user_id.parse().expect("generated uuid parses"),
+            host: "203.0.113.10",
+            port: 443,
+            server_name: "whatsapp.net",
+            public_key: &public_key,
+            short_id: &short_id,
+            remark: "beam",
+        });
+
+        let output = render(
+            &user_id,
+            private_key.as_str(),
+            &short_id,
+            "whatsapp.net",
+            &link,
+        );
+
+        assert!(!link.contains(private_key.as_str()));
+        assert!(link.contains(&format!("pbk={public_key}")));
+        assert!(link.contains(&format!("sid={short_id}")));
+        assert_eq!(output.matches(private_key.as_str()).count(), 1);
+        assert!(output.contains(&format!("id = \"{user_id}\"")));
+        assert!(output.contains(&format!("short_ids = [\"{short_id}\"]")));
+        assert!(output.contains("server_names = [\"whatsapp.net\"]"));
+        assert!(output.ends_with(&format!("{link}\n")));
+    }
+
+    #[test]
+    fn generate_args_require_the_client_endpoint() {
+        use clap::Parser;
+
+        #[derive(Debug, Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: GenerateArgs,
+        }
+
+        let args = Wrapper::parse_from(["test", "--host", "203.0.113.10", "--sni", "whatsapp.net"]);
+        assert_eq!(args.args.host, "203.0.113.10");
+        assert_eq!(args.args.port, 443);
+        assert_eq!(args.args.sni, "whatsapp.net");
+        assert_eq!(args.args.remark, "beam");
+
+        assert!(
+            Wrapper::try_parse_from(["test", "--host", "203.0.113.10"]).is_err(),
+            "--sni is required"
+        );
+        assert!(
+            Wrapper::try_parse_from(["test", "--sni", "whatsapp.net"]).is_err(),
+            "--host is required"
+        );
+    }
+
+    #[test]
+    fn generate_args_reject_values_that_would_break_the_link() {
+        use clap::Parser;
+
+        #[derive(Debug, Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: GenerateArgs,
+        }
+
+        let invalid: &[(&str, &[&str])] = &[
+            (
+                "empty host",
+                &["test", "--host", "", "--sni", "whatsapp.net"],
+            ),
+            (
+                "host with a scheme",
+                &[
+                    "test",
+                    "--host",
+                    "https://example.com",
+                    "--sni",
+                    "whatsapp.net",
+                ],
+            ),
+            (
+                "host with a port",
+                &[
+                    "test",
+                    "--host",
+                    "example.com:8443",
+                    "--sni",
+                    "whatsapp.net",
+                ],
+            ),
+            (
+                "bracketed IPv4",
+                &["test", "--host", "[203.0.113.10]", "--sni", "whatsapp.net"],
+            ),
+            (
+                "unspecified IPv4",
+                &["test", "--host", "0.0.0.0", "--sni", "whatsapp.net"],
+            ),
+            (
+                "unspecified IPv6",
+                &["test", "--host", "::", "--sni", "whatsapp.net"],
+            ),
+            (
+                "bracketed unspecified IPv6",
+                &["test", "--host", "[::]", "--sni", "whatsapp.net"],
+            ),
+            (
+                "empty sni",
+                &["test", "--host", "203.0.113.10", "--sni", ""],
+            ),
+            (
+                "sni with a scheme",
+                &[
+                    "test",
+                    "--host",
+                    "203.0.113.10",
+                    "--sni",
+                    "https://whatsapp.net",
+                ],
+            ),
+            (
+                "sni with a port",
+                &[
+                    "test",
+                    "--host",
+                    "203.0.113.10",
+                    "--sni",
+                    "whatsapp.net:443",
+                ],
+            ),
+            (
+                "port zero",
+                &[
+                    "test",
+                    "--host",
+                    "203.0.113.10",
+                    "--sni",
+                    "whatsapp.net",
+                    "--port",
+                    "0",
+                ],
+            ),
+        ];
+
+        for (label, argv) in invalid {
+            assert!(
+                Wrapper::try_parse_from(argv.iter().copied()).is_err(),
+                "{label} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_args_canonicalize_ipv6_hosts() {
+        use clap::Parser;
+
+        #[derive(Debug, Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: GenerateArgs,
+        }
+
+        for host in ["2001:0DB8::1", "[2001:0DB8::1]"] {
+            let args = Wrapper::try_parse_from(["test", "--host", host, "--sni", "whatsapp.net"])
+                .expect("IPv6 host must parse");
+            assert_eq!(args.args.host, "2001:db8::1");
+        }
+    }
+}

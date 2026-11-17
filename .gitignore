@@ -1,0 +1,28 @@
+/target
+**/*.rs.bk
+*.pcap
+*.log
+.env
+/tmp
+
+__pycache__/
+*.pyc
+
+/mobile-singbox.json
+/network-comparison.local.md
+
+# Windows tray launcher build artifacts and local runtime files
+/clients/windows-tray/beam-tray.exe
+/clients/windows-tray/app-res.o
+/clients/windows-tray/sing-box.exe
+/clients/windows-tray/config.json
+/clients/windows-tray/beam-install.ps1
+
+# Linux tray build artifacts
+/clients/linux-tray/beam-tray
+/clients/linux-tray/beam-helper
+
+# Editor and backup leftovers, never product code
+*.save
+
+/_local/

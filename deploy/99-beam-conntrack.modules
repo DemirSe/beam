@@ -1,0 +1,5 @@
+# Load the conntrack module before systemd-sysctl applies
+# /etc/sysctl.d/99-beam-conntrack.conf. systemd-sysctl.service is ordered
+# After=systemd-modules-load.service, so this makes the net.netfilter keys
+# available on a fresh boot even when nftables has not run yet.
+nf_conntrack

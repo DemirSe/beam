@@ -1,0 +1,39 @@
+[package]
+name = "beam-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Test-only helpers for the separate cargo-fuzz workspace. This feature is
+# never enabled in production builds.
+fuzz = []
+
+[dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+beam-sys = { workspace = true }
+bytes = "1"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+rand = { version = "0.10", default-features = false }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+toml = "0.9"
+tracing = "0.1"
+uuid = { version = "1", features = ["serde"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }

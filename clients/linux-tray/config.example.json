@@ -1,0 +1,132 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-hosts",
+        "type": "hosts",
+        "predefined": {
+          "example.com": [
+            "203.0.113.10",
+            "198.51.100.20"
+          ]
+        }
+      },
+      {
+        "tag": "remote-doh",
+        "type": "https",
+        "server": "example.com",
+        "server_port": 443,
+        "path": "/<PROFILE_ID>",
+        "detour": "proxy",
+        "domain_resolver": "dns-hosts"
+      },
+      {
+        "tag": "local-dns",
+        "type": "local",
+        "detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          ".lan",
+          ".local",
+          ".home.arpa"
+        ],
+        "server": "local-dns"
+      }
+    ],
+    "final": "remote-doh",
+    "strategy": "ipv4_only",
+    "cache_capacity": 4096
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "mtu": 1500,
+      "auto_route": true,
+      "strict_route": false,
+      "stack": "system",
+      "interface_name": "sbtun0",
+      "route_exclude_address": [
+        "203.0.113.10/32",
+        "198.51.100.20/32"
+      ],
+      "auto_redirect": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "203.0.113.10",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "flow": "xtls-rprx-vision",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "short_id": "0000000000000000"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "local-dns",
+    "rules": [
+      {
+        "ip_version": 6,
+        "action": "reject"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "action": "reject",
+        "network": "udp",
+        "port": [
+          443
+        ],
+        "method": "default",
+        "no_drop": true
+      },
+      {
+        "action": "sniff",
+        "sniffer": [
+          "http",
+          "tls",
+          "quic",
+          "dns"
+        ],
+        "timeout": "300ms"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      }
+    ],
+    "final": "proxy"
+  }
+}

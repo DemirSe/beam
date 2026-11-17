@@ -1,0 +1,104 @@
+name: interop
+
+# Authenticated end-to-end path: socks5 -> pinned sing-box -> VLESS/REALITY ->
+# beam, covering both datagram encodings. A second job runs `beam generate` and
+# uses the generated identity and link with pinned sing-box and Xray clients.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  SING_BOX_VERSION: "1.14.4"
+  SING_BOX_SHA256: "231e57c18378f780a08de832844a1ca9716e17a7bcf82964b350844d243c03ac"
+  XRAY_VERSION: "26.3.27"
+  XRAY_SHA256: "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        encoding: [xudp, packetaddr]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Build beam
+        run: cargo build --locked --release --bin beam
+      - name: Install pinned sing-box
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/sb.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64-glibc.tar.gz"
+          echo "${SING_BOX_SHA256}  /tmp/sb.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          install -m 0755 "/tmp/sing-box-${SING_BOX_VERSION}-linux-amd64-glibc/sing-box" /usr/local/bin/sing-box
+      - name: HTTPS through the tunnel
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_tls_in_tls.py target/release/beam /usr/local/bin/sing-box
+      - name: IPv6 destinations
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_ipv6.py target/release/beam /usr/local/bin/sing-box
+      - name: Half-close semantics
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_halfclose.py target/release/beam /usr/local/bin/sing-box
+      - name: Vision descriptor budget
+        if: matrix.encoding == 'xudp'
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_client.py --beam target/release/beam \
+            --sing-box /usr/local/bin/sing-box --selftest
+      - name: Splice-clone fallback
+        if: matrix.encoding == 'xudp'
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_tls_in_tls.py target/release/beam \
+            /usr/local/bin/sing-box --squeeze-clones
+      - name: Campaign (${{ matrix.encoding }})
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_interop.py --beam target/release/beam \
+            --sing-box /usr/local/bin/sing-box --repo . --encoding ${{ matrix.encoding }}
+
+  generated-link:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Build beam
+        run: cargo build --locked --release --bin beam
+      - name: Install pinned stock clients
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/sb.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64-glibc.tar.gz"
+          echo "${SING_BOX_SHA256}  /tmp/sb.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/sing-box-${SING_BOX_VERSION}-linux-amd64-glibc/sing-box" /usr/local/bin/sing-box
+
+          curl -fsSL -o /tmp/xray.zip \
+            "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip"
+          echo "${XRAY_SHA256}  /tmp/xray.zip" | sha256sum -c -
+          rm -rf /tmp/xray
+          mkdir -p /tmp/xray
+          unzip -q -o /tmp/xray.zip -d /tmp/xray
+          sudo install -m 0755 /tmp/xray/xray /usr/local/bin/xray
+          sing-box version
+          xray version | head -2
+      - name: Generated identity through stock clients
+        run: |
+          set -o pipefail
+          python3 tests/stress/vless_generated.py --beam target/release/beam \
+            --sing-box /usr/local/bin/sing-box --xray /usr/local/bin/xray
