@@ -17,6 +17,26 @@ auditable server with explicit resource bounds. It is not a multi-user proxy.
 - **XUDP:** carries bounded UDP sessions inside VLESS Mux frames, with legacy
   VLESS UDP and packetaddr modes for stock clients.
 
+## Should you run this?
+
+beam is for one operator who runs one Linux server and one tunnel, can read
+systemd journals, and can edit a TOML file. It is not for:
+
+- Teams, shared access, or resold access.
+- Panels, billing, or per-user limits.
+- Windows or macOS as the server.
+- Anyone without root, or anyone who wants a one-click client.
+
+It does not protect against:
+
+- Traffic analysis by an adversary who observes both ends.
+- The server provider's own logging.
+- A misconfigured host.
+- A cover site that does not look plausible from the client's network.
+
+Running a proxy may break the host provider's terms of service, and local law
+also applies. That decision is the operator's.
+
 ## Requirements
 
 - Linux x86_64 and a Rust toolchain. `rust-toolchain.toml` pins Rust 1.99.1
@@ -91,8 +111,7 @@ config to be readable by the service user. `SIGHUP` is ignored; restart the
 service to reload configuration. `SIGTERM` stops accepting, drains for at most
 `shutdown_drain_ms`, then bounds runtime shutdown.
 
-Operator procedures for one host — staging, rollout, rollback, and the tray DNS
-switch — are in [`DEPLOY.md`](docs/DEPLOY.md).
+Before you run an installer, read the recommendations in [`DEPLOY.md`](docs/DEPLOY.md). The deploy scripts make host policy changes. Do not run an installer unless you can reach the host's provider console.
 
 ## Verify
 

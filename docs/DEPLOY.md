@@ -3,6 +3,94 @@
 This is the operator runbook for one Linux host. It covers service install,
 host policy, client setup, and recovery.
 
+## Before you deploy
+
+Read this section before you change a host. It gives the choices and checks
+that must exist before you run any command in this runbook. If you cannot meet
+a requirement, stop.
+
+### Choose the host
+
+- Use the smallest dedicated server that fits one tunnel.
+- Choose a provider that allows the traffic you intend to send and receive.
+- Choose a region that makes your cover name plausible.
+- Choose a provider console or rescue mode that you tested.
+- Do not use a shared host with other services. Other services on the host
+  increase the blast radius.
+
+### Prepare the host
+
+1. Use your own account with key-only SSH and passwordless sudo. The scripts
+   need root.
+2. Use AlmaLinux 10 for `bootstrap-alma.sh` or Debian 13 for `bootstrap.sh`.
+   Both scripts also require x86_64. `beam-install.sh` checks systemd, not a
+   distribution.
+3. Keep the provider console reachable while you work.
+4. Take a snapshot or a backup that you can restore.
+5. Install the required tools before you run a script. None of the three
+   scripts installs OS packages. `bootstrap.sh` needs `/usr/sbin/sshd`,
+   `ssh.service`, the `sshd_config.d` Include, `ip`, `ss`, `sysctl`, and
+   `runuser`. When present, it uses `modprobe` and `tc`. `bootstrap-alma.sh`
+   needs `ip`, `ss`, `sysctl`, `nft`, `chronyc`, `systemctl`, `runuser`, and
+   `restorecon`. `beam-install.sh` needs `systemctl`, `sha256sum`, `getent`,
+   `groupadd`, `useradd`, `runuser`, and `install`. It also needs `tar` with
+   `BEAM_ARTIFACT`.
+
+### Recommended minimum posture
+
+- Keep the provider console open until the last verification passes.
+- Take the snapshot before the first change.
+- Pin the release artifact by hash with `BEAM_SHA256` or its sidecar file.
+- Keep the config at 0600 and out of git.
+- Change one thing at a time.
+- Keep a rollback path for each changed file and for each host policy.
+- Watch the journal after each step.
+
+### What each script changes, and what it leaves to you
+
+Each script has a fixed boundary. Read it before you assume a step is done.
+
+- `bootstrap.sh` installs and applies the SSH IPv4-only files and the host
+  IPv6 sysctl on Debian. It does this after beam becomes ready.
+- `bootstrap.sh` does not install nftables rules or start nftables. The
+  operator owns the firewall on Debian.
+- `bootstrap.sh` does not install chrony files, the `-4` clock option, or
+  fail2ban. The operator owns those items on Debian.
+- `bootstrap.sh` does not install the journald drop-in. The operator owns that
+  file on Debian.
+- `bootstrap.sh` warns on distributions other than Debian 13. It refuses
+  non-x86_64 hosts, missing sshd, a missing Include, an invalid sshd
+  configuration, no IPv4 SSH listener, or missing commands.
+- `bootstrap-alma.sh` does not change SSH or host IPv6. The operator owns both
+  changes on AlmaLinux.
+- `bootstrap-alma.sh` installs nftables files and validates the rules. It does
+  not start nftables or stop firewalld. The operator owns activation.
+- `bootstrap-alma.sh` installs chrony files, chronyd options, and the journald
+  drop-in. It does not install the chrony or fail2ban packages. It warns on
+  distributions other than AlmaLinux 10 and refuses non-x86_64 hosts.
+- `beam-install.sh` installs the binary, unit, example config, account, config,
+  and optional liveness set. It never changes SSH, nftables, sysctls, IPv6, or
+  the clock. It has no distribution check.
+
+### Order of operations
+
+1. Choose the host and confirm console access. If you stop here, the host
+   stays unchanged.
+2. Take the snapshot and prepare the account, sudo, and required tools. If you
+   stop here, the host still runs its original service.
+3. Prepare and check the config, then pin the release artifact by hash. If you
+   stop here, the live files stay as they are.
+4. Stage the bundle with the steps in [Stage the archive on the
+   host](#stage-the-archive-on-the-host). If you stop here, remove the
+   secret-bearing stage as that section describes.
+5. Run the bootstrap path for the host distribution. If you stop here, beam is
+   ready or restored by rollback. The Debian bootstrap applies SSH and IPv6
+   policy. The operator applies AlmaLinux policy in step 6.
+6. Verify production and install the remaining host policy from the sections
+   below. If you stop here, the checks confirm the applied policy.
+7. Remove the secret-bearing stage and watch the journal. If you stop here,
+   keep the snapshot until the next check.
+
 ## Operations
 
 Set `SSH_KEY` and `SERVER` in the shell before using the examples below.
@@ -192,8 +280,10 @@ ssh -4 -p "${SSH_PORT:-22}" -i "$SSH_KEY" "$SERVER" "rm -rf -- '$STAGE'"
 `bootstrap.sh` is the Debian path. On AlmaLinux, use the same commands with
 `bootstrap-alma.sh`. Both installers preserve an existing
 `/etc/beam/config.toml` by default and keep `.bak-<stamp>` copies of replaced
-files; they do not activate SSH, firewall, or host IPv6 changes. Set
-`BEAM_KEEP_CONFIG=0` explicitly to replace the live config. A plain
+files; they do not activate the firewall. For host policy, `bootstrap.sh`
+installs and applies the SSH and host IPv6 files on Debian.
+`bootstrap-alma.sh` only writes nftables files and leaves activation to the
+operator. Set `BEAM_KEEP_CONFIG=0` explicitly to replace the live config. A plain
 `sudo bash ...` cannot inherit an exported `BEAM_KEEP_CONFIG`, so use `env`
 for both modes. Do not use `BEAM_KEEP_CONFIG=1` for a host without
 `/etc/beam/config.toml`: the installer stops with an error.
