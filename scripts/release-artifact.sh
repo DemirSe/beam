@@ -131,6 +131,9 @@ install -m 0644 "$ROOT/deploy/beam-liveness.service" "$STAGE/beam-liveness.servi
 install -m 0644 "$ROOT/deploy/beam-liveness.timer" "$STAGE/beam-liveness.timer"
 BIN_SHA="$(sha256sum "$STAGE/beam" | awk '{print $1}')"
 printf '%s  %s\n' "$BIN_SHA" beam > "$STAGE/SHA256SUMS"
+# Artifact modes are part of the contract, so they must not follow the
+# caller's umask. build under `umask 077` still produces a verifiable bundle.
+chmod 0644 "$STAGE/SHA256SUMS"
 
 # Fixed ownership and timestamp keep the archive metadata off the hash input
 # that varies between runners.
