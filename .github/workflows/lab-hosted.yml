@@ -114,6 +114,12 @@ on:
         required: false
         default: ""
         type: string
+      job_timeout_minutes:
+        description: "Hard cap for the whole job, setup and builds included; queue time excluded"
+        required: false
+        default: '180'
+        type: choice
+        options: ['10', '180']
 
 permissions:
   contents: write
@@ -133,9 +139,10 @@ env:
 jobs:
   lab:
     runs-on: ubuntu-24.04
-    # Constant on purpose: per-profile budgets are enforced by `timeout` around
-    # each suite, so a smoke dispatch never sits here for two hours.
-    timeout-minutes: 180
+    # Whole-job hard cap: setup, tool install, builds and every suite. It does
+    # not include the queue time before the job starts. The 180 default keeps
+    # the campaign budget; a diagnostic dispatch can lower it.
+    timeout-minutes: ${{ fromJSON(inputs.job_timeout_minutes) }}
     steps:
       - uses: actions/checkout@v4
         with:
