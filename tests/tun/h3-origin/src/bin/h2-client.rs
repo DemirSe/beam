@@ -19,7 +19,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -28,6 +28,7 @@ use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::Barrier;
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::{
     self, DigitallySignedStruct, SignatureScheme,
@@ -36,6 +37,24 @@ use tokio_rustls::rustls::{
 };
 
 const MARKER: &[u8] = b"beam-tun-h3-ok\n";
+/// Per-stream response cap: the origin never emits more than this per request.
+const MAX_BODY_LEN: usize = 64 * 1024 * 1024;
+/// Aggregate cap over every stream in one run (documented runs total ~1 MiB).
+const MAX_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+/// Hard cap on concurrent streams; bounds the spawned task count.
+const MAX_STREAMS: usize = 1024;
+// Per-stage waits: a stalled stage reports its own name instead of hanging
+// on the external runner deadline. The overall bound below covers their sum.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TLS_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// No single body frame may stall longer than this; steady multi-frame
+/// progress of a large body is unaffected.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(15);
+/// Whole-run bound: covers the sequential stage bounds above with margin and
+/// fires inside the harness 90 s runner budget so the JSON verdict is written.
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The lab origin is freshly self-signed on every run; there is no CA to pin.
 #[derive(Debug)]
@@ -110,8 +129,8 @@ fn parse_args() -> Result<Args> {
                 streams = raw
                     .parse()
                     .with_context(|| format!("invalid stream count: {raw}"))?;
-                if !(1..=1024).contains(&streams) {
-                    bail!("--streams must be between 1 and 1024");
+                if !(1..=MAX_STREAMS).contains(&streams) {
+                    bail!("--streams must be between 1 and {MAX_STREAMS}");
                 }
             }
             "--out" => {
@@ -178,14 +197,28 @@ fn expected_len(url: &str) -> Result<usize> {
                 let len: usize = value
                     .parse()
                     .with_context(|| format!("invalid bytes parameter: {value}"))?;
-                if !(1..=64 * 1024 * 1024).contains(&len) {
-                    bail!("bytes must be between 1 and 67108864");
+                if !(1..=MAX_BODY_LEN).contains(&len) {
+                    bail!("bytes must be between 1 and {MAX_BODY_LEN}");
                 }
                 return Ok(len);
             }
         }
     }
     Ok(MARKER.len())
+}
+
+/// Rejects runs whose streams times body size would exceed the aggregate
+/// budget before any socket or allocation happens.
+fn check_aggregate_budget(streams: usize, per_stream: usize) -> Result<()> {
+    let total = per_stream
+        .checked_mul(streams)
+        .context("stream byte total overflows")?;
+    if total > MAX_TOTAL_BYTES {
+        bail!(
+            "requested {total} bytes across {streams} streams exceeds the aggregate budget of {MAX_TOTAL_BYTES} bytes; reduce --streams or ?bytes="
+        );
+    }
+    Ok(())
 }
 
 fn expected_body(len: usize) -> Vec<u8> {
@@ -228,7 +261,11 @@ struct Verdict {
 async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
     let uri: http::Uri = url.parse().with_context(|| format!("invalid URL: {url}"))?;
     let (host, addr) = split_url(url)?;
-    let expected = expected_body(expected_len(url)?);
+    let per_stream = expected_len(url)?;
+    check_aggregate_budget(streams, per_stream)?;
+    // One shared body: cloning it per stream would multiply a large
+    // allocation across every concurrent stream.
+    let expected: Arc<Vec<u8>> = Arc::new(expected_body(per_stream));
 
     let mut client = rustls::ClientConfig::builder()
         .dangerous()
@@ -239,26 +276,47 @@ async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
     let server_name = ServerName::try_from(host.clone())
         .with_context(|| format!("invalid server name: {host}"))?;
 
-    let tcp = match tokio::net::TcpStream::connect(addr).await {
-        Ok(stream) => stream,
-        Err(error) => {
+    let tcp = match timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
             bail!("could not connect to {addr}: {error}");
+        }
+        Err(_) => {
+            bail!(
+                "could not connect to {addr}: timed out after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            );
         }
     };
     let _ = tcp.set_nodelay(true);
-    let tls = match connector.connect(server_name, tcp).await {
-        Ok(stream) => stream,
-        Err(error) => bail!("TLS handshake with {addr} failed: {error}"),
+    let tls = match timeout(TLS_TIMEOUT, connector.connect(server_name, tcp)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => bail!("TLS handshake with {addr} failed: {error}"),
+        Err(_) => bail!(
+            "TLS handshake with {addr} timed out after {}s",
+            TLS_TIMEOUT.as_secs()
+        ),
     };
     let negotiated = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
     if negotiated.as_deref() != Some(b"h2") {
         bail!("origin did not negotiate ALPN h2: {negotiated:?}");
     }
 
-    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake(TokioIo::new(tls))
-        .await
-        .context("could not start the HTTP/2 client connection")?;
+    let (sender, connection) = match timeout(
+        HANDSHAKE_TIMEOUT,
+        hyper::client::conn::http2::Builder::new(TokioExecutor::new()).handshake(TokioIo::new(tls)),
+    )
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(error)) => {
+            bail!("could not start the HTTP/2 client connection: {error:#}");
+        }
+        Err(_) => bail!(
+            "HTTP/2 handshake timed out after {}s",
+            HANDSHAKE_TIMEOUT.as_secs()
+        ),
+    };
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             eprintln!("h2-client: connection driver ended: {error}");
@@ -288,34 +346,66 @@ async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
                     .uri(uri)
                     .body(Full::new(Bytes::new()))
                     .map_err(|error| format!("could not build the request: {error}"))?;
-                let response = sender
-                    .send_request(request)
-                    .await
-                    .map_err(|error| format!("request failed: {error}"))?;
+                let response = match timeout(SEND_TIMEOUT, sender.send_request(request)).await {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => return Err(format!("request failed: {error}")),
+                    Err(_) => {
+                        return Err(format!(
+                            "request submission timed out after {}s",
+                            SEND_TIMEOUT.as_secs()
+                        ));
+                    }
+                };
                 let status = response.status();
                 if status != StatusCode::OK {
                     return Err(format!("status {status}"));
                 }
                 let mut body = response.into_body();
-                let mut received = Vec::with_capacity(expected.len());
+                // Streaming compare against the shared body: no per-stream
+                // receive buffer is ever allocated.
+                let mut done = 0usize;
                 let mut ttfb_ms = None;
-                while let Some(frame) = body.frame().await {
-                    let frame = frame.map_err(|error| format!("body error: {error}"))?;
+                loop {
+                    let frame = match timeout(FRAME_TIMEOUT, body.frame()).await {
+                        Err(_) => {
+                            return Err(format!(
+                                "response body stalled: no frame for {}s (got {done} of {} bytes)",
+                                FRAME_TIMEOUT.as_secs(),
+                                expected.len()
+                            ));
+                        }
+                        Ok(None) => break,
+                        Ok(Some(frame)) => frame.map_err(|error| format!("body error: {error}"))?,
+                    };
                     if let Some(data) = frame.data_ref() {
                         if ttfb_ms.is_none() {
                             ttfb_ms = Some(request_started.elapsed().as_secs_f64() * 1000.0);
                         }
-                        received.extend_from_slice(data);
+                        let Some(end) = done
+                            .checked_add(data.len())
+                            .filter(|end| *end <= expected.len())
+                        else {
+                            return Err(format!(
+                                "body mismatch: got more than {} expected bytes",
+                                expected.len()
+                            ));
+                        };
+                        if expected[done..end] != data[..] {
+                            return Err(format!(
+                                "body mismatch at byte {done}: expected {} bytes",
+                                expected.len()
+                            ));
+                        }
+                        done = end;
                     }
                 }
-                if received != expected {
+                if done != expected.len() {
                     return Err(format!(
-                        "body mismatch: got {} bytes, expected {}",
-                        received.len(),
+                        "body mismatch: got {done} bytes, expected {}",
                         expected.len()
                     ));
                 }
-                Ok((received.len(), ttfb_ms.unwrap_or(0.0)))
+                Ok((done, ttfb_ms.unwrap_or(0.0)))
             }
             .await;
             active.fetch_sub(1, Ordering::SeqCst);
@@ -364,12 +454,20 @@ async fn run() -> Result<()> {
         bytes,
         ttfb_ms,
         errors,
-    } = run_requests(&url, streams)
-        .await
-        .unwrap_or_else(|error| Verdict {
+    } = match timeout(OVERALL_TIMEOUT, run_requests(&url, streams)).await {
+        Ok(Ok(verdict)) => verdict,
+        Ok(Err(error)) => Verdict {
             errors: vec![format!("{error:#}")],
             ..Verdict::default()
-        });
+        },
+        Err(_) => Verdict {
+            errors: vec![format!(
+                "run exceeded the overall {}s bound; stages stalled",
+                OVERALL_TIMEOUT.as_secs()
+            )],
+            ..Verdict::default()
+        },
+    };
     let total_ms = started.elapsed().as_secs_f64() * 1000.0;
     let hash_ok = completed == streams && errors.is_empty();
     let ok = hash_ok;
@@ -401,5 +499,28 @@ async fn main() -> ExitCode {
             eprintln!("h2-client: {error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_budget_accepts_the_documented_run() {
+        // The harness runs 16 streams of 64 KiB: ~1 MiB total.
+        assert!(check_aggregate_budget(16, 65536).is_ok());
+    }
+
+    #[test]
+    fn aggregate_budget_rejects_streams_times_bytes_overflow() {
+        // 16 streams of 64 MiB would allocate ~1 GiB across tasks.
+        let error = check_aggregate_budget(16, 64 * 1024 * 1024).unwrap_err();
+        assert!(format!("{error:#}").contains("aggregate budget"));
+    }
+
+    #[test]
+    fn expected_len_rejects_over_max_body() {
+        assert!(expected_len("https://example.com/?bytes=67108865").is_err());
     }
 }

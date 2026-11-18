@@ -19,9 +19,10 @@ use std::{
     net::SocketAddr,
     process::ExitCode,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -32,10 +33,122 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::rustls;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
 const MARKER: &[u8] = b"beam-tun-h3-ok\n";
 const MAX_BODY: usize = 64 * 1024 * 1024;
+/// Aggregate cap on response bytes still owned by a response body or by the
+/// connection that is sending it (documented runs emit ~1 MiB; the
+/// per-request MAX_BODY stays).
+const MAX_INFLIGHT_BYTES: u64 = 512 * 1024 * 1024;
+/// Cap on concurrent request handlers; matches the H2 load client's own max.
+const MAX_CONCURRENT_REQUESTS: usize = 1024;
+/// Request-body drain byte cap (unchanged behavior, now named).
+const MAX_REQUEST_BODY_DRAIN: usize = 1024 * 1024;
+// Stage bounds: a stalled peer must fail a stage, never pin a worker.
+// The bulk cases move 8 MiB in up to ~85 s under loss, so the connection
+// bound stays generous while the per-chunk bounds stay tight.
+const H2_TLS_TIMEOUT: Duration = Duration::from_secs(10);
+const H2_MAX_CONNECTION: Duration = Duration::from_secs(300);
+const H3_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+const H3_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const H3_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const H3_IDLE_ACCEPT: Duration = Duration::from_secs(120);
+
+/// Bytes currently owned by response bodies and by HTTP/2 send queues.
+static INFLIGHT_BYTES: LazyLock<Arc<ByteBudget>> =
+    LazyLock::new(|| ByteBudget::new(MAX_INFLIGHT_BYTES));
+/// Bounds concurrent request-handler work across both listeners.
+static REQUEST_SEMAPHORE: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_REQUESTS));
+
+/// Aggregate byte budget for response bodies.
+struct ByteBudget {
+    limit: u64,
+    used: AtomicU64,
+}
+
+impl ByteBudget {
+    fn new(limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            used: AtomicU64::new(0),
+        })
+    }
+
+    /// Reserves `len` bytes of the budget, failing instead of allocating past
+    /// it.
+    fn try_reserve(self: &Arc<Self>, len: usize) -> Result<ByteReservation> {
+        let len = u64::try_from(len).context("response size overflows the counter")?;
+        let mut current = self.used.load(Ordering::Relaxed);
+        loop {
+            let next = current
+                .checked_add(len)
+                .context("inflight byte total overflows")?;
+            if next > self.limit {
+                bail!(
+                    "server busy: {next} inflight response bytes would exceed the {}-byte budget; retry with fewer concurrent requests or smaller ?bytes=",
+                    self.limit
+                );
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Ok(ByteReservation {
+                        budget: Arc::clone(self),
+                        bytes: len,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+/// Reservation against a byte budget; released on drop.
+struct ByteReservation {
+    budget: Arc<ByteBudget>,
+    bytes: u64,
+}
+
+impl Drop for ByteReservation {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// A response buffer that keeps its budget reservation until the last
+/// `Bytes` handle drops.
+///
+/// HTTP/2 can hold yielded `Bytes` in its send queue after the body wrapper is
+/// gone. The reservation therefore travels with the byte allocation, not with
+/// the `Full` body: dropping the body never releases memory the connection
+/// still owns.
+struct BudgetedBody {
+    data: Vec<u8>,
+    _reservation: ByteReservation,
+}
+
+impl AsRef<[u8]> for BudgetedBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+fn busy_response(message: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("content-type", "text/plain")
+        .header("content-length", message.len())
+        .body(Full::new(Bytes::from(message)))
+        .expect("static response is always valid")
+}
 
 /// Monotonic connection id shared by the HTTP/3 and HTTP/2 listeners.
 static CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
@@ -190,13 +303,26 @@ fn requested_body_len(uri: &http::Uri) -> Result<usize> {
     default_body_len()
 }
 
-fn marker_body(len: usize) -> Bytes {
+fn marker_bytes(len: usize) -> Vec<u8> {
     let mut body = Vec::with_capacity(len);
     while body.len() < len {
         body.extend_from_slice(MARKER);
     }
     body.truncate(len);
-    Bytes::from(body)
+    body
+}
+
+fn marker_body(len: usize) -> Bytes {
+    Bytes::from(marker_bytes(len))
+}
+
+/// Builds a response body whose budget reservation lives with its bytes.
+fn budgeted_marker_body(budget: &Arc<ByteBudget>, len: usize) -> Result<Bytes> {
+    let reservation = budget.try_reserve(len)?;
+    Ok(Bytes::from_owner(BudgetedBody {
+        data: marker_bytes(len),
+        _reservation: reservation,
+    }))
 }
 
 #[tokio::main]
@@ -265,10 +391,17 @@ async fn serve_h2(listener: tokio::net::TcpListener, config: Arc<rustls::ServerC
         };
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            let stream = match acceptor.accept(socket).await {
-                Ok(stream) => stream,
-                Err(error) => {
+            let stream = match timeout(H2_TLS_TIMEOUT, acceptor.accept(socket)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
                     eprintln!("h2-origin: TLS handshake from {peer} failed: {error}");
+                    return;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "h2-origin: TLS handshake from {peer} timed out after {}s; closing",
+                        H2_TLS_TIMEOUT.as_secs()
+                    );
                     return;
                 }
             };
@@ -279,11 +412,19 @@ async fn serve_h2(listener: tokio::net::TcpListener, config: Arc<rustls::ServerC
                     let state = state.clone();
                     async move { Ok::<_, Infallible>(handle_h2_request(state, request)) }
                 });
-            if let Err(error) = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
-                eprintln!("h2-origin: connection conn={connection_id} ended: {error}");
+            let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service);
+            match timeout(H2_MAX_CONNECTION, connection).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("h2-origin: connection conn={connection_id} ended: {error}");
+                }
+                Err(_) => {
+                    eprintln!(
+                        "h2-origin: connection conn={connection_id} exceeded the {}s servicing bound; closing",
+                        H2_MAX_CONNECTION.as_secs()
+                    );
+                }
             }
         });
     }
@@ -295,8 +436,27 @@ fn handle_h2_request(
 ) -> Response<Full<Bytes>> {
     let path = request.uri().path().to_string();
     let request_id = state.start(&path);
+    // Bound concurrent handler work and aggregate allocations before asking
+    // for memory: excess load gets 503, never an unbounded allocation.
+    let _permit = match REQUEST_SEMAPHORE.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let message = format!(
+                "server busy: too many concurrent requests (cap {MAX_CONCURRENT_REQUESTS})\n"
+            );
+            state.end(request_id, &path, 503, message.len());
+            return busy_response(message);
+        }
+    };
     let body = match requested_body_len(request.uri()) {
-        Ok(len) => marker_body(len),
+        Ok(len) => match budgeted_marker_body(&INFLIGHT_BYTES, len) {
+            Ok(body) => body,
+            Err(error) => {
+                let message = format!("server busy: {error:#}\n");
+                state.end(request_id, &path, 503, message.len());
+                return busy_response(message);
+            }
+        },
         Err(error) => {
             let text = format!("bad request: {error:#}\n");
             state.end(request_id, &path, 400, text.len());
@@ -325,8 +485,10 @@ async fn serve_h3_connection(connection: quinn::Connection, state: Arc<ConnState
     .context("could not start the HTTP/3 connection")?;
 
     loop {
-        match h3.accept().await {
-            Ok(Some(resolver)) => {
+        // An idle peer that never sends must not pin this worker: close the
+        // connection after the bound instead of awaiting a request forever.
+        match timeout(H3_IDLE_ACCEPT, h3.accept()).await {
+            Ok(Ok(Some(resolver))) => {
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(error) = serve_h3_request(resolver, state.clone()).await {
@@ -334,11 +496,19 @@ async fn serve_h3_connection(connection: quinn::Connection, state: Arc<ConnState
                     }
                 });
             }
-            Ok(None) => return Ok(()),
-            Err(error) => {
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(error)) => {
                 eprintln!(
                     "h3-origin: HTTP/3 connection conn={} ended: {error}",
                     state.id
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                eprintln!(
+                    "h3-origin: HTTP/3 connection conn={} idle for {}s with no request; closing",
+                    state.id,
+                    H3_IDLE_ACCEPT.as_secs()
                 );
                 return Ok(());
             }
@@ -350,13 +520,27 @@ async fn serve_h3_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
     state: Arc<ConnState>,
 ) -> Result<()> {
-    let (request, mut stream) = resolver
-        .resolve_request()
-        .await
-        .context("could not read the request headers")?;
+    let (request, mut stream) = match timeout(H3_RESOLVE_TIMEOUT, resolver.resolve_request()).await
+    {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(error)) => {
+            return Err(error).context("could not read the request headers");
+        }
+        Err(_) => {
+            bail!(
+                "request headers stalled: no request for {}s",
+                H3_RESOLVE_TIMEOUT.as_secs()
+            );
+        }
+    };
     let path = request.uri().path().to_string();
     let request_id = state.start(&path);
+    let _permit = REQUEST_SEMAPHORE.try_acquire().map_err(|_| {
+        anyhow::anyhow!("server busy: too many concurrent requests (cap {MAX_CONCURRENT_REQUESTS})")
+    })?;
     let len = requested_body_len(request.uri())?;
+    // Held across every send below, so live response bytes count exactly.
+    let _reservation = INFLIGHT_BYTES.try_reserve(len)?;
     let body = marker_body(len);
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -365,27 +549,54 @@ async fn serve_h3_request(
         .body(())
         .context("could not build the response")?;
 
-    stream
-        .send_response(response)
-        .await
-        .context("could not send the response headers")?;
+    match timeout(H3_SEND_TIMEOUT, stream.send_response(response)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return Err(error).context("could not send the response headers");
+        }
+        Err(_) => {
+            bail!(
+                "response headers stalled: no progress for {}s",
+                H3_SEND_TIMEOUT.as_secs()
+            );
+        }
+    }
     // Send bounded chunks so the h3 layer can apply QUIC stream flow control.
     // A single multi-megabyte `send_data` is not a valid large-body test: it
     // makes the origin reset the stream before the tunnel is exercised.
+    // Each chunk has its own bound, so slow-but-moving transfers survive
+    // while a stalled peer fails the send stage instead of pinning the worker.
     const CHUNK: usize = 1024;
     let mut offset = 0;
     while offset < body.len() {
         let end = (offset + CHUNK).min(body.len());
-        stream
-            .send_data(body.slice(offset..end))
-            .await
-            .context("could not send the response body")?;
+        match timeout(H3_SEND_TIMEOUT, stream.send_data(body.slice(offset..end))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(error).context("could not send the response body");
+            }
+            Err(_) => {
+                bail!(
+                    "response body stalled: no progress for {}s at byte {offset} of {}",
+                    H3_SEND_TIMEOUT.as_secs(),
+                    body.len()
+                );
+            }
+        }
         offset = end;
     }
-    stream
-        .finish()
-        .await
-        .context("could not finish the stream")?;
+    match timeout(H3_SEND_TIMEOUT, stream.finish()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return Err(error).context("could not finish the stream");
+        }
+        Err(_) => {
+            bail!(
+                "response finish stalled: no progress for {}s",
+                H3_SEND_TIMEOUT.as_secs()
+            );
+        }
+    }
     state.end(request_id, &path, 200, len);
     // The harness only sends bodyless GETs. Read the request receive half to
     // EOF before dropping it: an open receive half dropped without reading
@@ -393,26 +604,97 @@ async fn serve_h3_request(
     // server" even though the response arrived complete.
     let mut drained = 0usize;
     loop {
-        match stream.recv_data().await {
-            Ok(Some(chunk)) => {
+        // The byte cap alone does not bound time: each receive waits at most
+        // the drain bound, so a trickling peer cannot hold the worker.
+        match timeout(H3_DRAIN_TIMEOUT, stream.recv_data()).await {
+            Ok(Ok(Some(chunk))) => {
                 drained += Buf::remaining(&chunk);
-                if drained > 1024 * 1024 {
+                if drained > MAX_REQUEST_BODY_DRAIN {
                     eprintln!(
-                        "h3-origin: request body on conn={} exceeded 1 MiB; dropping the rest",
+                        "h3-origin: request body on conn={} exceeded {MAX_REQUEST_BODY_DRAIN} bytes; dropping the rest",
                         state.id
                     );
                     break;
                 }
             }
-            Ok(None) => break,
-            Err(error) => {
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
                 eprintln!(
                     "h3-origin: request body on conn={} ended: {error:#}",
                     state.id
                 );
                 break;
             }
+            Err(_) => {
+                eprintln!(
+                    "h3-origin: request body drain on conn={} stalled for {}s; dropping the rest",
+                    state.id,
+                    H3_DRAIN_TIMEOUT.as_secs()
+                );
+                break;
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[test]
+    fn byte_budget_rejects_past_the_cap_and_releases() {
+        let budget = ByteBudget::new(150);
+        let first = budget.try_reserve(100).expect("fits the budget");
+        assert!(budget.try_reserve(100).is_err());
+        drop(first);
+        assert!(budget.try_reserve(100).is_ok());
+    }
+
+    #[tokio::test]
+    async fn h2_body_keeps_the_budget_until_its_bytes_drop() {
+        let budget = ByteBudget::new(150);
+        let first = budgeted_marker_body(&budget, 100).expect("first body fits");
+        let second = budgeted_marker_body(&budget, 40).expect("second body fits");
+        assert!(budget.try_reserve(20).is_err(), "the budget is exhausted");
+
+        // A partially consumed response keeps the same allocation: slicing
+        // and dropping the original `Bytes` must not release the reservation.
+        let slice = first.slice(10..20);
+        drop(first);
+        assert!(
+            budget.try_reserve(20).is_err(),
+            "a retained slice still owns the body bytes"
+        );
+
+        // Hyper may hold a yielded data frame after the body wrapper is gone.
+        // The reservation must follow the `Bytes` in that frame.
+        let mut full = Full::new(second);
+        let frame = full.frame().await.expect("the body has one data frame");
+        drop(full);
+        assert!(
+            budget.try_reserve(20).is_err(),
+            "a queued HTTP/2 data frame still owns the body bytes"
+        );
+
+        drop(frame);
+        assert!(
+            budget.try_reserve(60).is_err(),
+            "the retained slice still owns its bytes"
+        );
+        drop(slice);
+        assert!(
+            budget.try_reserve(150).is_ok(),
+            "dropping the last byte owner releases the whole budget"
+        );
+    }
+
+    #[test]
+    fn requested_body_len_still_bounds_per_request() {
+        let uri: http::Uri = "https://example.com/?bytes=67108865".parse().expect("URI");
+        assert!(requested_body_len(&uri).is_err());
+        let uri: http::Uri = "https://example.com/?bytes=1024".parse().expect("URI");
+        assert_eq!(requested_body_len(&uri).expect("valid"), 1024);
+    }
 }
