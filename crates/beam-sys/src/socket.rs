@@ -13,14 +13,15 @@ pub fn set_tcp_nodelay(fd: RawFd) -> io::Result<()> {
 /// Enables TCP keepalive on `fd` with the given idle time and probe interval.
 ///
 /// Both durations are in whole seconds. Durations that do not fit in a
-/// `c_int` are rejected before any socket option is changed.
+/// `c_int` are rejected before any socket option is changed. Timing options
+/// are applied before activation, so an error leaves keepalive disabled.
 pub fn set_tcp_keepalive(fd: RawFd, idle: Duration, interval: Duration) -> io::Result<()> {
     let idle = duration_secs(idle, "keepalive idle")?;
     let interval = duration_secs(interval, "keepalive interval")?;
 
-    setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
     setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, idle)?;
-    setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, interval)
+    setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, interval)?;
+    setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)
 }
 
 /// Sets the TCP maximum segment size for `fd`.
@@ -152,8 +153,8 @@ fn setsockopt_int(
 #[cfg(test)]
 mod tests {
     use super::{
-        get_tcp_maxseg, set_reuse_addr, set_tcp_keepalive, set_tcp_maxseg, set_tcp_nodelay,
-        set_udp_recv_buffer,
+        get_tcp_maxseg, getsockopt_int, set_reuse_addr, set_tcp_keepalive, set_tcp_maxseg,
+        set_tcp_nodelay, set_udp_recv_buffer,
     };
     use std::io;
     use std::net::{TcpListener, TcpStream, UdpSocket};
@@ -221,6 +222,28 @@ mod tests {
     }
 
     #[test]
+    fn keepalive_stays_disabled_when_a_timing_option_is_rejected() {
+        // A UDP socket accepts SO_KEEPALIVE but rejects the TCP timing
+        // options, so the option order is observable without a faulty host.
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let error = set_tcp_keepalive(
+            socket.as_raw_fd(),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            error.raw_os_error().is_some(),
+            "a real socket error is reported"
+        );
+        assert_eq!(
+            getsockopt_int(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE).unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn keepalive_rejects_zero_duration() {
         let (client, _server) = loopback_pair();
 
@@ -231,6 +254,10 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            getsockopt_int(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -245,5 +272,9 @@ mod tests {
         let interval_error =
             set_tcp_keepalive(client.as_raw_fd(), Duration::from_secs(30), too_large).unwrap_err();
         assert_eq!(interval_error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            getsockopt_int(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE).unwrap(),
+            0
+        );
     }
 }

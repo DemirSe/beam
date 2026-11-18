@@ -1251,6 +1251,63 @@ mod tests {
     }
 
     #[test]
+    fn observations_from_the_other_direction_cannot_enable_direct() {
+        // The detector is shared by both directions of one connection, matching
+        // the stock per-connection `TrafficState`. A buffer seen on the upload
+        // path can mark TLS, but Direct still requires a parsed TLS 1.3
+        // ServerHello and a complete application-data write.
+        let mut writer = VisionWriterState::new();
+        let mut rng = seeded(21);
+        let app = app_data_record(b"payload");
+
+        let observation = writer.inspect(&app);
+        assert!(observation.application_data);
+        assert!(!writer.is_tls());
+        assert!(!writer.enable_xtls());
+
+        let plan = writer.plan_write(&[&app], true, &mut rng);
+        assert_eq!(plan.blocks.len(), 1);
+        assert_eq!(plan.blocks[0].command, Command::Continue);
+        assert!(!plan.switch_to_raw);
+        assert!(!plan.switch_to_direct);
+
+        // A ClientHello on the upload path marks TLS only. The first complete
+        // download application-data write then ends padding, never Direct.
+        let observation = writer.inspect(&[0x16, 0x03, 0x01, 0x00, 0x00, 0x01]);
+        assert!(observation.client_hello);
+        assert!(writer.is_tls());
+        assert!(!writer.enable_xtls());
+
+        let plan = writer.plan_write(&[&app], true, &mut rng);
+        assert_eq!(plan.blocks.len(), 1);
+        assert_eq!(plan.blocks[0].command, Command::End);
+        assert!(plan.switch_to_raw);
+        assert!(!plan.switch_to_direct);
+    }
+
+    #[test]
+    fn direct_requires_the_complete_record_flag() {
+        let mut writer = VisionWriterState::new();
+        let mut rng = seeded(22);
+        writer.inspect(&server_hello(0x1301, 32, true, 0));
+        assert!(writer.enable_xtls());
+
+        // An application-data lookalike at a write chunk boundary is not a
+        // complete record and must keep padding.
+        let app = app_data_record(&[0x5a_u8; 64]);
+        let plan = writer.plan_write(&[&app[..3]], false, &mut rng);
+        assert_eq!(plan.blocks.len(), 1);
+        assert_eq!(plan.blocks[0].command, Command::Continue);
+        assert!(!plan.switch_to_raw);
+        assert!(!plan.switch_to_direct);
+
+        let plan = writer.plan_write(&[&app], true, &mut rng);
+        assert_eq!(plan.blocks.len(), 1);
+        assert_eq!(plan.blocks[0].command, Command::Direct);
+        assert!(plan.switch_to_direct);
+    }
+
+    #[test]
     fn app_data_without_xtls_ends_padding_and_leaves_the_rest_raw() {
         let mut writer = VisionWriterState::new();
         let mut rng = seeded(13);

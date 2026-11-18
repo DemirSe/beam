@@ -24,6 +24,32 @@ fn check_reports_stdout_failure_without_panicking() {
 }
 
 #[test]
+fn generate_refuses_a_loose_regular_file_stdout() {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = std::env::temp_dir().join(format!("beam-generate-{}", std::process::id()));
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(&path)
+        .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args(["generate", "--host", "example.com", "--sni", "example.com"])
+        .stdout(file)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("umask 077"));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn version_does_not_build_a_runtime() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_beam"))
         .arg("--version")

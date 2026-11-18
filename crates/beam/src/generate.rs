@@ -2,13 +2,15 @@
 
 use std::io::Write as _;
 use std::net::IpAddr;
+use std::os::unix::fs::MetadataExt;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use beam_core::config::is_plausible_dns_name;
 use beam_core::identity::{
     ClientLink, RealityKeyPair, client_link, generate_short_id, generate_uuid,
 };
 use clap::Args;
+use zeroize::Zeroizing;
 
 /// Message used for every rejected `--host` value.
 const HOST_HINT: &str = "host must be a DNS name or an IP address; pass the TCP \
@@ -34,8 +36,27 @@ pub struct GenerateArgs {
     remark: String,
 }
 
+/// True when a regular-file stdout is readable by group or other users.
+fn loose_regular_stdout(is_regular_file: bool, mode: u32) -> bool {
+    is_regular_file && mode & 0o077 != 0
+}
+
+/// Refuses a loose regular-file stdout before the secret is rendered.
+fn check_stdout_mode() -> Result<()> {
+    let metadata = std::fs::metadata("/proc/self/fd/1")
+        .context("could not inspect stdout; use umask 077 and redirect to a mode 0600 file")?;
+    if loose_regular_stdout(metadata.file_type().is_file(), metadata.mode()) {
+        bail!(
+            "refusing to write a secret to stdout: the regular file has group or other \
+             permissions; use `(umask 077; beam generate ... > identity.txt)` so the file is 0600"
+        );
+    }
+    Ok(())
+}
+
 /// Generates the identity and writes it to standard output.
 pub fn run(args: &GenerateArgs) -> Result<()> {
+    check_stdout_mode()?;
     let keys = RealityKeyPair::generate()?;
     let user_id = generate_uuid()?;
     let short_id = generate_short_id()?;
@@ -60,9 +81,10 @@ pub fn run(args: &GenerateArgs) -> Result<()> {
     );
     // Propagate a closed or full stdout as an error instead of panicking.
     std::io::stdout().lock().write_all(rendered.as_bytes())?;
-    eprintln!(
-        "warning: this output contains the REALITY private key; set umask 077, \
-         keep the config mode 0600, and never commit or paste it"
+    // A closed or full stderr must not panic after the identity is emitted.
+    let _ = std::io::stderr().write_all(
+        b"warning: this output contains the REALITY private key; set umask 077, \
+          keep the config mode 0600, and never commit or paste it\n",
     );
     Ok(())
 }
@@ -118,8 +140,8 @@ fn render(
     short_id: &str,
     server_name: &str,
     link: &str,
-) -> String {
-    format!(
+) -> Zeroizing<String> {
+    Zeroizing::new(format!(
         "# Generated identity. Keep it secret and never commit it.\n\
          \n[user]\n\
          id = \"{user_id}\"\n\
@@ -130,12 +152,22 @@ fn render(
          server_names = [\"{server_name}\"]\n\
          \n# Xray-compatible client link, public key only:\n\
          {link}\n"
-    )
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loose_regular_stdout_checks_only_group_and_other_bits() {
+        assert!(loose_regular_stdout(true, 0o644));
+        assert!(loose_regular_stdout(true, 0o100_644));
+        assert!(!loose_regular_stdout(true, 0o600));
+        assert!(!loose_regular_stdout(true, 0o100_600));
+        assert!(!loose_regular_stdout(false, 0o010_644)); // pipe
+        assert!(!loose_regular_stdout(false, 0o020_666)); // terminal
+    }
 
     fn generate() -> (RealityKeyPair, String, String, String) {
         let keys = RealityKeyPair::generate().expect("keypair generation");

@@ -41,6 +41,12 @@ const REPLAY_CAPACITY_MAX: usize = 131_072;
 /// useful, and the permit or session slot it holds outlives the traffic.
 const MAX_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Upper bound for UDP bind, resolve, write, and shutdown waits.
+const MAX_UDP_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Floor that keeps the shortest valid idle timeout from truncating UDP I/O.
+const MIN_UDP_IO_TIMEOUT: Duration = Duration::from_secs(1);
+
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BEAM_GIT_HASH"), ")");
 
 /// Bounds the exact-replay cache for the configured connection pool.
@@ -70,6 +76,30 @@ fn legacy_udp_stream_limit(max_xudp_sessions: u32) -> usize {
 /// Caps the UDP idle clock without changing the TCP relay idle timeout.
 fn udp_idle_clock(idle_timeout_ms: u64) -> Duration {
     Duration::from_millis(idle_timeout_ms).min(MAX_UDP_IDLE_TIMEOUT)
+}
+
+/// Derives the UDP I/O deadline independently of the TLS handshake deadline.
+///
+/// 30 s is half the 60 s UDP idle cap, so a stalled I/O wait cannot outlive a
+/// usable flow; 1 s is the minimum valid configured idle timeout, so a short
+/// idle clock cannot truncate an ordinary UDP send or shutdown.
+fn udp_io_timeout(idle_timeout_ms: u64) -> Duration {
+    Duration::from_millis(idle_timeout_ms)
+        .min(MAX_UDP_IO_TIMEOUT)
+        .max(MIN_UDP_IO_TIMEOUT)
+}
+
+#[cfg(test)]
+mod udp_io_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn udp_io_timeout_is_bounded_for_small_and_large_idle_clocks() {
+        assert_eq!(udp_io_timeout(500), MIN_UDP_IO_TIMEOUT);
+        assert_eq!(udp_io_timeout(1_000), Duration::from_secs(1));
+        assert_eq!(udp_io_timeout(300_000), MAX_UDP_IO_TIMEOUT);
+        assert_eq!(udp_io_timeout(86_400_000), MAX_UDP_IO_TIMEOUT);
+    }
 }
 
 /// High-performance VLESS + REALITY + Vision server.
@@ -197,14 +227,23 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
     // Leave room in the blocking pool for cover relays, DNS resolution, and
     // destination dials. Vision directions above this cap use the async copy
     // path instead of queueing forever in `spawn_blocking`.
-    let max_splice_tasks = splice_capacity(max_blocking_threads);
-    let splice_permits = Arc::new(Semaphore::new(max_splice_tasks));
     let pipe_pages_soft = beam_sys::pipe_user_pages_soft().unwrap_or(16_384);
-    let relay_pipe_size = beam_core::relay::pipe_size_for_budget(
-        pipe_pages_soft,
-        max_splice_tasks,
-        beam_sys::page_size(),
-    );
+    let page_size = beam_sys::page_size();
+    let requested_splice_tasks = splice_capacity(max_blocking_threads);
+    let supported_splice_tasks =
+        beam_core::relay::RelayConfig::supported_splice_tasks(pipe_pages_soft, page_size);
+    let max_splice_tasks = requested_splice_tasks.min(supported_splice_tasks);
+    if max_splice_tasks < requested_splice_tasks {
+        tracing::warn!(
+            soft_pages = pipe_pages_soft,
+            tasks_requested = requested_splice_tasks,
+            tasks_used = max_splice_tasks,
+            "splice task count clamped by pipe budget"
+        );
+    }
+    let splice_permits = Arc::new(Semaphore::new(max_splice_tasks));
+    let relay_pipe_size =
+        beam_core::relay::pipe_size_for_budget(pipe_pages_soft, max_splice_tasks, page_size);
     tracing::info!(
         soft_pages = pipe_pages_soft,
         splice_tasks = max_splice_tasks,
@@ -579,13 +618,15 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
     };
     let user_id = *config.user.id.as_bytes();
 
+    let udp_io = udp_io_timeout(config.limits.idle_timeout_ms);
+    tracing::info!(udp_io_timeout = ?udp_io, "independent UDP I/O deadline");
     let max_sessions = usize::try_from(config.limits.max_udp_destinations)
         .unwrap_or(usize::MAX)
         .clamp(1, usize::from(u16::MAX) + 1);
     let xudp = XudpConfig {
         max_sessions,
         session_idle_timeout: udp_idle_clock(config.limits.idle_timeout_ms),
-        io_timeout: Duration::from_millis(config.limits.handshake_timeout_ms),
+        io_timeout: udp_io,
         // A single HTTP/3 body can arrive as hundreds of UDP datagrams while
         // the outer TCP stream drains. Keep a larger bounded reply queue so a
         // short client-side pause does not turn into QUIC packet loss.
@@ -601,7 +642,7 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         .unwrap_or(usize::MAX)
         .clamp(1, 65_536);
     let udp = LegacyUdpConfig {
-        io_timeout: Duration::from_millis(config.limits.handshake_timeout_ms),
+        io_timeout: udp_io,
         // Same reasoning as XUDP: a retained idle flow must release its stream
         // permit long before the 300 s TCP idle timeout.
         idle_timeout: udp_idle_clock(config.limits.idle_timeout_ms),

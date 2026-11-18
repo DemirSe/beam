@@ -76,8 +76,10 @@ binds a socket. The important keys are:
 
 `handshake_timeout_ms` must be at least 100 and `idle_timeout_ms` at least
 1000; both are capped at 24 hours. `max_xudp_sessions` also sizes the legacy
-UDP stream pool and the XUDP kernel buffer budget. Keep it at 200 or more when
-a legacy or packetaddr client bursts short UDP flows.
+UDP stream pool and the XUDP kernel buffer budget. The derived packetaddr
+budget also limits `max_udp_destinations * max_xudp_sessions` to 4,194,304
+entries (512 MiB at an estimated 128 bytes per table entry). Keep it at 200 or
+more when a legacy or packetaddr client bursts short UDP flows.
 
 Generate a new identity under a restrictive umask, then put the server fragment
 into a copy of the example config:
@@ -91,6 +93,9 @@ target/release/beam --check -c config.toml
 
 The umask applies only to the subshell, so later build and test commands keep
 their normal modes. Both files hold secrets and are git-ignored.
+`beam generate` refuses to emit when standard output is a regular file that
+group or other users can read, so a forgotten umask fails instead of writing a
+0644 identity file.
 
 Replace every placeholder. Keep secrets out of git. Use mode `0600` locally
 and root:beam `0640` on the service host. See
@@ -232,7 +237,12 @@ Actions artifact.
 
 The TLS path pre-reads and authenticates ClientHello, then uses rustls through
 a record-bounded `TlsStream` that owns the TLS record boundary. TCP uses a
-blocking `splice(2)` fast path with a bounded async-copy fallback. XUDP uses
+blocking `splice(2)` fast path with a bounded async-copy fallback. Startup
+clamps splice concurrency to the pipe-page soft budget at the 4 KiB minimum
+pipe size and logs soft pages, requested tasks, and used tasks; a soft limit of
+zero means unlimited, and a soft limit that leaves no capacity above the
+1024-page reserve sets a zero-task limiter so every direction uses the async
+copy fallback. XUDP uses
 one outbound UDP socket per session, a per-mux session table, and a
 process-wide session limiter.
 
@@ -303,12 +313,18 @@ VLESS with `xtls-rprx-vision` is expected to work.
   its TCP half-close semantics, so an idle direction cannot cut a
   download-only Vision stream. Bounding unauthenticated retention keeps the
   cover cap from being pinned by disconnected probes.
+- A cover relay is also cut at a fixed 120 s maximum lifetime
+  (`COVER_MAX_LIFETIME`), because the idle timeout never fires while a probe
+  keeps both directions busy. Cutting an active relay bounds unauthenticated
+  admission retention; no config key controls it.
 
 ### VLESS and Vision
 
 - VLESS request: version, 16-byte UUID, addons, command, optional port and
   target address. Commands: TCP, UDP, Mux, Rvs. The response is always
-  `00 00`; unknown or malformed commands are rejected.
+  `00 00`; unknown or malformed commands are rejected. Rvs is recognised but
+  not served: the server writes `00 00` and closes, because reverse streams
+  are server-side in stock Xray and stay out of scope here.
 - Vision first block per direction carries the raw 16-byte UUID. Blocks carry
   command, content length, padding length, content, and zero padding. Padding
   follows the stock long/short rules, is clamped to the frame bound, and is
@@ -336,7 +352,11 @@ VLESS with `xtls-rprx-vision` is expected to work.
   Replies are Keep with Data, plus End on closure (Error only when relay
   failed). The empty-mux timer pauses while an accepted DNS lookup is pending.
   Only requests accepted by the UDP socket or send queue refresh session idle
-  time. Removing a live session owns its terminal report, including a reply
+  time. A transient send error (`WouldBlock`, `TimedOut`, `Interrupted`) or the
+  100 ms send deadline drops only that datagram and never closes the session; a
+  datagram that fails the immediate send is retried once through the bounded
+  send queue, and other send errors close the session with an error End.
+  Removing a live session owns its terminal report, including a reply
   failure already observed when it closes. An unknown stream ID gets a clean
   End and is discarded.
 - Accept zero GlobalID and per-frame destinations from sing-box. A nonzero
@@ -349,6 +369,12 @@ VLESS with `xtls-rprx-vision` is expected to work.
   after its first successful send. A 100 ms send timeout or a transient send error
   (`WouldBlock`, `TimedOut`, `Interrupted`) on the fixed-destination legacy
   path drops only that datagram; other send errors close the association.
+  A transient receive error (`WouldBlock`, `TimedOut`, `Interrupted`) retries
+  after a 1 ms backoff while the idle deadline still bounds the session; other
+  receive errors close the association. A packetaddr reply is admitted only when
+  `2 + source header (7 bytes for IPv4, 19 for IPv6) + payload` fits the
+  datagram cap; a v4-mapped source uses the 7-byte header, and a larger reply is
+  dropped without refreshing idle time.
 - Session sockets remain unconnected and accept replies from arbitrary UDP
   sources. This preserves stock XUDP/full-cone behavior (STUN, WebRTC, P2P).
   Only a valid, non-empty reply that passes size/frame/queue/byte-budget checks
@@ -367,9 +393,27 @@ VLESS with `xtls-rprx-vision` is expected to work.
   most four concurrent lookups; the resolver permit is held until the result
   is queued, so a full result channel backpressures the request queue instead
   of spawning unbounded tasks. Pending payload has a process-wide 4 MiB budget
-  plus bounded metadata, and UDP send/close waits are capped at 100 ms. This is
-  not universally nonblocking: a sequence of slow domains, a congested send,
-  or many close operations can still delay a mux briefly.
+  plus bounded metadata, and UDP send/close waits are capped at 100 ms. The
+  cache key is the domain, port, and requested address family, so a
+  family-constrained lookup never answers an unconstrained one. Only a later
+  `New` that would itself be accepted (UDP target, usable destination, payload
+  within the datagram cap) supersedes the pending `New` of the previous
+  attachment: a rejected `New` cannot cancel an accepted lookup. The
+  superseded result is dropped without creating or ending a session, and so
+  are the frames the old attachment queued before that `New` while no session
+  owns the id: they would otherwise answer with an `End` that the peer applies
+  to the replacement created next. A live session keeps those frames and its
+  own terminal `End`. If several acceptable replacements are already queued,
+  only the last is opened; intermediate attachments and their queued frames
+  are dropped without an `End`. Frames after the final replacement run in
+  arrival order, and a frame rejected by a full resolver queue gets an `End`
+  only when no session owns its stream id. A non-UDP or destination-less `New` likewise
+  cannot end an existing session: it is dropped while that session is live.
+  A `New` for an id whose live session carries a different GlobalID is also
+  dropped without an `End`, so that session keeps the id until its own close
+  path ends it. This is not universally nonblocking: a sequence of slow
+  domains, a congested send, or many close operations can still delay a mux
+  briefly.
 - Reply bytes are bounded by a 2 MiB per-mux budget inside the 32 MiB
   process-wide budget; one slow reader cannot hold the whole global allowance.
 - An empty mux closes after `session_idle_timeout` even while KeepAlive frames
@@ -379,6 +423,11 @@ VLESS with `xtls-rprx-vision` is expected to work.
   `limits.xudp_recv_buffer_bytes` (example defaults: 256 sessions and 128 KiB
   per socket). A mux holds at most half the global active slots. XUDP idle
   expiry is at most 60 seconds even when `idle_timeout_ms` is 300 seconds.
+- A GlobalID socket keeps one global session slot through retention and
+  reattachment. The slot is shared with any queued work that still owns the
+  session, so evicting or expiring the retained entry cannot release a permit
+  while an old datagram still owns the socket, and a reattach cannot count the
+  same socket twice.
 - Legacy/packetaddr UDP holds one stream permit per VLESS `Command::Udp`
   connection, and the pool equals `max_xudp_sessions` (256 with the example
   config); a stream owns one relay socket, or up to two in packetaddr mode when
@@ -393,6 +442,10 @@ VLESS with `xtls-rprx-vision` is expected to work.
   this pool and, at the cap, refused as `TlsServerError::LegacyUdpLimited` and
   counted in `legacy_udp_limited`. `max_xudp_sessions` also sizes the XUDP
   kernel buffer budget, so lowering it to save memory lowers this pool as well.
+- UDP bind, resolve, stream-write, and shutdown waits use their own deadline,
+  `min(idle_timeout_ms, 30 s)` with a 1 s floor, instead of the TLS
+  `handshake_timeout_ms`. Retuning the handshake deadline therefore does not
+  change how long UDP work can retain capacity.
 
 ### TLS stack, cover, and MTU
 
@@ -408,6 +461,20 @@ VLESS with `xtls-rprx-vision` is expected to work.
 - Set `TCP_MAXSEG=1400` before connecting every target and cover socket. This
   creates an effective advertised MSS around 1388 and avoids 1460-byte PMTU
   black holes on some paths. Host TCP traffic is not clamped.
+- Destination and cover dials share a process-wide 32-job DNS admission
+  limit. Address literals are dialed without a lookup, so an exhausted
+  resolver budget never delays an IP target. A blocking `getaddrinfo` job
+  keeps its permit after the caller's dial deadline, so a resolver outage
+  cannot grow the blocking pool past that bound.
+- Relay idleness is a property of the whole connection, in both the
+  authenticated and the cover relay: a direction with nothing to read, or a
+  sink that stops accepting bytes, is retried while the opposite direction
+  keeps the shared activity clock recent, and the relay ends once the whole
+  connection has been idle for `idle_timeout`. A blocked write retries the same
+  offset, so a slow sink cannot lose bytes, and it cannot spin: every write is
+  bounded and a zero-length write ends the direction. The one-way splice relay
+  shares that clock, so a stalled splice sink is kept alive and cut by the same
+  rule.
 - Keep `net.ipv4.tcp_mtu_probing=0` unless a measured PMTU failure justifies a
   change. Client TUN profiles use MTU 1500; lowering that MTU loses some
   HTTP/3 paths and stalls large H3 bodies in gVisor.

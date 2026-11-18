@@ -71,7 +71,8 @@ const LENGTH_PREFIX_LEN: usize = 2;
 /// One stream read.
 const READ_CHUNK_LEN: usize = 8192;
 
-/// Largest packetaddr inner address: `ATYP | IPv6 | port`.
+/// Packetaddr inner address header sizes: `ATYP | address | port`.
+const PACKETADDR_V4_HEADER_LEN: usize = 1 + 4 + 2;
 const MAX_PACKETADDR_HEADER_LEN: usize = 1 + 16 + 2;
 
 const PACKETADDR_ATYP_IPV4: u8 = 1;
@@ -94,6 +95,9 @@ pub const DEFAULT_MAX_PACKETADDR_DESTINATIONS: usize = 1024;
 /// dropped; this matches the bounded XUDP send wait.
 const MAX_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Backoff after a transient receive error; the idle deadline still bounds retries.
+const RECV_RETRY_BACKOFF: Duration = Duration::from_millis(1);
+
 /// Send failures that affect one datagram, not the association.
 ///
 /// A full socket buffer (`WouldBlock`), the local send deadline, or a signal
@@ -104,6 +108,23 @@ fn is_transient_send_error(error: &io::Error) -> bool {
         error.kind(),
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
     )
+}
+
+/// Receive failures that affect one read, not the association.
+///
+/// A transient read error must not close an otherwise healthy session. Other
+/// errors mean the stream or socket state is no longer trustworthy.
+fn is_transient_recv_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
+/// Pause briefly before retrying so repeated transient errors cannot spin.
+async fn backoff_after_transient_recv(error: &io::Error) {
+    tracing::trace!(%error, "transient UDP receive error; retrying");
+    sleep(RECV_RETRY_BACKOFF).await;
 }
 
 /// A stream write is bounded independently from DNS/bind setup. A slow client
@@ -360,12 +381,20 @@ where
                             break Err(error);
                         }
                     }
+                    Err(error) if is_transient_recv_error(&error) => {
+                        backoff_after_transient_recv(&error).await;
+                        continue 'session;
+                    }
                     Err(error) => break Err(UdpError::Io(error)),
                 }
             }
             received = socket.recv_from(&mut incoming) => {
                 let (length, _source) = match received {
                     Ok(value) => value,
+                    Err(error) if is_transient_recv_error(&error) => {
+                        backoff_after_transient_recv(&error).await;
+                        continue 'session;
+                    }
                     Err(error) => break Err(UdpError::Io(error)),
                 };
                 if length == 0 || length > payload_limit {
@@ -512,18 +541,27 @@ where
                             break Err(error);
                         }
                     }
+                    Err(error) if is_transient_recv_error(&error) => {
+                        backoff_after_transient_recv(&error).await;
+                        continue;
+                    }
                     Err(error) => break Err(UdpError::Io(error)),
                 }
             }
             received = recv_optional(v4.as_ref(), &mut v4_incoming) => {
                 let (length, source) = match received {
                     Ok(value) => value,
+                    Err(error) if is_transient_recv_error(&error) => {
+                        backoff_after_transient_recv(&error).await;
+                        continue;
+                    }
                     Err(error) => break Err(UdpError::Io(error)),
                 };
-                if length == 0 || length > payload_limit {
+                let reply_limit = packetaddr_reply_limit(config.max_datagram_size, source);
+                if length == 0 || length > reply_limit {
                     tracing::trace!(
                         length,
-                        limit = payload_limit,
+                        limit = reply_limit,
                         "packetaddr reply dropped by the datagram limit"
                     );
                     continue;
@@ -545,12 +583,17 @@ where
             received = recv_optional(v6.as_ref(), &mut v6_incoming) => {
                 let (length, source) = match received {
                     Ok(value) => value,
+                    Err(error) if is_transient_recv_error(&error) => {
+                        backoff_after_transient_recv(&error).await;
+                        continue;
+                    }
                     Err(error) => break Err(UdpError::Io(error)),
                 };
-                if length == 0 || length > payload_limit {
+                let reply_limit = packetaddr_reply_limit(config.max_datagram_size, source);
+                if length == 0 || length > reply_limit {
                     tracing::trace!(
                         length,
-                        limit = payload_limit,
+                        limit = reply_limit,
                         "packetaddr reply dropped by the datagram limit"
                     );
                     continue;
@@ -617,14 +660,20 @@ async fn resolve_fixed(
         Address::Ipv4(address) => Ok(SocketAddr::from((*address, destination.port))),
         Address::Ipv6(address) => Ok(SocketAddr::from((*address, destination.port))),
         Address::Domain(domain) => {
-            let addresses = timeout(
-                io_timeout,
-                tokio::net::lookup_host((domain.as_str(), destination.port)),
+            // The shared lookup keeps its admission permit until the blocking
+            // resolver job finishes, even when this deadline elapses first.
+            let addresses = crate::dns::lookup_host_until(
+                domain.as_str(),
+                destination.port,
+                Instant::now() + io_timeout,
             )
             .await
-            .map_err(|_| UdpError::Timeout {
-                stage: "destination resolution",
-            })??;
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::TimedOut => UdpError::Timeout {
+                    stage: "destination resolution",
+                },
+                _ => UdpError::Io(error),
+            })?;
 
             let mut fallback = None;
             for address in addresses {
@@ -800,7 +849,7 @@ fn malformed_packetaddr(reason: &'static str) -> UdpError {
 
 fn packetaddr_header_len(address: SocketAddr) -> usize {
     match address {
-        SocketAddr::V4(_) => 1 + 4 + 2,
+        SocketAddr::V4(_) => PACKETADDR_V4_HEADER_LEN,
         SocketAddr::V6(_) => MAX_PACKETADDR_HEADER_LEN,
     }
 }
@@ -834,6 +883,15 @@ fn normalize_address(address: SocketAddr) -> SocketAddr {
 /// Returns the largest payload the stream codec accepts for this config.
 fn framed_payload_limit(configured: usize) -> usize {
     configured.min(MAX_FRAMED_DATAGRAM_SIZE)
+}
+
+/// Largest reply payload that the actual source family can encode.
+///
+/// This matches [`encode_packetaddr_reply`], which stamps the normalized
+/// source header before framing the payload.
+fn packetaddr_reply_limit(configured: usize, source: SocketAddr) -> usize {
+    framed_payload_limit(configured)
+        .saturating_sub(packetaddr_header_len(normalize_address(source)))
 }
 
 fn send_timeout(io_timeout: Duration) -> Duration {
@@ -1015,14 +1073,17 @@ impl FrameDecoder {
 mod tests {
     use super::{
         FrameDecoder, LegacyUdpConfig, LegacyUdpConfigError, MAX_DATAGRAM_SIZE,
-        PACKETADDR_MAGIC_DOMAIN, UdpError, handle_packetaddr_bound, handle_udp_stream,
-        parse_packetaddr,
+        MAX_FRAMED_DATAGRAM_SIZE, MAX_PACKETADDR_HEADER_LEN, PACKETADDR_MAGIC_DOMAIN, UdpError,
+        handle_packetaddr_bound, handle_udp_stream, parse_packetaddr,
     };
     use crate::address::{Address, NetLocation};
     use proptest::prelude::*;
+    use std::io::{self, ErrorKind};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
     use tokio::net::UdpSocket;
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
@@ -1044,6 +1105,180 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
         ] {
             assert!(!super::is_transient_send_error(&std::io::Error::from(kind)));
+        }
+    }
+
+    #[test]
+    fn transient_udp_recv_errors_are_classified() {
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(super::is_transient_recv_error(&io::Error::from(kind)));
+        }
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::InvalidData,
+            ErrorKind::PermissionDenied,
+        ] {
+            assert!(!super::is_transient_recv_error(&io::Error::from(kind)));
+        }
+    }
+
+    struct InjectedReadError<S> {
+        inner: S,
+        remaining: usize,
+        kind: ErrorKind,
+    }
+
+    impl<S> InjectedReadError<S> {
+        fn new(inner: S, kind: ErrorKind) -> Self {
+            Self {
+                inner,
+                remaining: 1,
+                kind,
+            }
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for InjectedReadError<S> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.remaining > 0 {
+                this.remaining -= 1;
+                return Poll::Ready(Err(io::Error::from(this.kind)));
+            }
+            Pin::new(&mut this.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for InjectedReadError<S> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_stream_read_errors_do_not_close_fixed_session() {
+        let echo = spawn_ipv4_echo().await;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server = InjectedReadError::new(server, ErrorKind::Interrupted);
+        let task = tokio::spawn(async move {
+            handle_udp_stream(
+                server,
+                net_location(echo.address),
+                &test_config(MAX_DATAGRAM_SIZE),
+            )
+            .await
+        });
+
+        let mut client = client;
+        write_frame(&mut client, b"ping").await;
+        assert_eq!(read_frame(&mut client).await, b"ping");
+        finish_clean(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn transient_stream_read_errors_do_not_close_packetaddr_session() {
+        let echo = spawn_ipv4_echo().await;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server = InjectedReadError::new(server, ErrorKind::WouldBlock);
+        let task = tokio::spawn(async move {
+            handle_udp_stream(
+                server,
+                packetaddr_destination(),
+                &test_config(MAX_DATAGRAM_SIZE),
+            )
+            .await
+        });
+
+        let mut client = client;
+        write_frame(&mut client, &packetaddr_datagram(echo.address, b"ping")).await;
+        let reply = read_frame(&mut client).await;
+        let (source, payload) = parse_packetaddr_reply(&reply);
+        assert_eq!(source, echo.address);
+        assert_eq!(payload, b"ping");
+        finish_clean(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn fatal_stream_read_error_closes_fixed_session() {
+        let echo = spawn_ipv4_echo().await;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server = InjectedReadError::new(server, ErrorKind::ConnectionReset);
+        let task = tokio::spawn(async move {
+            handle_udp_stream(
+                server,
+                net_location(echo.address),
+                &test_config(MAX_DATAGRAM_SIZE),
+            )
+            .await
+        });
+
+        let error = finish_with_error(client, task).await;
+        assert!(
+            matches!(error, UdpError::Io(ref source) if source.kind() == ErrorKind::ConnectionReset),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn packetaddr_reply_limits_match_encoded_boundaries() {
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 9));
+        let mapped = SocketAddr::V6(std::net::SocketAddrV6::new(
+            Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1),
+            9,
+            0,
+            0,
+        ));
+        let v4_limit = MAX_FRAMED_DATAGRAM_SIZE - super::PACKETADDR_V4_HEADER_LEN;
+        let v6_limit = MAX_FRAMED_DATAGRAM_SIZE - MAX_PACKETADDR_HEADER_LEN;
+        assert_eq!(
+            super::packetaddr_reply_limit(MAX_DATAGRAM_SIZE, v4),
+            v4_limit
+        );
+        assert_eq!(
+            super::packetaddr_reply_limit(MAX_DATAGRAM_SIZE, v6),
+            v6_limit
+        );
+        assert_eq!(
+            super::packetaddr_reply_limit(MAX_DATAGRAM_SIZE, mapped),
+            v4_limit
+        );
+        assert_eq!(super::packetaddr_reply_limit(32, v4), 25);
+
+        let mut out = Vec::new();
+        for (source, limit) in [(v4, v4_limit), (v6, v6_limit)] {
+            assert!(super::encode_packetaddr_reply(
+                source,
+                &vec![0x5a; limit],
+                &mut out
+            ));
+            assert_eq!(out.len(), MAX_DATAGRAM_SIZE);
+            assert!(!super::encode_packetaddr_reply(
+                source,
+                &vec![0x5a; limit + 1],
+                &mut out
+            ));
         }
     }
 
@@ -1376,8 +1611,7 @@ mod tests {
             let oversize = vec![0xaa; MAX_DATAGRAM_SIZE - 8];
             loop {
                 // The packetaddr source header pushes this reply over the
-                // 8192-byte output bound even though the raw payload passes
-                // the socket receive limit.
+                // 8192-byte output bound, beyond the family receive limit.
                 let _ = responder.send_to(&oversize, peer).await;
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -1724,6 +1958,54 @@ mod tests {
                 max: 32
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn packetaddr_v4_accepts_only_the_encodable_reply_size() {
+        let responder = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("responder socket");
+        let address = responder.local_addr().expect("responder address");
+        let limit = super::packetaddr_reply_limit(MAX_DATAGRAM_SIZE, address);
+        let responder_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 64];
+            for (request, reply_size) in
+                [(b"one".as_slice(), limit), (b"two".as_slice(), limit + 1)]
+            {
+                let (length, peer) = responder
+                    .recv_from(&mut buffer)
+                    .await
+                    .expect("request receive");
+                assert_eq!(&buffer[..length], request);
+                responder
+                    .send_to(&vec![0xaa; reply_size], peer)
+                    .await
+                    .expect("reply send");
+            }
+            let (length, peer) = responder
+                .recv_from(&mut buffer)
+                .await
+                .expect("final request receive");
+            assert_eq!(&buffer[..length], b"three");
+            responder.send_to(b"after", peer).await.expect("final send");
+        });
+
+        let (mut client, task) = start(packetaddr_destination(), test_config(MAX_DATAGRAM_SIZE));
+        write_frame(&mut client, &packetaddr_datagram(address, b"one")).await;
+        let reply = read_frame(&mut client).await;
+        assert_eq!(reply.len(), MAX_FRAMED_DATAGRAM_SIZE);
+        let (source, payload) = parse_packetaddr_reply(&reply);
+        assert_eq!(source, address);
+        assert_eq!(payload.len(), limit);
+
+        write_frame(&mut client, &packetaddr_datagram(address, b"two")).await;
+        write_frame(&mut client, &packetaddr_datagram(address, b"three")).await;
+        let reply = read_frame(&mut client).await;
+        let (_, payload) = parse_packetaddr_reply(&reply);
+        assert_eq!(payload, b"after");
+
+        responder_task.await.expect("responder task");
+        finish_clean(client, task).await;
     }
 
     #[tokio::test]

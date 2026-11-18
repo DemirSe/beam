@@ -9,6 +9,29 @@ use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+/// Maximum number of nonblocking writes in one [`EventFd::notify`] call.
+///
+/// The relay's cancellation poll is capped at 250 ms, so a few EINTR retries
+/// are enough. After the bound, `Interrupted` is returned and that cap still
+/// bounds a missed wakeup.
+const MAX_NOTIFY_ATTEMPTS: usize = 4;
+
+/// Repeats a nonblocking write while it reports interruption.
+///
+/// `Ok(true)` means the wakeup succeeded: the counter was incremented or was
+/// already readable. `Ok(false)` means the write was interrupted.
+fn notify_with_attempts(mut attempt: impl FnMut() -> io::Result<bool>) -> io::Result<()> {
+    for _ in 0..MAX_NOTIFY_ATTEMPTS {
+        if attempt()? {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "eventfd write was interrupted too often",
+    ))
+}
+
 /// An owned, close-on-exec, nonblocking eventfd descriptor.
 pub struct EventFd {
     fd: OwnedFd,
@@ -35,10 +58,12 @@ impl EventFd {
     ///
     /// A counter overflow (`EAGAIN`) means the descriptor is already readable,
     /// so the wakeup goal is satisfied and the error is treated as success.
+    /// Interrupted writes are retried up to four times; further interruption
+    /// is returned as [`io::ErrorKind::Interrupted`].
     pub fn notify(&self) -> io::Result<()> {
         let value = 1_u64;
         let length = std::mem::size_of::<u64>();
-        loop {
+        notify_with_attempts(|| {
             // SAFETY: `value` is a live `u64` and `length` is exactly its size.
             // `write` reads at most that many bytes and does not retain the
             // pointer. The descriptor is owned by `self` and remains open for
@@ -51,28 +76,27 @@ impl EventFd {
                 )
             };
             if written == length as isize {
-                return Ok(());
+                return Ok(true);
             }
             if written < 0 {
                 let error = io::Error::last_os_error();
                 // A signal may interrupt the write before the counter is
-                // incremented. Retrying is nonblocking and keeps a stop from
-                // falling back to the full idle timeout.
+                // incremented. The retry helper bounds these attempts.
                 if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
+                    return Ok(false);
                 }
                 // Counter overflow means the descriptor is already readable,
                 // so the wakeup goal is satisfied.
                 if error.kind() == io::ErrorKind::WouldBlock {
-                    return Ok(());
+                    return Ok(true);
                 }
                 return Err(error);
             }
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::WriteZero,
                 "eventfd write wrote a partial value",
-            ));
-        }
+            ))
+        })
     }
 }
 
@@ -93,8 +117,9 @@ impl fmt::Debug for EventFd {
 
 #[cfg(test)]
 mod tests {
-    use super::EventFd;
+    use super::{EventFd, MAX_NOTIFY_ATTEMPTS, notify_with_attempts};
     use crate::poll::{PollEvents, PollFd, poll};
+    use std::io;
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
 
@@ -112,6 +137,39 @@ mod tests {
         // stop without consuming the counter.
         let mut second = [PollFd::new(event.as_raw_fd(), PollEvents::READ)];
         assert_eq!(poll(&mut second, Some(Duration::ZERO)).unwrap(), 1);
+    }
+
+    #[test]
+    fn notify_retries_interrupted_writes() {
+        let mut attempts = 0;
+
+        notify_with_attempts(|| {
+            attempts += 1;
+            Ok(attempts == 2)
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn notify_returns_after_bounded_interrupted_writes() {
+        let mut attempts = 0;
+
+        let error = notify_with_attempts(|| {
+            attempts += 1;
+            Ok(false)
+        })
+        .unwrap_err();
+        assert_eq!(attempts, MAX_NOTIFY_ATTEMPTS);
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn notify_reports_terminal_errors() {
+        let error =
+            notify_with_attempts(|| Err(io::Error::from(io::ErrorKind::BrokenPipe))).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]

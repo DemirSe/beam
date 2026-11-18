@@ -528,8 +528,11 @@ ShutdownSent → Done, where `is_done() = read_done && in_pipe == 0 &&
 shutdown_sent` (`relay/splice_copy.rs:272-274`); `maybe_shutdown` sends
 `shutdown(SHUT_WR)` exactly once (`826-832`). `read_ready`, `batch_enabled`,
 `rate_at`, `rate_bytes` drive the poll mask and adaptive batching.
-`RelayActivity` is Running → Stopped; `stop_fd` wakes blocked pollers with a
-250 ms fallback poll when eventfd creation failed (`440-560`).
+`RelayActivity` is Running → Stopped; `stop_fd` wakes blocked pollers, and
+every poll of a shared clock is capped at 250 ms, so a wakeup that the bounded
+eventfd retries gave up on still ends a blocked worker within that bound
+(`440-560`). The cap costs four wakeups per second while a direction is
+blocked; a hosted benchmark comparison of this relay path is pending.
 
 **Why implicit.** Flags plus one derived predicate; the idle/shutdown timeout
 decision depends on `shutdown_started` and `direction.read_done` together.
@@ -542,7 +545,8 @@ The comment now states that, instead of describing only the success path.
 
 **Tests.** `copies_large_payload_in_both_directions` (941),
 `one_way_copies_and_half_closes` (985),
-`a_stopped_relay_does_not_poll_periodically` (1056),
+`an_idle_relay_polls_within_the_stop_bound` (1056),
+`a_failed_wakeup_still_bounds_a_blocked_relay`,
 `half_close_keeps_the_other_direction_alive` (1153),
 `idle_timeout_returns_timed_out` (1245),
 `shutdown_timeout_bounds_a_half_closed_idle_connection` (1269).
@@ -614,9 +618,11 @@ phase gauge or empty-timer gauge.
 Closed. `closed` (first-close claim), `failed` (relay error), `stop` (task
 stop), table membership, and permit ownership all participate.
 
-**Transitions.** `New` create/reattach (`handle_new`, `1158`); `Keep` may append
-a non-empty Data datagram and update its destination after address/family
-validation. Empty and non-Data Keeps do not retarget the session or refresh
+**Transitions.** `New` create/reattach (`handle_new`, `1158`); a `New` for an
+id whose live session carries a different GlobalID is dropped without an
+`End`, so the live session keeps the id until its own close path ends it.
+`Keep` may append a non-empty Data datagram and update its destination after
+address/family validation. Empty and non-Data Keeps do not retarget the session or refresh
 session activity; address-less Keeps reuse the last destination accepted from
 `New` or a non-empty Data Keep. Domain destinations may still undergo resolution
 before this guard. `End` remove; sweep removes idle
@@ -679,8 +685,12 @@ limit tests.
 
 **States.** Active → Retained (`expires_at = now + close_expiry`) →
 Reattached / Expired / Evicted / Discarded. Keyed by 8-byte GlobalID in
-`SessionTable.expiring`; holds the global permit and counts toward
-`max_sessions`.
+`SessionTable.expiring`; shares the session's global slot and counts toward
+`max_sessions`. The slot is one cloneable handle: the permit is released only
+when the last owner (the session, a queued datagram's `Arc<Session>`, or a
+retained entry) drops it. Eviction or expiry therefore cannot free a slot whose
+socket is still owned by queued work, and a reattach shares the same slot
+instead of counting the socket twice.
 
 **Transitions.** `close_active` inserts only on a clean, drained, non-failed
 close with a nonzero GlobalID (`1533-1560`). `handle_new` takes a same-family
@@ -705,14 +715,19 @@ simplification, not byte-for-byte parity; the pinned client matrix has not been
 re-tested for cross-mux migration.
 
 **Observability.**
-`xudp_retained_{inserted,reattached,expired,evicted,discarded}`.
+`xudp_retained_{inserted,reattached,expired,evicted,discarded}`. Tests:
+`retained_slot_survives_eviction_and_expiry_until_queued_work_drops`,
+`reattach_shares_the_retained_slot_with_queued_work`.
 
 ### 17. XUDP resolution generations
 
 **States per session id.** Uncached → Pending(owner, suffix, generation) →
-Applied / Cancelled / Stale. A newer GlobalID cancels older pending New
-frames; a stale result is ignored by generation; a suffix that starts with
-another uncached domain re-enters Pending.
+Applied / Cancelled / Stale. A newer *acceptable* New (UDP target, usable
+destination, payload within the datagram cap) cancels older pending New
+frames; a rejected New cannot cancel an accepted lookup, so its owner and
+suffix still run and the rejection is handled on its own. A stale result is
+ignored by generation; a suffix that starts with another uncached domain
+re-enters Pending.
 
 **Bounds** (`xudp/server.rs:63,94,97,100,103`): 4 concurrent lookups per mux,
 64 concurrently pending resolutions, up to 64 queued frames per destination
@@ -725,7 +740,22 @@ cancelled, or queue-full.
 `slow_domain_does_not_block_an_unrelated_session` (3122),
 `stale_resolution_does_not_consume_same_id_replacement` (3226),
 `canceled_lookup_owner_does_not_reject_the_suffix` (3336),
-`newer_global_id_attachment_supersedes_pending_domain_new` (3400).
+`newer_global_id_attachment_supersedes_pending_domain_new` (3400),
+`rejected_replacement_new_does_not_supersede_a_pending_new`.
+
+**Superseded attachment frames.** When a later acceptable `New` supersedes the
+pending owner and no session owns the id, the frames queued before that `New`
+are dropped with the attachment. They could only answer as an unknown id
+(clean `End`) or reject a `New` (error `End`), and the peer treats an `End` as
+terminal for the replacement the same queue creates next. A live session keeps
+their frames: its data and its own terminal `End` still belong to it. The
+last acceptable replacement and its suffix run in arrival order. If several
+replacements are queued, intermediate attachments are never opened: their
+frames are discarded without a terminal `End`. The prefix belonging to an
+already live attachment still runs before it closes for the final replacement.
+Regressions: `replacement_new_does_not_inherit_pending_work`,
+`multiple_queued_replacements_do_not_end_the_final_attachment`, and
+`queued_replacements_preserve_only_the_live_attachments_end`.
 
 ### 18. Reply/send queue admission
 

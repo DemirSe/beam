@@ -123,11 +123,20 @@ impl fmt::Debug for PollFd {
     }
 }
 
+/// Longest finite timeout accepted by [`poll`].
+///
+/// `poll(2)` stores the timeout in a signed 32-bit millisecond count. Longer
+/// durations are clamped to this value, not rejected, so a caller with a very
+/// long deadline keeps waiting instead of failing and spinning.
+pub const MAX_POLL_TIMEOUT: Duration = Duration::from_millis(libc::c_int::MAX as u64);
+
+const MAX_POLL_MILLIS: u128 = libc::c_int::MAX as u128;
+
 /// Waits until one of `fds` is ready or `timeout` expires.
 ///
-/// `timeout` is rounded up to whole milliseconds; a non-zero duration below
-/// one millisecond waits for one millisecond instead of spinning. `None`
-/// blocks indefinitely.
+/// `timeout` is rounded up to whole milliseconds and clamped to
+/// [`MAX_POLL_TIMEOUT`]; a non-zero duration below one millisecond waits for
+/// one millisecond instead of spinning. `None` blocks indefinitely.
 ///
 /// Returns the number of entries with a non-zero `revents` field, or `0` on
 /// timeout. `EINTR` is reported as [`io::ErrorKind::Interrupted`] so callers
@@ -169,13 +178,13 @@ fn timeout_millis(timeout: Option<Duration>) -> libc::c_int {
         return -1;
     };
 
-    let millis = timeout.as_nanos().div_ceil(1_000_000);
+    let millis = timeout.as_nanos().div_ceil(1_000_000).min(MAX_POLL_MILLIS);
     libc::c_int::try_from(millis).unwrap_or(libc::c_int::MAX)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PollEvents, PollFd, poll};
+    use super::{MAX_POLL_TIMEOUT, PollEvents, PollFd, poll, timeout_millis};
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
@@ -183,6 +192,24 @@ mod tests {
 
     fn pair() -> (UnixStream, UnixStream) {
         UnixStream::pair().unwrap()
+    }
+
+    #[test]
+    fn timeout_maps_to_whole_milliseconds_with_a_documented_cap() {
+        assert_eq!(timeout_millis(None), -1);
+        assert_eq!(timeout_millis(Some(Duration::ZERO)), 0);
+        assert_eq!(timeout_millis(Some(Duration::from_nanos(1))), 1);
+        assert_eq!(timeout_millis(Some(Duration::from_nanos(1_000_001))), 2);
+        assert_eq!(timeout_millis(Some(Duration::from_millis(1_999))), 1_999);
+        assert_eq!(timeout_millis(Some(MAX_POLL_TIMEOUT)), libc::c_int::MAX);
+        assert_eq!(
+            timeout_millis(Some(MAX_POLL_TIMEOUT + Duration::from_nanos(1))),
+            libc::c_int::MAX
+        );
+        assert_eq!(
+            timeout_millis(Some(Duration::from_secs(u64::MAX))),
+            libc::c_int::MAX
+        );
     }
 
     #[test]

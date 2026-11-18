@@ -62,10 +62,6 @@ pub enum TlsStreamError {
     #[error("rustls made no progress consuming a TLS record")]
     NoProgress,
 
-    /// Queued outgoing TLS ciphertext exceeded its bound.
-    #[error("outgoing TLS ciphertext exceeded its bound")]
-    OutgoingOverflow,
-
     /// Raw handoff was requested while a record was partially read.
     #[error("raw handoff was requested with a partial TLS record")]
     PartialRecord,
@@ -521,10 +517,16 @@ impl TlsStream {
             self.outgoing_offset = 0;
         }
         while self.conn.wants_write() {
-            if self.outgoing.len() >= MAX_OUTGOING {
+            let room = MAX_OUTGOING.saturating_sub(self.outgoing.len());
+            if room == 0 {
                 break;
             }
-            let written = self.conn.write_tls(&mut self.outgoing)?;
+            // rustls appends one whole record per call, which would cross the
+            // bound when the socket is blocked. The window accepts at most the
+            // remaining room; rustls keeps the unsent tail queued.
+            let written = self
+                .conn
+                .write_tls(&mut OutgoingWindow::new(&mut self.outgoing, room))?;
             if written == 0 {
                 return Err(TlsStreamError::NoProgress);
             }
@@ -610,6 +612,35 @@ impl RawTlsHandoff for TlsStream {
 impl AsRawFd for TlsStream {
     fn as_raw_fd(&self) -> RawFd {
         self.socket.as_raw_fd()
+    }
+}
+
+/// Bounded write window into the outgoing ciphertext buffer.
+///
+/// One `write_tls` call emits at most one TLS record. Refusing bytes beyond
+/// `room` keeps the queued ciphertext inside its hard bound even when the
+/// socket is blocked, without losing the rest of the record.
+struct OutgoingWindow<'a> {
+    buffer: &'a mut Vec<u8>,
+    room: usize,
+}
+
+impl<'a> OutgoingWindow<'a> {
+    const fn new(buffer: &'a mut Vec<u8>, room: usize) -> Self {
+        Self { buffer, room }
+    }
+}
+
+impl Write for OutgoingWindow<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let take = buf.len().min(self.room);
+        self.buffer.extend_from_slice(&buf[..take]);
+        self.room -= take;
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1019,6 +1050,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outgoing_queue_stays_within_cap_under_backpressure() {
+        // The client finishes the handshake and then stops reading, so the
+        // server socket fills while rustls still holds plaintext. The queued
+        // ciphertext must stay inside MAX_OUTGOING and lose no bytes.
+        const PAYLOAD_LEN: usize = 8 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_config = test_server_config();
+        let (blocked_tx, blocked_rx) = oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let conn = ServerConnection::new(server_config).expect("server connection");
+            let mut tls = TlsStream::accept(socket, conn, Vec::new())
+                .await
+                .expect("server handshake");
+            let mut payload = vec![0u8; PAYLOAD_LEN];
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte = (index % 251) as u8;
+            }
+
+            let mut offset = 0usize;
+            let mut blocked_tx = Some(blocked_tx);
+            let mut peak = 0usize;
+            while offset < payload.len() {
+                let polled = {
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    Pin::new(&mut tls).poll_write(&mut cx, &payload[offset..])
+                };
+                match polled {
+                    Poll::Ready(Ok(0)) => panic!("server accepted zero plaintext bytes"),
+                    Poll::Ready(Ok(count)) => offset += count,
+                    Poll::Ready(Err(error)) => panic!("server write failed: {error}"),
+                    Poll::Pending => {
+                        let queued = tls.outgoing.len();
+                        assert!(
+                            queued <= MAX_OUTGOING,
+                            "queued {queued} ciphertext bytes exceed the cap"
+                        );
+                        assert!(queued > 0, "blocked write queued no ciphertext");
+                        peak = peak.max(queued);
+                        if let Some(tx) = blocked_tx.take() {
+                            // The first blocked write fills the window exactly.
+                            assert_eq!(queued, MAX_OUTGOING, "cap was not reached");
+                            tx.send(queued).expect("signal blocked write");
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+            tls.flush().await.expect("flush payload");
+            tls.shutdown().await.expect("server shutdown");
+            peak
+        });
+
+        let socket = TcpStream::connect(address).await.expect("client connect");
+        let connector = tokio_rustls::TlsConnector::from(test_client_config());
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut client = connector
+            .connect(name, socket)
+            .await
+            .expect("client handshake");
+
+        let queued = timeout(Duration::from_secs(10), blocked_rx)
+            .await
+            .expect("server never reached backpressure")
+            .expect("blocked notification");
+        assert_eq!(queued, MAX_OUTGOING);
+
+        let mut received = 0usize;
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = timeout(Duration::from_secs(20), client.read(&mut buffer))
+                .await
+                .expect("client read timed out")
+                .expect("client read");
+            if count == 0 {
+                break;
+            }
+            for byte in &buffer[..count] {
+                assert_eq!(*byte, (received % 251) as u8, "byte {received} differs");
+                received += 1;
+            }
+        }
+        assert_eq!(received, PAYLOAD_LEN, "payload was truncated or extended");
+
+        let peak = timeout(Duration::from_secs(20), server)
+            .await
+            .expect("server timed out")
+            .expect("server task");
+        assert_eq!(peak, MAX_OUTGOING);
+    }
+
+    #[tokio::test]
     async fn raw_handoff_keeps_plaintext_still_buffered_in_rustls() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -1129,6 +1256,79 @@ mod tests {
             .expect("server task");
         assert!(handed_off, "read handoff was not published");
         assert_eq!(output, expected);
+    }
+
+    #[tokio::test]
+    async fn vision_first_block_split_across_initial_body_and_tls_plaintext() {
+        use crate::vision::{Command, VisionStream, encode_block};
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+
+        let user_id = [0x42u8; 16];
+        let content = b"split-first-block".to_vec();
+        let mut wire = Vec::new();
+        encode_block(&mut wire, Some(user_id), Command::Continue, &content, 0)
+            .expect("encode first block");
+        encode_block(&mut wire, None, Command::Continue, b"after-first-block", 0)
+            .expect("encode second block");
+        let mut expected = content.clone();
+        expected.extend_from_slice(b"after-first-block");
+
+        // Split inside the block UUID, inside its length fields, and inside
+        // its content: the parser must join `initial_body` and TLS plaintext
+        // into one block without reordering or repeating bytes.
+        for split in [1usize, 18, 30] {
+            assert!(split < wire.len());
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("listener");
+            let address = listener.local_addr().expect("address");
+            let server_config = test_server_config();
+            let initial_body = wire[..split].to_vec();
+            let rest = wire[split..].to_vec();
+            let expected = expected.clone();
+
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("accept");
+                let conn = ServerConnection::new(server_config).expect("server connection");
+                let tls = TlsStream::accept(socket, conn, Vec::new())
+                    .await
+                    .expect("server handshake");
+                let mut vision =
+                    VisionStream::new(tls, user_id, initial_body, SmallRng::seed_from_u64(41));
+                let mut output = Vec::new();
+                let mut buffer = [0u8; 7];
+                loop {
+                    let count = timeout(Duration::from_secs(2), vision.read(&mut buffer))
+                        .await
+                        .expect("Vision read timed out")
+                        .expect("Vision read");
+                    if count == 0 {
+                        break;
+                    }
+                    output.extend_from_slice(&buffer[..count]);
+                }
+                assert_eq!(output, expected, "split at {split}");
+            });
+
+            let socket = TcpStream::connect(address).await.expect("client connect");
+            let connector = tokio_rustls::TlsConnector::from(test_client_config());
+            let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+            let mut client = connector
+                .connect(name, socket)
+                .await
+                .expect("client handshake");
+            client
+                .write_all(&rest)
+                .await
+                .expect("write block remainder");
+            client.flush().await.expect("flush block remainder");
+            client.shutdown().await.expect("client shutdown");
+            timeout(Duration::from_secs(2), server)
+                .await
+                .expect("server timed out")
+                .expect("server task");
+        }
     }
 
     #[tokio::test]

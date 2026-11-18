@@ -31,7 +31,7 @@ use rustls::{SignatureAlgorithm, SignatureScheme};
 use sha2::Sha512;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpSocket, TcpStream, lookup_host};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::{timeout, timeout_at};
 use zeroize::Zeroizing;
@@ -64,6 +64,15 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// thread for the full VPN idle timeout. A slow cover handshake or an idle
 /// probe is closed after this bound.
 const COVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum lifetime of one unauthenticated cover relay.
+///
+/// The idle timeout only ends a quiet relay, so a probe that keeps both
+/// directions busy could otherwise hold a cover permit and its sockets for an
+/// unbounded time. The relay is cut at this age regardless of activity, which
+/// bounds unauthenticated admission retention without a new config key. The
+/// first-half-close release still ends a gone probe earlier.
+const COVER_MAX_LIFETIME: Duration = Duration::from_secs(120);
 
 /// Maximum number of unauthenticated cover relays in flight at once.
 ///
@@ -1646,12 +1655,20 @@ async fn handle_authenticated(
                 command: Command::Mux,
             })
         }
-        command => {
-            tracing::warn!(
-                command = ?command,
-                "authenticated VLESS command is not implemented yet; closing"
-            );
-            Ok(ConnectionOutcome::Authenticated { command })
+        Command::Rvs => {
+            // Rvs is a valid command, but reverse streams are out of scope and
+            // clients never send it. The request is authenticated, so answer
+            // the documented response and close instead of leaving the peer to
+            // time out on a missing reply.
+            timeout_at(deadline, tls.write_all(&ResponseHeader::new().to_bytes()))
+                .await
+                .map_err(|_| TlsServerError::Timeout {
+                    stage: "VLESS response write",
+                })??;
+            tracing::debug!("authenticated VLESS Rvs is unsupported; answered and closing");
+            Ok(ConnectionOutcome::Authenticated {
+                command: Command::Rvs,
+            })
         }
     }
 }
@@ -1712,7 +1729,7 @@ async fn forward_to_cover(
     // Dropping this future on shutdown cancels the relay promptly, and the
     // relay ends on the first half-close so a disconnected probe cannot pin a
     // cover slot until the idle timeout.
-    relay_cover_bidirectional(client, cover, COVER_IDLE_TIMEOUT).await?;
+    relay_cover_bidirectional(client, cover, COVER_IDLE_TIMEOUT, COVER_MAX_LIFETIME).await?;
     Ok(ConnectionOutcome::CoverForwarded)
 }
 
@@ -1778,14 +1795,16 @@ async fn dial(
         Address::Domain(domain) => domain.clone(),
     };
     let deadline = tokio::time::Instant::now() + dial_timeout;
-    let addresses =
-        tokio::time::timeout_at(deadline, lookup_host((host.as_str(), destination.port)))
-            .await
-            .map_err(|_| TlsServerError::Timeout {
+    // The shared lookup keeps its admission permit until the blocking resolver
+    // job finishes, even when this deadline elapses first.
+    let addresses = crate::dns::lookup_host_until(host.as_str(), destination.port, deadline)
+        .await
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::TimedOut => TlsServerError::Timeout {
                 stage: "destination dial",
-            })?
-            .map_err(TlsServerError::Io)?
-            .collect::<Vec<_>>();
+            },
+            _ => TlsServerError::Io(error),
+        })?;
     if addresses.is_empty() {
         return Err(TlsServerError::Io(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
@@ -1896,7 +1915,8 @@ where
 
     // Idle is a property of the whole connection, not of each direction. A
     // download-only or upload-only transfer must not be torn down because the
-    // opposite direction has nothing to send.
+    // opposite direction has nothing to send, and a blocked write is retried
+    // while the other direction is recent. The splice relay shares this clock.
     let left_to_right = copy_direction(
         &mut left_read,
         &mut right_write,
@@ -1926,10 +1946,14 @@ where
 /// the remaining upload. FIN is not proof that the peer stopped reading, but
 /// an unauthenticated peer must not pin cover capacity after it is gone. The
 /// authenticated relay keeps its half-close semantics unchanged.
+///
+/// `max_lifetime` bounds a relay that stays active, because the idle timeout
+/// alone never fires while a probe keeps both directions busy.
 async fn relay_cover_bidirectional<A, B>(
     left: A,
     right: B,
     idle_timeout: Duration,
+    max_lifetime: Duration,
 ) -> Result<(), TlsServerError>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -1952,6 +1976,10 @@ where
             idle_timeout,
             Some(&activity),
         ) => result.map(|_| ()),
+        () = tokio::time::sleep(max_lifetime) => {
+            tracing::debug!(?max_lifetime, "cover relay reached its maximum lifetime; closing");
+            Ok(())
+        }
     }
 }
 
@@ -2240,21 +2268,12 @@ where
             break;
         }
 
-        let write = timeout(idle_timeout, writer.write_all(&buffer[..count]))
-            .await
-            .map_err(|_| TlsServerError::Timeout {
-                stage: "relay write",
-            })?;
-        match write {
-            Ok(()) => {
-                relayed = relayed.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-                if let Some(clock) = activity_clock {
-                    clock.touch();
-                }
-            }
-            Err(error) if is_peer_closed(&error) => break,
-            Err(error) => return Err(TlsServerError::Io(error)),
+        if write_relay_chunk(writer, &buffer[..count], idle_timeout, activity_clock).await?
+            == ChunkWrite::Closed
+        {
+            break;
         }
+        relayed = relayed.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
 
         if *handoff.borrow() {
             return Ok((relayed, true));
@@ -2304,8 +2323,8 @@ fn join_error(error: tokio::task::JoinError) -> TlsServerError {
 /// A `spawn_blocking` join handle cannot be aborted after the task starts, and
 /// dropping it detaches the task. The guard therefore publishes a cooperative
 /// stop flag before the handle is lost; the shared eventfd wakes a blocked
-/// relay immediately, with the older 250 ms check as a fallback when the
-/// descriptor cannot be created. Both directions disarm before returning. When
+/// relay immediately, and its 250 ms poll cap still ends a worker whose wakeup
+/// failed. Both directions disarm before returning. When
 /// one direction fails, `try_join!` drops the other future while its guard is
 /// still armed, and that drop stops the shared activity.
 struct RelayStopGuard<'a> {
@@ -2334,6 +2353,12 @@ impl Drop for RelayStopGuard<'_> {
     }
 }
 
+/// Copies one direction of an authenticated relay.
+///
+/// Reads, writes, and the final shutdown follow whole-connection idleness: a
+/// direction with nothing to read or a sink that stops accepting bytes is
+/// retried while the opposite direction is recent, so a download-only or
+/// upload-only stream is not torn down. See [`write_relay_chunk`].
 async fn copy_direction<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -2377,21 +2402,12 @@ where
         if count == 0 {
             break;
         }
-        let write = timeout(idle_timeout, writer.write_all(&buffer[..count]))
-            .await
-            .map_err(|_| TlsServerError::Timeout {
-                stage: "relay write",
-            })?;
-        match write {
-            Ok(()) => {
-                relayed = relayed.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-                if let Some(clock) = activity_clock {
-                    clock.touch();
-                }
-            }
-            Err(error) if is_peer_closed(&error) => break,
-            Err(error) => return Err(TlsServerError::Io(error)),
+        if write_relay_chunk(writer, &buffer[..count], idle_timeout, activity_clock).await?
+            == ChunkWrite::Closed
+        {
+            break;
         }
+        relayed = relayed.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
     }
     let shutdown = timeout(idle_timeout, writer.shutdown())
         .await
@@ -2415,10 +2431,74 @@ fn is_peer_closed(error: &io::Error) -> bool {
     )
 }
 
+/// Result of writing one relay chunk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkWrite {
+    /// The whole chunk reached the sink.
+    Written,
+    /// The direction ended without an error: the peer is gone or the relay was
+    /// stopped. The caller treats it as a half-close.
+    Closed,
+}
+
+/// Writes one relay chunk, retrying a blocked write only while the connection
+/// is alive in its other direction.
+///
+/// Idle is a property of the whole connection (issue #89). A sink that stops
+/// accepting bytes is not cut while the opposite direction keeps the shared
+/// [`RelayActivity`] clock recent, which is the same policy `copy_one_way`
+/// applies to a blocked splice. The retry is bounded: each `write` call has
+/// its own `idle_timeout` deadline, a retry requires a clock tick inside that
+/// window, a partial write is progress, and a zero-length write cannot spin.
+/// Without a shared clock the write timeout stays fatal, as before.
+async fn write_relay_chunk<W>(
+    writer: &mut W,
+    chunk: &[u8],
+    idle_timeout: Duration,
+    activity_clock: Option<&RelayActivity>,
+) -> Result<ChunkWrite, TlsServerError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut written = 0usize;
+    while written < chunk.len() {
+        match timeout(idle_timeout, writer.write(&chunk[written..])).await {
+            Err(_) => {
+                if activity_clock.is_some_and(RelayActivity::is_stopped) {
+                    return Ok(ChunkWrite::Closed);
+                }
+                if activity_clock
+                    .and_then(RelayActivity::elapsed)
+                    .is_some_and(|elapsed| elapsed < idle_timeout)
+                {
+                    continue;
+                }
+                return Err(TlsServerError::Timeout {
+                    stage: "relay write",
+                });
+            }
+            Ok(Ok(0)) => {
+                return Err(TlsServerError::Io(io::Error::from(
+                    io::ErrorKind::WriteZero,
+                )));
+            }
+            Ok(Ok(count)) => {
+                written += count;
+                if let Some(clock) = activity_clock {
+                    clock.touch();
+                }
+            }
+            Ok(Err(error)) if is_peer_closed(&error) => return Ok(ChunkWrite::Closed),
+            Ok(Err(error)) => return Err(TlsServerError::Io(error)),
+        }
+    }
+    Ok(ChunkWrite::Written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     struct UnexpectedEofReader;
 
@@ -2689,6 +2769,81 @@ mod tests {
             "target MSS {mss} exceeded the configured {TARGET_MSS}"
         );
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn dial_does_not_need_dns_admission_for_a_numeric_target() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("v4 listener");
+        let v4_port = listener.local_addr().expect("v4 address").port();
+        let v4_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("v4 accept");
+            drop(stream);
+        });
+
+        // Bind and probe IPv6 before holding the budget: some hosts accept a
+        // bind but blackhole a loopback connect, and the probe must not be
+        // attributed to the DNS budget.
+        let v6 = match tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await {
+            Ok(listener) => {
+                let port = listener.local_addr().expect("v6 address").port();
+                let server = tokio::spawn(async move {
+                    let (probe, _) = listener.accept().await.expect("v6 probe accept");
+                    drop(probe);
+                    let (stream, _) = listener.accept().await.expect("v6 accept");
+                    drop(stream);
+                });
+                let probe = tokio::net::TcpStream::connect((Ipv6Addr::LOCALHOST, port));
+                match tokio::time::timeout(Duration::from_secs(1), probe).await {
+                    Ok(Ok(stream)) => {
+                        drop(stream);
+                        Some((port, server))
+                    }
+                    _ => {
+                        server.abort();
+                        assert!(
+                            std::env::var_os("BEAM_REQUIRE_IPV6_TESTS").is_none(),
+                            "IPv6 loopback connect unavailable"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(_) => {
+                assert!(
+                    std::env::var_os("BEAM_REQUIRE_IPV6_TESTS").is_none(),
+                    "IPv6 loopback unavailable"
+                );
+                None
+            }
+        };
+
+        // A resolver outage must not delay a destination that is already an
+        // address: no `getaddrinfo` job exists to bound.
+        let _held = crate::dns::hold_all_permits_for_test().await;
+        let destination = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: v4_port,
+        };
+        let stream = dial(&destination, Duration::from_secs(2))
+            .await
+            .expect("an IPv4 literal must not wait for the DNS budget");
+        drop(stream);
+        v4_server.await.expect("v4 server task");
+
+        let Some((port, server)) = v6 else {
+            return;
+        };
+        let destination = NetLocation {
+            address: Address::Ipv6(Ipv6Addr::LOCALHOST),
+            port,
+        };
+        let stream = dial(&destination, Duration::from_secs(2))
+            .await
+            .expect("an IPv6 literal must not wait for the DNS budget");
+        drop(stream);
+        server.await.expect("v6 server task");
     }
 
     #[test]
@@ -3155,6 +3310,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stalled_write_is_cut_when_the_connection_is_idle() {
+        let (mut reader, mut feed) = tokio::io::duplex(64);
+        // The sink peer never reads, so the writer stops accepting bytes.
+        let (mut writer, _sink) = tokio::io::duplex(64);
+        let activity = Arc::new(RelayActivity::new());
+        let clock = Arc::clone(&activity);
+        let task = tokio::spawn(async move {
+            copy_direction(
+                &mut reader,
+                &mut writer,
+                Duration::from_millis(50),
+                Some(&clock),
+            )
+            .await
+        });
+
+        feed.write_all(&[0x7a; 128]).await.expect("feed");
+        let result = timeout(Duration::from_secs(1), task)
+            .await
+            .expect("an idle connection must cut the stalled write")
+            .expect("relay task panicked");
+        assert!(
+            matches!(
+                result,
+                Err(TlsServerError::Timeout {
+                    stage: "relay write"
+                })
+            ),
+            "an idle connection must fail as a write timeout, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_write_survives_an_active_opposite_direction() {
+        let (left, left_peer) = tokio::io::duplex(1024);
+        let (right, right_peer) = tokio::io::duplex(1024);
+        let (mut left_peer_read, mut left_peer_write) = tokio::io::split(left_peer);
+        // The upload sink is never read, so its buffer fills.
+        let (_right_peer_read, mut right_peer_write) = tokio::io::split(right_peer);
+        let idle = Duration::from_millis(50);
+        let task = tokio::spawn(relay_bidirectional(left, right, idle));
+
+        let upload = tokio::spawn(async move {
+            loop {
+                if left_peer_write.write_all(&[b'y'; 1024]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // The download direction keeps the shared activity clock recent.
+        let download = tokio::spawn(async move {
+            let mut buffer = [0u8; 64];
+            loop {
+                if right_peer_write.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if left_peer_read.read(&mut buffer).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        tokio::time::sleep(idle * 5).await;
+        assert!(
+            !task.is_finished(),
+            "a blocked write must not cut a connection whose other direction is active"
+        );
+
+        // Once the opposite direction stops, the connection is idle and the
+        // stalled write must end the relay.
+        download.abort();
+        let result = timeout(Duration::from_secs(1), task)
+            .await
+            .expect("an idle connection must end the stalled write")
+            .expect("relay task panicked");
+        assert!(
+            matches!(result, Err(TlsServerError::Timeout { .. })),
+            "an idle connection must end the relay, got {result:?}"
+        );
+        upload.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_splice_write_survives_a_recent_shared_clock() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let (source, mut source_peer) = UnixStream::pair().expect("source pair");
+        let (sink, _sink_peer) = UnixStream::pair().expect("sink pair");
+        let activity = Arc::new(RelayActivity::new());
+        let idle = Duration::from_millis(200);
+        let config = splice_config(idle, 16 * 1024);
+
+        // `_sink_peer` never reads, so the one-way relay fills the socket and
+        // cannot make progress.
+        let feeder = std::thread::spawn(move || {
+            let data = [0u8; 64 * 1024];
+            while source_peer.write_all(&data).is_ok() {}
+        });
+        let heartbeat_for = Duration::from_millis(600);
+        let heartbeat = tokio::spawn({
+            let activity = Arc::clone(&activity);
+            async move {
+                let deadline = tokio::time::Instant::now() + heartbeat_for;
+                while tokio::time::Instant::now() < deadline {
+                    activity.touch();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let source_fd = source.as_raw_fd();
+        let sink_fd = sink.as_raw_fd();
+        let relay_activity = Arc::clone(&activity);
+        let relay = tokio::task::spawn_blocking(move || {
+            beam_sys::set_nonblocking(source_fd)?;
+            beam_sys::set_nonblocking(sink_fd)?;
+            copy_one_way(source_fd, sink_fd, &config, Some(&relay_activity))
+        });
+        let result = timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("the stalled splice must end after the shared clock goes stale")
+            .expect("splice task");
+        heartbeat.abort();
+        assert!(
+            started.elapsed() >= heartbeat_for,
+            "the splice must not cut a direction while the shared clock is recent: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            result
+                .expect_err("a stalled splice sink must time out")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        drop(source);
+        drop(sink);
+        feeder.join().expect("feeder thread");
+    }
+
+    #[tokio::test]
+    async fn handoff_waits_for_the_completed_read_to_be_written() {
+        struct HandoffReader {
+            chunk: &'static [u8],
+            handoff: watch::Sender<bool>,
+            fired: bool,
+        }
+
+        impl AsyncRead for HandoffReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                if this.fired {
+                    return Poll::Ready(Ok(()));
+                }
+                this.fired = true;
+                buf.put_slice(this.chunk);
+                // The handoff is published in the same poll that completes the
+                // read, so the write below races the notification.
+                let _ = this.handoff.send(true);
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (handoff, mut handoff_rx) = watch::channel(false);
+        let mut reader = HandoffReader {
+            chunk: b"final-bytes",
+            handoff,
+            fired: false,
+        };
+        let mut writer = Vec::new();
+        let (copied, raw_read) = copy_direction_until_handoff(
+            &mut reader,
+            &mut writer,
+            Duration::from_millis(50),
+            &mut handoff_rx,
+            None,
+        )
+        .await
+        .expect("relay until handoff");
+
+        assert!(raw_read, "the handoff must be observed");
+        assert_eq!(copied, 11);
+        assert_eq!(
+            writer, b"final-bytes",
+            "the completed read must reach the writer before raw mode"
+        );
+    }
+
+    #[tokio::test]
     async fn cover_relays_with_async_copy() {
         let cover_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -3202,6 +3552,47 @@ mod tests {
             .expect("fallback relay task");
         assert!(matches!(outcome, Ok(ConnectionOutcome::CoverForwarded)));
         cover_task.await.expect("cover task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cover_relay_is_cut_at_its_maximum_lifetime() {
+        let (probe, mut probe_peer) = tokio::io::duplex(1024);
+        let (cover, mut cover_peer) = tokio::io::duplex(1024);
+        let idle = Duration::from_secs(30);
+        let lifetime = Duration::from_millis(100);
+        let relay = tokio::spawn(relay_cover_bidirectional(probe, cover, idle, lifetime));
+
+        // Keep both directions active: the idle timeout alone would let this
+        // relay hold its cover permit for `idle`.
+        let started = tokio::time::Instant::now();
+        let traffic = tokio::spawn(async move {
+            let mut buffer = [0u8; 16];
+            loop {
+                if probe_peer.write_all(b"probe").await.is_err() {
+                    break;
+                }
+                if cover_peer.write_all(b"cover").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if cover_peer.read(&mut buffer).await.is_err()
+                    || probe_peer.read(&mut buffer).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let outcome = timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("an active cover relay must be cut at its maximum lifetime")
+            .expect("cover relay task");
+        assert!(outcome.is_ok(), "cover relay failed: {outcome:?}");
+        assert!(
+            started.elapsed() < idle,
+            "the relay must end at the lifetime bound, not the idle timeout"
+        );
+        traffic.abort();
     }
 
     #[tokio::test]

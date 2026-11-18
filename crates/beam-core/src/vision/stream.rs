@@ -830,6 +830,162 @@ mod tests {
         }
     }
 
+    /// Inner stream that accepts a bounded number of bytes per write and
+    /// reports `Pending` on every other poll without waking the caller.
+    struct ShortInner {
+        output: Vec<u8>,
+        budget: usize,
+        blocked: bool,
+    }
+
+    impl ShortInner {
+        const fn new(budget: usize) -> Self {
+            Self {
+                output: Vec::new(),
+                budget,
+                blocked: false,
+            }
+        }
+    }
+
+    impl AsyncWrite for ShortInner {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.blocked {
+                self.blocked = false;
+                return Poll::Pending;
+            }
+            let take = buf.len().min(self.budget);
+            assert!(take > 0, "short inner writer received an empty buffer");
+            self.output.extend_from_slice(&buf[..take]);
+            self.blocked = true;
+            Poll::Ready(Ok(take))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for ShortInner {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl RawTlsHandoff for ShortInner {
+        fn switch_read_to_raw(&mut self) {}
+
+        fn switch_write_to_raw(&mut self) {}
+
+        fn take_plaintext(&mut self) -> Result<Vec<u8>, crate::tls::stream::TlsStreamError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Drives `poll_write` until every byte is accepted, tolerating short and
+    /// pending inner writes.
+    async fn write_through_short_inner(vision: &mut VisionStream<ShortInner>, data: &[u8]) {
+        let mut offset = 0usize;
+        let mut polls = 0usize;
+        while offset < data.len() {
+            let polled = {
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                Pin::new(&mut *vision).poll_write(&mut cx, &data[offset..])
+            };
+            match polled {
+                Poll::Ready(Ok(0)) => panic!("Vision writer accepted zero bytes"),
+                Poll::Ready(Ok(count)) => offset += count,
+                Poll::Ready(Err(error)) => panic!("Vision write failed: {error}"),
+                Poll::Pending => {}
+            }
+            polls += 1;
+            assert!(polls < 8 * data.len() + 64, "short inner write stuck");
+        }
+    }
+
+    async fn shutdown_short_inner(vision: &mut VisionStream<ShortInner>) {
+        for _ in 0..128 {
+            let polled = {
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                Pin::new(&mut *vision).poll_shutdown(&mut cx)
+            };
+            match polled {
+                Poll::Ready(Ok(())) => return,
+                Poll::Ready(Err(error)) => panic!("Vision shutdown failed: {error}"),
+                Poll::Pending => {}
+            }
+        }
+        panic!("Vision shutdown did not finish");
+    }
+
+    #[tokio::test]
+    async fn writer_accounts_short_and_blocked_inner_writes() {
+        let record = app_data_record(&[0x5a_u8; 64]);
+        let tail = b"short-tail";
+        let mut vision = VisionStream::new(ShortInner::new(3), USER_ID, Vec::new(), rng(24));
+
+        // Short inner writes split each accepted payload across several polls,
+        // including bytes of one TLS record.
+        write_through_short_inner(&mut vision, &record[..7]).await;
+        write_through_short_inner(&mut vision, &record[7..]).await;
+        write_through_short_inner(&mut vision, tail).await;
+        shutdown_short_inner(&mut vision).await;
+
+        let raw = std::mem::take(&mut vision.inner.output);
+        let blocks = read_raw_blocks(&raw);
+        assert_eq!(blocks.len(), 3, "one block per accepted write");
+        assert_eq!(blocks[0].uuid, Some(USER_ID));
+        assert_eq!(blocks[0].command, Command::Continue);
+        assert_eq!(blocks[0].content, &record[..7]);
+        assert_eq!(blocks[1].uuid, None);
+        assert_eq!(blocks[1].command, Command::Continue);
+        assert_eq!(blocks[1].content, &record[7..]);
+        assert_eq!(blocks[2].uuid, None);
+        assert_eq!(blocks[2].command, Command::Continue);
+        assert_eq!(blocks[2].content, tail);
+    }
+
+    #[test]
+    fn complete_record_length_never_crosses_a_write_chunk_boundary() {
+        let first = app_data_record(&[0x5a_u8; 32]);
+        let second = app_data_record(&[0x33_u8; 7]);
+        let mut wire = first.clone();
+        wire.extend_from_slice(&second);
+
+        assert_eq!(complete_tls_records_len(&wire), wire.len());
+        for split in 0..wire.len() {
+            let complete = complete_tls_records_len(&wire[..split]);
+            assert!(
+                complete == 0 || complete == first.len(),
+                "split {split} reported a partial record as complete: {complete}"
+            );
+        }
+
+        // A record header followed by fewer body bytes than it declares is not
+        // a complete record, so the Direct trigger cannot fire early.
+        assert_eq!(complete_tls_records_len(&wire[..first.len() - 1]), 0);
+        let mut short_record = vec![0x17, 0x03, 0x03, 0x00, 0x02];
+        short_record.extend_from_slice(b"ab!");
+        assert_eq!(
+            complete_tls_records_len(&short_record),
+            short_record.len() - 1
+        );
+        assert!(!is_partial_tls_record(&short_record));
+        assert!(is_partial_tls_record(&short_record[..6]));
+    }
+
     fn server_hello() -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]);

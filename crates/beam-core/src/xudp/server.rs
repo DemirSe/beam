@@ -184,6 +184,8 @@ struct ResolutionResult {
     id: u16,
     generation: u64,
     destination: NetLocation,
+    /// Lookup semantics of the request, so the cache stores the same request.
+    family: Option<SocketFamily>,
     result: Result<SocketAddr, ResolveError>,
 }
 
@@ -217,7 +219,7 @@ struct PendingResolution {
 /// Once the result arrives the read loop rewrites those frames to the resolved
 /// IP and dispatches them normally. Unrelated IP sessions continue immediately.
 struct ResolutionState {
-    cache: HashMap<(String, u16), (SocketAddr, Instant)>,
+    cache: HashMap<(String, u16, Option<SocketFamily>), (SocketAddr, Instant)>,
     pending: HashMap<u16, PendingResolution>,
     requests: mpsc::Sender<ResolutionRequest>,
     results: mpsc::Receiver<ResolutionResult>,
@@ -251,6 +253,7 @@ impl ResolutionState {
                             id: request.id,
                             generation: request.generation,
                             destination: request.destination,
+                            family: request.family,
                             result,
                         })
                         .await;
@@ -269,9 +272,16 @@ impl ResolutionState {
         }
     }
 
-    fn cache_key(destination: &NetLocation) -> Option<(String, u16)> {
+    /// Keys the cache by the whole lookup semantics, not only by domain and
+    /// port. A family-constrained lookup and an unconstrained one are
+    /// different requests: the unconstrained lookup prefers IPv4, so a hit on
+    /// an entry stored for one caller must not answer the other.
+    fn cache_key(
+        destination: &NetLocation,
+        family: Option<SocketFamily>,
+    ) -> Option<(String, u16, Option<SocketFamily>)> {
         match &destination.address {
-            Address::Domain(domain) => Some((domain.clone(), destination.port)),
+            Address::Domain(domain) => Some((domain.clone(), destination.port, family)),
             Address::Ipv4(_) | Address::Ipv6(_) => None,
         }
     }
@@ -281,7 +291,7 @@ impl ResolutionState {
         destination: &NetLocation,
         family: Option<SocketFamily>,
     ) -> Option<SocketAddr> {
-        let key = Self::cache_key(destination)?;
+        let key = Self::cache_key(destination, family)?;
         let (address, inserted) = self.cache.get(&key)?;
         if inserted.elapsed() > RESOLUTION_CACHE_TTL {
             self.cache.remove(&key);
@@ -293,8 +303,13 @@ impl ResolutionState {
         Some(*address)
     }
 
-    fn cache_insert(&mut self, destination: &NetLocation, address: SocketAddr) {
-        let Some(key) = Self::cache_key(destination) else {
+    fn cache_insert(
+        &mut self,
+        destination: &NetLocation,
+        address: SocketAddr,
+        family: Option<SocketFamily>,
+    ) {
+        let Some(key) = Self::cache_key(destination, family) else {
             return;
         };
         if self.cache.len() >= MAX_RESOLUTION_CACHE {
@@ -413,29 +428,76 @@ async fn apply_resolution(
         return Ok(false);
     };
     let PendingResolution {
-        mut owner, frames, ..
+        mut owner,
+        mut frames,
+        ..
     } = pending;
     let ResolutionResult {
         id,
         destination,
+        family,
         result,
         ..
     } = result;
+    // A later acceptable `New` for the same stream id starts a new attachment.
+    // The lookup owner then belongs to the superseded attachment: it must not
+    // create a session that the replacement has to take over, and it must not
+    // be rejected with an `End` the replacement would inherit. A `New` that
+    // `acceptable_new` rejects (wrong network, no destination, oversize) owns
+    // no attachment, so it must not supersede the accepted owner either.
+    let replacement = frames
+        .iter()
+        .rposition(|queued| state.acceptable_new(&queued.frame.as_borrowed()));
+    let owner_superseded = replacement.is_some();
+    // Use the final acceptable replacement: earlier queued replacements have
+    // never opened and must not emit an End for the final attachment.
+    // Frames queued before the replacement belong to the superseded attachment
+    // too. While no session owns the id they can only report an unknown id or
+    // reject a `New`, and the peer treats either `End` as terminal for the
+    // replacement that this queue creates next, so they are dropped with the
+    // attachment. A live session keeps its frames: their data and its own
+    // terminal `End` still belong to it.
+    let superseded_idle = owner_superseded && state.session(id).is_none();
+    if let Some(boundary) = replacement {
+        if superseded_idle {
+            frames.drain(..boundary);
+        } else if let Some(first) = frames
+            .iter()
+            .position(|queued| state.acceptable_new(&queued.frame.as_borrowed()))
+        {
+            // Preserve the live attachment's prefix, but never open an
+            // intermediate attachment only to end it before the final one.
+            frames.drain(first..boundary);
+        }
+    }
+    // The owner is part of that attachment: a superseded `New` never runs, and
+    // another status runs only while a live session still owns the id.
+    let owner_is_stale = |status: SessionStatus| {
+        (status == SessionStatus::New && owner_superseded) || superseded_idle
+    };
     let mut session_activity = false;
 
     match result {
         Ok(address) => {
-            resolutions.cache_insert(&destination, address);
+            resolutions.cache_insert(&destination, address, family);
             if let Some(mut frame) = owner.take() {
-                if frame.frame.status == SessionStatus::New
-                    && let Some(global_id) = frame.frame.global_id
-                {
-                    resolutions.cancel_global(global_id);
+                if owner_is_stale(frame.frame.status) {
+                    tracing::debug!(
+                        session_id = id,
+                        status = ?frame.frame.status,
+                        "XUDP pending frame is dropped with its superseded attachment"
+                    );
+                } else {
+                    if frame.frame.status == SessionStatus::New
+                        && let Some(global_id) = frame.frame.global_id
+                    {
+                        resolutions.cancel_global(global_id);
+                    }
+                    frame.frame.rewrite_destination(address);
+                    session_activity |= state
+                        .handle_frame_with_session_transition(&frame.frame.as_borrowed())
+                        .await?;
                 }
-                frame.frame.rewrite_destination(address);
-                session_activity |= state
-                    .handle_frame_with_session_transition(&frame.frame.as_borrowed())
-                    .await?;
             }
         }
         Err(error) => {
@@ -444,12 +506,14 @@ async fn apply_resolution(
                 %error,
                 "XUDP domain resolution failed"
             );
-            if let Some(frame) = owner.take() {
+            if let Some(frame) = owner.take()
+                && !owner_is_stale(frame.frame.status)
+            {
                 match frame.frame.status {
-                    SessionStatus::New => state.try_send_end(id, true),
+                    SessionStatus::New => state.try_send_reject_end(id, true),
                     SessionStatus::Keep if state.session(id).is_none() => {
                         // Match handle_keep's clean End for an unknown session.
-                        state.try_send_end(id, false);
+                        state.try_send_reject_end(id, false);
                     }
                     _ => {}
                 }
@@ -482,7 +546,7 @@ async fn process_pending_frames(
                 let reject = parsed.status == SessionStatus::New;
                 frames.push_front(frame);
                 if !resolutions.start(next_id, location, family, frames) {
-                    state.try_send_end(next_id, reject);
+                    state.try_send_reject_end(next_id, reject);
                 }
                 return Ok(session_activity);
             }
@@ -594,8 +658,9 @@ impl Drop for MuxTeardown {
                 self.metrics.record_xudp_closed_mux();
             }
             entry.session.stop();
-            // Release the global slot now; the reply task only holds the socket.
-            drop(entry.session.take_permit());
+            // Keep the global permit with the socket owner. The reply task is
+            // aborted below and may still hold the session, so releasing the
+            // permit here would leave a live socket unaccounted for.
             if let Some(task) = entry.reply_task {
                 task.abort();
             }
@@ -883,7 +948,7 @@ where
                                 "XUDP pending-resolution queue is full; dropping frame"
                             );
                             if parsed.status == SessionStatus::New {
-                                state.try_send_end(id, true);
+                                state.try_send_reject_end(id, true);
                             }
                         }
                         consumed += used;
@@ -904,7 +969,7 @@ where
                                 &state.limiter,
                             ) else {
                                 if parsed.status == SessionStatus::New {
-                                    state.try_send_end(id, true);
+                                    state.try_send_reject_end(id, true);
                                 }
                                 consumed += used;
                                 debug_assert!(consumed <= buffer.len());
@@ -917,7 +982,7 @@ where
                                     "XUDP pending-resolution limit reached; rejecting frame"
                                 );
                                 if parsed.status == SessionStatus::New {
-                                    state.try_send_end(id, true);
+                                    state.try_send_reject_end(id, true);
                                 }
                             }
                         }
@@ -1052,11 +1117,26 @@ where
     }
 }
 
+/// Send failures that affect one datagram, not the session.
+///
+/// A full socket buffer, the bounded send deadline, and a signal interruption
+/// are transient: the next datagram can still succeed, so they drop the
+/// datagram instead of tearing down the session. This matches the legacy UDP
+/// classifier; `Interrupted` must never be fatal.
+fn is_transient_send_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
 /// Sends one UDP datagram without waiting on the shared mux read loop.
 fn try_send_now(socket: &UdpSocket, payload: &[u8], destination: SocketAddr) -> io::Result<bool> {
     match socket.try_send_to(payload, destination) {
         Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        // Retry a transient failure once through the bounded send queue rather
+        // than failing the session.
+        Err(error) if is_transient_send_error(&error) => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -1092,10 +1172,8 @@ async fn send_loop(
         };
         let fatal = match &result {
             Ok(()) => false,
-            Err(error) => !matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ),
+            // A transient send failure drops only this datagram.
+            Err(error) => !is_transient_send_error(error),
         };
         if result.is_err() {
             metrics.record_xudp_send_dropped();
@@ -1245,10 +1323,12 @@ impl MuxState {
 
         if parsed.network != Some(TargetNetwork::Udp) {
             tracing::debug!(session_id = id, "XUDP New is not a UDP target; rejecting");
-            return self.send_end(id, true).await;
+            self.try_send_reject_end(id, true);
+            return Ok(());
         }
         let Some(destination) = parsed.destination.as_ref() else {
-            return self.send_end(id, true).await;
+            self.try_send_reject_end(id, true);
+            return Ok(());
         };
 
         // Resolution happens before touching any session state: a domain that
@@ -1267,7 +1347,10 @@ impl MuxState {
                     %error,
                     "XUDP New destination resolution failed"
                 );
-                return self.send_end(id, true).await;
+                // An older attachment for this id may still be live; it owns
+                // its terminal `End`, so this rejection must not queue one.
+                self.try_send_reject_end(id, true);
+                return Ok(());
             }
         };
         let family = SocketFamily::of(resolved);
@@ -1275,11 +1358,16 @@ impl MuxState {
 
         match self.duplicate_status(id, global_id) {
             DuplicateStatus::DifferentGlobalId => {
+                // The live session keeps its id: an `End` here would tell the
+                // peer to close an id that stays open, and the peer treats an
+                // `End` as terminal. Drop the conflicting `New` instead; the
+                // live session's own close path owns its terminal `End`.
                 tracing::debug!(
                     session_id = id,
-                    "XUDP duplicate session id with a different GlobalID; rejecting"
+                    "XUDP duplicate session id with a different GlobalID; dropping the New"
                 );
-                return self.send_end(id, true).await;
+                self.try_send_reject_end(id, true);
+                return Ok(());
             }
             DuplicateStatus::SameGlobalId => {
                 let taken = { lock_table(&self.table).take(id) };
@@ -1333,12 +1421,15 @@ impl MuxState {
             None => None,
         };
         let reattached = matches!(&retained, Some(entry) if entry.family == family);
-        let (socket, permit) = match retained {
-            Some(retained) if retained.family == family => (retained.socket, retained.permit),
+        let (socket, fresh_permit, retained_slot) = match retained {
+            Some(retained) if retained.family == family => {
+                (retained.socket, None, Some(retained.permit))
+            }
             retained => {
                 // A family change cannot reuse the retained socket; it was
-                // removed from the table and is dropped here. Release its
-                // permit before asking the global limiter for a fresh slot.
+                // removed from the table and is dropped here. That releases
+                // its slot unless queued work still owns the socket, so ask
+                // the limiter only after the drop.
                 if retained.is_some() {
                     self.limiter.metrics().record_xudp_retained_discarded();
                 }
@@ -1411,13 +1502,16 @@ impl MuxState {
                         return self.send_end(id, true).await;
                     }
                 };
-                (socket, Some(permit))
+                (socket, Some(permit), None)
             }
         };
 
-        let session = Arc::new(Session::new(
-            id, global_id, socket, family, resolved, permit,
-        ));
+        let session = Arc::new(match retained_slot {
+            // A reattach shares the retained socket's global slot: the permit
+            // stays used while any queued work still owns the old session.
+            Some(slot) => Session::reattached(id, global_id, socket, family, resolved, slot),
+            None => Session::new(id, global_id, socket, family, resolved, fresh_permit),
+        });
         let session_handle = Arc::clone(&session);
         let reply_task = spawn_reply_task(
             Arc::clone(&session),
@@ -1631,7 +1725,13 @@ impl MuxState {
             self.send_end(session.id, error).await?;
         }
 
-        let permit = session.take_permit();
+        // The permit moves with the socket. A clean close with a GlobalID and
+        // a stopped reply task shares the session's slot with the retained
+        // entry; a session that is not retained keeps its slot until the last
+        // `Arc<Session>` (which owns the socket) is dropped. A queued datagram
+        // can therefore never keep a socket alive after its permit was
+        // released, and an entry eviction cannot release a permit whose socket
+        // is still owned by queued work.
         if reason.retains_socket()
             && reply_stopped
             && !session.failed()
@@ -1645,7 +1745,7 @@ impl MuxState {
                 // A pathological Duration must not panic on overflow; an
                 // immediately expired entry only loses optional retention.
                 expires_at: now.checked_add(self.config.close_expiry).unwrap_or(now),
-                permit,
+                permit: session.slot(),
             };
             let replaced = lock_table(&self.table).insert_expiring(global_id, retained);
             self.limiter.metrics().record_xudp_retained_inserted();
@@ -1674,11 +1774,24 @@ impl MuxState {
     /// reused the 16-bit id. Reporting the failure by id alone would close, and
     /// queue an error `End` for, an unrelated newer session; identity is the
     /// `Arc<Session>` instance, so the guard is `take_if_same`.
+    ///
+    /// A failure reported after the session was retained must reach the
+    /// retained entry: its socket is the same kernel socket, so the entry is
+    /// released with it instead of keeping a dead socket and its global permit
+    /// for a later reattach.
     async fn close_if_same(&self, session: &Arc<Session>) -> Result<(), MuxError> {
         let taken = { lock_table(&self.table).take_if_same(session.id, session) };
         match taken {
             Some(active) => self.close_active(active, CloseReason::RelayError).await,
-            None => Ok(()),
+            None => {
+                let retired = session.global_id.is_some_and(|global_id| {
+                    lock_table(&self.table).remove_expiring_if_same(global_id, &session.socket)
+                });
+                if retired {
+                    self.limiter.metrics().record_xudp_retained_expired(1);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1733,6 +1846,25 @@ impl MuxState {
     /// by the number of expired sessions.
     fn try_send_end(&self, id: u16, error: bool) {
         let _ = self.enqueue_end(id, error);
+    }
+
+    /// Queues a rejection `End` unless a live session already owns the id.
+    ///
+    /// A frame can be rejected while an older attachment for the same stream
+    /// id is still live (a replacement `New`, a frame queued behind a full
+    /// resolver, or a queued `Keep`). An `End` there would tell the peer to
+    /// close an id that stays open, so the rejected datagram is dropped
+    /// instead; the live session's own close path owns its `End`.
+    fn try_send_reject_end(&self, id: u16, error: bool) {
+        if self.session(id).is_some() {
+            tracing::debug!(
+                session_id = id,
+                error,
+                "XUDP rejection End suppressed because the session is still live"
+            );
+            return;
+        }
+        self.try_send_end(id, error);
     }
 
     /// Expires idle sessions and retained sockets.
@@ -1834,8 +1966,8 @@ fn lock_table(table: &Mutex<SessionTable>) -> MutexGuard<'_, SessionTable> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MuxError, MuxState, MuxTeardown, OutboundDatagram, OwnedFrame, SEND_QUEUE_CAPACITY,
-        handle_mux_stream,
+        MuxError, MuxState, MuxTeardown, OutboundDatagram, OwnedFrame, ResolutionState,
+        SEND_QUEUE_CAPACITY, handle_mux_stream,
     };
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{
@@ -1843,9 +1975,9 @@ mod tests {
         XudpError, encode_frame, parse_frame,
     };
     use crate::xudp::session::{
-        ActiveSession, DEFAULT_STREAM_REPLY_BUDGET, QueuedFrame, ReplyQueueBudget, Session,
-        SessionTable, SlotGuard, SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter,
-        spawn_reply_task,
+        ActiveSession, DEFAULT_STREAM_REPLY_BUDGET, QueuedFrame, ReplyQueueBudget, RetainedLookup,
+        Session, SessionTable, SlotGuard, SocketFamily, XudpConfig, XudpConfigError,
+        XudpSessionLimiter, spawn_reply_task,
     };
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::atomic::AtomicUsize;
@@ -2019,6 +2151,336 @@ mod tests {
         );
         assert_eq!(metrics.snapshot().xudp_closed_error, 1);
         assert_eq!(metrics.snapshot().xudp_closed_end, 0);
+    }
+
+    #[test]
+    fn send_error_classification_matches_the_legacy_policy() {
+        // A signal interruption, a full buffer, and the bounded send deadline
+        // affect one datagram. They must never close the session.
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert!(
+                super::is_transient_send_error(&std::io::Error::from(kind)),
+                "{kind:?} must be transient"
+            );
+        }
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(
+                !super::is_transient_send_error(&std::io::Error::from(kind)),
+                "{kind:?} must be fatal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn late_send_failure_releases_the_retained_socket() {
+        let limiter = XudpSessionLimiter::new(2);
+        let metrics = limiter.metrics();
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let (outbound, _outbound_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let state = MuxState {
+            config: test_config(),
+            table: Arc::clone(&table),
+            outbound,
+            queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
+            limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+        };
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let global_id = [3u8; GLOBAL_ID_LEN];
+        let socket = Arc::new(
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("session socket"),
+        );
+        let session = Arc::new(Session::new(
+            7,
+            Some(global_id),
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            destination,
+            Some(limiter.try_acquire().expect("session permit")),
+        ));
+
+        // A clean close of a GlobalID session retains the socket and its permit.
+        state
+            .close_active(
+                ActiveSession {
+                    session,
+                    reply_task: None,
+                },
+                super::CloseReason::ClientEnd,
+            )
+            .await
+            .expect("clean close");
+        assert_eq!(table.lock().expect("table").retained_len(), 1);
+        assert_eq!(
+            limiter.stats().available,
+            1,
+            "retained socket keeps its permit"
+        );
+
+        // A stale session that shares the GlobalID but not the socket belongs
+        // to another attachment and must not evict the retained entry.
+        let other = Arc::new(Session::new(
+            7,
+            Some(global_id),
+            Arc::new(
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .await
+                    .expect("other socket"),
+            ),
+            SocketFamily::V4,
+            destination,
+            None,
+        ));
+        state
+            .close_if_same(&other)
+            .await
+            .expect("unrelated failure");
+        assert_eq!(table.lock().expect("table").retained_len(), 1);
+
+        // A late failure of the session whose socket is retained reaches the
+        // entry: a failed socket must not stay available for a reattach.
+        let stale = Arc::new(Session::new(
+            7,
+            Some(global_id),
+            Arc::clone(&socket),
+            SocketFamily::V4,
+            destination,
+            None,
+        ));
+        state.close_if_same(&stale).await.expect("late failure");
+        assert_eq!(table.lock().expect("table").retained_len(), 0);
+        assert_eq!(
+            limiter.stats().available,
+            2,
+            "the retained permit is released once"
+        );
+        assert_eq!(metrics.snapshot().xudp_retained_expired, 1);
+    }
+
+    #[tokio::test]
+    async fn permit_is_released_with_the_socket_after_a_non_retaining_close() {
+        let limiter = XudpSessionLimiter::new(2);
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let (outbound, _outbound_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let state = MuxState {
+            config: test_config(),
+            table: Arc::clone(&table),
+            outbound,
+            queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
+            limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+        };
+        let session = Arc::new(Session::new(
+            5,
+            None,
+            Arc::new(
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .await
+                    .expect("session socket"),
+            ),
+            SocketFamily::V4,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Some(limiter.try_acquire().expect("session permit")),
+        ));
+        // A queued datagram holds the session, and with it the socket, after
+        // the close released the table entry.
+        let queued_work = Arc::clone(&session);
+
+        state
+            .close_active(
+                ActiveSession {
+                    session: Arc::clone(&session),
+                    reply_task: None,
+                },
+                super::CloseReason::RelayError,
+            )
+            .await
+            .expect("failed close");
+        assert_eq!(table.lock().expect("table").active_len(), 0);
+        assert_eq!(
+            limiter.stats().available,
+            1,
+            "the permit must stay with the socket that queued work still owns"
+        );
+
+        drop(queued_work);
+        drop(session);
+        assert_eq!(
+            limiter.stats().available,
+            2,
+            "the permit is released together with the socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_slot_survives_eviction_and_expiry_until_queued_work_drops() {
+        let limiter = XudpSessionLimiter::new(2);
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let (outbound, _outbound_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let state = MuxState {
+            config: test_config(),
+            table: Arc::clone(&table),
+            outbound,
+            queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
+            limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+        };
+
+        for evict in [true, false] {
+            let queued_work = retain_queued_session(&state, &limiter, &table, 11).await;
+            assert_eq!(
+                limiter.stats().available,
+                1,
+                "the retained entry keeps the slot"
+            );
+
+            // Evicting or expiring the optional entry must not release a slot
+            // whose socket is still owned by queued work.
+            if evict {
+                assert!(table.lock().expect("table").evict_oldest_expiring());
+            } else {
+                let expired = table
+                    .lock()
+                    .expect("table")
+                    .expire_retained(Instant::now() + state.config.close_expiry);
+                assert_eq!(expired, 1);
+            }
+            assert_eq!(
+                limiter.stats().available,
+                1,
+                "queued work still owns the retained socket"
+            );
+
+            drop(queued_work);
+            assert_eq!(
+                limiter.stats().available,
+                2,
+                "the last socket owner releases the slot"
+            );
+        }
+    }
+
+    /// Creates a session, retains its GlobalID socket, and returns the queued
+    /// work's handle so a test can observe when the socket's last owner drops.
+    async fn retain_queued_session(
+        state: &MuxState,
+        limiter: &XudpSessionLimiter,
+        table: &Arc<Mutex<SessionTable>>,
+        id: u16,
+    ) -> Arc<Session> {
+        let session = Arc::new(Session::new(
+            id,
+            Some([4u8; GLOBAL_ID_LEN]),
+            Arc::new(
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .await
+                    .expect("session socket"),
+            ),
+            SocketFamily::V4,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Some(limiter.try_acquire().expect("session permit")),
+        ));
+        let queued_work = Arc::clone(&session);
+        state
+            .close_active(
+                ActiveSession {
+                    session,
+                    reply_task: None,
+                },
+                super::CloseReason::ClientEnd,
+            )
+            .await
+            .expect("clean close");
+        assert_eq!(table.lock().expect("table").retained_len(), 1);
+        queued_work
+    }
+
+    #[tokio::test]
+    async fn reattach_shares_the_retained_slot_with_queued_work() {
+        let limiter = XudpSessionLimiter::new(2);
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let (outbound, _outbound_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let state = MuxState {
+            config: test_config(),
+            table: Arc::clone(&table),
+            outbound,
+            queued: Arc::new(AtomicUsize::new(0)),
+            stream_reply_budget: ReplyQueueBudget::new(DEFAULT_STREAM_REPLY_BUDGET),
+            limiter: limiter.clone(),
+            send_tx: test_send_sender(),
+        };
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let global_id = [5u8; GLOBAL_ID_LEN];
+        let session = Arc::new(Session::new(
+            12,
+            Some(global_id),
+            Arc::new(
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .await
+                    .expect("session socket"),
+            ),
+            SocketFamily::V4,
+            destination,
+            Some(limiter.try_acquire().expect("session permit")),
+        ));
+        let queued_work = Arc::clone(&session);
+        state
+            .close_active(
+                ActiveSession {
+                    session,
+                    reply_task: None,
+                },
+                super::CloseReason::ClientEnd,
+            )
+            .await
+            .expect("clean close");
+        let entry = match table
+            .lock()
+            .expect("table")
+            .take_expiring(global_id, Instant::now())
+        {
+            Some(RetainedLookup::Live(entry)) => entry,
+            _ => panic!("the retained entry must still be live"),
+        };
+
+        let replacement = Arc::new(Session::reattached(
+            13,
+            Some(global_id),
+            entry.socket,
+            entry.family,
+            destination,
+            entry.permit,
+        ));
+        assert_eq!(
+            limiter.stats().available,
+            1,
+            "an old queued session and its reattached replacement share one slot"
+        );
+
+        drop(queued_work);
+        assert_eq!(
+            limiter.stats().available,
+            1,
+            "the replacement keeps the shared slot"
+        );
+        drop(replacement);
+        assert_eq!(
+            limiter.stats().available,
+            2,
+            "the last owner of the shared socket releases the slot"
+        );
     }
 
     #[tokio::test]
@@ -3583,6 +4045,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolution_cache_is_keyed_by_the_lookup_family() {
+        let mut resolutions = ResolutionState::new(XudpSessionLimiter::default());
+        let destination = NetLocation {
+            address: Address::Domain("localhost".to_owned()),
+            port: 9,
+        };
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 9));
+
+        // A family-constrained lookup is a different request from the
+        // unconstrained one, which prefers IPv4 on a fresh lookup.
+        resolutions.cache_insert(&destination, v6, Some(SocketFamily::V6));
+        assert_eq!(
+            resolutions.cache_get(&destination, Some(SocketFamily::V6)),
+            Some(v6)
+        );
+        assert_eq!(resolutions.cache_get(&destination, None), None);
+        assert_eq!(
+            resolutions.cache_get(&destination, Some(SocketFamily::V4)),
+            None
+        );
+
+        resolutions.cache_insert(&destination, v4, None);
+        assert_eq!(resolutions.cache_get(&destination, None), Some(v4));
+        assert_eq!(
+            resolutions.cache_get(&destination, Some(SocketFamily::V6)),
+            Some(v6)
+        );
+    }
+
+    #[tokio::test]
     async fn domain_new_and_keep_are_applied_in_order() {
         let echo = spawn_ipv4_echo().await;
         let port = echo.address.port();
@@ -3687,7 +4180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_domain_new_does_not_drop_a_replacement_new() {
+    async fn replacement_new_supersedes_a_pending_domain_new() {
         let echo = spawn_ipv4_echo().await;
         let destination = net_location(echo.address);
         let bad = NetLocation {
@@ -3699,22 +4192,286 @@ mod tests {
 
         write_frame(&mut client, new_spec(1, &bad, b"bad", None)).await;
         write_frame(&mut client, new_spec(1, &destination, b"good", None)).await;
-        let first = read_frame(&mut client, &mut buffer)
-            .await
-            .expect("failed New must produce an End");
-        assert_eq!(first.status, SessionStatus::End);
-        assert!(first.option.has_error());
+        // The replacement owns the id now: the superseded lookup must not
+        // create a session, reject it, or end the id.
         let reply = read_frame(&mut client, &mut buffer)
             .await
-            .expect("replacement New must still be processed");
+            .expect("replacement New must be processed");
         assert_eq!(reply.session_id, 1);
+        assert_eq!(reply.status, SessionStatus::Keep);
         assert_eq!(reply.payload, b"good");
+
+        // Let the superseded lookup settle, then check that it left the
+        // replacement alone.
+        sleep(Duration::from_millis(650)).await;
+        write_frame(&mut client, keep_spec(1, None, b"alive")).await;
+        let alive = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("replacement session must still echo");
+        assert_eq!(alive.session_id, 1);
+        assert_eq!(alive.payload, b"alive");
+
+        // A stale End would be written before the acknowledgement of this one.
+        write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(
+            !end.option.has_error(),
+            "the superseded lookup must not end the replacement"
+        );
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn rejected_replacement_new_does_not_supersede_a_pending_new() {
+        let echo = spawn_ipv4_echo().await;
+        let slow = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &slow, b"owner", None)).await;
+        // A later New that `acceptable_new` rejects must not supersede the
+        // accepted lookup: it has no session to take over and is rejected on
+        // its own when its turn in the queue arrives.
+        write_frame(
+            &mut client,
+            FrameSpec {
+                network: Some(TargetNetwork::Tcp),
+                ..new_spec(1, &slow, b"reject", None)
+            },
+        )
+        .await;
+        // The queued suffix still belongs to the accepted owner and must run
+        // after it.
+        write_frame(&mut client, keep_spec(1, None, b"after")).await;
+
+        let mut echoes = Vec::new();
+        for _ in 0..2 {
+            let frame = read_frame(&mut client, &mut buffer)
+                .await
+                .expect("owner and suffix replies");
+            assert_eq!(frame.session_id, 1);
+            assert_eq!(
+                frame.status,
+                SessionStatus::Keep,
+                "a rejected replacement must not end the live owner"
+            );
+            echoes.push(frame.payload);
+        }
+        assert_eq!(
+            echoes,
+            vec![b"owner".to_vec(), b"after".to_vec()],
+            "the accepted UDP New and its queued suffix must run"
+        );
 
         write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
         let end = read_frame(&mut client, &mut buffer)
             .await
             .expect("End must be acknowledged");
         assert_eq!(end.status, SessionStatus::End);
+        assert!(!end.option.has_error(), "the session ended cleanly");
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_new_does_not_inherit_pending_work() {
+        check_queued_replacements(1).await;
+    }
+
+    #[tokio::test]
+    async fn multiple_queued_replacements_do_not_end_the_final_attachment() {
+        check_queued_replacements(3).await;
+    }
+
+    #[tokio::test]
+    async fn queued_replacements_preserve_only_the_live_attachments_end() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let slow = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+        write_frame(&mut client, new_spec(1, &destination, b"seed", None)).await;
+        assert_eq!(
+            read_frame(&mut client, &mut buffer)
+                .await
+                .expect("seed reply")
+                .payload,
+            b"seed"
+        );
+        write_frame(&mut client, keep_spec(1, Some(&slow), b"live")).await;
+        for _ in 0..2 {
+            write_frame(
+                &mut client,
+                new_spec(1, &destination, b"intermediate", None),
+            )
+            .await;
+            write_frame(&mut client, keep_spec(1, None, b"stale")).await;
+            write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        }
+        write_frame(&mut client, new_spec(1, &destination, b"final", None)).await;
+        let mut ends = 0;
+        loop {
+            let frame = read_frame(&mut client, &mut buffer)
+                .await
+                .expect("replacement reply");
+            assert_eq!(frame.session_id, 1);
+            if frame.status == SessionStatus::End {
+                ends += 1;
+                assert_eq!(ends, 1, "only the already live attachment may end");
+                assert!(!frame.option.has_error());
+            } else {
+                assert_eq!(frame.status, SessionStatus::Keep);
+                if frame.payload == b"final" {
+                    assert_eq!(
+                        ends, 1,
+                        "the live attachment must close before its replacement"
+                    );
+                    break;
+                }
+                assert_eq!(
+                    frame.payload, b"live",
+                    "an intermediate attachment leaked data"
+                );
+            }
+        }
+        write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("final close");
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(!end.option.has_error());
+        finish(client, task).await;
+    }
+
+    async fn check_queued_replacements(replacements: usize) {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let slow = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &slow, b"old", None)).await;
+        // Queued behind the lookup: work of the superseded attachment and a
+        // replacement New without a GlobalID. A client treats an `End` on the
+        // id as terminal, so none of this may answer with one.
+        write_frame(&mut client, keep_spec(1, None, b"stale")).await;
+        write_frame(
+            &mut client,
+            FrameSpec {
+                network: Some(TargetNetwork::Tcp),
+                ..new_spec(1, &destination, b"reject", None)
+            },
+        )
+        .await;
+        for _ in 1..replacements {
+            write_frame(
+                &mut client,
+                new_spec(1, &destination, b"intermediate", None),
+            )
+            .await;
+            write_frame(&mut client, keep_spec(1, None, b"intermediate-keep")).await;
+            write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        }
+        write_frame(&mut client, new_spec(1, &destination, b"new", None)).await;
+
+        // The next frame on the id belongs to the replacement: an echo, not the
+        // clean `End` an unknown id gets, and no inherited stale datagram.
+        let first = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("the replacement must answer");
+        assert_eq!(first.session_id, 1);
+        assert_eq!(
+            first.status,
+            SessionStatus::Keep,
+            "the superseded attachment must not end the replacement"
+        );
+        assert_eq!(first.payload, b"new");
+
+        write_frame(&mut client, keep_spec(1, None, b"alive")).await;
+        let alive = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("the replacement must still answer");
+        assert_eq!(alive.status, SessionStatus::Keep);
+        assert_eq!(alive.payload, b"alive");
+
+        write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(!end.option.has_error(), "the client's own End is clean");
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn resolver_rejection_does_not_end_a_live_session() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &destination, b"seed", None)).await;
+        let seed = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("seed echo");
+        assert_eq!(seed.payload, b"seed");
+
+        // Fill the resolver queue with distinct uncached domains so a lookup
+        // started now is rejected. `slow.test` keeps the entries pending.
+        for offset in 0..64u16 {
+            let pending = NetLocation {
+                address: Address::Domain("slow.test".to_owned()),
+                port: 20_000 + offset,
+            };
+            write_frame(&mut client, new_spec(100 + offset, &pending, b"x", None)).await;
+        }
+        let replacement = NetLocation {
+            address: Address::Domain("slow.test".to_owned()),
+            port: 30_000,
+        };
+        write_frame(&mut client, new_spec(1, &replacement, b"replacement", None)).await;
+
+        write_frame(&mut client, keep_spec(1, None, b"alive")).await;
+        let mut alive = None;
+        for _ in 0..200 {
+            let Some(frame) = read_frame(&mut client, &mut buffer).await else {
+                break;
+            };
+            assert!(
+                !(frame.session_id == 1 && frame.status == SessionStatus::End),
+                "a rejected lookup must not end the live session"
+            );
+            if frame.session_id == 1 && frame.payload == b"alive" {
+                alive = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            alive.is_some(),
+            "the live session must survive the resolver rejection"
+        );
+
+        write_frame(&mut client, FrameSpec::new(1, SessionStatus::End)).await;
+        for _ in 0..200 {
+            let Some(frame) = read_frame(&mut client, &mut buffer).await else {
+                break;
+            };
+            if frame.session_id == 1 && frame.status == SessionStatus::End {
+                assert!(!frame.option.has_error(), "the live session closes cleanly");
+                break;
+            }
+        }
         finish(client, task).await;
     }
 
@@ -5108,24 +5865,30 @@ mod tests {
             new_spec(40, &destination, b"intruder", Some([0x33; GLOBAL_ID_LEN])),
         )
         .await;
-        let end = read_frame(&mut client, &mut buffer)
-            .await
-            .expect("conflicting duplicate must get End");
-        assert_eq!(end.session_id, 40);
-        assert_eq!(end.status, SessionStatus::End);
-        assert!(end.option.has_error());
-
-        // The original session is untouched.
+        // The conflicting New is dropped, not ended: the live session keeps
+        // the id, so the peer must not get the terminal `End` it would apply
+        // to that id. The next frame on the id is the live session's echo.
         write_frame(&mut client, keep_spec(40, None, b"still-original")).await;
         let reply = read_frame(&mut client, &mut buffer)
             .await
             .expect("original session must survive");
+        assert_eq!(reply.session_id, 40);
+        assert_eq!(
+            reply.status,
+            SessionStatus::Keep,
+            "a conflicting duplicate must not end the live session"
+        );
         assert_eq!(reply.payload, b"still-original");
 
         write_frame(&mut client, FrameSpec::new(40, SessionStatus::End)).await;
-        let _ = read_frame(&mut client, &mut buffer)
+        let end = read_frame(&mut client, &mut buffer)
             .await
             .expect("End must be acknowledged");
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(
+            !end.option.has_error(),
+            "the live session's own End is clean"
+        );
 
         finish(client, task).await;
     }

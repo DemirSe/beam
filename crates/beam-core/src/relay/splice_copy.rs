@@ -29,6 +29,9 @@ pub const MIN_PIPE_SIZE: usize = 4096;
 /// a new measurement, so the accepted range stays deliberately small.
 pub const MAX_PIPE_SIZE: usize = 1024 * 1024;
 
+/// Pages reserved for other pipes owned by the same uid.
+const RESERVE_PAGES: u64 = 1024;
+
 /// Selects the largest power-of-two pipe size that keeps every splice permit
 /// under the per-uid pipe-page soft limit.
 ///
@@ -40,7 +43,6 @@ pub const MAX_PIPE_SIZE: usize = 1024 * 1024;
 /// the only way to avoid an 8x-64x splice-syscall cliff.
 #[must_use]
 pub fn pipe_size_for_budget(soft_pages: u64, splice_tasks: usize, page_size: u64) -> usize {
-    const RESERVE_PAGES: u64 = 1024;
     if soft_pages == 0 {
         return MIN_PIPE_SIZE;
     }
@@ -91,10 +93,11 @@ const BATCH_RESET: Duration = Duration::from_millis(100);
 const BATCH_RATE_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 const BATCH_RATE_WINDOW_TIME: Duration = Duration::from_millis(50);
 
-/// Fallback cancellation poll interval when an eventfd cannot be created.
+/// Cancellation poll interval for a relay that shares an activity clock.
 ///
-/// The normal path wakes immediately through the shared [`EventFd`]; this
-/// bound only keeps cancellation working if descriptor creation failed.
+/// The normal path wakes immediately through the shared [`EventFd`]. The
+/// eventfd write has a bounded retry count, though, so this cap also bounds a
+/// poller that missed the wakeup because the write failed.
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Relay tuning and limits.
@@ -135,6 +138,23 @@ impl Default for RelayConfig {
 }
 
 impl RelayConfig {
+    /// Returns how many splice tasks fit in `soft_pages` at [`MIN_PIPE_SIZE`].
+    ///
+    /// Linux uses zero to disable the soft pipe-page limit, so that case needs
+    /// no clamp. The result saturates at `usize::MAX`. A soft limit that leaves
+    /// no capacity above [`RESERVE_PAGES`] returns zero; a zero-permit limiter
+    /// makes every direction use the async copy fallback.
+    #[must_use]
+    pub fn supported_splice_tasks(soft_pages: u64, page_size: u64) -> usize {
+        if soft_pages == 0 {
+            return usize::MAX;
+        }
+        let page = page_size.max(1);
+        let pages_per_task = (MIN_PIPE_SIZE as u64).div_ceil(page);
+        let tasks = soft_pages.saturating_sub(RESERVE_PAGES) / pages_per_task;
+        usize::try_from(tasks).unwrap_or(usize::MAX)
+    }
+
     /// Returns the default configuration.
     #[must_use]
     pub fn new() -> Self {
@@ -286,9 +306,14 @@ pub struct RelayActivity {
     /// Wakes every direction blocked in `poll` when [`Self::stop`] runs.
     ///
     /// Eventfd creation is best-effort: if the process is out of descriptors,
-    /// the relay keeps the older bounded-poll fallback instead of failing the
-    /// connection.
+    /// the relay keeps its bounded-poll cancellation path instead of failing
+    /// the connection.
     stop_fd: Option<EventFd>,
+    /// Test-only: models a wakeup that the bounded eventfd retries gave up on.
+    /// The descriptor stays in the poll set, so only the poll cap can end a
+    /// blocked relay.
+    #[cfg(test)]
+    fail_notify: AtomicBool,
 }
 
 impl RelayActivity {
@@ -299,6 +324,17 @@ impl RelayActivity {
             last: Mutex::new(Instant::now()),
             stopped: AtomicBool::new(false),
             stop_fd: EventFd::new().ok(),
+            #[cfg(test)]
+            fail_notify: AtomicBool::new(false),
+        }
+    }
+
+    /// Test-only clock with a live stop descriptor whose wakeup fails.
+    #[cfg(test)]
+    fn with_failing_notify() -> Self {
+        Self {
+            fail_notify: AtomicBool::new(true),
+            ..Self::new()
         }
     }
 
@@ -316,8 +352,16 @@ impl RelayActivity {
     }
 
     /// Asks every relay sharing this clock to stop and wakes blocked pollers.
+    ///
+    /// The flag alone cannot end a poller that is already blocked, so a failed
+    /// wakeup relies on the [`STOP_POLL_INTERVAL`] poll cap in
+    /// [`copy_one_way`].
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+        #[cfg(test)]
+        if self.fail_notify.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(stop_fd) = &self.stop_fd
             && let Err(error) = stop_fd.notify()
         {
@@ -478,9 +522,13 @@ fn run_one_way(
         stats.polls = stats.polls.saturating_add(1);
         let poll_timeout =
             inactivity_limit(config, shutdown_started.is_some()).saturating_sub(idle_elapsed);
-        // An eventfd wakes both directions immediately. Only the fallback
-        // path, used when descriptor creation failed, needs a periodic poll.
-        let poll_timeout = if activity_clock.is_some() && stop_fd.is_none() {
+        // The eventfd wakes both directions immediately, but its write is
+        // bounded and can fail. An already blocked poller would then sleep
+        // until the idle timeout with its pipe, sockets, and thread retained.
+        // Cap every poll of a shared clock so a missed wakeup costs at most
+        // STOP_POLL_INTERVAL; the cost is four wakeups per second while a
+        // direction is blocked.
+        let poll_timeout = if activity_clock.is_some() {
             poll_timeout.min(STOP_POLL_INTERVAL)
         } else {
             poll_timeout
@@ -805,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_relay_does_not_poll_periodically() {
+    fn an_idle_relay_polls_within_the_stop_bound() {
         let (_client, relay_a, relay_b, _target) = relay_pair();
         let activity = Arc::new(super::RelayActivity::new());
         assert!(
@@ -833,7 +881,8 @@ mod tests {
             let _ = sender.send(result);
         });
 
-        // The old fallback polled every 250 ms purely to observe cancellation.
+        // An idle shared clock still polls at the cancellation bound; the
+        // eventfd only makes the usual wakeup immediate.
         thread::sleep(Duration::from_millis(600));
         let started = Instant::now();
         activity.stop();
@@ -846,10 +895,55 @@ mod tests {
             "cancellation took {:?}",
             started.elapsed()
         );
+        // It polls at the cap instead of sleeping through the idle timeout.
         assert!(
-            stats.polls <= 2,
-            "an idle eventfd relay polled {} times",
+            (2..=8).contains(&stats.polls),
+            "an idle relay polled {} times in 600 ms",
             stats.polls
+        );
+    }
+
+    #[test]
+    fn a_failed_wakeup_still_bounds_a_blocked_relay() {
+        let (_client, relay_a, relay_b, _target) = relay_pair();
+        let activity = Arc::new(super::RelayActivity::with_failing_notify());
+        assert!(
+            activity.stop_fd().is_some(),
+            "the test requires eventfd support"
+        );
+        let relay_activity = Arc::clone(&activity);
+        let config = RelayConfig {
+            idle_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(30),
+            ..config()
+        };
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| {
+                beam_sys::set_nonblocking(relay_a.as_raw_fd())?;
+                beam_sys::set_nonblocking(relay_b.as_raw_fd())?;
+                copy_one_way(
+                    relay_a.as_raw_fd(),
+                    relay_b.as_raw_fd(),
+                    &config,
+                    Some(&relay_activity),
+                )
+            })();
+            let _ = sender.send(result);
+        });
+
+        // Let the worker block in poll before the wakeup fails.
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        activity.stop();
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a failed wakeup left the relay blocked past the idle timeout");
+        assert!(result.is_ok(), "stopped relay failed: {result:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "cancellation took {:?}",
+            started.elapsed()
         );
     }
 
@@ -1065,6 +1159,28 @@ mod tests {
         assert_eq!(pipe_size_for_budget(1_024, 120, 4096), MIN_PIPE_SIZE);
         assert_eq!(pipe_size_for_budget(0, 120, 4096), MIN_PIPE_SIZE);
         assert_eq!(pipe_size_for_budget(16_384, 0, 4096), DEFAULT_PIPE_SIZE);
+    }
+
+    #[test]
+    fn supported_splice_tasks_returns_zero_when_the_reserve_uses_the_budget() {
+        // No capacity above the reserve: zero permits, so startup selects the
+        // async fallback instead of oversubscribing the pipe-page soft limit.
+        assert_eq!(RelayConfig::supported_splice_tasks(1_023, 4096), 0);
+        assert_eq!(RelayConfig::supported_splice_tasks(1_024, 4096), 0);
+        assert_eq!(RelayConfig::supported_splice_tasks(1_025, 4096), 1);
+        assert_eq!(RelayConfig::supported_splice_tasks(1_025, 8_192), 1);
+    }
+
+    #[test]
+    fn supported_splice_tasks_respects_the_pipe_budget() {
+        assert_eq!(RelayConfig::supported_splice_tasks(0, 4096), usize::MAX);
+        assert_eq!(RelayConfig::supported_splice_tasks(2_048, 4096), 1_024);
+        assert_eq!(RelayConfig::supported_splice_tasks(2_048, 0), 0);
+        assert_eq!(
+            RelayConfig::supported_splice_tasks(u64::MAX, 4096),
+            usize::try_from(u64::MAX - 1_024).unwrap_or(usize::MAX)
+        );
+        assert_eq!(RelayConfig::supported_splice_tasks(16_384, 4096), 15_360);
     }
 
     #[test]

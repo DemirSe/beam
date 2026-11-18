@@ -46,7 +46,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout};
+use tokio::time::Instant;
 
 use crate::address::{Address, NetLocation};
 use crate::metrics::Metrics;
@@ -518,7 +518,7 @@ impl Drop for LiveHandlerGuard {
 }
 
 /// Address family of a session socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SocketFamily {
     /// IPv4 socket.
     V4,
@@ -615,12 +615,18 @@ pub(crate) async fn resolve_destination(
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 return Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, destination.port)));
             }
-            let addresses = timeout(
-                resolve_timeout,
-                tokio::net::lookup_host((domain.as_str(), destination.port)),
+            // The shared lookup keeps its admission permit until the blocking
+            // resolver job finishes, even when this deadline elapses first.
+            let addresses = crate::dns::lookup_host_until(
+                domain.as_str(),
+                destination.port,
+                Instant::now() + resolve_timeout,
             )
             .await
-            .map_err(|_| ResolveError::Timeout)??;
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::TimedOut => ResolveError::Timeout,
+                _ => ResolveError::Io(error),
+            })?;
 
             let mut chosen = None;
             for address in addresses {
@@ -785,6 +791,26 @@ fn now_ms() -> u64 {
     epoch().elapsed().as_millis() as u64
 }
 
+/// One global session slot, shared by every owner of one session socket.
+///
+/// A cleanly closed GlobalID session moves this handle to its retained entry;
+/// a reattach shares it with the new session. The permit is released only when
+/// the last owner (a `Session`, a queued datagram's `Arc<Session>`, or a
+/// retained entry) drops the handle, so permit accounting cannot end while an
+/// old queued datagram still owns the socket.
+#[derive(Clone)]
+pub(crate) struct GlobalSlot {
+    _permit: Option<Arc<OwnedSemaphorePermit>>,
+}
+
+impl GlobalSlot {
+    pub(crate) fn new(permit: Option<OwnedSemaphorePermit>) -> Self {
+        Self {
+            _permit: permit.map(Arc::new),
+        }
+    }
+}
+
 /// One UDP relay session.
 pub(crate) struct Session {
     /// Mux session id.
@@ -803,8 +829,8 @@ pub(crate) struct Session {
     stop: watch::Sender<bool>,
     closed: AtomicBool,
     failed: AtomicBool,
-    /// Global session slot, released when the socket is finally dropped.
-    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    /// Global session slot, released when the socket's last owner drops it.
+    permit: GlobalSlot,
 }
 
 impl Session {
@@ -816,6 +842,36 @@ impl Session {
         family: SocketFamily,
         destination: SocketAddr,
         permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        Self::with_slot(
+            id,
+            global_id,
+            socket,
+            family,
+            destination,
+            GlobalSlot::new(permit),
+        )
+    }
+
+    /// Creates a session for a retained socket and shares its global slot.
+    pub(crate) fn reattached(
+        id: u16,
+        global_id: Option<[u8; GLOBAL_ID_LEN]>,
+        socket: Arc<UdpSocket>,
+        family: SocketFamily,
+        destination: SocketAddr,
+        slot: GlobalSlot,
+    ) -> Self {
+        Self::with_slot(id, global_id, socket, family, destination, slot)
+    }
+
+    fn with_slot(
+        id: u16,
+        global_id: Option<[u8; GLOBAL_ID_LEN]>,
+        socket: Arc<UdpSocket>,
+        family: SocketFamily,
+        destination: SocketAddr,
+        permit: GlobalSlot,
     ) -> Self {
         let (stop, _) = watch::channel(false);
         Self {
@@ -829,13 +885,13 @@ impl Session {
             stop,
             closed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
-            permit: Mutex::new(permit),
+            permit,
         }
     }
 
-    /// Takes the global session slot so it can move to a retained socket.
-    pub(crate) fn take_permit(&self) -> Option<OwnedSemaphorePermit> {
-        lock(&self.permit).take()
+    /// Returns a handle that keeps the global slot with the socket.
+    pub(crate) fn slot(&self) -> GlobalSlot {
+        self.permit.clone()
     }
 
     #[cfg(test)]
@@ -928,8 +984,8 @@ pub(crate) struct ExpiringSession {
     pub(crate) family: SocketFamily,
     /// Absolute expiry instant.
     pub(crate) expires_at: Instant,
-    /// Global session slot held while the socket is retained.
-    pub(crate) permit: Option<OwnedSemaphorePermit>,
+    /// Global session slot shared with the session that retained the socket.
+    pub(crate) permit: GlobalSlot,
 }
 
 /// Result of looking up a retained GlobalID socket.
@@ -1025,6 +1081,25 @@ impl SessionTable {
             Some(RetainedLookup::Expired)
         } else {
             Some(RetainedLookup::Live(entry))
+        }
+    }
+
+    /// Removes the retained socket for `global_id` only when it is `socket`.
+    ///
+    /// A late send failure can be reported after the owning session was
+    /// retained. Removing the entry releases its permit exactly once and keeps
+    /// a failed socket from being reattached; the identity check keeps a newer
+    /// attachment of the same GlobalID untouched.
+    pub(crate) fn remove_expiring_if_same(
+        &mut self,
+        global_id: [u8; GLOBAL_ID_LEN],
+        socket: &Arc<UdpSocket>,
+    ) -> bool {
+        match self.expiring.get(&global_id) {
+            Some(entry) if Arc::ptr_eq(&entry.socket, socket) => {
+                self.expiring.remove(&global_id).is_some()
+            }
+            _ => false,
         }
     }
 
@@ -1419,8 +1494,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::{
         DEFAULT_MAX_GLOBAL_SESSIONS, DEFAULT_RESOLUTION_QUEUE_BUDGET, DEFAULT_STREAM_REPLY_BUDGET,
-        ExpiringSession, ReplyQueueBudget, ResolveError, Session, SessionTable, SocketFamily,
-        XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
+        ExpiringSession, GlobalSlot, ReplyQueueBudget, ResolveError, Session, SessionTable,
+        SocketFamily, XudpConfig, XudpConfigError, XudpSessionLimiter, encode_end_frame,
         queue_failed_session_end, reply_frame_len, reply_loop, resolve_destination,
         socket_addr_to_location,
     };
@@ -1604,7 +1679,7 @@ mod tests {
                 socket: Arc::clone(&socket),
                 family: SocketFamily::V4,
                 expires_at: now,
-                permit: Some(permit),
+                permit: GlobalSlot::new(Some(permit)),
             },
         );
         // The deadline itself is expired, matching `expire_retained`.
@@ -1623,7 +1698,7 @@ mod tests {
                 socket,
                 family: SocketFamily::V4,
                 expires_at: now + Duration::from_secs(60),
-                permit: None,
+                permit: GlobalSlot::new(None),
             },
         );
         let live = table.take_expiring([9; 8], now + Duration::from_millis(1));
@@ -1960,7 +2035,7 @@ mod tests {
             socket,
             family: SocketFamily::V4,
             expires_at: tokio::time::Instant::now() + Duration::from_secs(1),
-            permit: None,
+            permit: GlobalSlot::new(None),
         };
         table.insert_expiring([7; 8], entry);
         assert_eq!(table.total(), 2);
@@ -2071,7 +2146,7 @@ mod tests {
                 socket,
                 family: SocketFamily::V4,
                 expires_at: Instant::now() + Duration::from_secs(10),
-                permit: limiter.try_acquire(),
+                permit: GlobalSlot::new(limiter.try_acquire()),
             },
         );
         let stats = limiter.stats();
@@ -2102,7 +2177,7 @@ mod tests {
                 socket: Arc::clone(&socket),
                 family: SocketFamily::V4,
                 expires_at: now + Duration::from_secs(20),
-                permit: limiter.try_acquire(),
+                permit: GlobalSlot::new(limiter.try_acquire()),
             },
         );
         second.lock().expect("second table").insert_expiring(
@@ -2111,7 +2186,7 @@ mod tests {
                 socket,
                 family: SocketFamily::V4,
                 expires_at: now + Duration::from_secs(5),
-                permit: limiter.try_acquire(),
+                permit: GlobalSlot::new(limiter.try_acquire()),
             },
         );
         let permit = limiter
@@ -2149,7 +2224,7 @@ mod tests {
             socket,
             family: SocketFamily::V4,
             expires_at: now,
-            permit: None,
+            permit: GlobalSlot::new(None),
         };
         table.insert_expiring([9; 8], entry);
         assert_eq!(table.expire_retained(now), 1);

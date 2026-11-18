@@ -28,6 +28,16 @@ const MAX_DNS_LABEL_LEN: usize = 63;
 /// budget are rejected instead of passing --check and later OOMing.
 const MAX_XUDP_SOCKET_BUDGET: u64 = 512 * 1024 * 1024;
 
+/// Conservative estimate for one `HashSet<SocketAddr>` entry: the address,
+/// hash-table control bytes, bucket and allocator overhead. It is an estimate,
+/// not a measured resident size.
+const PACKETADDR_DESTINATION_ENTRY_BYTES: u64 = 128;
+
+/// Worst-case memory for every destination table in the legacy UDP pool.
+/// The pool has `max_xudp_sessions` streams, each with at most
+/// `max_udp_destinations` entries.
+const MAX_PACKETADDR_TABLE_BUDGET: u64 = 512 * 1024 * 1024;
+
 /// Errors produced while loading a configuration file.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -137,6 +147,19 @@ pub enum ValidationError {
     XudpBufferBudget {
         /// Estimated kernel buffer bytes, including the kernel's SO_RCVBUF
         /// doubling.
+        bytes: u64,
+        /// Supported budget.
+        max: u64,
+    },
+
+    /// The aggregate packetaddr destination tables cannot fit the memory budget.
+    #[error(
+        "limits.max_udp_destinations * limits.max_xudp_sessions needs about {bytes} bytes for {entries} packetaddr destinations, above the {max}-byte budget"
+    )]
+    PacketaddrTableBudget {
+        /// Product of the two configured limits.
+        entries: u64,
+        /// Estimated table bytes at `PACKETADDR_DESTINATION_ENTRY_BYTES` per entry.
         bytes: u64,
         /// Supported budget.
         max: u64,
@@ -440,6 +463,17 @@ fn validate_limits(raw: RawLimits) -> Result<LimitsConfig, ValidationError> {
         return Err(ValidationError::XudpBufferBudget {
             bytes: xudp_socket_budget,
             max: MAX_XUDP_SOCKET_BUDGET,
+        });
+    }
+    let packetaddr_entries =
+        u64::from(raw.max_udp_destinations).saturating_mul(u64::from(raw.max_xudp_sessions));
+    let packetaddr_table_bytes =
+        packetaddr_entries.saturating_mul(PACKETADDR_DESTINATION_ENTRY_BYTES);
+    if packetaddr_table_bytes > MAX_PACKETADDR_TABLE_BUDGET {
+        return Err(ValidationError::PacketaddrTableBudget {
+            entries: packetaddr_entries,
+            bytes: packetaddr_table_bytes,
+            max: MAX_PACKETADDR_TABLE_BUDGET,
         });
     }
     if raw.listen_backlog == 0 {
@@ -887,6 +921,33 @@ idle_timeout_ms = 300000
                 max: 536_870_912
             })
         ));
+    }
+
+    #[test]
+    fn packetaddr_destination_table_budget_boundary() {
+        let key = private_key();
+        let at_budget = config_toml(&key).replace(
+            "max_udp_destinations = 2048",
+            "max_udp_destinations = 16384",
+        );
+        assert!(Config::from_toml_str(&at_budget).is_ok());
+
+        let over_budget = config_toml(&key).replace(
+            "max_udp_destinations = 2048",
+            "max_udp_destinations = 16385",
+        );
+        let error = Config::from_toml_str(&over_budget).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ConfigError::Validation(ValidationError::PacketaddrTableBudget {
+                    entries: 4_194_560,
+                    bytes: 536_903_680,
+                    max: 536_870_912
+                })
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]
