@@ -46,6 +46,11 @@ supervision.
 - When work is delegated in parallel, assign non-overlapping file ownership
   or make a task read-only. If changes overlap, designate one agent to combine
   them and verify the result.
+- Keep one short checklist in the task's shared context for delegated work.
+  Record each item’s relevant files, status, acceptance criteria, and verification
+  result. Update it after each round. When handing work to another agent, send
+  the open items, verification commands, and any constraints they need. Link
+  to prior evidence instead of repeating reports.
 - Present consequential decisions early and briefly: options, user impact,
   tradeoffs and missing evidence. Continue already authorized routine work,
   including Actions dispatches, without asking again; preserve the owner's
