@@ -156,13 +156,13 @@ authenticated failures close without cover.
 **States.** Starting (parse, validate, build TLS config, bind) → Running
 (accept loop) → Draining → Stopped.
 
-- Config load `main.rs:84-97`; fd-budget check `102-105`; `--check` builds the
-  runtime config and returns `123-130`; runtime state `132-180`; listener
-  `177`; metrics task `193`; signals `286-294`; accept loop `307`.
-- Shutdown: `drop(listener)` `367`, then wait while any authenticated, pre-auth,
-  or cover permit is outstanding (`370-372`), bounded by `shutdown_drain_ms`;
-  `main` then bounds runtime shutdown at 3 s (`76-82`).
-- SIGHUP is logged and ignored (`286-294`); only SIGTERM/SIGINT drain.
+- The service registers SIGTERM, SIGINT and SIGHUP before config loading.
+  SIGHUP uses the default or inherited disposition before registration. Once
+  registered it is ignored and logged after startup.
+- On SIGTERM or SIGINT the listener closes. The drain waits while an
+  authenticated, pre-auth or cover permit is outstanding, up to
+  `shutdown_drain_ms` or the next SIGTERM/SIGINT. Runtime shutdown has its own
+  three-second bound for blocking work.
 
 **Guards / edges.** Accept errors are counted and backed off, never fatal
 (`318-327`). New work stops after the listener drop, but already-accepted tasks
@@ -552,7 +552,12 @@ The comment now states that, instead of describing only the success path.
 **States.** Validate → Running (read loop) → Draining → Returned.
 `empty_since: Option<Instant>` is the empty-stream timer: `None` while any
 active session exists, `Some(t)` otherwise. KeepAlive-only batches do not
-restart it; a coalesced New+End does (`790-900`).
+restart it; a coalesced New+End does (`790-900`). A pending domain lookup never
+pauses or restarts it: the lookup defers the close, and the deadline keeps its
+original start, so a lookup that creates no session ends the mux instead of
+buying a fresh idle window. Frames the server rejects (a non-UDP New, or a
+payload above `max_datagram_size`) never start a lookup and never supersede a
+pending one.
 
 **Transitions.** `handle_mux_stream` builds channels/tasks and calls `read_loop`
 (`593-697`). `read_loop` selects on writer failure, send failure, resolution
@@ -580,8 +585,11 @@ still runs when `read_loop` returns. For every other ending — runtime shutdown
 a cancelled task, a panic — `MuxTeardown` is registered for the handler's whole
 lifetime and, on drop, drains the table, clears retained sockets, claims and
 stops each session, releases its global permit, and aborts its reply task. It is
-idempotent: the return path drains first, so the guard then finds nothing. Pinned
-by `aborting_the_mux_handler_releases_sessions_and_permits`, which aborts a live
+idempotent: the return path drains first, so the guard then finds nothing. The
+entry removed from the table owns the one terminal report, and a reply failure
+the reply task already observed is reported as `xudp_closed_error` instead of a
+clean `xudp_closed_mux`. Pinned by
+`aborting_the_mux_handler_releases_sessions_and_permits`, which aborts a live
 handler with three sessions and requires `active == 0` and every permit back;
 before the guard it observably leaked three of eight permits.
 
@@ -594,7 +602,11 @@ phase gauge or empty-timer gauge.
 `coalesced_new_end_restarts_the_empty_timer` (2449),
 `shutdown_releases_a_session_whose_reply_task_has_not_run` (2638),
 `truncated_frame_at_eof_is_reported` (3692),
-`mux_read_deadline_is_not_extended_by_sweeps` (D1).
+`mux_read_deadline_is_not_extended_by_sweeps` (D1),
+`rejected_tcp_new_does_not_start_a_lookup`,
+`oversize_new_does_not_start_a_lookup`,
+`rejected_new_does_not_cancel_a_pending_lookup`,
+`teardown_reports_observed_reply_failures_once`.
 
 ### 15. XUDP session lifecycle (P1)
 
@@ -643,8 +655,9 @@ replacement with an error End. `OutboundDatagram` now carries
 by id because it runs synchronously inside the read loop, which is the only
 inserter.
 
-**Why implicit.** Five sources of truth. The good news: one close claim
-(`closed.swap`) and one enqueue gate make the main races testable.
+**Close ownership.** Removing the live table entry owns the terminal report.
+A reply task removes only its own entry, with the error End ordered under the
+table lock. The closed flag and enqueue gate stop reply work during teardown.
 
 **Observability.** Admitted/closed/retained counters
 (`metrics.rs:157-219`); `XudpStats` active/retained/live tables/handlers; a
@@ -748,8 +761,9 @@ cursor.
 
 **Error policy differs by mode.** Fixed: a transient send error drops one
 datagram, anything else closes the association. Packetaddr: table-full and
-missing-family drop one datagram; a malformed inner address closes. Zero-length
-datagrams are skipped. Idle refreshes only on admitted sends/replies.
+missing-family drop one datagram; a malformed inner address closes. A new
+destination uses a table slot after its first successful send. Zero-length
+datagrams are skipped. Idle refreshes only on successful sends and accepted replies.
 
 **Observability.** `UdpError` plus debug/trace logs; no per-association counters
 beyond `legacy_udp_limited`.

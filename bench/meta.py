@@ -146,14 +146,18 @@ def qdisc_evidence(log_dir: Path | None) -> dict:
     result: dict[str, dict] = {}
     for role in ("client", "server"):
         # Drops accumulate during the run, so the final dump is the counter
-        # source; the initial dump is the fallback when the run never finished.
-        parsed = parse_qdisc_json(log_dir / f"tc-{role}-final.json")
-        if parsed is None:
-            parsed = parse_qdisc_json(log_dir / f"tc-{role}-initial.json")
-        if parsed is None:
-            parsed = parse_qdisc_text(log_dir / f"tc-{role}-final.txt")
-        if parsed is None:
-            parsed = parse_qdisc_text(log_dir / f"tc-{role}.txt")
+        # source. The initial dump proves the impairment, not the counters.
+        parsed = None
+        for path, parse, final in (
+            (log_dir / f"tc-{role}-final.json", parse_qdisc_json, True),
+            (log_dir / f"tc-{role}-initial.json", parse_qdisc_json, False),
+            (log_dir / f"tc-{role}-final.txt", parse_qdisc_text, True),
+            (log_dir / f"tc-{role}.txt", parse_qdisc_text, False),
+        ):
+            parsed = parse(path)
+            if parsed is not None:
+                parsed["final"] = final
+                break
         result[role] = parsed or {"source": "unavailable"}
     return result
 

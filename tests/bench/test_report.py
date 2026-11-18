@@ -5,10 +5,15 @@ Fixtures are generated in a temporary directory: no network, no namespaces,
 no keys. Every test pins one decision that the hosted lab depends on.
 """
 
+import argparse
 import importlib.util
 import json
+import struct
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -22,6 +27,11 @@ def _load(name: str, path: Path):
 
 report = _load("bench_report", ROOT / "bench" / "report.py")
 meta = _load("bench_meta", ROOT / "bench" / "meta.py")
+measure = _load("bench_measure", ROOT / "bench" / "measure.py")
+
+sys.path.insert(0, str(ROOT / "bench"))
+import preprod
+sys.path.pop(0)
 
 SCENARIOS = (
     "tcp-dl-1",
@@ -79,6 +89,7 @@ def _qdisc(rtt_ms, loss_pct, drops=0):
     entry = {
         "source": "json",
         "kind": "netem",
+        "final": True,
         "delay_ms": rtt_ms / 2 if rtt_ms else None,
         "loss_pct": loss_pct if loss_pct else None,
         "drops": drops,
@@ -287,6 +298,18 @@ class ReportContractTests(unittest.TestCase):
         for role in ("client", "server"):
             self.assertEqual(evidence[role]["drops"], 732)
             self.assertEqual(evidence[role]["delay_ms"], 25.0)
+            self.assertTrue(evidence[role]["final"])
+
+        # Without a final capture the counters are initial-only, so the
+        # preprod gate must see the evidence as incomplete.
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            (logs / "tc-client-initial.json").write_text(
+                json.dumps(initial), encoding="utf-8"
+            )
+            evidence = meta.qdisc_evidence(logs)
+        self.assertFalse(evidence["client"]["final"])
+        self.assertEqual(evidence["server"], {"source": "unavailable"})
 
     def test_qdisc_evidence_is_verified(self):
         import tempfile
@@ -482,6 +505,101 @@ class ReportContractTests(unittest.TestCase):
             self.assertEqual(report.row_status(rows[label]), "INFO", label)
         self.assertEqual(rows["Server memory peak (memory.peak)"]["beam"], "32.0 MiB")
         self.assertEqual(rows["Server OOM kills (memory.events)"]["beam"], "0")
+
+
+class PreprodTests(unittest.TestCase):
+    def setUp(self):
+        self.results = _results(3, arms=preprod.ARMS)
+        for row in self.results:
+            row["cpu"]["server_memory_max"] = str(preprod.MEMORY_MAX)
+            row["metrics"].update(
+                sent=2, received=2, attempts=2, latency_sent=2, planned=2, errors=[]
+            )
+        self.resources = "\n".join(
+            f"{arm}\t{rep}\tserver-resources\t-\tmemory_max={preprod.MEMORY_MAX} "
+            "memory_peak=1000 oom=0 oom_kill=0"
+            for arm in preprod.ARMS for rep in preprod.REPS
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _write(tmp, self.results, _meta(3, arms=list(preprod.ARMS)))
+            self.summary = report.build(root, require_complete=True)
+
+    def test_complete_paired_evidence_passes(self):
+        self.assertEqual(preprod.failures(self.summary, self.results, self.resources), [])
+
+    def test_speed_latency_and_delivery_fail_closed(self):
+        self.summary["comparisons"]["tcp-dl-1"]["ratio"] = 0.97
+        self.summary["comparisons"]["latency"]["dns-a"]["p99_ratio"] = 1.03
+        self.summary["comparisons"]["latency"]["h3-latency"]["p95_ratio"] = float("nan")
+        for row in self.results:
+            if row["scenario"] == "dns-a":
+                row["metrics"]["received"] = 1
+        errors = preprod.failures(self.summary, self.results, self.resources)
+        for reason in ("tcp-dl-1: throughput", "dns-a: p99", "h3-latency: p95", "receive a reply"):
+            self.assertTrue(any(reason in error for error in errors), errors)
+
+    def test_missing_repetition_and_bad_resource_readbacks_fail(self):
+        self.results.pop()
+        self.results[0]["cpu"]["server_cpu_max"] = "max 100000"
+        resources = self.resources.replace("oom_kill=0", "oom_kill=1", 1)
+        errors = preprod.failures(self.summary, self.results, resources)
+        for reason in ("successful result", "limit readback", "OOM evidence"):
+            self.assertTrue(any(reason in error for error in errors), errors)
+
+    def test_dns_requires_the_planned_error_free_run(self):
+        for row in self.results:
+            if row["scenario"] == "dns-a":
+                row["metrics"]["planned"] = 3
+                row["metrics"]["errors"] = ["timeout"]
+        errors = preprod.failures(self.summary, self.results, self.resources)
+        self.assertTrue(any("planned 3" in error for error in errors), errors)
+        self.assertTrue(any("DNS errors" in error for error in errors), errors)
+
+    def test_initial_only_netem_counters_fail(self):
+        self.summary["meta"]["qdisc"]["client"]["final"] = False
+        self.summary["meta"]["qdisc"]["server"]["drops"] = None
+        errors = preprod.failures(self.summary, self.results, self.resources)
+        self.assertTrue(any("client: no final netem counters" in error for error in errors), errors)
+        self.assertTrue(any("server: no final netem counters" in error for error in errors), errors)
+
+    def test_fixed_window_udp_pps_no_longer_gates(self):
+        self.summary["comparisons"]["udp"]["pps"]["ratio"] = 0.5
+        self.assertEqual(preprod.failures(self.summary, self.results, self.resources), [])
+
+
+class DnsMeasurementTests(unittest.TestCase):
+    def test_truncated_run_fails_even_when_an_answer_arrived(self):
+        class FakeSocket:
+            def __init__(self, *_args, **_kwargs):
+                self.sends = 0
+
+            def settimeout(self, _value):
+                pass
+
+            def connect(self, _address):
+                pass
+
+            def send(self, _payload):
+                self.sends += 1
+                if self.sends > 1:
+                    raise OSError("interface down")
+
+            def recv(self, _size):
+                return struct.pack("!HHHHHH", 0, 0x8180, 1, 1, 0, 0) + b"\x0a\x0a\x02\x02"
+
+            def close(self):
+                pass
+
+        args = argparse.Namespace(
+            dns_server="10.10.2.2", dns_port=53, dns_count=3, timeout=1
+        )
+        with mock.patch("socket.socket", FakeSocket):
+            outcome, _ = measure.run_dns(args)
+        self.assertEqual(outcome["status"], "fail")
+        self.assertEqual(outcome["metrics"]["planned"], 3)
+        self.assertEqual(outcome["metrics"]["sent"], 1)
+        self.assertEqual(outcome["metrics"]["received"], 1)
+        self.assertIn("incomplete DNS run", outcome["reason"])
 
 
 if __name__ == "__main__":

@@ -299,6 +299,8 @@ SERVER_KIND=""
 # error. SERVER_PID/SERVER_LOG/SERVER_KIND are only meaningful while starting,
 # running, restarting or failed.
 SERVER_STATE=none
+SERVER_SCOPE=""
+SERVER_SCOPE_PID=""
 BASELINE_RTT_MS=0
 BASELINE_TARGET_RTT_MS=0
 NAMESPACES=(tun-client tun-server tun-target)
@@ -530,6 +532,78 @@ server_require() {
   fi
 }
 
+# Keep the server as a known PID across exec, including protocol restarts.
+launch_server() {
+  local kind=$1
+  shift
+  if [ "${TUN_SERVER_BOUNDED:-0}" != 1 ]; then
+    ip netns exec tun-server "$@" >> "$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+    return
+  fi
+
+  local pid_file="$RUN_DIR/.server.pid"
+  rm -f "$pid_file"
+  local wrapper="$RUN_DIR/.server-scope.sh"
+  cat > "$wrapper" <<'SCOPE'
+#!/bin/sh
+set -eu
+pid_file=$1
+scope=$2
+shift 2
+cgroup=$(sed -n 's/^0:://p' /proc/self/cgroup)
+case "$cgroup" in
+  */"$scope.scope") ;;
+  *) echo "server is outside expected cgroup: $cgroup" >&2; exit 1 ;;
+esac
+cpu=$(cat "/sys/fs/cgroup$cgroup/cpu.max")
+memory=$(cat "/sys/fs/cgroup$cgroup/memory.max")
+printf 'server cgroup=%s cpu.max=%s memory.max=%s\n' "$cgroup" "$cpu" "$memory"
+[ "$cpu" = "50000 100000" ] && [ "$memory" = 805306368 ] || exit 1
+echo $$ > "$pid_file"
+exec ip netns exec tun-server "$@"
+SCOPE
+  SERVER_SCOPE="beam-tun-$kind-$$-$RANDOM"
+  systemd-run --scope --quiet --unit="$SERVER_SCOPE" \
+    -p CPUQuota=50% -p MemoryMax=768M -- sh "$wrapper" "$pid_file" "$SERVER_SCOPE" "$@" \
+    >> "$SERVER_LOG" 2>&1 &
+  SERVER_SCOPE_PID=$!
+  for _ in $(seq 1 100); do
+    if [ -s "$pid_file" ]; then
+      read -r SERVER_PID < "$pid_file"
+      return
+    fi
+    kill -0 "$SERVER_SCOPE_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  fail_harness "server $kind did not start with the required CPU and memory limits"
+  return 1
+}
+
+verify_server_scope() {
+  [ -n "$SERVER_SCOPE" ] || return 0
+  local cgroup peak events
+  cgroup=$(sed -n 's/^0:://p' "/proc/$SERVER_PID/cgroup" 2>/dev/null || true)
+  peak=$(cat "/sys/fs/cgroup$cgroup/memory.peak" 2>/dev/null || true)
+  events=$(cat "/sys/fs/cgroup$cgroup/memory.events" 2>/dev/null || true)
+  printf '%s cgroup=%s memory.peak=%s\n%s\n' "$SERVER_KIND" "$cgroup" "$peak" "$events" \
+    >> "$LOG_DIR/server-cgroups.txt"
+  if [[ "$cgroup" != */"$SERVER_SCOPE.scope" || ! "$peak" =~ ^[0-9]+$ ]] \
+    || [ "$peak" -eq 0 ] || [ "$peak" -gt 805306368 ] \
+    || ! grep -qx 'oom 0' <<<"$events" || ! grep -qx 'oom_kill 0' <<<"$events"; then
+    fail_harness "$SERVER_KIND server scope exited or lacked valid memory/OOM evidence"
+  fi
+}
+
+stop_server_scope() {
+  if [ -n "$SERVER_SCOPE" ]; then
+    systemctl stop "$SERVER_SCOPE.scope" >/dev/null 2>&1 || true
+    stop_pid "$SERVER_SCOPE_PID"
+    SERVER_SCOPE=""
+    SERVER_SCOPE_PID=""
+  fi
+}
+
 # server_start beam|xray [mark]: none/stopped -> starting -> running|failed.
 # A byte mark makes readiness mean "a listening line after this offset", so a
 # restarted process cannot pass on the previous process's message.
@@ -546,10 +620,8 @@ server_start() {
   SERVER_KIND=$kind
   if [ "$kind" = "beam" ]; then
     SERVER_LOG=$BEAM_LOG
-    ip netns exec tun-server "$BEAM_BIN" --config "$CONFIG_DIR/beam.toml" \
-      >> "$BEAM_LOG" 2>&1 &
-    BEAM_PID=$!
-    SERVER_PID=$BEAM_PID
+    launch_server beam "$BEAM_BIN" --config "$CONFIG_DIR/beam.toml" || return 1
+    BEAM_PID=$SERVER_PID
     if [ -n "$mark" ]; then
       wait_for_marker_after "$BEAM_LOG" "$mark" "beam listening" "$BEAM_PID" 15 || ready=0
     else
@@ -561,10 +633,8 @@ server_start() {
     fi
   else
     SERVER_LOG=$XRAY_LOG
-    ip netns exec tun-server "$XRAY_BIN" run -c "$CONFIG_DIR/xray-server.json" \
-      >> "$XRAY_LOG" 2>&1 &
-    XRAY_PID=$!
-    SERVER_PID=$XRAY_PID
+    launch_server xray "$XRAY_BIN" run -c "$CONFIG_DIR/xray-server.json" || return 1
+    XRAY_PID=$SERVER_PID
     if wait_for_command "$XRAY_PID" 20 \
       ip netns exec tun-server "$PYTHON" -c 'import socket; socket.create_connection(("10.10.1.1", 443), 0.2).close()'; then
       SERVER_STATE=running
@@ -590,6 +660,7 @@ server_stop() {
     XRAY_PID=""
   fi
   SERVER_PID=""
+  stop_server_scope
   SERVER_STATE=stopped
 }
 
@@ -608,6 +679,7 @@ server_restart() {
   fi
   old_start=$(awk '{print $22}' "/proc/$old_pid/stat")
   killed=$("$PYTHON" -c 'import time; print(int(time.time() * 1000))')
+  verify_server_scope
   SERVER_STATE=restarting
   kill -TERM "$old_pid" 2>/dev/null || true
   for _ in $(seq 1 100); do
@@ -627,6 +699,7 @@ server_restart() {
     kill -KILL "$old_pid" 2>/dev/null || true
   fi
   wait "$old_pid" 2>/dev/null || true
+  stop_server_scope
   mark=$(wc -c < "$log" 2>/dev/null || echo 0)
   SERVER_STATE=stopped
   SERVER_PID=""
@@ -702,6 +775,7 @@ write_environment() {
     echo "control=$CONTROL"
     echo "suite=$SUITE"
     echo "udp_mode=$UDP_MODE"
+    echo "commit=${GIT_COMMIT:-local}"
     echo "rtt_ms=$TUN_RTT_MS"
     echo "loss_pct=$TUN_LOSS_PCT"
     echo "tun_mtu=$TUN_MTU"
@@ -1601,6 +1675,7 @@ else
 fi
 
 if [ "$CONTROL" = "1" ]; then
+  verify_server_scope
   log "stopping the server under test and starting the stock Xray control"
   server_stop
   if ! server_start xray; then
@@ -1615,4 +1690,5 @@ if [ "$CONTROL" = "1" ]; then
   fi
 fi
 
+verify_server_scope
 finish

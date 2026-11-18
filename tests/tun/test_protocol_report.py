@@ -48,6 +48,8 @@ def _case(name: str, **overrides) -> dict:
         case["metrics"].update(
             old_pid=100, new_pid=200, old_reaped=True, post_restart_hash_ok=True
         )
+    if name == "mixed-hol-60s":
+        case["metrics"].update(h2_completed=1, h2_mib_per_s=0.5)
     case.update(overrides)
     return case
 
@@ -90,11 +92,11 @@ class ValidatorTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
         return str(path)
 
-    def _validate(self, path: str, control: str = "") -> tuple[int, str]:
+    def _validate(self, path: str, control: str = "", *, preprod_commit: str = "") -> tuple[int, str]:
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
             code = report.validate(
-                _namespace(report=path, control=control, require_arm="beam")
+                _namespace(report=path, control=control, require_arm="beam", preprod_commit=preprod_commit)
             )
         return code, buffer.getvalue()
 
@@ -106,6 +108,47 @@ class ValidatorTests(unittest.TestCase):
             f"/{len(report.REQUIRED_CASES)} cases ({len(report.REQUIRED_CASES)} PASS, 0 WARN)",
             output,
         )
+
+    def test_preprod_requires_candidate_commit_and_bounded_mixed_latency(self) -> None:
+        payload = _valid_report()
+        mixed = next(case for case in payload["cases"] if case["name"] == "mixed-hol-60s")
+        mixed["metrics"]["small_p95_ms"] = 2000
+        code, output = self._validate(self._write(payload), preprod_commit=payload["commit"])
+        self.assertEqual(code, 0, output)
+
+        mixed["metrics"]["small_p95_ms"] = 2000.01
+        code, output = self._validate(self._write(payload), preprod_commit="2" * 40)
+        self.assertEqual(code, 1, output)
+        self.assertIn("does not match the candidate", output)
+        self.assertIn("small-request p95", output)
+
+    def test_preprod_mixed_hol_requires_real_h2_completion_and_numeric_p95(self) -> None:
+        payload = _valid_report()
+        case = next(row for row in payload["cases"] if row["name"] == "mixed-hol-60s")
+        metrics = case["metrics"]
+        commit = payload["commit"]
+
+        metrics["small_p95_ms"] = True
+        code, output = self._validate(self._write(payload), preprod_commit=commit)
+        self.assertEqual(code, 1, output)
+        self.assertIn("small-request p95", output)
+
+        metrics["small_p95_ms"] = 120.0
+        metrics["h2_mib_per_s"] = 0.0
+        code, output = self._validate(self._write(payload), preprod_commit=commit)
+        self.assertEqual(code, 1, output)
+        self.assertIn("HTTP/2 bulk throughput", output)
+
+        metrics["h2_mib_per_s"] = float("inf")
+        code, output = self._validate(self._write(payload), preprod_commit=commit)
+        self.assertEqual(code, 1, output)
+        self.assertIn("HTTP/2 bulk throughput", output)
+
+        metrics["h2_mib_per_s"] = 0.5
+        metrics["h2_completed"] = 0
+        code, output = self._validate(self._write(payload), preprod_commit=commit)
+        self.assertEqual(code, 1, output)
+        self.assertIn("no HTTP/2 bulk completion", output)
 
     def test_missing_required_case_fails(self) -> None:
         payload = _valid_report()

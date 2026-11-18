@@ -108,9 +108,12 @@ The default config path is `/etc/beam/config.toml`. For systemd, use
 [`deploy/beam.service`](deploy/beam.service) as the unit. It runs
 `/usr/local/bin/beam -c /etc/beam/config.toml` as the unprivileged `beam` user,
 runs `--check` first, and sets resource and sandbox limits. It expects the
-config to be readable by the service user. `SIGHUP` is ignored; restart the
-service to reload configuration. `SIGTERM` stops accepting, drains for at most
-`shutdown_drain_ms`, then bounds runtime shutdown.
+config to be readable by the service user. Beam installs its service signal
+handlers before loading the configuration. Once installed, `SIGHUP` is
+ignored. Restart the service to reload configuration. `SIGTERM` or `SIGINT`
+stops accepting and drains for at most `shutdown_drain_ms`. A further
+`SIGTERM` or `SIGINT` delivered during drain ends it early. Runtime shutdown
+has a separate three-second bound.
 
 Before you run an installer, read [Deploy](#deploy) below. The deploy scripts
 make host policy changes. Do not run an installer unless you can reach the
@@ -195,6 +198,27 @@ Parser changes also require the relevant fuzz target; hot-path changes require
 a benchmark comparison. Root, TUN, netem, stress, soak, and long benchmark
 runs belong in hosted CI, not in this local loop. See
 [AGENTS.md](AGENTS.md#verification-before-every-commit) for the full rule.
+
+### Before promoting to production
+
+Dispatch [lab-hosted](.github/workflows/lab-hosted.yml) on the exact candidate
+commit with `suite=preprod`, `profile=standard`, `publish=false`, and the
+current full `prod` SHA as `baseline_ref`. Review that run before promotion.
+
+The hosted runner requires real TUN, private network namespaces and netem. It
+runs the IPv4/IPv6 client matrix in XUDP, legacy and packetaddr modes, followed
+by the XUDP protocol suite with mixed traffic, payload verification and restart
+recovery. Small-request p95 under mixed load must stay at or below 2 s. The lab
+server runs with 50% of one vCPU and 768 MiB of memory.
+The paired benchmark uses the same limits for both builds, three repetitions,
+250 ms RTT and zero configured loss. TCP and HTTPS throughput must be at least
+98% of the baseline. Every planned DNS query must be sent, and every query must
+answer without an error. Every UDP echo request must receive a reply. UDP echo,
+DNS and HTTP/3 p50/p95/p99 latency must stay within 102% of baseline. The UDP
+packet rate is informational only because the client driver core bounds it.
+Incomplete evidence, a noisy or producer-bound run, missing replies, HTTP/3
+retries or server OOM fail the gate. The workflow keeps the evidence as an
+Actions artifact.
 
 ## Architecture
 
@@ -310,14 +334,19 @@ VLESS with `xtls-rprx-vision` is expected to work.
   non-Data Keeps do not update the session destination, and address-less Keeps
   reuse the last destination accepted from `New` or a non-empty Data Keep.
   Replies are Keep with Data, plus End on closure (Error only when relay
-  failed). An unknown stream ID gets a clean End and is discarded.
+  failed). The empty-mux timer pauses while an accepted DNS lookup is pending.
+  Only requests accepted by the UDP socket or send queue refresh session idle
+  time. Removing a live session owns its terminal report, including a reply
+  failure already observed when it closes. An unknown stream ID gets a clean
+  End and is discarded.
 - Accept zero GlobalID and per-frame destinations from sing-box. A nonzero
   GlobalID may reattach a retained socket only within the same mux and user;
   never use GlobalID as identity or policy.
 - XUDP datagram payloads are capped at 8192 bytes; empty or oversize
   datagrams are dropped. Legacy UDP is capped at 8190 bytes. packetaddr uses
   the magic `sp.packet-addr.v2fly.arpa` destination and carries an inner
-  address per datagram. A 100 ms send timeout or a transient send error
+  address per datagram. A new packetaddr destination occupies a table slot
+  after its first successful send. A 100 ms send timeout or a transient send error
   (`WouldBlock`, `TimedOut`, `Interrupted`) on the fixed-destination legacy
   path drops only that datagram; other send errors close the association.
 - Session sockets remain unconnected and accept replies from arbitrary UDP

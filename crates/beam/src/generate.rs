@@ -78,7 +78,7 @@ fn parse_host(value: &str) -> Result<String, String> {
             return Err(HOST_HINT.to_owned());
         };
         return match inner.parse::<std::net::Ipv6Addr>() {
-            Ok(address) if address.is_unspecified() => {
+            Ok(address) if IpAddr::V6(address).to_canonical().is_unspecified() => {
                 Err("host must be an address a client can reach, not 0.0.0.0 or ::".to_owned())
             }
             Ok(address) => Ok(address.to_string()),
@@ -87,7 +87,7 @@ fn parse_host(value: &str) -> Result<String, String> {
     }
 
     if let Ok(address) = value.parse::<IpAddr>() {
-        if address.is_unspecified() {
+        if address.to_canonical().is_unspecified() {
             return Err("host must be an address a client can reach, not 0.0.0.0 or ::".to_owned());
         }
         return Ok(address.to_string());
@@ -253,6 +253,20 @@ mod tests {
             (
                 "bracketed unspecified IPv6",
                 &["test", "--host", "[::]", "--sni", "whatsapp.net"],
+            ),
+            (
+                "IPv4-mapped wildcard",
+                &["test", "--host", "::ffff:0.0.0.0", "--sni", "whatsapp.net"],
+            ),
+            (
+                "bracketed IPv4-mapped wildcard",
+                &[
+                    "test",
+                    "--host",
+                    "[::ffff:0.0.0.0]",
+                    "--sni",
+                    "whatsapp.net",
+                ],
             ),
             (
                 "empty sni",

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -454,6 +455,28 @@ def merge(args) -> int:
     return 0
 
 
+def preprod_problems(report: dict, commit: str) -> list[str]:
+    problems = []
+    if report.get("commit") != commit:
+        problems.append("protocol report commit does not match the candidate")
+    cases = {str(row.get("name")): row for row in report.get("cases") or []}
+    metrics = (cases.get("mixed-hol-60s") or {}).get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+    p95 = metrics.get("small_p95_ms")
+    if type(p95) not in (int, float) or not math.isfinite(p95) or not 0 < p95 <= 2000:
+        problems.append(f"mixed-hol-60s: small-request p95 {p95!r} ms outside (0, 2000]")
+    # h2_mib_per_s is only recorded after a 200 response whose body matched, so
+    # a positive rate proves the bulk stream really completed under load.
+    rate = metrics.get("h2_mib_per_s")
+    completed = metrics.get("h2_completed")
+    if type(completed) is not int or completed <= 0:
+        problems.append(f"mixed-hol-60s: no HTTP/2 bulk completion ({completed!r})")
+    elif type(rate) not in (int, float) or not math.isfinite(rate) or rate <= 0:
+        problems.append(f"mixed-hol-60s: HTTP/2 bulk throughput {rate!r} MiB/s")
+    return problems
+
+
 def validate(args) -> int:
     try:
         report = json.loads(Path(args.report).read_text(encoding="utf-8"))
@@ -467,6 +490,8 @@ def validate(args) -> int:
         except (OSError, ValueError) as error:
             print(f"::warning::control report unreadable: {args.control}: {error}")
     problems = check_report(report, args.require_arm)
+    if args.preprod_commit:
+        problems.extend(preprod_problems(report, args.preprod_commit))
     print_rows(report)
     if control is None:
         print("\n::warning::no control (Xray) report; beam-only attribution")
@@ -521,6 +546,7 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--report", required=True)
     item.add_argument("--control", default="", help="optional Xray arm report")
     item.add_argument("--require-arm", default="beam")
+    item.add_argument("--preprod-commit", default="")
     item.set_defaults(handler=validate)
 
     return parser

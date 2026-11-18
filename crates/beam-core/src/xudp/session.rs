@@ -838,6 +838,11 @@ impl Session {
         lock(&self.permit).take()
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_activity_for_test(&self) -> u64 {
+        self.last_activity_ms.load(Ordering::Acquire)
+    }
+
     /// Marks request or reply activity.
     pub(crate) fn touch(&self) {
         self.last_activity_ms.store(now_ms(), Ordering::Release);
@@ -886,14 +891,14 @@ impl Session {
         self.stop.subscribe()
     }
 
-    /// Returns `true` when a closer already claimed this session.
+    /// Returns `true` when the session is closing.
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Claims the close responsibility. Returns `true` for the first caller.
-    pub(crate) fn mark_closed(&self) -> bool {
-        !self.closed.swap(true, Ordering::AcqRel)
+    /// Prevents more reply work after the table entry is removed.
+    pub(crate) fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
     }
 
     /// Records that the UDP relay failed.
@@ -1290,7 +1295,7 @@ async fn reply_loop(
         }
     }
 
-    if failed && session.mark_closed() {
+    if failed {
         queue_failed_session_end(
             &table,
             &outbound,
@@ -1322,6 +1327,7 @@ fn queue_failed_session_end(
     if removed.is_none() {
         return false;
     }
+    session.mark_closed();
     metrics.record_xudp_closed_error();
     let end = encode_end_frame(session.id, true);
     if !end.is_empty() {
@@ -2000,7 +2006,6 @@ mod tests {
             })
             .expect("same id must replace");
         drop(replaced);
-        assert!(old.mark_closed());
 
         let (outbound, mut inbound) = tokio::sync::mpsc::channel(4);
         let queued = Arc::new(AtomicUsize::new(0));
@@ -2017,9 +2022,9 @@ mod tests {
             "a stale failure End must not follow the replacement"
         );
         assert_eq!(table.lock().expect("table").total(), 1);
+        assert!(!replacement.is_closed());
         assert_eq!(limiter.metrics().snapshot().xudp_closed_error, 0);
 
-        assert!(replacement.mark_closed());
         assert!(queue_failed_session_end(
             &table,
             &outbound,
@@ -2028,6 +2033,7 @@ mod tests {
             &replacement,
             &limiter.metrics()
         ));
+        assert!(replacement.is_closed());
         let queued = inbound.recv().await.expect("current failure End");
         let encoded = queued.encoded();
         let (frame, used) = parse_frame(&encoded)

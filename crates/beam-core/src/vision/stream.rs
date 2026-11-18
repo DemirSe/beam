@@ -1425,6 +1425,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_handoff_waits_for_raw_carry_under_backpressure() {
+        let (client, mut peer) = duplex(1);
+        let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(13));
+        vision.writer.inspect(&server_hello());
+        let handoff = vision.write_direct_watch();
+
+        let app = app_data_record(b"payload");
+        let raw_tail = &app_data_record(b"next")[..3];
+        let first = [app.as_slice(), raw_tail].concat();
+        let mut wire = Vec::new();
+        let mut saw_blocked_raw_tail = false;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        for _ in 0..MAX_WRITE_BATCH {
+            match Pin::new(&mut vision).poll_write(&mut cx, &first) {
+                Poll::Pending => {
+                    assert!(!*handoff.borrow(), "published on a blocked write");
+                    saw_blocked_raw_tail |= vision.write_is_raw();
+                }
+                Poll::Ready(result) => {
+                    assert_eq!(result.expect("Vision write"), first.len());
+                    assert!(saw_blocked_raw_tail);
+                    assert!(*handoff.borrow());
+                    assert!(vision.write_carry.is_empty());
+                    assert!(vision.write_queue.is_empty());
+                    vision.shutdown().await.expect("shutdown after handoff");
+                    peer.read_to_end(&mut wire)
+                        .await
+                        .expect("read remaining output");
+                    let (block, used) = parse_block(&wire, true)
+                        .expect("Direct framing")
+                        .expect("complete Direct block");
+                    assert_eq!(block.command, Command::Direct);
+                    assert_eq!(block.content, app);
+                    assert_eq!(&wire[used..], raw_tail);
+                    return;
+                }
+            }
+            let mut byte = [0];
+            let mut buf = ReadBuf::new(&mut byte);
+            assert!(matches!(
+                Pin::new(&mut peer).poll_read(&mut cx, &mut buf),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(buf.filled().len(), 1);
+            wire.push(byte[0]);
+            tokio::task::yield_now().await;
+        }
+        panic!("Vision write did not complete");
+    }
+
+    #[tokio::test]
     async fn split_app_data_record_still_triggers_direct() {
         let (client, mut peer) = duplex(64 * 1024);
         let mut vision = VisionStream::new(client, USER_ID, Vec::new(), rng(12));

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -19,7 +20,7 @@ use beam_core::xudp::{XudpConfig, XudpSessionLimiter};
 
 use clap::{Parser, Subcommand};
 use tokio::net::{TcpListener, TcpSocket};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, sleep};
 
@@ -94,6 +95,10 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    if let Some(Command::Generate(args)) = &cli.command {
+        return generate::run(args);
+    }
     // Each Vision Direct relay can occupy up to two blocking splice tasks.
     // The default covers about 60 fully spliced relay pairs (120 splice
     // permits); max_connections is an admission cap, not a promise of 1024
@@ -110,7 +115,7 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("failed to build the Tokio runtime")?;
-    let result = runtime.block_on(async_main(max_blocking_threads));
+    let result = runtime.block_on(async_main(cli, max_blocking_threads));
     // A blocking splice cannot be aborted once it has started. The shutdown
     // path drains normal connections briefly; this bound is the final backstop
     // for a wedged relay so systemd can restart the service.
@@ -118,12 +123,17 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    // Generation is one-shot and needs no configuration file.
-    if let Some(Command::Generate(args)) = &cli.command {
-        return generate::run(args);
-    }
+async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()> {
+    // Install SIGHUP before any blocking startup work so an operator's hangup
+    // cannot kill the service mid-start. SIGTERM and SIGINT keep their default
+    // disposition until the accept loop can observe them, so a stuck config
+    // read stays interruptible instead of swallowing the signal.
+    let mut sighup = signal(SignalKind::hangup()).context("failed to watch SIGHUP")?;
+    tokio::spawn(async move {
+        while sighup.recv().await.is_some() {
+            tracing::warn!("SIGHUP ignored; restart the service to reload configuration");
+        }
+    });
     let config = Config::from_path(&cli.config)
         .with_context(|| format!("failed to load `{}`", cli.config.display()))?;
 
@@ -132,17 +142,9 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     // or a lab install may inherit a smaller soft limit; validate against the
     // deployment floor and make the mismatch visible instead of rejecting a
     // configuration that the service can serve.
-    const DEPLOYMENT_FD_FLOOR: u64 = 65_536;
-    let actual_fd_limit = beam_sys::open_file_limit().unwrap_or(DEPLOYMENT_FD_FLOOR);
-    if actual_fd_limit < DEPLOYMENT_FD_FLOOR {
-        tracing::warn!(
-            actual_fd_limit,
-            deployment_floor = DEPLOYMENT_FD_FLOOR,
-            "process soft fd limit is below the deployment floor; validate the service limit"
-        );
-    }
+    let validation_fd_limit = validation_fd_limit(beam_sys::open_file_limit());
     config
-        .validate_fd_budget(actual_fd_limit.max(DEPLOYMENT_FD_FLOOR))
+        .validate_fd_budget(validation_fd_limit)
         .context("file descriptor budget")?;
     if let Ok(raw) = std::env::var("BEAM_MAX_BLOCKING_THREADS") {
         let valid = raw
@@ -165,7 +167,12 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         // limits, TLS material) before systemd's ExecStartPre says OK and the
         // real start crash-loops. This performs no bind or network I/O.
         build_tls_config(&config)?;
-        println!("configuration is valid: {}", cli.config.display());
+        writeln!(
+            std::io::stdout().lock(),
+            "configuration is valid: {}",
+            cli.config.display()
+        )
+        .context("could not write configuration check result")?;
         return Ok(());
     }
 
@@ -190,7 +197,7 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     // Leave room in the blocking pool for cover relays, DNS resolution, and
     // destination dials. Vision directions above this cap use the async copy
     // path instead of queueing forever in `spawn_blocking`.
-    let max_splice_tasks = max_blocking_threads.saturating_sub(40).max(1);
+    let max_splice_tasks = splice_capacity(max_blocking_threads);
     let splice_permits = Arc::new(Semaphore::new(max_splice_tasks));
     let pipe_pages_soft = beam_sys::pipe_user_pages_soft().unwrap_or(16_384);
     let relay_pipe_size = beam_core::relay::pipe_size_for_budget(
@@ -339,21 +346,11 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
         }
     });
 
+    // Only now, with the listener bound and the accept loop about to select on
+    // them, do the termination signals become our responsibility. A signal that
+    // arrives earlier keeps the default disposition and ends the process.
     let mut sigterm = signal(SignalKind::terminate()).context("failed to watch SIGTERM")?;
     let mut sigint = signal(SignalKind::interrupt()).context("failed to watch SIGINT")?;
-    let mut sighup = signal(SignalKind::hangup()).context("failed to watch SIGHUP")?;
-    tokio::spawn(async move {
-        while sighup.recv().await.is_some() {
-            tracing::warn!("SIGHUP ignored; restart the service to reload configuration");
-        }
-    });
-    let shutdown = async move {
-        tokio::select! {
-            _ = sigterm.recv() => {}
-            _ = sigint.recv() => {}
-        }
-    };
-    tokio::pin!(shutdown);
 
     // A transient fd shortage must not turn into a permanent outage. `accept`
     // can fail with EMFILE/ENFILE, ECONNABORTED, or an interrupted syscall;
@@ -361,9 +358,10 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
     // dropping the runtime (and any in-flight blocking relays) on the first
     // error.
     let mut accept_backoff = Duration::from_millis(10);
-    loop {
+    let first_signal = loop {
         let accepted = tokio::select! {
-            _ = &mut shutdown => break,
+            biased;
+            signal = termination_signal(&mut sigterm, &mut sigint) => break signal,
             accepted = listener.accept() => accepted,
         };
         let (stream, peer) = match accepted {
@@ -375,7 +373,8 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                 metrics.record_accept_error();
                 tracing::warn!(%error, "listener accept failed; retrying");
                 tokio::select! {
-                    _ = &mut shutdown => break,
+                    biased;
+                    signal = termination_signal(&mut sigterm, &mut sigint) => break signal,
                     _ = sleep(accept_backoff) => {}
                 }
                 accept_backoff = (accept_backoff * 2).min(Duration::from_secs(1));
@@ -415,31 +414,97 @@ async fn async_main(max_blocking_threads: usize) -> anyhow::Result<()> {
                 Err(error) => tracing::debug!(%peer, %error, "connection failed"),
             }
         });
-    }
-
+    };
     // Stop accepting immediately, then let established connections finish.
-    // New work is not started. A relay that ignores the idle timeout is
-    // bounded by the runtime shutdown deadline in `main`.
     drop(listener);
-    tracing::info!("shutdown signal received; draining connections");
+    tracing::info!(
+        signal = first_signal,
+        "shutdown signal received; draining connections"
+    );
     let deadline = Instant::now() + Duration::from_millis(config.limits.shutdown_drain_ms);
-    while authenticated.available_permits() < max_connections
-        || preauth.available_permits() < max_pending_handshakes
-        || tls_config.cover_inflight() > 0
+    let remaining = || {
+        // A worker takes its authenticated or cover permit before it releases
+        // pre-auth. Read the predecessor first to avoid missing that handoff.
+        preauth.available_permits() < max_pending_handshakes
+            || authenticated.available_permits() < max_connections
+            || tls_config.cover_inflight() > 0
+    };
+    match drain_connections(
+        deadline,
+        remaining,
+        termination_signal(&mut sigterm, &mut sigint),
+    )
+    .await
     {
-        if Instant::now() >= deadline {
-            tracing::warn!(
-                authenticated_remaining = max_connections - authenticated.available_permits(),
-                preauth_remaining = max_pending_handshakes - preauth.available_permits(),
-                cover_remaining = tls_config.cover_inflight(),
-                "shutdown drain deadline reached; closing remaining connections"
-            );
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
+        DrainOutcome::Complete => tracing::info!("shutdown drain complete"),
+        DrainOutcome::Deadline => tracing::warn!(
+            authenticated_remaining = max_connections - authenticated.available_permits(),
+            preauth_remaining = max_pending_handshakes - preauth.available_permits(),
+            cover_remaining = tls_config.cover_inflight(),
+            "shutdown drain deadline reached; starting runtime shutdown"
+        ),
+        DrainOutcome::Signal(signal) => tracing::warn!(
+            signal,
+            "second shutdown signal received; starting runtime shutdown"
+        ),
     }
-    tracing::info!("shutdown complete");
     Ok(())
+}
+
+async fn termination_signal(sigterm: &mut Signal, sigint: &mut Signal) -> &'static str {
+    tokio::select! {
+        _ = sigterm.recv() => "SIGTERM",
+        _ = sigint.recv() => "SIGINT",
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DrainOutcome {
+    Complete,
+    Deadline,
+    Signal(&'static str),
+}
+
+async fn drain_connections(
+    deadline: Instant,
+    remaining: impl Fn() -> bool,
+    termination: impl Future<Output = &'static str>,
+) -> DrainOutcome {
+    tokio::pin!(termination);
+    while remaining() {
+        tokio::select! {
+            biased;
+            signal = &mut termination => return DrainOutcome::Signal(signal),
+            _ = tokio::time::sleep_until(deadline) => return DrainOutcome::Deadline,
+            _ = sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    DrainOutcome::Complete
+}
+
+fn splice_capacity(blocking_threads: usize) -> usize {
+    blocking_threads.saturating_sub(40)
+}
+
+fn validation_fd_limit(soft_limit: std::io::Result<Option<u64>>) -> u64 {
+    const DEPLOYMENT_FD_FLOOR: u64 = 65_536;
+    match soft_limit {
+        Ok(None) => u64::MAX,
+        Ok(Some(actual_fd_limit)) => {
+            if actual_fd_limit < DEPLOYMENT_FD_FLOOR {
+                tracing::warn!(
+                    actual_fd_limit,
+                    deployment_floor = DEPLOYMENT_FD_FLOOR,
+                    "process soft fd limit is below the deployment floor; validate the service limit"
+                );
+            }
+            actual_fd_limit.max(DEPLOYMENT_FD_FLOOR)
+        }
+        Err(error) => {
+            tracing::warn!(%error, deployment_floor = DEPLOYMENT_FD_FLOOR, "could not query the process fd limit; using the deployment floor");
+            DEPLOYMENT_FD_FLOOR
+        }
+    }
 }
 
 /// Warns when the secrets-bearing config is readable by unrelated users or
@@ -631,6 +696,40 @@ mod tests {
             ])
             .is_err(),
             "generate reads no config file"
+        );
+    }
+
+    #[test]
+    fn blocking_pool_keeps_its_non_splice_reserve() {
+        for (threads, splice) in [(1, 0), (40, 0), (41, 1), (160, 120), (512, 472)] {
+            assert_eq!(splice_capacity(threads), splice);
+        }
+    }
+
+    #[test]
+    fn fd_validation_distinguishes_unlimited_from_query_failure() {
+        assert_eq!(validation_fd_limit(Ok(None)), u64::MAX);
+        assert_eq!(validation_fd_limit(Ok(Some(256))), 65_536);
+        assert_eq!(validation_fd_limit(Ok(Some(131_072))), 131_072);
+        assert_eq!(
+            validation_fd_limit(Err(std::io::Error::other("test"))),
+            65_536
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_honors_deadline_and_second_signal() {
+        assert_eq!(
+            drain_connections(Instant::now(), || true, std::future::ready("SIGINT")).await,
+            DrainOutcome::Signal("SIGINT")
+        );
+        assert_eq!(
+            drain_connections(Instant::now(), || true, std::future::pending()).await,
+            DrainOutcome::Deadline
+        );
+        assert_eq!(
+            drain_connections(Instant::now(), || false, std::future::pending()).await,
+            DrainOutcome::Complete
         );
     }
 

@@ -12,6 +12,7 @@
 
 use std::{
     env, fs,
+    io::{self, Write},
     net::{SocketAddr, ToSocketAddrs},
     process::ExitCode,
     sync::{
@@ -214,10 +215,20 @@ fn json_escape(text: &str) -> String {
     out
 }
 
-async fn run() -> Result<()> {
-    let Args { url, streams, out } = parse_args()?;
-    let (host, addr) = split_url(&url)?;
-    let expected = expected_body(expected_len(&url)?);
+#[derive(Default)]
+struct Verdict {
+    connections: usize,
+    completed: usize,
+    peak_active: usize,
+    bytes: usize,
+    ttfb_ms: f64,
+    errors: Vec<String>,
+}
+
+async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
+    let uri: http::Uri = url.parse().with_context(|| format!("invalid URL: {url}"))?;
+    let (host, addr) = split_url(url)?;
+    let expected = expected_body(expected_len(url)?);
 
     let mut client = rustls::ClientConfig::builder()
         .dangerous()
@@ -227,9 +238,6 @@ async fn run() -> Result<()> {
     let connector = TlsConnector::from(Arc::new(client));
     let server_name = ServerName::try_from(host.clone())
         .with_context(|| format!("invalid server name: {host}"))?;
-
-    let started = Instant::now();
-    let mut errors: Vec<String> = Vec::new();
 
     let tcp = match tokio::net::TcpStream::connect(addr).await {
         Ok(stream) => stream,
@@ -264,7 +272,7 @@ async fn run() -> Result<()> {
 
     for _ in 0..streams {
         let mut sender = sender.clone();
-        let uri: http::Uri = url.parse().with_context(|| format!("invalid URL: {url}"))?;
+        let uri = uri.clone();
         let expected = expected.clone();
         let active = active.clone();
         let peak = peak.clone();
@@ -317,40 +325,65 @@ async fn run() -> Result<()> {
 
     barrier.wait().await;
 
-    let mut bytes = 0usize;
-    let mut ttfb_ms = 0.0f64;
-    let mut completed = 0usize;
+    let mut verdict = Verdict {
+        connections: 1,
+        ..Verdict::default()
+    };
     for handle in handles {
         match handle.await {
             Ok(Ok((len, stream_ttfb))) => {
-                completed += 1;
-                bytes += len;
-                ttfb_ms = ttfb_ms.max(stream_ttfb);
+                verdict.completed += 1;
+                verdict.bytes += len;
+                verdict.ttfb_ms = verdict.ttfb_ms.max(stream_ttfb);
             }
-            Ok(Err(error)) => errors.push(error),
-            Err(error) => errors.push(format!("stream task failed: {error}")),
+            Ok(Err(error)) => verdict.errors.push(error),
+            Err(error) => verdict.errors.push(format!("stream task failed: {error}")),
         }
     }
+    verdict.peak_active = peak.load(Ordering::SeqCst);
+    Ok(verdict)
+}
+
+fn write_verdict(mut stdout: impl Write, out: Option<&str>, result: &str) -> Result<()> {
+    let console = writeln!(stdout, "{result}")
+        .and_then(|()| stdout.flush())
+        .context("could not write verdict to stdout");
+    let file = out.map_or(Ok(()), |path| {
+        fs::write(path, format!("{result}\n")).with_context(|| format!("could not write {path}"))
+    });
+    console.and(file)
+}
+
+async fn run() -> Result<()> {
+    let Args { url, streams, out } = parse_args()?;
+    let started = Instant::now();
+    let Verdict {
+        connections,
+        completed,
+        peak_active,
+        bytes,
+        ttfb_ms,
+        errors,
+    } = run_requests(&url, streams)
+        .await
+        .unwrap_or_else(|error| Verdict {
+            errors: vec![format!("{error:#}")],
+            ..Verdict::default()
+        });
     let total_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let peak_active = peak.load(Ordering::SeqCst);
     let hash_ok = completed == streams && errors.is_empty();
     let ok = hash_ok;
-
     let errors_json = errors
         .iter()
         .map(|error| format!("\"{}\"", json_escape(error)))
         .collect::<Vec<_>>()
         .join(",");
     let result = format!(
-        "{{\"ok\":{ok},\"connections\":1,\"streams\":{streams},\"completed\":{completed},\
+        "{{\"ok\":{ok},\"connections\":{connections},\"streams\":{streams},\"completed\":{completed},\
          \"peak_active\":{peak_active},\"bytes\":{bytes},\"hash_ok\":{hash_ok},\
          \"ttfb_ms\":{ttfb_ms:.3},\"total_ms\":{total_ms:.3},\"errors\":[{errors_json}]}}"
     );
-    if let Some(path) = out {
-        fs::write(&path, format!("{result}\n"))
-            .with_context(|| format!("could not write {path}"))?;
-    }
-    println!("{result}");
+    write_verdict(io::stdout().lock(), out.as_deref(), &result)?;
     if !ok {
         bail!(
             "{completed}/{streams} streams verified, {} error(s)",

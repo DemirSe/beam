@@ -454,7 +454,7 @@ where
                 continue;
             };
 
-            if !table.admit(destination) {
+            if !table.can_send(destination) {
                 tracing::trace!(
                     %destination,
                     max = config.max_packetaddr_destinations,
@@ -484,6 +484,7 @@ where
             }
             decoder.consume(frame.end);
             if matches!(sent, Ok(Ok(_))) {
+                table.entries.insert(destination);
                 idle.as_mut().reset(next_deadline(config.idle_timeout));
             }
         }
@@ -907,16 +908,8 @@ impl DestinationTable {
         }
     }
 
-    /// Returns `true` if this destination may be used or is already known.
-    fn admit(&mut self, destination: SocketAddr) -> bool {
-        if self.entries.contains(&destination) {
-            return true;
-        }
-        if self.entries.len() >= self.max {
-            return false;
-        }
-        self.entries.insert(destination);
-        true
+    fn can_send(&self, destination: SocketAddr) -> bool {
+        self.entries.len() < self.max || self.entries.contains(&destination)
     }
 }
 
@@ -1565,7 +1558,11 @@ mod tests {
     #[tokio::test]
     async fn packetaddr_send_failure_drops_only_that_datagram() {
         let echo = spawn_ipv4_echo().await;
-        let (mut client, task) = start(packetaddr_destination(), test_config(MAX_DATAGRAM_SIZE));
+        let config = LegacyUdpConfig {
+            max_packetaddr_destinations: 1,
+            ..test_config(MAX_DATAGRAM_SIZE)
+        };
+        let (mut client, task) = start(packetaddr_destination(), config);
 
         // An unconnected socket cannot send to the limited broadcast address
         // without SO_BROADCAST. The packetaddr session must survive and still

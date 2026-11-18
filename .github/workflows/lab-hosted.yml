@@ -9,7 +9,8 @@ name: lab-hosted
 # Manual only: a shared runner's noisy, high-RTT numbers must never gate a
 # release by themselves, so this workflow is not triggered by pushes or tags.
 # Green means "the TUN matrix passed and the bench cell is complete and
-# unsaturated"; ratios are reported, and a ratio outside +-5% only warns.
+# unsaturated" for diagnostic suites. The preprod suite compares the
+# candidate with the pinned prod SHA and enforces functional and numeric gates.
 # suite=protocols runs the real-protocol campaign through the full-TUN path
 # under netem and gates on the validated protocol report for the beam arm; the
 # stock Xray arm is a diagnostic control, not a gate.
@@ -31,7 +32,7 @@ on:
         required: true
         default: both
         type: choice
-        options: [both, bench, tun, stress, protocols]
+        options: [both, bench, tun, stress, protocols, preprod]
       udp_mode:
         description: "sing-box packet encoding for the TUN suite"
         required: true
@@ -122,8 +123,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SING_BOX_VERSION: "1.14.3"
-  SING_BOX_SHA256: "e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee"
+  SING_BOX_VERSION: "1.14.4"
+  SING_BOX_SHA256: "231e57c18378f780a08de832844a1ca9716e17a7bcf82964b350844d243c03ac"
   XRAY_VERSION: "26.3.27"
   XRAY_SHA256: "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
   CURL_VERSION: "8.23.0-1"
@@ -134,7 +135,7 @@ jobs:
     runs-on: ubuntu-24.04
     # Constant on purpose: per-profile budgets are enforced by `timeout` around
     # each suite, so a smoke dispatch never sits here for two hours.
-    timeout-minutes: 150
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,9 +143,27 @@ jobs:
           fetch-depth: 0
 
       - name: Resolve profile
+        env:
+          INPUT_PROFILE: ${{ inputs.profile }}
+          INPUT_SCENARIOS: ${{ inputs.scenarios }}
+          INPUT_HTTPS_MIB: ${{ inputs.https_mib }}
+          INPUT_HTTPS_PARALLEL: ${{ inputs.https_parallel }}
+          INPUT_RTT_MS: ${{ inputs.rtt_ms }}
+          INPUT_LOSS_PCT: ${{ inputs.loss_pct }}
+          INPUT_REPS: ${{ inputs.reps }}
+          INPUT_DURATION: ${{ inputs.duration }}
+          INPUT_BASELINE_REF: ${{ inputs.baseline_ref }}
+          INPUT_PERF: ${{ inputs.perf }}
+          INPUT_PERF_EVENTS: ${{ inputs.perf_events }}
+          INPUT_UDP_COUNT: ${{ inputs.udp_count }}
+          INPUT_UDP_WINDOW: ${{ inputs.udp_window }}
+          INPUT_PIPE_PAGES_SOFT: ${{ inputs.pipe_pages_soft }}
+          INPUT_LOG_LEVEL: ${{ inputs.log_level }}
+          INPUT_SUITE: ${{ inputs.suite }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
           set -euo pipefail
-          case "${{ inputs.profile }}" in
+          case "${INPUT_PROFILE}" in
             smoke)
               rtt=250; quota=50%; loss=0; reps=2; duration=5; quick=1
               bench_timeout=900; tun_timeout=300 ;;
@@ -155,19 +174,19 @@ jobs:
               rtt=250; quota=50%; loss=0; reps=10; duration=10; quick=0
               bench_timeout=6000; tun_timeout=600 ;;
             *)
-              echo "::error::unknown profile: ${{ inputs.profile }}"; exit 1 ;;
+              echo "::error::unknown profile: ${INPUT_PROFILE}"; exit 1 ;;
           esac
 
           # Optional targeted-experiment overrides. Empty keeps the profile
           # value. A filtered scenario list disables completeness checks and
           # should normally be paired with publish=false.
-          scenarios="${{ inputs.scenarios }}"
-          https_mib="${{ inputs.https_mib }}"
-          https_parallel="${{ inputs.https_parallel }}"
-          rtt_override="${{ inputs.rtt_ms }}"
-          loss_override="${{ inputs.loss_pct }}"
-          reps_override="${{ inputs.reps }}"
-          duration_override="${{ inputs.duration }}"
+          scenarios="${INPUT_SCENARIOS}"
+          https_mib="${INPUT_HTTPS_MIB}"
+          https_parallel="${INPUT_HTTPS_PARALLEL}"
+          rtt_override="${INPUT_RTT_MS}"
+          loss_override="${INPUT_LOSS_PCT}"
+          reps_override="${INPUT_REPS}"
+          duration_override="${INPUT_DURATION}"
           if [ -n "$scenarios" ] \
             && ! printf '%s' "$scenarios" | grep -Eq '^[a-z0-9,-]+$'; then
             echo "::error::scenarios must be a comma list of scenario ids"; exit 1
@@ -197,21 +216,21 @@ jobs:
             require_complete=0
           fi
 
-          baseline_ref="${{ inputs.baseline_ref }}"
+          baseline_ref="${INPUT_BASELINE_REF}"
           if [ -n "$baseline_ref" ] \
             && ! printf '%s' "$baseline_ref" | grep -Eq '^[0-9a-f]{7,40}$'; then
             echo "::error::baseline_ref must be a commit SHA"; exit 1
           fi
-          perf_flag="${{ inputs.perf }}"
-          perf_events="${{ inputs.perf_events }}"
+          perf_flag="${INPUT_PERF}"
+          perf_events="${INPUT_PERF_EVENTS}"
           if [ -n "$perf_events" ] \
             && ! printf '%s' "$perf_events" | grep -Eq '^[A-Za-z0-9_:,*.-]+$'; then
             echo "::error::perf_events contains unsupported characters"; exit 1
           fi
-          udp_count_override="${{ inputs.udp_count }}"
-          udp_window_override="${{ inputs.udp_window }}"
-          pipe_soft="${{ inputs.pipe_pages_soft }}"
-          log_level="${{ inputs.log_level }}"
+          udp_count_override="${INPUT_UDP_COUNT}"
+          udp_window_override="${INPUT_UDP_WINDOW}"
+          pipe_soft="${INPUT_PIPE_PAGES_SOFT}"
+          log_level="${INPUT_LOG_LEVEL}"
           if [ -n "$log_level" ] \
             && ! printf '%s' "$log_level" | grep -Eq '^(trace|debug|info|warn|error)$'; then
             echo "::error::log_level must be trace, debug, info, warn or error"; exit 1
@@ -226,6 +245,17 @@ jobs:
           if [ -n "$udp_window_override" ] \
             && { [ "$udp_window_override" -lt 1 ] || [ "$udp_window_override" -gt 1024 ]; }; then
             echo "::error::udp_window must be 1..1024"; exit 1
+          fi
+          if [ "$INPUT_SUITE" = preprod ]; then
+            [ "$INPUT_PROFILE" = standard ] && [ "$INPUT_PUBLISH" = false ] \
+              || { echo "::error::preprod requires profile=standard and publish=false"; exit 1; }
+            [ "${#baseline_ref}" -eq 40 ] \
+              && [ "$baseline_ref" = "$(git rev-parse --verify refs/remotes/origin/prod)" ] \
+              && git merge-base --is-ancestor "$baseline_ref" "$GITHUB_SHA" \
+              || { echo "::error::baseline_ref must be the full prod SHA and an ancestor of the candidate"; exit 1; }
+            [ -z "$INPUT_SCENARIOS$https_mib$https_parallel$rtt_override$loss_override$reps_override$duration_override$udp_count_override$udp_window_override$pipe_soft$log_level$perf_events" ] \
+              && [ "$perf_flag" = false ] \
+              || { echo "::error::preprod uses the standard measurement profile without overrides"; exit 1; }
           fi
           arms=stock,beam
           [ -z "$baseline_ref" ] || arms=baseline,beam
@@ -252,7 +282,7 @@ jobs:
             [ -z "$pipe_soft" ] || echo "PIPE_PAGES_SOFT=$pipe_soft"
             [ -z "$log_level" ] || echo "BENCH_LOG_LEVEL=$log_level"
           } >> "$GITHUB_ENV"
-          echo "profile=${{ inputs.profile }} scenarios=$scenarios rtt=$rtt loss=$loss reps=$reps duration=$duration https_mib=$https_mib https_parallel=$https_parallel complete=$require_complete baseline=$baseline_ref arms=$arms perf=$perf_value"
+          echo "profile=${INPUT_PROFILE} scenarios=$scenarios rtt=$rtt loss=$loss reps=$reps duration=$duration https_mib=$https_mib https_parallel=$https_parallel complete=$require_complete baseline=$baseline_ref arms=$arms perf=$perf_value"
 
       - name: Capability gate
         if: inputs.suite != 'stress'
@@ -319,11 +349,11 @@ jobs:
           tools="$RUNNER_TEMP/tools"
           mkdir -p "$tools"
 
-          sing_url="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz"
+          sing_url="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64-glibc.tar.gz"
           curl -fsSL -o "$RUNNER_TEMP/sing-box.tgz" "$sing_url"
           echo "${SING_BOX_SHA256}  $RUNNER_TEMP/sing-box.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/sing-box.tgz" -C "$tools"
-          install -m 0755 "$tools/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box" "$tools/sing-box"
+          install -m 0755 "$tools/sing-box-${SING_BOX_VERSION}-linux-amd64-glibc/sing-box" "$tools/sing-box"
 
           xray_url="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip"
           curl -fsSL -o "$RUNNER_TEMP/xray.zip" "$xray_url"
@@ -374,6 +404,16 @@ jobs:
           ls -l target/release/beam tests/tun/h3-origin/target/debug/h3-origin \
                 tests/tun/h3-origin/target/debug/h2-client
 
+      - name: Preprod unit and configuration gates
+        if: inputs.suite == 'preprod'
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          source scripts/dev-env.sh
+          make verify
+          cargo test --locked --manifest-path tests/tun/h3-origin/Cargo.toml --test h2_client
+          python3 tests/stress/config_matrix.py target/release/beam
+
       - name: Build baseline
         if: inputs.baseline_ref != ''
         timeout-minutes: 20
@@ -407,12 +447,47 @@ jobs:
               --udp-mode "${{ inputs.udp_mode }}" --out "$out" \
             2>&1 | tee "$RUNNER_TEMP/tun-run.log"
 
+      - name: Preprod TUN matrix (root, bounded server)
+        if: inputs.suite == 'preprod'
+        timeout-minutes: 36
+        run: |
+          set -euo pipefail
+          for mode in xudp legacy packetaddr; do
+            out="$RUNNER_TEMP/preprod-tun/$mode"
+            sudo -n unshare --mount --propagation private --net --fork env \
+              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+              TUN_ALLOW_ROOT=1 TUN_OUT="$out" TUN_SERVER_BOUNDED=1 \
+              IMAGE_OS="${ImageOS:-local}" GIT_COMMIT="$GITHUB_SHA" \
+              SING_BOX="$RUNNER_TEMP/tools/sing-box" \
+              XRAY_BIN="$RUNNER_TEMP/tools/xray-bin" \
+              TEST_CONFIG="$GITHUB_WORKSPACE/config.example.toml" \
+              H3_ORIGIN_BIN="$GITHUB_WORKSPACE/tests/tun/h3-origin/target/debug/h3-origin" \
+              timeout -s INT --kill-after=120 "$TUN_TIMEOUT" \
+              bash "$GITHUB_WORKSPACE/tests/tun/run.sh" --release --no-build \
+                --udp-mode "$mode" --out "$out" \
+              2>&1 | tee "$RUNNER_TEMP/preprod-tun-$mode.log"
+            # The matrix output is root-owned 0700 until the ownership step, so
+            # read the provenance with the same privileges that wrote it.
+            sudo -n grep -Fx "commit=$GITHUB_SHA" "$out/environment.txt"
+            sudo -n grep -Fx "udp_mode=$mode" "$out/environment.txt"
+          done
+
       - name: Protocol suite (root, private namespaces)
-        if: inputs.suite == 'protocols'
+        if: inputs.suite == 'protocols' || inputs.suite == 'preprod'
         timeout-minutes: 45
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/protocol-out"
+          udp_mode="${{ inputs.udp_mode }}"
+          bounded=0
+          control=()
+          # The stock Xray arm is a diagnostic control. A preprod candidate
+          # must not be blocked by that arm's start, restart, scope or timeout.
+          if [ "${{ inputs.suite }}" = protocols ]; then control+=(--control); fi
+          if [ "${{ inputs.suite }}" = preprod ]; then
+            udp_mode=xudp
+            bounded=1
+          fi
           # Half the matrix is unreachable without both HTTP/2 and HTTP/3 in the
           # pinned curl; fail closed instead of reporting a smaller matrix.
           curl_features="$(curl --version | sed -n 's/^Features: //p')"
@@ -422,7 +497,7 @@ jobs:
             || { echo "::error::the pinned curl has no HTTP/3 support"; exit 1; }
           sudo -n unshare --mount --propagation private --net --fork env \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            TUN_ALLOW_ROOT=1 TUN_OUT="$out" \
+            TUN_ALLOW_ROOT=1 TUN_OUT="$out" TUN_SERVER_BOUNDED="$bounded" \
             TUN_RTT_MS="${RTT_MS:-250}" TUN_LOSS_PCT="${LOSS:-0}" \
             IMAGE_OS="${ImageOS:-local}" GIT_COMMIT="$GITHUB_SHA" \
             SING_BOX="$RUNNER_TEMP/tools/sing-box" \
@@ -432,17 +507,19 @@ jobs:
             H2_CLIENT_BIN="$GITHUB_WORKSPACE/tests/tun/h3-origin/target/debug/h2-client" \
             timeout -s INT --kill-after=120 2400 \
             bash "$GITHUB_WORKSPACE/tests/tun/run.sh" --release --no-build \
-              --suite protocols --control \
-              --udp-mode "${{ inputs.udp_mode }}" --out "$out" \
+              --suite protocols "${control[@]}" \
+              --udp-mode "$udp_mode" --out "$out" \
             2>&1 | tee "$RUNNER_TEMP/protocol-run.log"
 
       - name: Benchmark (root, private namespaces)
-        if: inputs.suite == 'both' || inputs.suite == 'bench'
+        if: inputs.suite == 'both' || inputs.suite == 'bench' || inputs.suite == 'preprod'
         timeout-minutes: 110
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/bench-out"
           iperf3_bin="$(command -v iperf3)"
+          memory_max=1G
+          if [ "${{ inputs.suite }}" = preprod ]; then memory_max=768M; fi
           bench_args=(--reps "$REPS" --duration "$DURATION" --rtt-ms "$RTT_MS"
                       --arms "$BENCH_ARMS" --out "$out")
           if [ "$QUICK" = "1" ]; then
@@ -461,7 +538,7 @@ jobs:
             BENCH_CLIENT_CPUS=0,1 \
             BENCH_DRIVER_CPU=0 \
             BENCH_SERVER_CPU_QUOTA="$SERVER_CPU_QUOTA" \
-            BENCH_SERVER_MEMORY_MAX=1G \
+            BENCH_SERVER_MEMORY_MAX="$memory_max" \
             BENCH_LOSS="$LOSS" \
             BENCH_RTT_MS="$RTT_MS" \
             BENCH_MAX_LOAD=4 \
@@ -488,7 +565,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/bench-run.log"
 
       - name: Loopback stress probes
-        if: inputs.suite == 'stress' || inputs.suite == 'both'
+        if: inputs.suite == 'stress' || inputs.suite == 'both' || inputs.suite == 'preprod'
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -502,7 +579,7 @@ jobs:
         run: |
           sudo chown -R "$(id -u):$(id -g)" \
             "$RUNNER_TEMP/bench-out" "$RUNNER_TEMP/tun-out" \
-            "$RUNNER_TEMP/protocol-out" 2>/dev/null || true
+            "$RUNNER_TEMP/protocol-out" "$RUNNER_TEMP/preprod-tun" 2>/dev/null || true
 
       - name: Step summary
         if: always()
@@ -529,6 +606,9 @@ jobs:
           if [ "${{ inputs.suite }}" = "bench" ] || [ "${{ inputs.suite }}" = "stress" ] \
             || [ "${{ inputs.suite }}" = "protocols" ]; then
             echo "TUN: skipped (suite=${{ inputs.suite }})." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ inputs.suite }}" = preprod ]; then
+            echo "TUN: see separate XUDP, legacy and packetaddr matrices in the evidence artifact." >> "$GITHUB_STEP_SUMMARY"
+            echo "Production baseline: \`${BASELINE_REF:-unavailable}\`." >> "$GITHUB_STEP_SUMMARY"
           elif [ -f "$RUNNER_TEMP/tun-out/results-beam.tsv" ]; then
             {
               echo "## TUN"
@@ -554,7 +634,7 @@ jobs:
           fi
 
       - name: Protocol summary
-        if: always() && inputs.suite == 'protocols'
+        if: always() && (inputs.suite == 'protocols' || inputs.suite == 'preprod')
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/protocol-out"
@@ -602,13 +682,19 @@ jobs:
             ${{ runner.temp }}/tun-out/xray-version.txt
             ${{ runner.temp }}/tun-out/logs
             ${{ runner.temp }}/tun-out/probes
+            ${{ runner.temp }}/preprod-tun/*/results-beam.tsv
+            ${{ runner.temp }}/preprod-tun/*/environment.txt
+            ${{ runner.temp }}/preprod-tun/*/network.txt
+            ${{ runner.temp }}/preprod-tun/*/logs
+            ${{ runner.temp }}/preprod-tun/*/probes
+            ${{ runner.temp }}/preprod-tun-*.log
             ${{ runner.temp }}/protocol-out
             ${{ runner.temp }}/stress-out
           retention-days: 7
           if-no-files-found: warn
 
       - name: Publish results branch
-        if: always() && inputs.publish
+        if: always() && inputs.publish && inputs.suite != 'preprod'
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/bench-out"
@@ -695,11 +781,19 @@ jobs:
           )
           PY
 
+      - name: Preprod benchmark acceptance
+        if: always() && inputs.suite == 'preprod'
+        run: python3 bench/preprod.py "$RUNNER_TEMP/bench-out"
+
       - name: TUN acceptance
-        if: always() && (inputs.suite == 'tun' || inputs.suite == 'both')
+        if: always() && (inputs.suite == 'tun' || inputs.suite == 'both' || inputs.suite == 'preprod')
         run: |
           set -euo pipefail
-          python3 - "$RUNNER_TEMP/tun-out/results-beam.tsv" <<'PY'
+          results=("$RUNNER_TEMP/tun-out/results-beam.tsv")
+          if [ "${{ inputs.suite }}" = preprod ]; then
+            results=("$RUNNER_TEMP"/preprod-tun/{xudp,legacy,packetaddr}/results-beam.tsv)
+          fi
+          python3 - "${results[@]}" <<'PY'
           import sys
           from pathlib import Path
 
@@ -707,39 +801,45 @@ jobs:
               "tcp-http-v4", "tcp-http-v6", "udp-echo", "udp-echo-v6",
               "dns-udp", "dns-udp-v6", "quic-udp", "https-direct",
           )
-          path = Path(sys.argv[1])
-          if not path.is_file():
-              print(f"::error::TUN produced no results at {path}")
+          failures = []
+          for name in sys.argv[1:]:
+              path = Path(name)
+              if not path.is_file():
+                  failures.append(f"{path}: missing results")
+                  continue
+              for probe in required:
+                  statuses = [
+                      fields[1]
+                      for line in path.read_text(encoding="utf-8").splitlines()
+                      if len(fields := line.split("\t")) >= 2 and fields[0] == probe
+                  ]
+                  if statuses != ["PASS"]:
+                      failures.append(f"{path}: {probe}={statuses or 'MISSING'}")
+          for problem in failures:
+              print(f"::error::{problem}")
+          if failures:
               raise SystemExit(1)
-          rows = {}
-          for line in path.read_text(encoding="utf-8").splitlines():
-              parts = line.split("\t")
-              if len(parts) >= 2:
-                  rows[parts[0]] = parts[1]
-          problems = [
-              f"{name}={rows.get(name, 'MISSING')}"
-              for name in required
-              if rows.get(name) != "PASS"
-          ]
-          if problems:
-              print("::error::TUN matrix did not pass: " + ", ".join(problems))
-              raise SystemExit(1)
-          print("TUN acceptance: 8/8 PASS")
+          print(f"TUN acceptance: 8/8 PASS on {len(sys.argv) - 1} matrix/matrices")
           PY
 
       - name: Protocol acceptance
-        if: always() && inputs.suite == 'protocols'
+        if: always() && (inputs.suite == 'protocols' || inputs.suite == 'preprod')
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/protocol-out"
           python3 "$GITHUB_WORKSPACE/tests/tun/test_protocol_report.py" -v
+          args=()
+          if [ "${{ inputs.suite }}" = preprod ]; then
+            args+=(--preprod-commit "$GITHUB_SHA")
+          else
+            args+=(--control "$out/protocol-report-xray.json")
+          fi
           python3 "$GITHUB_WORKSPACE/tests/tun/protocol_report.py" validate \
             --report "$out/protocol-report-beam.json" \
-            --control "$out/protocol-report-xray.json" \
-            --require-arm beam
+            --require-arm beam "${args[@]}"
 
       - name: Stress acceptance
-        if: always() && (inputs.suite == 'stress' || inputs.suite == 'both')
+        if: always() && (inputs.suite == 'stress' || inputs.suite == 'both' || inputs.suite == 'preprod')
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP/stress-out/summary.json" <<'PY'
@@ -757,7 +857,7 @@ jobs:
               for check in summary.get("checks") or []
               if check.get("ok") is not True
           ]
-          if failures or summary.get("ok") is not True:
+          if not summary.get("checks") or failures or summary.get("ok") is not True:
               print("::error::stress checks failed: " + ", ".join(failures or ["summary"]))
               raise SystemExit(1)
           print("stress acceptance: all checks passed")

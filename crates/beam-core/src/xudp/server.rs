@@ -471,37 +471,23 @@ async fn process_pending_frames(
     mut frames: VecDeque<PendingFrame>,
 ) -> Result<bool, MuxError> {
     let mut session_activity = false;
-    while let Some(mut frame) = frames.pop_front() {
-        if let Some(location) = frame.frame.destination.clone()
-            && matches!(location.address, Address::Domain(_))
-        {
-            let family = if frame.frame.status == SessionStatus::New {
-                None
+    while let Some(frame) = frames.pop_front() {
+        let mut parsed = frame.frame.as_borrowed();
+        if let Some((location, family)) = state.domain_resolution(&parsed) {
+            if let Some(cached) = resolutions.cache_get(location, family) {
+                parsed.destination = Some(socket_addr_to_location(cached));
             } else {
-                state
-                    .session(frame.frame.session_id)
-                    .map(|session| session.family)
-            };
-            if let Some(cached) = resolutions.cache_get(&location, family) {
-                frame.frame.rewrite_destination(cached);
-            } else {
+                let location = location.clone();
+                let next_id = parsed.session_id;
+                let reject = parsed.status == SessionStatus::New;
                 frames.push_front(frame);
-                let next_id = frames
-                    .front()
-                    .map(|frame| frame.frame.session_id)
-                    .expect("queue is non-empty");
-                let reject = frames
-                    .front()
-                    .is_some_and(|frame| frame.frame.status == SessionStatus::New);
                 if !resolutions.start(next_id, location, family, frames) {
                     state.try_send_end(next_id, reject);
                 }
                 return Ok(session_activity);
             }
         }
-        session_activity |= state
-            .handle_frame_with_session_transition(&frame.frame.as_borrowed())
-            .await?;
+        session_activity |= state.handle_frame_with_session_transition(&parsed).await?;
     }
     Ok(session_activity)
 }
@@ -599,7 +585,12 @@ impl Drop for MuxTeardown {
             self.metrics.record_xudp_retained_expired(retained);
         }
         for entry in active {
-            if entry.session.mark_closed() {
+            // The entry removed here owns its terminal report. A reply failure
+            // that the reply task already observed keeps its error outcome.
+            entry.session.mark_closed();
+            if entry.session.failed() {
+                self.metrics.record_xudp_closed_error();
+            } else {
                 self.metrics.record_xudp_closed_mux();
             }
             entry.session.stop();
@@ -694,10 +685,13 @@ where
     // shutdown budget by the session limit.
     let active = lock_table(&table).drain_active();
     for entry in &active {
-        // A reply task may have claimed the close just before the drain. Only
-        // the first close owner records a reason, so admitted/closed counters
-        // reconcile instead of double-counting that race.
-        if entry.session.mark_closed() {
+        // Draining the table owns the close report for every entry removed.
+        // A reply failure the task already observed is reported as an error so
+        // the admitted and closed counters reconcile without double counting.
+        entry.session.mark_closed();
+        if entry.session.failed() {
+            metrics.record_xudp_closed_error();
+        } else {
             metrics.record_xudp_closed_mux();
         }
         // A spawned reply task may not have been polled yet. Marking the
@@ -874,19 +868,15 @@ where
                     let id = parsed.session_id;
                     if parsed.status == SessionStatus::New
                         && let Some(global_id) = parsed.global_id
+                        && state.acceptable_new(&parsed)
                     {
                         // A newer attachment for the same GlobalID supersedes
                         // any older pending domain New. Otherwise the delayed
-                        // old lookup could migrate the flow backwards.
+                        // old lookup could migrate the flow backwards. A frame
+                        // that is rejected here must not cancel that lookup.
                         resolutions.cancel_global(global_id);
                     }
                     if resolutions.has_pending(id) {
-                        if parsed.option.has_data()
-                            && !parsed.payload.is_empty()
-                            && let Some(session) = state.session(id)
-                        {
-                            session.touch();
-                        }
                         if !resolutions.push_frame(id, OwnedFrame::from_borrowed(&parsed)) {
                             tracing::debug!(
                                 session_id = id,
@@ -901,15 +891,7 @@ where
                         continue;
                     }
 
-                    if matches!(parsed.status, SessionStatus::New | SessionStatus::Keep)
-                        && let Some(destination) = parsed.destination.as_ref()
-                        && matches!(destination.address, Address::Domain(_))
-                    {
-                        let family = if parsed.status == SessionStatus::New {
-                            None
-                        } else {
-                            state.session(id).map(|session| session.family)
-                        };
+                    if let Some((destination, family)) = state.domain_resolution(&parsed) {
                         if let Some(cached) = resolutions.cache_get(destination, family) {
                             let mut owned = OwnedFrame::from_borrowed(&parsed);
                             owned.rewrite_destination(cached);
@@ -917,13 +899,6 @@ where
                                 .handle_frame_with_session_transition(&owned.as_borrowed())
                                 .await?;
                         } else {
-                            if parsed.status == SessionStatus::Keep
-                                && parsed.option.has_data()
-                                && !parsed.payload.is_empty()
-                                && let Some(session) = state.session(id)
-                            {
-                                session.touch();
-                            }
                             let Some(frame) = PendingFrame::new(
                                 OwnedFrame::from_borrowed(&parsed),
                                 &state.limiter,
@@ -968,7 +943,8 @@ where
             // A session created and closed inside the same batch must restart
             // the deadline; otherwise a coalesced New+End near the old
             // deadline closes the mux early. KeepAlive-only batches leave
-            // this false and cannot extend the timer.
+            // this false and cannot extend the timer. A pending lookup never
+            // pauses or restarts the deadline: only a live session does.
             if state.has_active_sessions() {
                 empty_since = None;
             } else if batch_session_activity {
@@ -1005,6 +981,16 @@ where
                     empty_since = None;
                 } else if session_activity {
                     empty_since = Some(Instant::now());
+                } else {
+                    // The deadline keeps its original start. A lookup that
+                    // creates no session ends the mux instead of buying it a
+                    // fresh idle window.
+                    let since = *empty_since.get_or_insert_with(Instant::now);
+                    if resolutions.pending.is_empty()
+                        && since.elapsed() >= state.config.session_idle_timeout
+                    {
+                        return Ok(());
+                    }
                 }
             }
             _ = sweep.tick() => {
@@ -1021,7 +1007,11 @@ where
                     empty_since = Some(Instant::now());
                 } else {
                     let since = *empty_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= state.config.session_idle_timeout {
+                    // An accepted lookup may still create a session, so it
+                    // defers the close without extending the deadline.
+                    if resolutions.pending.is_empty()
+                        && since.elapsed() >= state.config.session_idle_timeout
+                    {
                         return Ok(());
                     }
                 }
@@ -1117,6 +1107,41 @@ async fn send_loop(
 }
 
 impl MuxState {
+    /// True when `handle_new` can accept this frame at all.
+    ///
+    /// A frame that fails these checks is rejected without a session, so it
+    /// must not supersede a pending lookup for the same GlobalID either.
+    fn acceptable_new(&self, frame: &Frame<'_>) -> bool {
+        frame.status == SessionStatus::New
+            && frame.network == Some(TargetNetwork::Udp)
+            && frame.destination.is_some()
+            && frame.payload.len() <= self.config.max_datagram_size
+    }
+
+    /// Only resolve destinations that the frame handler can use.
+    fn domain_resolution<'a>(
+        &self,
+        frame: &'a Frame<'_>,
+    ) -> Option<(&'a NetLocation, Option<SocketFamily>)> {
+        // A frame that `handle_frame` rejects must not spend a resolver slot or
+        // defer the empty-mux deadline: the rejection is immediate work.
+        if frame.payload.len() > self.config.max_datagram_size {
+            return None;
+        }
+        let destination = frame.destination.as_ref()?;
+        if !matches!(destination.address, Address::Domain(_)) {
+            return None;
+        }
+        let family = match frame.status {
+            SessionStatus::New if frame.network == Some(TargetNetwork::Udp) => None,
+            SessionStatus::Keep if frame.option.has_data() && !frame.payload.is_empty() => {
+                Some(self.session(frame.session_id)?.family)
+            }
+            _ => return None,
+        };
+        Some((destination, family))
+    }
+
     /// Sends a datagram now, or queues it without blocking the read loop.
     fn dispatch_datagram(
         &self,
@@ -1129,17 +1154,32 @@ impl MuxState {
         // load, which costs more than the UDP ordering that the fast path
         // could disturb (UDP does not guarantee ordering anyway).
         match try_send_now(&session.socket, payload, destination) {
-            Ok(true) => return Ok(()),
+            Ok(true) => {
+                session.touch();
+                return Ok(());
+            }
             Ok(false) => {}
             Err(error) => return Err(error),
         }
+        self.enqueue_datagram(session, payload, destination)
+    }
+
+    fn enqueue_datagram(
+        &self,
+        session: &Arc<Session>,
+        payload: &[u8],
+        destination: SocketAddr,
+    ) -> io::Result<()> {
         let datagram = OutboundDatagram {
             session: Arc::clone(session),
             destination,
             payload: payload.to_vec(),
         };
         match self.send_tx.try_send(datagram) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                session.touch();
+                Ok(())
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.limiter.metrics().record_xudp_send_dropped();
                 Ok(())
@@ -1474,7 +1514,6 @@ impl MuxState {
                 self.close_if_same(&session).await
             }
         } else {
-            session.touch();
             Ok(())
         }
     }
@@ -1555,7 +1594,9 @@ impl MuxState {
             session,
             reply_task,
         } = active;
-        let first = session.mark_closed();
+        // The caller took this entry from the table. Only that owner can
+        // report its close; the closed flag stops the reply task.
+        session.mark_closed();
         session.stop();
         // Fence any reply enqueue that was already in flight, then wait only
         // briefly for the reply task. If it does not stop, abort and do not
@@ -1571,18 +1612,14 @@ impl MuxState {
             reply_stopped = false;
         }
 
-        if !first {
-            return Ok(());
-        }
-
         // The reply task may have observed a socket error just before this
         // close claimed the session; report it as an error even when the
         // close itself was clean.
         let error = reason.is_error() || session.failed();
-        match reason {
-            CloseReason::Idle => self.limiter.metrics().record_xudp_closed_idle(),
-            CloseReason::RelayError => self.limiter.metrics().record_xudp_closed_error(),
-            CloseReason::ClientEnd => self.limiter.metrics().record_xudp_closed_end(),
+        match (error, reason) {
+            (true, _) => self.limiter.metrics().record_xudp_closed_error(),
+            (false, CloseReason::Idle) => self.limiter.metrics().record_xudp_closed_idle(),
+            (false, _) => self.limiter.metrics().record_xudp_closed_end(),
         }
         if reason == CloseReason::Idle {
             // A sweep can expire many sessions at once. Waiting for each idle
@@ -1797,7 +1834,8 @@ fn lock_table(table: &Mutex<SessionTable>) -> MutexGuard<'_, SessionTable> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MuxError, MuxState, OutboundDatagram, OwnedFrame, SEND_QUEUE_CAPACITY, handle_mux_stream,
+        MuxError, MuxState, MuxTeardown, OutboundDatagram, OwnedFrame, SEND_QUEUE_CAPACITY,
+        handle_mux_stream,
     };
     use crate::address::{Address, NetLocation};
     use crate::xudp::frame::{
@@ -1867,10 +1905,13 @@ mod tests {
             })
             .expect("prefill queue");
         let before = metrics.snapshot().xudp_send_dropped;
+        let last_activity = session.last_activity_for_test();
+        sleep(Duration::from_millis(2)).await;
         state
-            .dispatch_datagram(&session, b"second", destination)
+            .enqueue_datagram(&session, b"second", destination)
             .expect("a full queue drops rather than fails the session");
         assert_eq!(metrics.snapshot().xudp_send_dropped, before + 1);
+        assert_eq!(session.last_activity_for_test(), last_activity);
         assert!(send_rx.try_recv().is_ok());
     }
 
@@ -1949,8 +1990,17 @@ mod tests {
         );
         assert_eq!(metrics.snapshot().xudp_closed_error, 0);
 
+        let active = table
+            .lock()
+            .expect("table")
+            .take(7)
+            .expect("current session");
+        // A reply failure can already be visible when the read loop owns
+        // the table entry. The owner still owes one terminal outcome.
+        current.mark_failed();
+        current.mark_closed();
         state
-            .close_if_same(&current)
+            .close_active(active, super::CloseReason::ClientEnd)
             .await
             .expect("the current owner closes");
         assert!(table.lock().expect("table").active(7).is_none());
@@ -1968,6 +2018,7 @@ mod tests {
             "the close must queue exactly one End"
         );
         assert_eq!(metrics.snapshot().xudp_closed_error, 1);
+        assert_eq!(metrics.snapshot().xudp_closed_end, 0);
     }
 
     #[tokio::test]
@@ -3839,6 +3890,212 @@ mod tests {
             .expect("End must be acknowledged");
         assert_eq!(end.status, SessionStatus::End);
         finish(client, task).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_domain_keep_does_not_wait_on_resolution() {
+        let config = Arc::new(XudpConfig {
+            session_idle_timeout: Duration::from_millis(200),
+            ..test_config().as_ref().clone()
+        });
+        let destination = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: 9,
+        };
+        let (mut client, task) = start_mux(config);
+        write_frame(&mut client, keep_spec(1, Some(&destination), b"late")).await;
+
+        let reply = timeout(
+            Duration::from_millis(100),
+            read_frame(&mut client, &mut Vec::new()),
+        )
+        .await
+        .expect("unknown Keep must not start a lookup")
+        .expect("unknown Keep must get an End");
+        assert_eq!(reply.status, SessionStatus::End);
+        assert_eq!(reply.option, FrameOption(0));
+        timeout(Duration::from_millis(300), task)
+            .await
+            .expect("empty mux must expire")
+            .expect("mux task did not panic")
+            .expect("clean mux expiry");
+    }
+
+    #[tokio::test]
+    async fn first_pending_resolution_keeps_the_mux_alive() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let config = Arc::new(XudpConfig {
+            session_idle_timeout: Duration::from_millis(200),
+            ..test_config().as_ref().clone()
+        });
+        let (mut client, task) = start_mux(config);
+        write_frame(&mut client, new_spec(1, &destination, b"echo", None)).await;
+
+        let reply = read_frame(&mut client, &mut Vec::new())
+            .await
+            .expect("the accepted lookup must finish before empty-mux expiry");
+        assert_eq!(reply.payload, b"echo");
+        finish(client, task).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_tcp_new_does_not_start_a_lookup() {
+        let config = Arc::new(XudpConfig {
+            session_idle_timeout: Duration::from_millis(200),
+            ..test_config().as_ref().clone()
+        });
+        let destination = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: 9,
+        };
+        let (mut client, task) = start_mux(config);
+        let rejected = FrameSpec {
+            network: Some(TargetNetwork::Tcp),
+            ..new_spec(1, &destination, b"stream", None)
+        };
+        write_frame(&mut client, rejected).await;
+
+        let reply = timeout(
+            Duration::from_millis(100),
+            read_frame(&mut client, &mut Vec::new()),
+        )
+        .await
+        .expect("a rejected TCP New must not wait for a lookup")
+        .expect("a rejected TCP New must get an End");
+        assert_eq!(reply.status, SessionStatus::End);
+        assert_eq!(reply.option, FrameOption::ERROR);
+        finish(client, task).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversize_new_does_not_start_a_lookup() {
+        let config = Arc::new(XudpConfig {
+            max_datagram_size: 64,
+            session_idle_timeout: Duration::from_millis(200),
+            ..test_config().as_ref().clone()
+        });
+        let destination = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: 9,
+        };
+        let (mut client, task) = start_mux(config);
+        let payload = vec![0u8; 65];
+        write_frame(&mut client, new_spec(1, &destination, &payload, None)).await;
+
+        let reply = timeout(
+            Duration::from_millis(100),
+            read_frame(&mut client, &mut Vec::new()),
+        )
+        .await
+        .expect("an oversize New must not wait for a lookup")
+        .expect("an oversize New must get an End");
+        assert_eq!(reply.status, SessionStatus::End);
+        assert_eq!(reply.option, FrameOption::ERROR);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn rejected_new_does_not_cancel_a_pending_lookup() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let global_id = [7u8; GLOBAL_ID_LEN];
+        let config = Arc::new(XudpConfig {
+            max_datagram_size: 64,
+            ..test_config().as_ref().clone()
+        });
+        let (mut client, task) = start_mux(config);
+        write_frame(
+            &mut client,
+            new_spec(1, &destination, b"echo", Some(global_id)),
+        )
+        .await;
+        // An oversize New for the same GlobalID is rejected without a session,
+        // so it must not supersede the accepted lookup that is still running.
+        let payload = vec![0u8; 65];
+        write_frame(
+            &mut client,
+            new_spec(2, &destination, &payload, Some(global_id)),
+        )
+        .await;
+
+        let end = read_frame(&mut client, &mut Vec::new())
+            .await
+            .expect("the rejected New must get an End");
+        assert_eq!(end.session_id, 2);
+        assert_eq!(end.status, SessionStatus::End);
+        assert_eq!(end.option, FrameOption::ERROR);
+
+        let reply = timeout(TEST_TIMEOUT, read_frame(&mut client, &mut Vec::new()))
+            .await
+            .expect("the accepted lookup must still finish")
+            .expect("the pending New must still reach the echo");
+        assert_eq!(reply.session_id, 1);
+        assert_eq!(reply.status, SessionStatus::Keep);
+        assert_eq!(reply.payload, b"echo");
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn teardown_reports_observed_reply_failures_once() {
+        let limiter = XudpSessionLimiter::default();
+        let metrics = limiter.metrics();
+        let table = Arc::new(Mutex::new(SessionTable::default()));
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let failed_socket = Arc::new(
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("failed session socket"),
+        );
+        let clean_socket = Arc::new(
+            UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("clean session socket"),
+        );
+        let failed = Arc::new(Session::new(
+            1,
+            None,
+            failed_socket,
+            SocketFamily::V4,
+            destination,
+            None,
+        ));
+        let clean = Arc::new(Session::new(
+            2,
+            None,
+            clean_socket,
+            SocketFamily::V4,
+            destination,
+            None,
+        ));
+        failed.mark_failed();
+        {
+            let mut table = table.lock().expect("table");
+            table.insert(ActiveSession {
+                session: Arc::clone(&failed),
+                reply_task: None,
+            });
+            table.insert(ActiveSession {
+                session: Arc::clone(&clean),
+                reply_task: None,
+            });
+        }
+
+        drop(MuxTeardown {
+            table: Arc::clone(&table),
+            metrics: Arc::clone(&metrics),
+        });
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.xudp_closed_error, 1);
+        assert_eq!(snapshot.xudp_closed_mux, 1);
+        assert_eq!(table.lock().expect("table").active_len(), 0);
     }
 
     #[tokio::test]

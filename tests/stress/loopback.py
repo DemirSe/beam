@@ -453,8 +453,8 @@ def probe_basic(
     check(
         results,
         "churn_fd_stable",
-        server.proc.poll() is None and after <= before + 2,
-        f"accepted={accepted} fds {before}->{after} rss={server.rss()}KiB",
+        accepted >= 1800 and server.proc.poll() is None and after <= before + 2,
+        f"accepted={accepted}/2000 (minimum 1800) fds {before}->{after} rss={server.rss()}KiB",
     )
 
 
@@ -646,6 +646,39 @@ def probe_shutdown(beam: Path, out: Path, results: list[dict]) -> None:
         server.stop()
 
 
+def probe_second_shutdown_signal(beam: Path, out: Path, results: list[dict]) -> None:
+    server = Server(beam, out, "shutdown-repeat", "127.0.0.1:9", handshake_ms=10_000)
+    try:
+        with connect(server.port) as holder:
+            time.sleep(0.4)
+            server.proc.terminate()
+            deadline = time.monotonic() + 1.0
+            started_drain = False
+            while time.monotonic() < deadline and server.proc.poll() is None:
+                log = server.log_path.read_text(encoding="utf-8", errors="replace")
+                if "shutdown signal received; draining connections" in log:
+                    started_drain = True
+                    break
+                time.sleep(0.02)
+            draining = started_drain and server.proc.poll() is None and is_open(holder)
+            if draining:
+                server.proc.send_signal(signal.SIGINT)
+                try:
+                    server.proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            log = server.log_path.read_text(encoding="utf-8", errors="replace")
+            second_logged = "second shutdown signal received" in log
+            check(
+                results,
+                "shutdown_second_signal",
+                draining and server.proc.returncode == 0 and second_logged,
+                f"draining={draining} exit={server.proc.returncode} second_logged={second_logged}",
+            )
+    finally:
+        server.stop()
+
+
 def write_reports(out: Path, results: list[dict]) -> bool:
     ok = all(item["ok"] for item in results)
     summary = {
@@ -715,6 +748,7 @@ def main() -> int:
     probe_admission(beam, out, results)
     probe_refused_cover(beam, out, results)
     probe_shutdown(beam, out, results)
+    probe_second_shutdown_signal(beam, out, results)
 
     ok = write_reports(out, results)
     print(f"summary: {out / 'summary.json'}")

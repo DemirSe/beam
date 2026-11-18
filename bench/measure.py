@@ -406,6 +406,8 @@ def run_udp(args: argparse.Namespace) -> tuple[dict, list[str]]:
     family = socket.AF_INET6 if ":" in args.host else socket.AF_INET
     warnings: list[str] = []
     samples_us: list[float] = []
+    latency_sent = 0
+    latency_us: list[float] = []
     sent = 0
     received = 0
     failure = None
@@ -447,11 +449,11 @@ def run_udp(args: argparse.Namespace) -> tuple[dict, list[str]]:
 
         # Drain late replies, then measure clean sequential RTTs.
         _drain(sock)
-        latency_us: list[float] = []
         for seq in range(args.latency_count):
             payload = _udp_payload(seq, min(args.payload, 256))
             send_at = time.monotonic_ns()
             sock.send(payload)
+            latency_sent += 1
             try:
                 data = sock.recv(65535)
             except socket.timeout:
@@ -480,6 +482,7 @@ def run_udp(args: argparse.Namespace) -> tuple[dict, list[str]]:
         "bytes": received * args.payload,
         **{f"rtt_{key}": value for key, value in latency_summary(latency_us).items()},
         "rtt_samples_us": latency_us,
+        "latency_sent": latency_sent,
         "window_rtt_samples_us": samples_us,
     }
     if received == 0:
@@ -517,6 +520,7 @@ def run_dns(args: argparse.Namespace) -> tuple[dict, list[str]]:
     errors: list[str] = []
     sock = socket.socket(family, socket.SOCK_DGRAM)
     sock.settimeout(args.timeout)
+    planned = args.dns_count
     sent = 0
     received = 0
     try:
@@ -554,6 +558,7 @@ def run_dns(args: argparse.Namespace) -> tuple[dict, list[str]]:
 
     summary = latency_summary(samples_us)
     metrics = {
+        "planned": planned,
         "sent": sent,
         "received": received,
         "loss_pct": round((sent - received) / sent * 100.0, 3) if sent else None,
@@ -561,6 +566,14 @@ def run_dns(args: argparse.Namespace) -> tuple[dict, list[str]]:
         "latency_samples_us": samples_us,
         **{f"rtt_{key}": value for key, value in summary.items()},
     }
+    if sent != planned:
+        return {
+            "status": "fail",
+            "reason": f"incomplete DNS run: sent {sent}/{planned} queries",
+            "command": ["dns", args.dns_server, "target.test", "A"],
+            "metrics": metrics,
+            "warnings": warnings,
+        }, warnings
     if received == 0:
         return {
             "status": "fail",

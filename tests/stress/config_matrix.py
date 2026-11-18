@@ -2,8 +2,8 @@
 """Config-matrix gate: `beam --check` must always answer, never panic or hang.
 
 For each numeric limit it tries boundary values (0, 1, max, max+1, huge) and for
-each text field malformed values, then requires the binary to exit 0 (accepted)
-or 1 (rejected with a message). Exit 101 (panic), a signal, or a timeout is a
+each text field malformed values, then requires the expected exit status: 0
+for accepted settings, 1 with a diagnostic for rejected settings. Exit 101 (panic), a signal, or a timeout is a
 bug: `--check` is what a rollout runs before it touches a live server.
 """
 
@@ -18,16 +18,18 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 TEMPLATE = REPO / "config.example.toml"
 
+# Each pair lists accepted then rejected values with the rest of the example
+# configuration intact. The socket budget rejects a 4 MiB buffer at 256 sessions.
 LIMITS = {
-    "max_connections": ["0", "1", "2", "4294967295", "18446744073709551615"],
-    "max_udp_destinations": ["0", "1", "65536", "18446744073709551615"],
-    "max_preauth_per_ip": ["0", "1", "4294967295"],
-    "max_xudp_sessions": ["0", "1", "4294967295", "18446744073709551615"],
-    "xudp_recv_buffer_bytes": ["0", "1", "16383", "16384", "4194304", "4194305"],
-    "listen_backlog": ["0", "1", "65535", "65536"],
-    "shutdown_drain_ms": ["0", "1", "3000", "3001"],
-    "handshake_timeout_ms": ["0", "1", "99", "100", "86400000", "86400001"],
-    "idle_timeout_ms": ["0", "1", "999", "1000", "86400000", "86400001"],
+    "max_connections": ([1, 2], [0, 4294967295, 18446744073709551615]),
+    "max_udp_destinations": ([1, 65536], [0, 65537, 18446744073709551615]),
+    "max_preauth_per_ip": ([1, 65536], [0, 65537, 4294967295]),
+    "max_xudp_sessions": ([1], [0, 4294967295, 18446744073709551615]),
+    "xudp_recv_buffer_bytes": ([16384], [0, 1, 16383, 4194304, 4194305]),
+    "listen_backlog": ([1, 65535], [0, 65536]),
+    "shutdown_drain_ms": ([1, 3000], [0, 3001]),
+    "handshake_timeout_ms": ([100, 86400000], [0, 1, 99, 86400001]),
+    "idle_timeout_ms": ([1000, 86400000], [0, 1, 999, 86400001]),
 }
 
 TEXT_CASES = [
@@ -49,7 +51,7 @@ TEXT_CASES = [
 FAILURES = 0
 
 
-def check(binary: Path, config: Path, label: str) -> None:
+def check(binary: Path, config: Path, label: str, *, accepted: bool = False) -> None:
     global FAILURES
     try:
         proc = subprocess.run(
@@ -64,11 +66,12 @@ def check(binary: Path, config: Path, label: str) -> None:
         return
     out = (proc.stdout or "") + (proc.stderr or "")
     panicked = "panicked" in out or proc.returncode == 101
-    ok = proc.returncode in (0, 1) and not panicked
+    expected = 0 if accepted else 1
+    ok = proc.returncode == expected and not panicked and (accepted or proc.stderr.strip())
     FAILURES += 0 if ok else 1
     if not ok:
         tail = [line for line in out.splitlines() if line.strip()][-2:]
-        print(f"FAIL {label}: exit={proc.returncode} panicked={panicked} {' | '.join(tail)}")
+        print(f"FAIL {label}: expected={expected} exit={proc.returncode} panicked={panicked} {' | '.join(tail)}")
 
 
 def main() -> int:
@@ -77,13 +80,20 @@ def main() -> int:
     out = Path(tempfile.mkdtemp(prefix="config-matrix-"))
     cases = 0
 
-    for key, values in LIMITS.items():
-        for value in values:
-            text = re.sub(rf"^{key}\s*=.*$", f"{key} = {value}", template, count=1, flags=re.M)
-            path = out / f"{key}-{value}.toml"
-            path.write_text(text, encoding="utf-8")
-            check(binary, path, f"{key}={value}")
-            cases += 1
+    check(binary, TEMPLATE, "example", accepted=True)
+    cases += 1
+    for key, (valid, invalid) in LIMITS.items():
+        for accepted, values in ((True, valid), (False, invalid)):
+            for value in values:
+                text, replacements = re.subn(
+                    rf"^{key}\s*=.*$", f"{key} = {value}", template, count=1, flags=re.M
+                )
+                if replacements != 1:
+                    raise ValueError(f"missing config matrix setting: {key}")
+                path = out / f"{key}-{value}.toml"
+                path.write_text(text, encoding="utf-8")
+                check(binary, path, f"{key}={value}", accepted=accepted)
+                cases += 1
 
     for index, (_key, line) in enumerate(TEXT_CASES):
         text = re.sub(rf"^{_key}\s*=.*$", line, template, count=1, flags=re.M)
