@@ -19,10 +19,11 @@ REPO = Path(__file__).resolve().parents[2]
 TEMPLATE = REPO / "config.example.toml"
 
 # Each pair lists accepted then rejected values with the rest of the example
-# configuration intact. The socket budget rejects a 4 MiB buffer at 256 sessions.
+# configuration intact. The socket budget rejects a 4 MiB buffer at 256 sessions;
+# the packetaddr table budget permits 16384 destinations at those 256 sessions.
 LIMITS = {
     "max_connections": ([1, 2], [0, 4294967295, 18446744073709551615]),
-    "max_udp_destinations": ([1, 65536], [0, 65537, 18446744073709551615]),
+    "max_udp_destinations": ([1, 16384], [0, 16385, 65536, 65537, 18446744073709551615]),
     "max_preauth_per_ip": ([1, 65536], [0, 65537, 4294967295]),
     "max_xudp_sessions": ([1], [0, 4294967295, 18446744073709551615]),
     "xudp_recv_buffer_bytes": ([16384], [0, 1, 16383, 4194304, 4194305]),
@@ -94,6 +95,21 @@ def main() -> int:
                 path.write_text(text, encoding="utf-8")
                 check(binary, path, f"{key}={value}", accepted=accepted)
                 cases += 1
+
+    # The scalar maximum is still valid with fewer sessions: exercise both
+    # sides of the aggregate table budget without weakening either limit.
+    for sessions, accepted in ((64, True), (65, False)):
+        text = template
+        for key, value in (("max_udp_destinations", 65536), ("max_xudp_sessions", sessions)):
+            text, replacements = re.subn(
+                rf"^{key}\s*=.*$", f"{key} = {value}", text, count=1, flags=re.M
+            )
+            if replacements != 1:
+                raise ValueError(f"missing config matrix setting: {key}")
+        path = out / f"packetaddr-budget-{sessions}.toml"
+        path.write_text(text, encoding="utf-8")
+        check(binary, path, f"packetaddr-budget: 65536 destinations x {sessions} sessions", accepted=accepted)
+        cases += 1
 
     for index, (_key, line) in enumerate(TEXT_CASES):
         text = re.sub(rf"^{_key}\s*=.*$", line, template, count=1, flags=re.M)
