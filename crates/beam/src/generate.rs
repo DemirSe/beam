@@ -150,6 +150,8 @@ fn render(
          private_key = \"{private_key}\"\n\
          short_ids = [\"{short_id}\"]\n\
          server_names = [\"{server_name}\"]\n\
+         # Cover: set reality.dest to a host:port whose certificate is valid for\n\
+         # {server_name} (for example \"{server_name}:443\"), not an unrelated sample dest.\n\
          \n# Xray-compatible client link, public key only:\n\
          {link}\n"
     ))
@@ -207,6 +209,30 @@ mod tests {
         assert!(output.contains(&format!("short_ids = [\"{short_id}\"]")));
         assert!(output.contains("server_names = [\"whatsapp.net\"]"));
         assert!(output.ends_with(&format!("{link}\n")));
+    }
+
+    #[test]
+    fn render_explains_the_cover_destination_for_the_sni() {
+        let output = render(
+            "00000000-0000-0000-0000-000000000000",
+            "synthetic-key",
+            "0123456789abcdef",
+            "cover.example",
+            "vless://synthetic",
+        );
+
+        assert!(output.contains("reality.dest"), "{}", output.as_str());
+        assert!(
+            output.contains("certificate is valid for"),
+            "{}",
+            output.as_str()
+        );
+        assert!(output.contains("cover.example:443"), "{}", output.as_str());
+        assert!(
+            output.contains("not an unrelated sample dest"),
+            "{}",
+            output.as_str()
+        );
     }
 
     #[test]

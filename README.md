@@ -97,9 +97,14 @@ their normal modes. Both files hold secrets and are git-ignored.
 group or other users can read, so a forgotten umask fails instead of writing a
 0644 identity file.
 
-Replace every placeholder. Keep secrets out of git. Use mode `0600` locally
-and root:beam `0640` on the service host. See
-[Security notes](#security-notes) for the full rule.
+Replace every placeholder. `beam generate` does not choose a cover
+destination: set `reality.dest` to a `host:port` whose TLS certificate is valid
+for your `--sni` value, usually `<sni>:443`, and replace the sample
+`whatsapp.net:443` unless that name is your SNI. The cover must serve the chosen
+name and meet the cover parity rules in
+[TLS stack, cover, and MTU](#tls-stack-cover-and-mtu); `--check` does not test
+it. Keep secrets out of git. Use mode `0600` locally and root:beam `0640` on
+the service host. See [Security notes](#security-notes) for the full rule.
 
 The startup and `--check` permission warning reads mode bits only: it reports
 when other users can access the config or the file's group can write it. It

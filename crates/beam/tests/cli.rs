@@ -240,6 +240,17 @@ fn check_accepts_a_generated_identity() {
         .unwrap();
     assert!(generated.status.success(), "{generated:?}");
     let identity = String::from_utf8_lossy(&generated.stdout);
+    // The fragment must point at a cover destination that serves the SNI,
+    // because the sample dest is only valid for the sample name.
+    assert!(
+        identity.contains("# Cover: set reality.dest")
+            && identity.contains("example.com (for example \"example.com:443\")"),
+        "generated output has no matching cover instruction: {identity}"
+    );
+    assert!(
+        !identity.contains("whatsapp.net"),
+        "generated output kept the sample cover name: {identity}"
+    );
 
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml");
     let sample = std::fs::read_to_string(example).unwrap();

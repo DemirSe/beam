@@ -208,7 +208,8 @@ it explicitly.
    enable the time daemon and the jail; the post-boot check names each unit
    that is not active.
 2. Run `make build`. Copy `config.example.toml`, replace every value with your
-   own X25519 key, short ID, UUID, and cover name, then run
+   own X25519 key, short ID, UUID, cover name, and cover destination
+   (`reality.dest`), then run
    `target/release/beam --check -c <your-config>`. Keep the file mode 0600.
 3. Build the bundle with your config:
    `BEAM_CONFIG=<your-config> bash deploy/package.sh`. It prints
