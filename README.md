@@ -101,6 +101,11 @@ Replace every placeholder. Keep secrets out of git. Use mode `0600` locally
 and root:beam `0640` on the service host. See
 [Security notes](#security-notes) for the full rule.
 
+The startup and `--check` permission warning reads mode bits only: it reports
+when other users can access the config or the file's group can write it. It
+does not verify the owner or group, so verify those separately against the
+ownership your service unit uses. A custom owner or group is valid.
+
 Beam warns at startup and during `--check` when `user.id`,
 `reality.private_key`, or a `reality.short_ids` entry still holds the published
 sample value. It prints the field names only, never the values, on stderr and

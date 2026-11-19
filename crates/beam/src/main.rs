@@ -602,25 +602,43 @@ fn warn_if_sample_identity(config: &Config) {
     });
 }
 
-/// Warns when the secrets-bearing config is readable by unrelated users or
-/// writable by a non-owner group. Production uses root:beam 0640.
+/// Warns when the config mode lets other users access the secrets-bearing
+/// file or lets the file's group write it.
+///
+/// Only mode bits are inspected. Ownership is left to the operator because the
+/// service unit can use a custom owner or group; this check is not proof of the
+/// documented `root:beam 0640` deployment layout.
 fn warn_if_config_permissions_are_loose(path: &std::path::Path) {
     let Ok(metadata) = std::fs::metadata(path) else {
         return;
     };
-    let mode = metadata.permissions().mode() & 0o777;
+    let mode = metadata.permissions().mode();
+    let Some(reason) = loose_config_mode(mode) else {
+        return;
+    };
+    tracing::warn!(
+        path = %path.display(),
+        mode = format!("{:03o}", mode & 0o777),
+        "config file {reason}; only mode bits are checked, verify the owner and group separately"
+    );
+}
+
+/// Reason a config file mode is too loose for a secrets-bearing file.
+///
+/// Group read is not reported because group access is a deployment choice
+/// (`root:beam 0640`). Other-user access covers read, write, and execute, and
+/// group write is reported separately because the file's group can then change
+/// the config.
+///
+/// `permissions().mode()` also carries the file-type bits, which the masks
+/// below cannot match because they sit above the low mode bits.
+fn loose_config_mode(mode: u32) -> Option<&'static str> {
     if mode & 0o007 != 0 {
-        tracing::warn!(
-            path = %path.display(),
-            mode = format!("{mode:03o}"),
-            "config file is readable by other users; use root:beam 0640"
-        );
+        Some("is accessible to other users; use 0600, or 0640 with a trusted group")
     } else if mode & 0o020 != 0 {
-        tracing::warn!(
-            path = %path.display(),
-            mode = format!("{mode:03o}"),
-            "config file is group-writable; use root:beam 0640"
-        );
+        Some("is group-writable; use 0600, or 0640 with a trusted group")
+    } else {
+        None
     }
 }
 
@@ -794,6 +812,31 @@ mod tests {
             .is_err(),
             "generate reads no config file"
         );
+    }
+
+    #[test]
+    fn loose_config_mode_reports_only_the_loose_bits() {
+        for mode in [0o600, 0o640, 0o400, 0o440] {
+            assert_eq!(loose_config_mode(mode), None, "{mode:03o}");
+        }
+        // 0o624 sets other-read and group-write; other-user access wins.
+        for mode in [0o604, 0o606, 0o601, 0o624] {
+            assert_eq!(
+                loose_config_mode(mode),
+                Some("is accessible to other users; use 0600, or 0640 with a trusted group"),
+                "{mode:03o}"
+            );
+        }
+        for mode in [0o620, 0o660, 0o670] {
+            assert_eq!(
+                loose_config_mode(mode),
+                Some("is group-writable; use 0600, or 0640 with a trusted group"),
+                "{mode:03o}"
+            );
+        }
+        // Metadata mode carries the file-type bits; they never match a mask.
+        assert!(loose_config_mode(0o100_644).is_some());
+        assert_eq!(loose_config_mode(0o100_600), None);
     }
 
     #[test]

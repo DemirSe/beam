@@ -93,6 +93,67 @@ fn check_tolerates_a_full_stderr() {
     );
 }
 
+/// A loose config mode must be reported with its real scope: mode bits only.
+///
+/// The check reads the mode only. It never inspects the owner or group, so a
+/// clean 0640 mode stays quiet without any ownership check, and a loose mode is
+/// reported on the configured sink (stdout) rather than the stderr channel
+/// used by the sample-identity warning.
+#[test]
+fn check_scopes_the_permission_warning_to_mode_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml");
+    let config = std::fs::read_to_string(example).unwrap();
+    for (mode, reason) in [
+        (0o644, Some("accessible to other users")),
+        (0o620, Some("group-writable")),
+        (0o640, None),
+    ] {
+        let path = std::env::temp_dir().join(format!("beam-mode-{mode:o}-{}", std::process::id()));
+        std::fs::write(&path, &config).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_beam"))
+            .args(["--check", "--config"])
+            .arg(&path)
+            .env("RUST_LOG", "warn")
+            .output()
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(output.status.success(), "{mode:03o}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // The permission warning reaches the configured logging sink, which is
+        // stdout; stderr carries only the scoped sample-identity warning.
+        let on_stdout = stdout.contains("config file");
+        assert_eq!(on_stdout, reason.is_some(), "{mode:03o}: {stdout}");
+        if let Some(reason) = reason {
+            assert!(stdout.contains(reason), "{mode:03o}: {stdout}");
+            // The rendered field must hold the low permission octal only, not
+            // the file-type bits that metadata mode also carries.
+            assert!(
+                stdout.contains(&format!("mode=\"{mode:03o}\"")),
+                "{mode:03o}: {stdout}"
+            );
+            assert!(
+                stdout.contains("only mode bits are checked"),
+                "{mode:03o}: {stdout}"
+            );
+            assert!(
+                stdout.contains("verify the owner and group separately"),
+                "{mode:03o}: {stdout}"
+            );
+        }
+        assert!(!stderr.contains("config file"), "{mode:03o}: {stderr}");
+        assert!(
+            stdout.contains("configuration is valid"),
+            "{mode:03o}: {stdout}"
+        );
+    }
+}
+
 /// A direct start must name the sample identity too, not only `--check`.
 ///
 /// The test holds the loopback port, so startup reaches the warning and then
