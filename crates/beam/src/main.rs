@@ -49,6 +49,14 @@ const MIN_UDP_IO_TIMEOUT: Duration = Duration::from_secs(1);
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BEAM_GIT_HASH"), ")");
 
+/// Identity values published in `config.example.toml`.
+///
+/// Startup and `--check` name the fields that still hold them, so a copied
+/// sample is not mistaken for a deployment-ready identity. Both values are
+/// public test data; the warning prints field names only.
+const SAMPLE_PRIVATE_KEY: [u8; 32] = [0x5a; 32];
+const SAMPLE_SHORT_ID: &str = "0123456789abcdef";
+
 /// Bounds the exact-replay cache for the configured connection pool.
 ///
 /// The README promises `max_connections * 128` bounded to 4096..131072. A full
@@ -190,6 +198,10 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
         }
     }
     warn_if_config_permissions_are_loose(&cli.config);
+    // A direct start must warn too: after a successful copy of the example
+    // file, the first start would otherwise serve the published sample
+    // identity silently.
+    warn_if_sample_identity(&config);
 
     if cli.check {
         // `validate_limits` covers syntax and scalar bounds; constructing the
@@ -546,6 +558,50 @@ fn validation_fd_limit(soft_limit: std::io::Result<Option<u64>>) -> u64 {
     }
 }
 
+/// Returns the identity fields that still hold the published sample values.
+fn sample_identity_fields(config: &Config) -> Vec<String> {
+    let mut fields = Vec::new();
+    if config.user.id.is_nil() {
+        fields.push("user.id".to_owned());
+    }
+    if *config.reality.private_key == SAMPLE_PRIVATE_KEY {
+        fields.push("reality.private_key".to_owned());
+    }
+    for (index, short_id) in config.reality.short_ids.iter().enumerate() {
+        if short_id.eq_ignore_ascii_case(SAMPLE_SHORT_ID) {
+            fields.push(format!("reality.short_ids[{index}]"));
+        }
+    }
+    fields
+}
+
+/// Names the unchanged sample identity on stderr.
+///
+/// A scoped subscriber reaches stderr even under `RUST_LOG=off` or `error`,
+/// without changing the process-wide logging configuration. The write stays
+/// best effort: the sample identity is valid, so a closed or full stderr must
+/// not turn this warning into a startup or check failure. The fmt layer's
+/// failed-write fallback is `eprintln!`, which panics on such a stderr, so it
+/// is disabled here.
+fn warn_if_sample_identity(config: &Config) {
+    let fields = sample_identity_fields(config);
+    if fields.is_empty() {
+        return;
+    }
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .log_internal_errors(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::warn!(
+            fields = %fields.join(", "),
+            "sample identity values are unchanged; replace them before deployment"
+        );
+    });
+}
+
 /// Warns when the secrets-bearing config is readable by unrelated users or
 /// writable by a non-owner group. Production uses root:beam 0640.
 fn warn_if_config_permissions_are_loose(path: &std::path::Path) {
@@ -738,6 +794,56 @@ mod tests {
             .is_err(),
             "generate reads no config file"
         );
+    }
+
+    #[test]
+    fn sample_identity_fields_name_the_published_placeholders() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.toml");
+        let sample = || Config::from_path(path).expect("the example config must load");
+        let replaced_id = "1b4e28ba-2fa1-4d6b-8a3c-1f9d6e2b7a0c".parse().unwrap();
+
+        assert_eq!(
+            sample_identity_fields(&sample()),
+            vec![
+                "user.id".to_owned(),
+                "reality.private_key".to_owned(),
+                "reality.short_ids[0]".to_owned()
+            ]
+        );
+
+        // A partly replaced identity must still name every leftover field.
+        let mut only_user = sample();
+        only_user.reality.private_key = zeroize::Zeroizing::new([0x11; 32]);
+        only_user.reality.short_ids = vec!["deadbeef".to_owned()];
+        assert_eq!(
+            sample_identity_fields(&only_user),
+            vec!["user.id".to_owned()]
+        );
+
+        let mut only_key = sample();
+        only_key.user.id = replaced_id;
+        only_key.reality.short_ids = vec!["deadbeef".to_owned()];
+        assert_eq!(
+            sample_identity_fields(&only_key),
+            vec!["reality.private_key".to_owned()]
+        );
+
+        // The validator accepts uppercase short IDs, so the sample match must
+        // not depend on the stored case, and the report must carry the slot.
+        let mut later_slot = sample();
+        later_slot.user.id = replaced_id;
+        later_slot.reality.private_key = zeroize::Zeroizing::new([0x11; 32]);
+        later_slot.reality.short_ids = vec!["deadbeef".to_owned(), "0123456789ABCDEF".to_owned()];
+        assert_eq!(
+            sample_identity_fields(&later_slot),
+            vec!["reality.short_ids[1]".to_owned()]
+        );
+
+        let mut replaced = sample();
+        replaced.user.id = replaced_id;
+        replaced.reality.private_key = zeroize::Zeroizing::new([0x11; 32]);
+        replaced.reality.short_ids = vec!["deadbeef".to_owned()];
+        assert!(sample_identity_fields(&replaced).is_empty());
     }
 
     #[test]
