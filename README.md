@@ -113,7 +113,8 @@ ownership your service unit uses. A custom owner or group is valid.
 
 Beam warns at startup and during `--check` when `user.id`,
 `reality.private_key`, or a `reality.short_ids` entry still holds the published
-sample value. It prints the field names only, never the values, on stderr and
+sample value (including X25519-equivalent encodings of the sample private
+key). It prints the field names only, never the values, on stderr and
 independently of `RUST_LOG`. The warning does not fail either path, because
 builds and tests load the example file. A passing check or a running server
 with this warning is not deployment ready.

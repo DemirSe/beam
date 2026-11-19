@@ -564,7 +564,23 @@ fn sample_identity_fields(config: &Config) -> Vec<String> {
     if config.user.id.is_nil() {
         fields.push("user.id".to_owned());
     }
-    if *config.reality.private_key == SAMPLE_PRIVATE_KEY {
+    // X25519 clamping ignores the low three bits and fixes the top two bits.
+    // Compare every effective key bit without copying the secret.
+    let key_difference = config
+        .reality
+        .private_key
+        .iter()
+        .zip(SAMPLE_PRIVATE_KEY)
+        .enumerate()
+        .fold(0u8, |difference, (index, (actual, sample))| {
+            let mask = match index {
+                0 => 0xf8,
+                31 => 0x3f,
+                _ => 0xff,
+            };
+            difference | ((actual ^ sample) & mask)
+        });
+    if key_difference == 0 {
         fields.push("reality.private_key".to_owned());
     }
     for (index, short_id) in config.reality.short_ids.iter().enumerate() {
@@ -887,6 +903,34 @@ mod tests {
         replaced.reality.private_key = zeroize::Zeroizing::new([0x11; 32]);
         replaced.reality.short_ids = vec!["deadbeef".to_owned()];
         assert!(sample_identity_fields(&replaced).is_empty());
+    }
+
+    #[test]
+    fn sample_identity_warning_matches_effective_x25519_key() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.toml");
+        let mut config = Config::from_path(path).expect("example config");
+        config.user.id = "1b4e28ba-2fa1-4d6b-8a3c-1f9d6e2b7a0c".parse().unwrap();
+        config.reality.short_ids = vec!["deadbeef".to_owned()];
+        // All 32 encodings differ only in bits discarded by X25519 clamping.
+        for low in 0..8 {
+            for high in 0..4 {
+                *config.reality.private_key = SAMPLE_PRIVATE_KEY;
+                config.reality.private_key[0] = (SAMPLE_PRIVATE_KEY[0] & 0xf8) | low;
+                config.reality.private_key[31] = (SAMPLE_PRIVATE_KEY[31] & 0x3f) | (high << 6);
+                assert_eq!(sample_identity_fields(&config), vec!["reality.private_key"]);
+            }
+        }
+        // Changing any effective bit must no longer identify the sample key.
+        for index in 0..32 {
+            for bit in 0..8 {
+                if (index == 0 && bit < 3) || (index == 31 && bit >= 6) {
+                    continue;
+                }
+                *config.reality.private_key = SAMPLE_PRIVATE_KEY;
+                config.reality.private_key[index] ^= 1 << bit;
+                assert!(sample_identity_fields(&config).is_empty());
+            }
+        }
     }
 
     #[test]
