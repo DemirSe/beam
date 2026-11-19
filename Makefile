@@ -57,6 +57,7 @@ test: test-scripts
 test-scripts:
 	python3 tests/bench/test_report.py
 	python3 tests/tun/test_protocol_report.py
+	python3 tests/preprod/test_preprod_gate.py
 	python3 tests/test_ipv4_only.py
 	python3 tests/deploy/test_deploy_contracts.py
 	python3 tests/deploy/test_restart_policy.py

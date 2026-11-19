@@ -15,6 +15,11 @@ name: lab-hosted
 # under netem and gates on the validated protocol report for the beam arm; the
 # stock Xray arm is a diagnostic control, not a gate.
 #
+# For suite=preprod, four independent lab jobs run the tun, protocols, bench
+# and stress phases on separate runners. Each job uploads evidence under a
+# unique artifact name. The preprod-gate job passes only when all four phases
+# pass on the candidate commit and the current prod baseline.
+#
 # Results go to the `bench-results` branch (latest run), an artifact, and the
 # step summary. Binaries are pinned by version and release-asset digest.
 
@@ -149,11 +154,18 @@ jobs:
     # not include the queue time before the job starts. The 180 default keeps
     # the campaign budget; a diagnostic dispatch can lower it.
     timeout-minutes: ${{ fromJSON(inputs.job_timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Standalone suites keep one runner. Preprod splits the same validators
+        # into four independent campaigns with separate output paths.
+        phase: ${{ fromJSON(inputs.suite == 'preprod' && '["tun","protocols","bench","stress"]' || '["all"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
+          ref: ${{ github.sha }}
 
       - name: Resolve profile
         env:
@@ -428,7 +440,7 @@ jobs:
           python3 tests/stress/config_matrix.py target/release/beam
 
       - name: Build baseline
-        if: inputs.baseline_ref != ''
+        if: inputs.baseline_ref != '' && (inputs.suite != 'preprod' || matrix.phase == 'bench')
         timeout-minutes: 20
         run: |
           set -euo pipefail
@@ -443,7 +455,7 @@ jobs:
           "$RUNNER_TEMP/beam-baseline" --version
 
       - name: TUN suite (root, private namespaces)
-        if: inputs.suite == 'both' || inputs.suite == 'tun'
+        if: (inputs.suite == 'both' || inputs.suite == 'tun') && matrix.phase == 'all'
         timeout-minutes: 20
         run: |
           set -euo pipefail
@@ -461,7 +473,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/tun-run.log"
 
       - name: Preprod TUN matrix (root, bounded server)
-        if: inputs.suite == 'preprod'
+        if: inputs.suite == 'preprod' && matrix.phase == 'tun'
         timeout-minutes: 36
         run: |
           set -euo pipefail
@@ -486,7 +498,7 @@ jobs:
           done
 
       - name: Protocol suite (root, private namespaces)
-        if: inputs.suite == 'protocols' || inputs.suite == 'preprod'
+        if: (inputs.suite == 'protocols' && matrix.phase == 'all') || (inputs.suite == 'preprod' && matrix.phase == 'protocols')
         timeout-minutes: 45
         run: |
           set -euo pipefail
@@ -525,7 +537,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/protocol-run.log"
 
       - name: Benchmark (root, private namespaces)
-        if: inputs.suite == 'both' || inputs.suite == 'bench' || inputs.suite == 'preprod'
+        if: (inputs.suite == 'both' || inputs.suite == 'bench') && matrix.phase == 'all' || (inputs.suite == 'preprod' && matrix.phase == 'bench')
         timeout-minutes: 110
         run: |
           set -euo pipefail
@@ -578,7 +590,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/bench-run.log"
 
       - name: Loopback stress probes
-        if: inputs.suite == 'stress' || inputs.suite == 'both' || inputs.suite == 'preprod'
+        if: (inputs.suite == 'stress' || inputs.suite == 'both') && matrix.phase == 'all' || (inputs.suite == 'preprod' && matrix.phase == 'stress')
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -599,7 +611,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "## lab-hosted: profile=${{ inputs.profile }} suite=${{ inputs.suite }}"
+            echo "## lab-hosted: profile=${{ inputs.profile }} suite=${{ inputs.suite }} phase=${{ matrix.phase }}"
             echo ""
             echo "commit \`$GITHUB_SHA\` · run [$GITHUB_RUN_ID](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
             echo ""
@@ -673,7 +685,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lab-hosted-${{ github.run_id }}
+          name: lab-hosted-${{ github.run_id }}-${{ matrix.phase }}
           path: |
             ${{ runner.temp }}/bench-run.log
             ${{ runner.temp }}/tun-run.log
@@ -795,11 +807,11 @@ jobs:
           PY
 
       - name: Preprod benchmark acceptance
-        if: always() && inputs.suite == 'preprod'
+        if: always() && inputs.suite == 'preprod' && matrix.phase == 'bench'
         run: python3 bench/preprod.py "$RUNNER_TEMP/bench-out"
 
       - name: TUN acceptance
-        if: always() && (inputs.suite == 'tun' || inputs.suite == 'both' || inputs.suite == 'preprod')
+        if: always() && (((inputs.suite == 'tun' || inputs.suite == 'both') && matrix.phase == 'all') || (inputs.suite == 'preprod' && matrix.phase == 'tun'))
         run: |
           set -euo pipefail
           results=("$RUNNER_TEMP/tun-out/results-beam.tsv")
@@ -836,7 +848,7 @@ jobs:
           PY
 
       - name: Protocol acceptance
-        if: always() && (inputs.suite == 'protocols' || inputs.suite == 'preprod')
+        if: always() && ((inputs.suite == 'protocols' && matrix.phase == 'all') || (inputs.suite == 'preprod' && matrix.phase == 'protocols'))
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/protocol-out"
@@ -852,7 +864,7 @@ jobs:
             --require-arm beam "${args[@]}"
 
       - name: Stress acceptance
-        if: always() && (inputs.suite == 'stress' || inputs.suite == 'both' || inputs.suite == 'preprod')
+        if: always() && (((inputs.suite == 'stress' || inputs.suite == 'both') && matrix.phase == 'all') || (inputs.suite == 'preprod' && matrix.phase == 'stress'))
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP/stress-out/summary.json" <<'PY'
@@ -875,3 +887,99 @@ jobs:
               raise SystemExit(1)
           print("stress acceptance: all checks passed")
           PY
+
+      - name: Stage preprod gate evidence
+        if: success() && inputs.suite == 'preprod'
+        run: |
+          set -euo pipefail
+          phase="${{ matrix.phase }}"
+          stage="$RUNNER_TEMP/preprod-gate"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          python3 "$GITHUB_WORKSPACE/tests/preprod/gate.py" record \
+            --out "$stage/evidence-$phase.json" --phase "$phase" \
+            --commit "$GITHUB_SHA" --baseline "$BASELINE_REF" --run-id "$GITHUB_RUN_ID"
+          case "$phase" in
+            tun)
+              for mode in xudp legacy packetaddr; do
+                mkdir -p "$stage/tun/$mode"
+                cp "$RUNNER_TEMP/preprod-tun/$mode/environment.txt" \
+                   "$RUNNER_TEMP/preprod-tun/$mode/results-beam.tsv" \
+                   "$RUNNER_TEMP/preprod-tun-$mode.log" "$stage/tun/$mode/"
+              done ;;
+            protocols)
+              mkdir -p "$stage/protocols"
+              cp "$RUNNER_TEMP/protocol-out/protocol-report-beam.json" \
+                 "$RUNNER_TEMP/protocol-out/environment.txt" \
+                 "$RUNNER_TEMP/protocol-run.log" "$stage/protocols/" ;;
+            bench)
+              mkdir -p "$stage/bench"
+              cp "$RUNNER_TEMP/bench-out/summary.json" \
+                 "$RUNNER_TEMP/bench-out/meta.json" \
+                 "$RUNNER_TEMP/bench-out/environment.txt" \
+                 "$RUNNER_TEMP/bench-out/masks.tsv" \
+                 "$RUNNER_TEMP/bench-run.log" "$stage/bench/" ;;
+            stress)
+              mkdir -p "$stage/stress"
+              cp "$RUNNER_TEMP/stress-out/summary.json" \
+                 "$RUNNER_TEMP/stress-run.log" "$stage/stress/" ;;
+          esac
+
+      - name: Upload preprod gate evidence
+        if: always() && inputs.suite == 'preprod'
+        uses: actions/upload-artifact@v4
+        with:
+          name: preprod-gate-${{ github.run_id }}-${{ matrix.phase }}
+          path: ${{ runner.temp }}/preprod-gate
+          retention-days: 7
+          if-no-files-found: ignore
+
+  preprod-gate:
+    needs: lab
+    if: ${{ always() && inputs.suite == 'preprod' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Verify candidate and prod baseline
+        env:
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          INPUT_PROFILE: ${{ inputs.profile }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [ "$INPUT_PROFILE" = standard ] || fail "preprod requires profile=standard"
+          [ "$INPUT_PUBLISH" = false ] || fail "preprod requires publish=false"
+          printf '%s' "$BASELINE_REF" | grep -Eq '^[0-9a-f]{40}$' \
+            || fail "baseline_ref must be the full prod SHA"
+          [ "$BASELINE_REF" = "$(git rev-parse --verify refs/remotes/origin/prod)" ] \
+            || fail "baseline_ref is not the current origin/prod SHA"
+          git merge-base --is-ancestor "$BASELINE_REF" "$GITHUB_SHA" \
+            || fail "baseline_ref is not an ancestor of the candidate"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: preprod-gate-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/preprod-evidence
+          merge-multiple: true
+
+      - name: Final preprod gate
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          LAB_RESULT: ${{ needs.lab.result }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/tests/preprod/gate.py" check \
+            --root "$RUNNER_TEMP/preprod-evidence" \
+            --commit "$CANDIDATE_SHA" --baseline "$BASELINE_REF" \
+            --run-id "$RUN_ID" --lab-result "$LAB_RESULT"

@@ -207,6 +207,7 @@ before the cargo tests:
 ```bash
 python3 tests/bench/test_report.py
 python3 tests/tun/test_protocol_report.py
+python3 tests/preprod/test_preprod_gate.py
 python3 tests/test_ipv4_only.py
 python3 tests/deploy/test_deploy_contracts.py
 python3 tests/deploy/test_restart_policy.py
@@ -226,16 +227,24 @@ runs belong in hosted CI, not in this local loop. See
 
 Dispatch [lab-hosted](.github/workflows/lab-hosted.yml) on the exact candidate
 commit with `suite=preprod`, `profile=standard`, `publish=false`, and the
-current full `prod` SHA as `baseline_ref`. Review that run before promotion.
+current full `prod` SHA as `baseline_ref`. Review the final gate before
+promotion.
+
+Preprod runs four independent jobs: `tun`, `protocols`, `bench` and `stress`.
+Each job uses the same candidate commit and the current `prod` SHA. Each job
+uploads evidence under its own artifact name. The `preprod-gate` job checks all
+four reports, their commits and the matrix result. It fails on a missing,
+cancelled, failed or duplicated phase. A green final gate is the only
+production evidence for that dispatch. Standalone suites still run as one job.
 
 For independent parallel campaigns, select distinct `concurrency_slot` values
 (`parallel-1`, `parallel-2`, `parallel-3`). The default `shared` slot serializes
-runs. `job_timeout_minutes=10` caps setup, builds, and tests together; a timeout
-leaves the production gate incomplete.
+runs. `job_timeout_minutes=180` bounds each job. A `10`-minute cap leaves the
+production gate incomplete.
 
 The hosted runner requires real TUN, private network namespaces and netem. It
-runs the IPv4/IPv6 client matrix in XUDP, legacy and packetaddr modes, followed
-by the XUDP protocol suite with mixed traffic, payload verification and restart
+runs the IPv4/IPv6 client matrix in XUDP, legacy and packetaddr modes, alongside
+the XUDP protocol suite with mixed traffic, payload verification and restart
 recovery. Small-request p95 under mixed load must stay at or below 2 s. The lab
 server runs with 50% of one vCPU and 768 MiB of memory.
 The paired benchmark uses the same limits for both builds, three repetitions,
