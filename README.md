@@ -228,6 +228,11 @@ Dispatch [lab-hosted](.github/workflows/lab-hosted.yml) on the exact candidate
 commit with `suite=preprod`, `profile=standard`, `publish=false`, and the
 current full `prod` SHA as `baseline_ref`. Review that run before promotion.
 
+For independent parallel campaigns, select distinct `concurrency_slot` values
+(`parallel-1`, `parallel-2`, `parallel-3`). The default `shared` slot serializes
+runs. `job_timeout_minutes=10` caps setup, builds, and tests together; a timeout
+leaves the production gate incomplete.
+
 The hosted runner requires real TUN, private network namespaces and netem. It
 runs the IPv4/IPv6 client matrix in XUDP, legacy and packetaddr modes, followed
 by the XUDP protocol suite with mixed traffic, payload verification and restart

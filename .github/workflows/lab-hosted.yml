@@ -114,6 +114,12 @@ on:
         required: false
         default: ""
         type: string
+      concurrency_slot:
+        description: "Independent runner slot; shared preserves serialized lab runs"
+        required: false
+        default: shared
+        type: choice
+        options: [shared, parallel-1, parallel-2, parallel-3]
       job_timeout_minutes:
         description: "Hard cap for the whole job, setup and builds included; queue time excluded"
         required: false
@@ -125,7 +131,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: lab-hosted
+  group: lab-hosted-${{ inputs.concurrency_slot || 'shared' }}
   cancel-in-progress: false
 
 env:
