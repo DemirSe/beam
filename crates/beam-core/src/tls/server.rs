@@ -17,6 +17,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1830,6 +1831,25 @@ fn dial_attempt_timeout(remaining: Duration, last: bool) -> Duration {
     }
 }
 
+/// Warns once per process about a destination socket option that failed.
+///
+/// The options tune the outbound socket, so the connection continues. A
+/// warning per dial would flood the log when the kernel or a sandbox rejects
+/// the option for every destination.
+static DESTINATION_OPTION_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_destination_option_once(error: &io::Error, option: &'static str) {
+    if DESTINATION_OPTION_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(%error, option, "could not apply a destination socket option");
+    } else {
+        tracing::warn!(
+            %error,
+            option,
+            "could not apply a destination socket option; relay tuning is degraded"
+        );
+    }
+}
+
 async fn dial_addresses(
     addresses: &[SocketAddr],
     deadline: tokio::time::Instant,
@@ -1861,7 +1881,7 @@ async fn dial_addresses(
         // MSS option in the SYN and the local send limit only when it is set
         // while the socket is still unconnected.
         if let Err(error) = beam_sys::set_tcp_maxseg(socket.as_raw_fd(), TARGET_MSS) {
-            tracing::debug!(%error, "could not set TCP_MAXSEG on the destination");
+            warn_destination_option_once(&error, "TCP_MAXSEG");
         }
         match timeout(attempt, socket.connect(address)).await {
             Ok(Ok(stream)) => {
@@ -1869,14 +1889,14 @@ async fn dial_addresses(
                 // for Nagle/delayed-ACK interaction on the outbound socket.
                 // The accepted client socket already sets this in `main`.
                 if let Err(error) = stream.set_nodelay(true) {
-                    tracing::debug!(%error, "could not set TCP_NODELAY on the destination");
+                    warn_destination_option_once(&error, "TCP_NODELAY");
                 }
                 if let Err(error) = beam_sys::set_tcp_keepalive(
                     stream.as_raw_fd(),
                     Duration::from_secs(60),
                     Duration::from_secs(15),
                 ) {
-                    tracing::debug!(%error, "could not set TCP keepalive on the destination");
+                    warn_destination_option_once(&error, "TCP keepalive");
                 }
                 return Ok(stream);
             }

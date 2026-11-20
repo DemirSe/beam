@@ -4,6 +4,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 mod generate;
@@ -32,6 +33,10 @@ const REALITY_TIMESTAMP_WINDOW: Duration = Duration::from_secs(300);
 const REPLAY_CAPACITY_PER_CONNECTION: usize = 128;
 const REPLAY_CAPACITY_MIN: usize = 4_096;
 const REPLAY_CAPACITY_MAX: usize = 131_072;
+
+/// Accept backoff after a successful accept, and after a failure.
+const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_LIMIT: Duration = Duration::from_secs(1);
 
 /// Upper bound for the UDP idle clock on both the XUDP and legacy paths.
 ///
@@ -350,6 +355,7 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
                     cover_limited = current.cover_limited,
                     connection_limited = current.connection_limited,
                     accept_errors = current.accept_errors,
+                    accept_errors_resource = current.accept_errors_resource,
                     xudp_rejected_per_stream = current.xudp_rejected_per_stream,
                     xudp_rejected_global = current.xudp_rejected_global,
                     xudp_retained_evicted = current.xudp_retained_evicted,
@@ -410,7 +416,7 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
     // keep the listener alive and retry with a bounded backoff instead of
     // dropping the runtime (and any in-flight blocking relays) on the first
     // error.
-    let mut accept_backoff = Duration::from_millis(10);
+    let mut accept_backoff = ACCEPT_BACKOFF_START;
     let first_signal = loop {
         let accepted = tokio::select! {
             biased;
@@ -419,18 +425,24 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
         };
         let (stream, peer) = match accepted {
             Ok(accepted) => {
-                accept_backoff = Duration::from_millis(10);
+                accept_backoff = ACCEPT_BACKOFF_START;
                 accepted
             }
             Err(error) => {
-                metrics.record_accept_error();
-                tracing::warn!(%error, "listener accept failed; retrying");
+                let failure = beam_sys::AcceptError::classify(&error);
+                metrics.record_accept_error(failure == beam_sys::AcceptError::ResourceShortage);
+                tracing::warn!(
+                    %error,
+                    reason = failure.as_str(),
+                    backoff_ms = accept_backoff.as_millis(),
+                    "listener accept failed; retrying"
+                );
                 tokio::select! {
                     biased;
                     signal = termination_signal(&mut sigterm, &mut sigint) => break signal,
                     _ = sleep(accept_backoff) => {}
                 }
-                accept_backoff = (accept_backoff * 2).min(Duration::from_secs(1));
+                accept_backoff = next_accept_backoff(accept_backoff);
                 continue;
             }
         };
@@ -452,14 +464,14 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
 
         tokio::spawn(async move {
             if let Err(error) = stream.set_nodelay(true) {
-                tracing::debug!(%peer, %error, "could not set TCP_NODELAY");
+                warn_socket_option_once(&error, "TCP_NODELAY", peer);
             }
             if let Err(error) = beam_sys::set_tcp_keepalive(
                 stream.as_raw_fd(),
                 Duration::from_secs(60),
                 Duration::from_secs(15),
             ) {
-                tracing::debug!(%peer, %error, "could not set TCP keepalive");
+                warn_socket_option_once(&error, "TCP keepalive", peer);
             }
 
             match handle_connection_admitted(stream, tls_config, Some(preauth_permit)).await {
@@ -657,6 +669,32 @@ fn loose_config_mode(mode: u32) -> Option<&'static str> {
         Some("is group-writable; use 0600, or 0640 with a trusted group")
     } else {
         None
+    }
+}
+
+/// Returns the next accept backoff, bounded so a persistent failure keeps
+/// retrying at one attempt per second instead of spinning.
+fn next_accept_backoff(current: Duration) -> Duration {
+    (current * 2).min(ACCEPT_BACKOFF_LIMIT)
+}
+
+/// Warns once per process about a socket option that could not be applied.
+///
+/// The option is tuning, not correctness, so the connection continues. Warning
+/// on every connection would flood the log when the kernel or a seccomp policy
+/// rejects the option for all of them.
+static SOCKET_OPTION_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_socket_option_once(error: &std::io::Error, option: &'static str, peer: SocketAddr) {
+    if SOCKET_OPTION_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(%peer, %error, option, "could not apply a socket option");
+    } else {
+        tracing::warn!(
+            %peer,
+            %error,
+            option,
+            "could not apply a socket option; relay tuning is degraded"
+        );
     }
 }
 
@@ -1030,6 +1068,27 @@ mod tests {
         assert_eq!(
             tls.relay_idle_timeout,
             Duration::from_millis(config.limits.idle_timeout_ms)
+        );
+    }
+
+    #[test]
+    fn accept_backoff_is_bounded_and_monotonic() {
+        let mut backoff = ACCEPT_BACKOFF_START;
+        let mut steps = Vec::new();
+        for _ in 0..12 {
+            steps.push(backoff);
+            backoff = next_accept_backoff(backoff);
+        }
+        assert_eq!(steps[0], Duration::from_millis(10));
+        assert!(steps.windows(2).all(|pair| pair[1] >= pair[0]));
+        assert_eq!(
+            *steps.last().unwrap(),
+            ACCEPT_BACKOFF_LIMIT,
+            "the backoff must stop growing at the bound"
+        );
+        assert_eq!(
+            next_accept_backoff(ACCEPT_BACKOFF_LIMIT),
+            ACCEPT_BACKOFF_LIMIT
         );
     }
 

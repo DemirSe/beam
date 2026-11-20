@@ -5,6 +5,40 @@ use std::mem::size_of;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
+/// Classifies a listener `accept` error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptError {
+    /// The process or the system is short of a resource (`EMFILE`, `ENFILE`,
+    /// `ENOBUFS`, `ENOMEM`). A retry cannot succeed until something is freed,
+    /// so the caller should back off further than for one bad connection.
+    ResourceShortage,
+    /// The failure applies to one connection (`ECONNABORTED`) or the call was
+    /// interrupted. The listener is still usable.
+    Transient,
+}
+
+impl AcceptError {
+    /// Classifies an `accept` error.
+    #[must_use]
+    pub fn classify(error: &io::Error) -> Self {
+        match error.raw_os_error() {
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+                Self::ResourceShortage
+            }
+            _ => Self::Transient,
+        }
+    }
+
+    /// Returns a stable label for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResourceShortage => "resource_shortage",
+            Self::Transient => "transient",
+        }
+    }
+}
+
 /// Enables `TCP_NODELAY` on `fd`.
 pub fn set_tcp_nodelay(fd: RawFd) -> io::Result<()> {
     setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1)
@@ -153,13 +187,21 @@ fn setsockopt_int(
 #[cfg(test)]
 mod tests {
     use super::{
-        get_tcp_maxseg, getsockopt_int, set_reuse_addr, set_tcp_keepalive, set_tcp_maxseg,
-        set_tcp_nodelay, set_udp_recv_buffer,
+        AcceptError, get_tcp_maxseg, getsockopt_int, set_reuse_addr, set_tcp_keepalive,
+        set_tcp_maxseg, set_tcp_nodelay, set_udp_recv_buffer,
     };
     use std::io;
     use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::os::fd::AsRawFd;
     use std::time::Duration;
+
+    fn rmem_max() -> Option<libc::c_int> {
+        std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
 
     fn loopback_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -177,11 +219,29 @@ mod tests {
     }
 
     #[test]
+    fn tcp_maxseg_round_trips_before_connect() {
+        // The dial path sets the option on an unconnected socket, which is the
+        // only point where Linux uses it for the SYN and the local send limit.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        set_tcp_maxseg(listener.as_raw_fd(), 1400).unwrap();
+        assert_eq!(
+            get_tcp_maxseg(listener.as_raw_fd()).unwrap(),
+            1400,
+            "an unconnected socket reports the requested segment size"
+        );
+    }
+
+    #[test]
     fn tcp_maxseg_accepts_loopback_stream_and_rejects_zero() {
         let (client, _server) = loopback_pair();
 
+        // A connected socket keeps the MSS its handshake negotiated: a later
+        // set does not lower it, so `dial` sets the option before `connect`.
+        let negotiated = get_tcp_maxseg(client.as_raw_fd()).unwrap();
+        assert!(negotiated >= 48, "a connected socket reports an MSS");
         set_tcp_maxseg(client.as_raw_fd(), 1400).unwrap();
-        assert!(get_tcp_maxseg(client.as_raw_fd()).is_ok());
+        assert_eq!(get_tcp_maxseg(client.as_raw_fd()).unwrap(), negotiated);
 
         let error = set_tcp_maxseg(client.as_raw_fd(), 0).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -213,9 +273,30 @@ mod tests {
     }
 
     #[test]
-    fn udp_recv_buffer_succeeds_and_rejects_zero() {
+    fn udp_recv_buffer_reports_the_effective_size() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        set_udp_recv_buffer(socket.as_raw_fd(), 64 * 1024).unwrap();
+        let requested = 32 * 1024;
+        set_udp_recv_buffer(socket.as_raw_fd(), requested).unwrap();
+
+        let effective =
+            getsockopt_int(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF).unwrap();
+        let doubled = libc::c_int::try_from(requested * 2).unwrap();
+        assert!(
+            effective <= doubled,
+            "the kernel must not report more than twice the request"
+        );
+        match rmem_max() {
+            // Linux stores twice the request, clamped to `rmem_max` before the
+            // doubling, so a cap at or above the request yields an exact value.
+            Some(cap) if cap >= libc::c_int::try_from(requested).unwrap() => assert_eq!(
+                effective, doubled,
+                "a receive buffer below rmem_max reads back doubled"
+            ),
+            // The host cannot satisfy the exact value; the bound above is the
+            // only assertable part.
+            Some(_) => {}
+            None => assert_eq!(effective, doubled, "no rmem_max cap is readable"),
+        }
 
         let error = set_udp_recv_buffer(socket.as_raw_fd(), 0).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -258,6 +339,27 @@ mod tests {
             getsockopt_int(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn accept_errors_separate_a_resource_shortage_from_one_bad_connection() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert_eq!(
+                AcceptError::classify(&error),
+                AcceptError::ResourceShortage,
+                "errno {errno} is a resource shortage"
+            );
+        }
+        for error in [
+            io::Error::from_raw_os_error(libc::ECONNABORTED),
+            io::Error::from_raw_os_error(libc::EINVAL),
+            io::Error::new(io::ErrorKind::Interrupted, "signal"),
+        ] {
+            assert_eq!(AcceptError::classify(&error), AcceptError::Transient);
+        }
+        assert_eq!(AcceptError::ResourceShortage.as_str(), "resource_shortage");
+        assert_eq!(AcceptError::Transient.as_str(), "transient");
     }
 
     #[test]

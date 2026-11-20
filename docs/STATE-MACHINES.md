@@ -233,10 +233,28 @@ of a fixed address, and the probe deadline stays above the cover bound.
 
 ### 2. Accept backoff
 
-One `Duration`: 10 ms after success, doubling on error to 1 s (`main.rs:307-325`).
-An interrupted accept is treated as an ordinary error and backs off. No test
-references `accept_backoff`, so the exact sequence is unpinned. The invariant is
-"a transient accept error never drops the listener".
+One `Duration`: 10 ms after success, doubling on error to 1 s. An interrupted
+accept is treated as an ordinary error and backs off. `next_accept_backoff`
+pins the bound and the monotonic sequence (`accept_backoff_is_bounded_and_monotonic`),
+so the invariant "a transient accept error never drops the listener" is tested.
+
+**Classification.** `beam_sys::AcceptError::classify` separates a resource
+shortage (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) from a transient error for one
+connection. The warn line carries `reason=resource_shortage|transient` and the
+current `backoff_ms`, and both cases still back off on the same bounded
+sequence. `accept_errors` counts every error; `accept_errors_resource` isolates
+the shortage case, which is the one an operator must act on
+(`accept_errors_separate_a_resource_shortage_from_one_bad_connection`).
+
+**Socket options on accepted sockets.** `TCP_NODELAY` and keepalive failures are
+tuning, not correctness: the connection continues, and the first failure in the
+process logs one `warn` with the option name. Later failures log at `debug` so a
+kernel or sandbox policy that rejects the option cannot flood the log.
+Destination dial options (`TCP_MAXSEG`, `TCP_NODELAY`, keepalive) use the same
+first-failure warning. `tcp_maxseg_round_trips_before_connect` pins that Linux
+only uses `TCP_MAXSEG` before `connect`, and
+`udp_recv_buffer_reports_the_effective_size` pins the effective `SO_RCVBUF`
+value (doubled by the kernel, clamped by `rmem_max`).
 
 ### 3. Pre-auth and authenticated admission (P1)
 

@@ -18,8 +18,8 @@ pub use eventfd::EventFd;
 pub use fd::{set_cloexec, set_nonblocking};
 pub use poll::{PollEvents, PollFd, poll};
 pub use socket::{
-    get_tcp_maxseg, set_reuse_addr, set_tcp_keepalive, set_tcp_maxseg, set_tcp_nodelay,
-    set_udp_recv_buffer,
+    AcceptError, get_tcp_maxseg, set_reuse_addr, set_tcp_keepalive, set_tcp_maxseg,
+    set_tcp_nodelay, set_udp_recv_buffer,
 };
 pub use splice::{SpliceFlags, pipe, splice};
 

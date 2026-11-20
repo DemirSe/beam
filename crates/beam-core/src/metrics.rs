@@ -12,6 +12,7 @@ pub struct Metrics {
     cover_limited: AtomicU64,
     connection_limited: AtomicU64,
     accept_errors: AtomicU64,
+    accept_errors_resource: AtomicU64,
     xudp_rejected_per_stream: AtomicU64,
     xudp_rejected_global: AtomicU64,
     xudp_retained_evicted: AtomicU64,
@@ -50,6 +51,9 @@ pub struct MetricsSnapshot {
     pub connection_limited: u64,
     /// Listener accept errors.
     pub accept_errors: u64,
+    /// Listener accept errors caused by a resource shortage (`EMFILE`,
+    /// `ENFILE`, `ENOBUFS`, `ENOMEM`) rather than one bad connection.
+    pub accept_errors_resource: u64,
     /// XUDP `New` frames rejected by the per-stream session limit.
     pub xudp_rejected_per_stream: u64,
     /// XUDP `New` frames rejected by the process-wide session limit.
@@ -127,9 +131,13 @@ impl Metrics {
         self.connection_limited.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Counts one listener accept error.
-    pub fn record_accept_error(&self) {
+    /// Counts one listener accept error and whether it was a resource
+    /// shortage rather than a transient failure.
+    pub fn record_accept_error(&self, resource_shortage: bool) {
         self.accept_errors.fetch_add(1, Ordering::Relaxed);
+        if resource_shortage {
+            self.accept_errors_resource.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Counts one XUDP per-stream session rejection.
@@ -270,6 +278,7 @@ impl Metrics {
             cover_limited: self.cover_limited.load(Ordering::Relaxed),
             connection_limited: self.connection_limited.load(Ordering::Relaxed),
             accept_errors: self.accept_errors.load(Ordering::Relaxed),
+            accept_errors_resource: self.accept_errors_resource.load(Ordering::Relaxed),
             xudp_rejected_per_stream: self.xudp_rejected_per_stream.load(Ordering::Relaxed),
             xudp_rejected_global: self.xudp_rejected_global.load(Ordering::Relaxed),
             xudp_retained_evicted: self.xudp_retained_evicted.load(Ordering::Relaxed),
@@ -311,7 +320,8 @@ mod tests {
         metrics.record_preauth_rejection();
         metrics.record_cover_limit();
         metrics.record_connection_limit();
-        metrics.record_accept_error();
+        metrics.record_accept_error(false);
+        metrics.record_accept_error(true);
         metrics.record_xudp_rejected_per_stream();
         metrics.record_xudp_rejected_global();
         metrics.record_xudp_retained_evicted();
@@ -339,7 +349,8 @@ mod tests {
         assert_eq!(snapshot.preauth_rejected, 2);
         assert_eq!(snapshot.cover_limited, 1);
         assert_eq!(snapshot.connection_limited, 1);
-        assert_eq!(snapshot.accept_errors, 1);
+        assert_eq!(snapshot.accept_errors, 2);
+        assert_eq!(snapshot.accept_errors_resource, 1);
         assert_eq!(snapshot.xudp_rejected_per_stream, 1);
         assert_eq!(snapshot.xudp_rejected_global, 1);
         assert_eq!(snapshot.xudp_retained_evicted, 1);
