@@ -51,6 +51,13 @@ supervision.
   result. Update it after each round. When handing work to another agent, send
   the open items, verification commands, and any constraints they need. Link
   to prior evidence instead of repeating reports.
+- Keep delegation briefs to the goal, tested SHA, existing evidence link,
+  acceptance criteria and task-specific constraints. Reference existing
+  instructions and the shared checklist instead of repeating rules or history.
+- Keep subagent reports to at most six lines: result, tested SHA/run link,
+  failed checks, actionable findings, unverified evidence, and next step.
+  Link existing Actions logs or artifacts for details instead of repeating
+  context. Create a separate report file only when the owner requests one.
 - Present consequential decisions early and briefly: options, user impact,
   tradeoffs and missing evidence. Continue already authorized routine work,
   including Actions dispatches, without asking again; preserve the owner's
