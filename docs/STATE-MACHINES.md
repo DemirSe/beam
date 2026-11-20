@@ -80,7 +80,7 @@ independent variables.
 |4|Connection classification|explicit outcome, implicit path|`tls/server.rs:805-862`, `257-273`|`ClientHelloRead`, `Option<(Auth, ReplayReservation)>`, `ConnectionOutcome`|
 |5|REALITY replay cache **P1**|explicit|`tls/server.rs` replay section|`ReplayPhase` + `states` + `deadlines`|
 |6|TLS record stream + raw handoff **P1**|implicit|`tls/stream.rs:180-260,490-530`|`read_raw`, `write_raw`, `record`, `pending`, `plaintext`, `outgoing`, `pending_write`, `closed`|
-|7|Cover relay|implicit|`tls/server.rs:1426-1461,1673-1713`|cover permit + first-half-close `select!`|
+|7|Cover relay|implicit|`tls/server.rs:1716-1965,2021-2071`|cover permit + first-half-close `select!`|
 |8|Authenticated request pipeline|explicit command, implicit phases|`tls/server.rs:1253-1410`|absolute deadline + `match request.command`|
 |9|Vision TLS detector|implicit|`vision/state.rs:72-257`|`filter_budget`, `is_tls`, `is_tls12_or_above`, `enable_xtls`, `pending_server_hello`|
 |10|Vision writer|implicit|`vision/state.rs:454-660`|`first_block`, `padding_enabled`, `VisionWritePlan` flags|
@@ -245,6 +245,8 @@ current `backoff_ms`, and both cases still back off on the same bounded
 sequence. `accept_errors` counts every error; `accept_errors_resource` isolates
 the shortage case, which is the one an operator must act on
 (`accept_errors_separate_a_resource_shortage_from_one_bad_connection`).
+`a_resource_shortage_is_the_accept_error_that_feeds_the_resource_counter` pins
+the counter mapping for both classified cases.
 
 **Socket options on accepted sockets.** `TCP_NODELAY` and keepalive failures are
 tuning, not correctness: the connection continues, and the first failure of each
@@ -414,20 +416,25 @@ half-close; the direct test covers `close_notify`, not a bare FIN
 **States.** Unauthenticated probe → cover dial → ClientHello write →
 bidirectional relay → first half-close → return. The permit is held for the
 whole relay. `relay_cover_bidirectional` selects over both copy directions, so
-either side finishing ends the relay (`1673-1713`).
+either side finishing ends the relay (`2021`).
 
 **Illegal / edge.** A relay read that ends at its inactivity deadline is an idle
 close, not a failure: `cover_outcome` maps only the `relay read` timeout to
 `ConnectionOutcome::IdleClosed { path: "cover" }`. A write or shutdown timeout
-keeps its stage, because the peer stopped reading mid-record and the probe was
-truncated. A half-close maps to `CoverForwarded` and any other error keeps its
-stage. Dial or ClientHello write failure closes the probe; no TLS alert is ever
-synthesized. A full cover limiter closes immediately (`CoverLimited`), never
-queues.
+usually keeps its stage, because the peer stopped reading mid-record and the
+probe was truncated. `tokio::select!` polls its branches in random order, so a
+`relay read` timeout can beat a stalled write on an idle connection and report
+`IdleClosed`. A half-close maps to `CoverForwarded` and any other error keeps
+its stage. Dial or ClientHello write failure closes the probe; no TLS
+alert is ever synthesized. A full cover limiter closes immediately
+(`CoverLimited`), never queues.
 
-**Tests.** `cover_relays_with_async_copy` (2680),
-`cover_relay_ends_when_the_probe_half_closes` (2729),
-`cover_relay_ends_when_the_cover_closes_first` (2777), the two limit tests, plus
+**Tests.** `cover_relays_with_async_copy` (3700),
+`cover_relay_ends_when_the_probe_half_closes` (3791),
+`cover_relay_ends_when_the_cover_closes_first` (3840),
+`an_idle_cover_relay_closes_normally`, `a_cover_read_timeout_is_an_idle_close`,
+`a_cover_write_timeout_keeps_its_stage`,
+`a_cover_shutdown_timeout_keeps_its_stage`, the two limit tests, plus
 `loopback.py` `cover_eof_release`.
 
 ### 8. Authenticated request pipeline
@@ -630,15 +637,18 @@ before the guard it observably leaked three of eight permits.
 phase gauge or empty-timer gauge.
 
 **Tests.** `aborting_the_mux_handler_releases_sessions_and_permits` (D8e),
-`empty_stream_closes_after_the_idle_timeout` (2393),
-`empty_mux_keepalive_does_not_extend_idle` (2409),
-`coalesced_new_end_restarts_the_empty_timer` (2449),
-`shutdown_releases_a_session_whose_reply_task_has_not_run` (2638),
-`truncated_frame_at_eof_is_reported` (3692),
+`empty_stream_closes_after_the_idle_timeout` (3442),
+`empty_mux_keepalive_does_not_extend_idle` (3458),
+`coalesced_new_end_restarts_the_empty_timer` (3547),
+`shutdown_releases_a_session_whose_reply_task_has_not_run` (3736),
+`truncated_frame_at_eof_is_reported` (5637),
 `mux_read_deadline_is_not_extended_by_sweeps` (D1),
 `rejected_tcp_new_does_not_start_a_lookup`,
 `oversize_new_does_not_start_a_lookup`,
 `rejected_new_does_not_cancel_a_pending_lookup`,
+`a_failed_domain_lookup_counts_the_new_frame`,
+`coalesced_waiters_apply_in_order_when_the_first_is_superseded`,
+`a_frame_the_byte_budget_rejects_is_counted`,
 `teardown_reports_observed_reply_failures_once`.
 
 ### 15. XUDP session lifecycle (P1)
@@ -778,11 +788,11 @@ session existed (non-UDP target, missing destination, failed resolution
 including a queued frame whose lookup failed, conflicting GlobalID, socket
 bind). With `xudp_admitted_{fresh,reattach}` and
 `xudp_rejected_{per_stream,global}` it accounts for every `xudp_new_frames`
-count. `xudp_resolution_rejected` counts frames dropped by the
-pending-resolution table, its request queue, or the queued-frame byte budget.
-`New` frames that never reach an outcome (a resolver admission drop, or a
-superseded pending frame) are outside that identity and are documented per
-path.
+count. `xudp_resolution_rejected` counts drop events at the pending-resolution
+table, its request queue, or the queued-frame byte budget. One event can cover
+the whole rejected suffix of a queue, and only the head `New` of a drop is
+answered with an error `End`. `New` frames dropped before dispatch are outside
+that identity and are documented per path.
 
 **Tests.** `resolver_churn_stays_bounded` (2053),
 `slow_domain_does_not_block_an_unrelated_session` (3122),
@@ -863,7 +873,8 @@ that ends at a failed stage is dropped without writing to it: the stream state
 is unknown. `UdpError::Io` carries the failing stage (`stream read`,
 `stream write`, `UDP send`, `UDP receive`, `socket bind`, `destination
 resolution`, `stream shutdown`). Pinned by
-`idle_close_shuts_the_stream_down_once` and by
+`idle_close_shuts_the_stream_down_once`, by
+`an_idle_close_sends_close_notify_on_the_wire` for the wire bytes, and by
 `fatal_stream_read_error_closes_fixed_session`, which requires no shutdown on a
 failed stage.
 

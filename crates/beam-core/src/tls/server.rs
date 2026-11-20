@@ -2057,7 +2057,9 @@ where
 /// A half-close ends the relay normally. A read that only stopped because the
 /// inactivity deadline elapsed is an idle close, not a failure. Any other
 /// error keeps its stage for the connection log: a write or shutdown timeout
-/// means the peer stopped reading mid-record, so the probe was truncated.
+/// usually means the peer stopped reading mid-record, so the probe was
+/// truncated. The `select!` is unbiased, so a `relay read` timeout can win the
+/// race against a stalled write on an idle connection and report `IdleClosed`.
 fn cover_outcome(result: Result<u64, TlsServerError>) -> Result<ConnectionOutcome, TlsServerError> {
     match result {
         Ok(_) => Ok(ConnectionOutcome::CoverForwarded),
