@@ -513,7 +513,9 @@ VLESS with `xtls-rprx-vision` is expected to work.
   offset, so a slow sink cannot lose bytes, and it cannot spin: every write is
   bounded and a zero-length write ends the direction. The one-way splice relay
   shares that clock, so a stalled splice sink is kept alive and cut by the same
-  rule.
+  rule. Once the source has finished, a sink that no longer accepts the bytes
+  still buffered in the pipe ends at the 30 s shutdown deadline and reports a
+  timeout, so a half-open sink is not recorded as a completed copy.
 - Keep `net.ipv4.tcp_mtu_probing=0` unless a measured PMTU failure justifies a
   change. Client TUN profiles use MTU 1500; lowering that MTU loses some
   HTTP/3 paths and stalls large H3 bodies in gVisor.

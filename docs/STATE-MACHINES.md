@@ -549,7 +549,8 @@ The comment now states that, instead of describing only the success path.
 `a_failed_wakeup_still_bounds_a_blocked_relay`,
 `half_close_keeps_the_other_direction_alive` (1153),
 `idle_timeout_returns_timed_out` (1245),
-`shutdown_timeout_bounds_a_half_closed_idle_connection` (1269).
+`shutdown_timeout_bounds_a_half_closed_idle_connection` (1269),
+`a_stalled_sink_reports_the_shutdown_deadline`.
 
 ### 14. XUDP mux lifecycle (P1)
 

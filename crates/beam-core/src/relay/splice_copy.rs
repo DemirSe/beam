@@ -460,12 +460,16 @@ fn run_one_way(
             .map_or(local_elapsed, |shared| shared.min(local_elapsed));
         let limit = inactivity_limit(config, shutdown_started.is_some());
         if idle_elapsed >= limit {
-            if shutdown_started.is_some() {
-                break;
-            }
+            // A shutdown that still holds undelivered bytes never sent
+            // `SHUT_WR`, so the sink is stalled and the copy did not finish.
+            // Reporting success here would hide the half-open sink.
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "one-way relay idle timeout",
+                if shutdown_started.is_some() {
+                    "one-way relay shutdown timeout with undelivered bytes"
+                } else {
+                    "one-way relay idle timeout"
+                },
             ));
         }
 
@@ -1032,6 +1036,40 @@ mod tests {
         assert!(received.iter().all(|&byte| byte == 0x33));
         assert_eq!(stats.bytes_a_to_b, received.len() as u64);
         assert_eq!(stats.half_closes, 1);
+    }
+
+    #[test]
+    fn a_stalled_sink_reports_the_shutdown_deadline() {
+        let (mut client, relay_a, relay_b, target) = relay_pair();
+        // Pre-fill the sink's send queue so the sink cannot accept the bytes
+        // the source still has. The relay then reaches EOF with data stuck in
+        // its pipe and cannot send the half-close.
+        relay_b.set_nonblocking(true).unwrap();
+        let chunk = [0_u8; 4096];
+        loop {
+            match (&relay_b).write(&chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("could not fill the sink queue: {error}"),
+            }
+        }
+        let receiver = run_relay(
+            relay_a,
+            relay_b,
+            RelayConfig {
+                idle_timeout: Duration::from_secs(5),
+                shutdown_timeout: Duration::from_millis(100),
+                ..config()
+            },
+        );
+
+        client.write_all(&[0x5a; 128]).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let error = wait(receiver).expect_err("a stalled sink must not report success");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(client);
+        drop(target);
     }
 
     #[test]
