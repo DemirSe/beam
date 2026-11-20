@@ -1268,6 +1268,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixed_udp_rejects_a_zero_port() {
+        // Only the packetaddr sentinel may carry port zero.
+        let (client, task) = start(
+            NetLocation {
+                address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                port: 0,
+            },
+            test_config(MAX_DATAGRAM_SIZE),
+        );
+        let error = finish_with_error(client, task).await;
+        assert!(
+            matches!(
+                error,
+                UdpError::InvalidDestination {
+                    reason: "port must be non-zero"
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn idle_close_shuts_the_stream_down_once() {
         // The idle exit runs the same bounded shutdown as a peer close, so the
         // TLS layer below can send close_notify.

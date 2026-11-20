@@ -44,6 +44,8 @@ pub use frame::{
     METADATA_PREFIX_LEN, MIN_METADATA_LEN, SessionStatus, TargetNetwork, XudpError, encode_frame,
     parse_frame,
 };
+#[cfg(feature = "fuzz")]
+pub use server::fuzz_frame_sequence;
 pub use server::{MuxError, handle_mux_stream};
 pub use session::{
     DEFAULT_MAX_GLOBAL_SESSIONS, XudpConfig, XudpConfigError, XudpSessionLimiter, XudpStats,

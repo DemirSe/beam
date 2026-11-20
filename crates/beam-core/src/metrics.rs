@@ -77,7 +77,7 @@ pub struct MetricsSnapshot {
     /// Vision relays that used the async copy path because a splice permit was
     /// unavailable or a raw descriptor could not be duplicated.
     pub splice_fallback: u64,
-    /// XUDP `New` frames observed.
+    /// XUDP `New` frames handled by the session layer.
     pub xudp_new_frames: u64,
     /// XUDP `New` frames carrying a nonzero GlobalID.
     pub xudp_new_global_id: u64,

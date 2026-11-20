@@ -20,8 +20,15 @@ cd "$ROOT"
 for target in $TARGETS; do
     corpus="$CACHE/$target"
     mkdir -p "$corpus"
-    echo "fuzz-smoke: $target for ${SECONDS_PER_TARGET}s (corpus=$corpus)"
-    cargo +nightly fuzz run "$target" "$corpus" -- \
+    # Checked-in synthetic seeds give each target a valid starting input; the
+    # cache directory stays the writable corpus.
+    corpora=("$corpus")
+    seeds="$ROOT/fuzz/seeds/$target"
+    if [ -d "$seeds" ]; then
+        corpora+=("$seeds")
+    fi
+    echo "fuzz-smoke: $target for ${SECONDS_PER_TARGET}s (corpus=$corpus seeds=$seeds)"
+    cargo +nightly fuzz run "$target" "${corpora[@]}" -- \
         -max_total_time="$SECONDS_PER_TARGET" -timeout=10 -rss_limit_mb=1536
 done
 echo "fuzz-smoke: PASS; corpus cache is $CACHE"

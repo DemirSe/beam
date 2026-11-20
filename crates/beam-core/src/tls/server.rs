@@ -533,6 +533,13 @@ pub enum TlsServerError {
     #[error("authenticated VLESS TCP request has no destination")]
     MissingDestination,
 
+    /// A TCP destination cannot be dialed.
+    #[error("invalid TCP destination: {reason}")]
+    InvalidDestination {
+        /// Why the destination was rejected.
+        reason: &'static str,
+    },
+
     /// The VLESS user id did not match the configured user.
     #[error("VLESS user id is not authorized")]
     UnauthorizedUser,
@@ -1414,7 +1421,9 @@ impl AsyncRead for FuzzReader<'_> {
 /// This is compiled only with the `fuzz` feature and is not part of the
 /// production API. It exercises multi-record assembly, the cover-prefix
 /// invariants, and both header and body read timeouts without opening a
-/// socket.
+/// socket. Every input runs twice: once with the budget the record header
+/// suggests, and once at the production cap, so the cap path is not left to
+/// the derived value.
 #[cfg(feature = "fuzz")]
 #[doc(hidden)]
 pub fn fuzz_client_hello_assembler(data: &[u8]) {
@@ -1452,30 +1461,35 @@ pub fn fuzz_client_hello_assembler(data: &[u8]) {
     };
 
     RUNTIME.with(|runtime| {
-        let mut reader = FuzzReader {
-            data,
-            offset: 0,
-            mode,
-        };
-        let result = runtime.block_on(read_client_hello_record_with_limits(
-            &mut reader,
-            deadline,
+        for budget in [
             max_client_hello_bytes,
-        ));
-        match result {
-            Ok(ClientHelloRead::Complete { wire, .. }) => {
-                assert!(
-                    data.starts_with(&wire),
-                    "complete wire must be an input prefix"
-                );
+            TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+        ] {
+            let mut reader = FuzzReader {
+                data,
+                offset: 0,
+                mode,
+            };
+            let result = runtime.block_on(read_client_hello_record_with_limits(
+                &mut reader,
+                deadline,
+                budget,
+            ));
+            match result {
+                Ok(ClientHelloRead::Complete { wire, .. }) => {
+                    assert!(
+                        data.starts_with(&wire),
+                        "complete wire must be an input prefix"
+                    );
+                }
+                Ok(ClientHelloRead::Forward(prefix)) => {
+                    assert!(
+                        data.starts_with(&prefix),
+                        "forward prefix must be an input prefix"
+                    );
+                }
+                Err(_) => {}
             }
-            Ok(ClientHelloRead::Forward(prefix)) => {
-                assert!(
-                    data.starts_with(&prefix),
-                    "forward prefix must be an input prefix"
-                );
-            }
-            Err(_) => {}
         }
     });
 }
@@ -1810,6 +1824,14 @@ async fn dial(
     destination: &NetLocation,
     dial_timeout: Duration,
 ) -> Result<TcpStream, TlsServerError> {
+    // Port zero is not a routable TCP destination. The legacy UDP path keeps
+    // port zero for the packetaddr sentinel and rejects it in `resolve_fixed`,
+    // so only a dial needs this check.
+    if destination.port == 0 {
+        return Err(TlsServerError::InvalidDestination {
+            reason: "port must be non-zero",
+        });
+    }
     let host = match &destination.address {
         Address::Ipv4(address) => address.to_string(),
         Address::Ipv6(address) => address.to_string(),
@@ -1989,6 +2011,10 @@ where
 ///
 /// `max_lifetime` bounds a relay that stays active, because the idle timeout
 /// alone never fires while a probe keeps both directions busy.
+///
+/// Returns [`ConnectionOutcome::CoverForwarded`] when a direction finished,
+/// [`ConnectionOutcome::IdleClosed`] when the inactivity deadline ended it, and
+/// the relay error otherwise.
 async fn relay_cover_bidirectional<A, B>(
     left: A,
     right: B,
@@ -3336,6 +3362,33 @@ mod tests {
         assert_eq!(cache.stats(now).in_flight, 1);
         cache.release([2; 32]);
         assert_eq!(cache.phase([2; 32], now), ReplayPhase::Unseen);
+    }
+
+    #[tokio::test]
+    async fn dial_rejects_a_zero_port_without_a_lookup() {
+        let destination = NetLocation {
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: 0,
+        };
+        let error = dial(&destination, Duration::from_millis(50))
+            .await
+            .expect_err("port zero is not routable");
+        assert!(matches!(
+            error,
+            TlsServerError::InvalidDestination {
+                reason: "port must be non-zero"
+            }
+        ));
+
+        // A domain destination is rejected before any DNS work.
+        let domain = NetLocation {
+            address: Address::Domain("localhost".to_owned()),
+            port: 0,
+        };
+        assert!(matches!(
+            dial(&domain, Duration::from_millis(50)).await,
+            Err(TlsServerError::InvalidDestination { .. })
+        ));
     }
 
     #[tokio::test]

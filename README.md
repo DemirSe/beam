@@ -378,6 +378,10 @@ VLESS with `xtls-rprx-vision` is expected to work.
   one direction.
 - Unknown Vision commands, overlong lengths, and malformed state transitions
   are rejected rather than passed through and desynchronized.
+- A TCP destination with port 0 is rejected before any lookup or dial. Port 0
+  stays valid only for the legacy UDP packetaddr sentinel
+  (`sp.packet-addr.v2fly.arpa`), which selects packetaddr framing; a fixed UDP
+  destination with port 0 is rejected before a socket is bound.
 
 ### XUDP, legacy UDP, and packetaddr
 

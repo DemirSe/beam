@@ -21,8 +21,8 @@ policy or an admission bound, it is marked **policy**.
   and process-handle states.
 - **What is explicit today:** `VisionReaderMode`, `VisionReaderAction`,
   `SessionStatus`, `SessionTable`, `CloseReason`, `MuxError`, `UdpError`,
-  `ConnectionOutcome`, `IpLimitReject`, `RelayConfig`. These are outcomes and
-  containers, not phases.
+  `UdpClose`, `ConnectionOutcome`, `IpLimitReject`, `RelayConfig`. These are
+  outcomes and containers, not phases.
 - **What is implicit:** booleans, `Option`s, counters, table membership, task
   presence, permit ownership, and filesystem/process presence. One logical
   state is typically spread over three to five such variables.
@@ -288,7 +288,9 @@ removal); `cover_limit_is_global_and_bounded` (2821),
 
 **States.** `ClientHelloRead::{Complete,Forward}` → `Option<(Auth,
 ReplayReservation)>` → `ConnectionOutcome::{CoverForwarded,CoverLimited,
-ConnectionLimited,Authenticated{command}}`.
+ConnectionLimited,Authenticated{command},IdleClosed{path}}`. `IdleClosed` is a
+normal close: the cover relay reports `path: "cover"` and a legacy UDP flow
+reports `path: "udp"` when the inactivity deadline ended it.
 
 **Truthfulness gap (D8b, fixed).** `ClientHelloRead::Forward` can carry an empty
 prefix: the peer closed, or sent nothing, before a plausible ClientHello. That
@@ -787,6 +789,12 @@ identity and are documented per path.
 `new_failures_are_counted_and_account_for_every_new_frame`,
 `a_full_pending_resolution_table_is_counted`.
 
+**Fuzz coverage.** `fuzz/fuzz_targets/xudp.rs` also runs
+`xudp::fuzz_frame_sequence`, which applies a bounded New/Keep/End/KeepAlive
+sequence to a session model, and `fuzz/seeds/xudp/` supplies a synthetic
+multi-frame seed. `crates/beam-core/tests/fuzz_seeds.rs` validates and can
+regenerate the seeds.
+
 **Superseded attachment frames.** When a later acceptable `New` supersedes the
 pending owner and no session owns the id, the frames queued before that `New`
 are dropped with the attachment. They could only answer as an unknown id
@@ -833,6 +841,13 @@ sockets plus a bounded
 `DestinationTable`. `FrameDecoder` is its own need-header/need-payload/has-frame
 cursor. A normal close returns `UdpClose::{PeerClosed, Idle}`; `Idle` is a
 normal ending, not a failed stage.
+
+**Port zero.** The packetaddr sentinel is the only destination allowed to carry
+port zero: `RequestHeader` parses it, `is_packetaddr_destination` selects the
+packetaddr path, and `resolve_fixed` rejects a fixed destination with port zero
+(`fixed_udp_rejects_a_zero_port`). A TCP destination with port zero is rejected
+by `dial` before any lookup (`dial_rejects_a_zero_port_without_a_lookup`), where
+it used to fail at `connect`.
 
 **Close and shutdown.** Peer EOF and the idle expiry both run one bounded
 `shutdown_writer` that flushes the buffered reply and lets the TLS layer send

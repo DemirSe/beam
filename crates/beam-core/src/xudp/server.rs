@@ -612,6 +612,67 @@ async fn process_pending_frames(
     Ok(session_activity)
 }
 
+/// Test-only entry point for the stateful XUDP fuzz target.
+///
+/// Consumes a bounded sequence of frames the way the mux read loop does and
+/// applies `New`/`Keep`/`End`/`KeepAlive` to a small session model. No socket,
+/// task, or DNS lookup is created: the point is parser and state-transition
+/// coverage across frames, not one frame in isolation.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub fn fuzz_frame_sequence(data: &[u8]) {
+    use std::collections::HashMap;
+
+    use super::frame::{MAX_PAYLOAD_LEN, parse_frame};
+
+    /// Model bound, so a long input cannot grow the model without limit.
+    const MAX_MODEL_SESSIONS: usize = 16;
+    /// Frame bound, so one input cannot spend unbounded CPU.
+    const MAX_MODEL_FRAMES: usize = 512;
+
+    let mut sessions: HashMap<u16, NetLocation> = HashMap::new();
+    let mut offset = 0;
+    let mut frames = 0;
+    while offset < data.len() && frames < MAX_MODEL_FRAMES {
+        let Ok(Some((frame, used))) = parse_frame(&data[offset..]) else {
+            break;
+        };
+        assert!(used > 0 && used <= data.len() - offset);
+        offset += used;
+        frames += 1;
+        match frame.status {
+            SessionStatus::New => {
+                let usable = frame.network == Some(TargetNetwork::Udp)
+                    && frame.payload.len() <= MAX_PAYLOAD_LEN
+                    && sessions.len() < MAX_MODEL_SESSIONS;
+                match (usable, frame.destination) {
+                    (true, Some(destination)) => {
+                        sessions.insert(frame.session_id, destination.clone());
+                    }
+                    _ => {
+                        // A rejected New leaves the table alone; a live
+                        // session keeps its id.
+                    }
+                }
+            }
+            SessionStatus::Keep => {
+                if let Some(current) = sessions.get_mut(&frame.session_id)
+                    && frame.option.has_data()
+                    && !frame.payload.is_empty()
+                    && let Some(destination) = frame.destination
+                {
+                    *current = destination.clone();
+                }
+            }
+            SessionStatus::End => {
+                sessions.remove(&frame.session_id);
+            }
+            SessionStatus::KeepAlive => {}
+        }
+        assert!(sessions.len() <= MAX_MODEL_SESSIONS);
+    }
+}
+
 /// Errors returned by [`handle_mux_stream`].
 #[derive(Debug, thiserror::Error)]
 pub enum MuxError {
