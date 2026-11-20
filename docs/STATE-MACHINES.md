@@ -774,13 +774,15 @@ order, so a shared answer cannot reorder two attachments that name the same
 destination (`coalesced_waiters_keep_their_arrival_order`).
 
 **Observability.** `xudp_new_failed` counts `New` frames that failed before a
-session existed (non-UDP target, missing destination, failed resolution,
-conflicting GlobalID, socket bind). With `xudp_admitted_{fresh,reattach}` and
+session existed (non-UDP target, missing destination, failed resolution
+including a queued frame whose lookup failed, conflicting GlobalID, socket
+bind). With `xudp_admitted_{fresh,reattach}` and
 `xudp_rejected_{per_stream,global}` it accounts for every `xudp_new_frames`
-count. `xudp_resolution_rejected` counts frames dropped by the pending-resolution
-table or request-queue bounds. `New` frames that never reach the session handler
-(a resolver admission drop, or a superseded pending frame) are outside that
-identity and are documented per path.
+count. `xudp_resolution_rejected` counts frames dropped by the
+pending-resolution table, its request queue, or the queued-frame byte budget.
+`New` frames that never reach an outcome (a resolver admission drop, or a
+superseded pending frame) are outside that identity and are documented per
+path.
 
 **Tests.** `resolver_churn_stays_bounded` (2053),
 `slow_domain_does_not_block_an_unrelated_session` (3122),

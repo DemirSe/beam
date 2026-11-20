@@ -565,7 +565,16 @@ async fn apply_pending(
                 && !owner_is_stale(frame.frame.status)
             {
                 match frame.frame.status {
-                    SessionStatus::New => state.try_send_reject_end(id, true),
+                    SessionStatus::New => {
+                        // The frame never reached `handle_new`, so count it here
+                        // to keep the New accounting identity intact.
+                        state
+                            .limiter
+                            .metrics()
+                            .record_xudp_new(frame.frame.global_id.is_some());
+                        state.limiter.metrics().record_xudp_new_failed();
+                        state.try_send_reject_end(id, true);
+                    }
                     SessionStatus::Keep if state.session(id).is_none() => {
                         // Match handle_keep's clean End for an unknown session.
                         state.try_send_reject_end(id, false);
@@ -1086,6 +1095,10 @@ where
                                 OwnedFrame::from_borrowed(&parsed),
                                 &state.limiter,
                             ) else {
+                                // A frame the pending byte budget cannot hold is
+                                // dropped the same way as one the table or the
+                                // queue rejects.
+                                state.limiter.metrics().record_xudp_resolution_rejected();
                                 if parsed.status == SessionStatus::New {
                                     state.try_send_reject_end(id, true);
                                 }
@@ -4230,6 +4243,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_domain_lookup_counts_the_new_frame() {
+        // The lookup owner never reaches `handle_new`, so the New counters must
+        // move in the lookup-error path instead. `slow.test` is the failing
+        // fixture domain.
+        let limiter = XudpSessionLimiter::default();
+        let metrics = limiter.metrics();
+        let (mut client, task) = start_mux_with_limiter(test_config(), limiter);
+        let mut buffer = Vec::new();
+        let destination = NetLocation {
+            address: Address::Domain("slow.test".to_owned()),
+            port: 53,
+        };
+
+        write_frame(&mut client, new_spec(1, &destination, b"x", None)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("a failed lookup rejects the New");
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(end.option.has_error());
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.xudp_new_frames, 1);
+        assert_eq!(snapshot.xudp_new_failed, 1);
+        assert_eq!(snapshot.xudp_admitted_fresh, 0);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
     async fn a_full_pending_resolution_table_is_counted() {
         let echo = spawn_ipv4_echo().await;
         let unresolved = NetLocation {
@@ -4285,6 +4326,55 @@ mod tests {
         let waiters = resolutions.take_waiters(&key, generation);
         let order: Vec<u16> = waiters.iter().map(|(id, _)| *id).collect();
         assert_eq!(order, vec![2, 1], "waiters must run in arrival order");
+    }
+
+    #[tokio::test]
+    async fn coalesced_waiters_apply_in_order_when_the_first_is_superseded() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+
+        // Session 3 owns the lookup and a replacement New for the same id is
+        // queued behind it, so that owner is superseded. Sessions 1 and 2 then
+        // join the same lookup after the supersession. The replacement must
+        // still run in the owner's arrival slot, before the later sessions,
+        // even though their ids sort first.
+        write_frame(&mut client, new_spec(3, &destination, b"owner", None)).await;
+        write_frame(&mut client, new_spec(3, &destination, b"replacement", None)).await;
+        write_frame(&mut client, new_spec(1, &destination, b"second", None)).await;
+        write_frame(&mut client, new_spec(2, &destination, b"third", None)).await;
+
+        let mut served = Vec::new();
+        for _ in 0..3 {
+            let reply = read_frame(&mut client, &mut buffer)
+                .await
+                .expect("every waiter must be served");
+            served.push((reply.session_id, reply.payload));
+        }
+        assert_eq!(
+            served,
+            vec![
+                (3, b"replacement".to_vec()),
+                (1, b"second".to_vec()),
+                (2, b"third".to_vec()),
+            ],
+            "a superseded owner must not run and waiters must keep their arrival order"
+        );
+
+        for id in 1..=3 {
+            write_frame(&mut client, FrameSpec::new(id, SessionStatus::End)).await;
+        }
+        for _ in 0..3 {
+            let end = read_frame(&mut client, &mut buffer)
+                .await
+                .expect("End must be acknowledged");
+            assert_eq!(end.status, SessionStatus::End);
+        }
+        finish(client, task).await;
     }
 
     #[tokio::test]

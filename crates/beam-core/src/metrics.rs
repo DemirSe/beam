@@ -77,7 +77,8 @@ pub struct MetricsSnapshot {
     /// Vision relays that used the async copy path because a splice permit was
     /// unavailable or a raw descriptor could not be duplicated.
     pub splice_fallback: u64,
-    /// XUDP `New` frames handled by the session layer.
+    /// XUDP `New` frames that reached an outcome, either in the session layer
+    /// or as a queued frame whose destination lookup failed.
     pub xudp_new_frames: u64,
     /// XUDP `New` frames carrying a nonzero GlobalID.
     pub xudp_new_global_id: u64,
@@ -87,8 +88,9 @@ pub struct MetricsSnapshot {
     /// with the admitted and rejected counters it accounts for every
     /// `xudp_new_frames` count.
     pub xudp_new_failed: u64,
-    /// XUDP frames dropped because the pending-resolution table or its request
-    /// queue was full. A dropped `New` is answered with an error `End`.
+    /// XUDP frames dropped because the pending-resolution table, its request
+    /// queue, or the queued-frame byte budget was full. A dropped `New` is
+    /// answered with an error `End`.
     pub xudp_resolution_rejected: u64,
     /// XUDP `End` frames observed.
     pub xudp_end_frames: u64,
