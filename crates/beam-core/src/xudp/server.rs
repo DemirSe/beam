@@ -2113,9 +2113,9 @@ mod tests {
         XudpError, encode_frame, parse_frame,
     };
     use crate::xudp::session::{
-        ActiveSession, DEFAULT_STREAM_REPLY_BUDGET, QueuedFrame, ReplyQueueBudget, RetainedLookup,
-        Session, SessionTable, SlotGuard, SocketFamily, XudpConfig, XudpConfigError,
-        XudpSessionLimiter, spawn_reply_task, test_resolve_calls,
+        ActiveSession, DEFAULT_RESOLUTION_QUEUE_BUDGET, DEFAULT_STREAM_REPLY_BUDGET, QueuedFrame,
+        ReplyQueueBudget, RetainedLookup, Session, SessionTable, SlotGuard, SocketFamily,
+        XudpConfig, XudpConfigError, XudpSessionLimiter, spawn_reply_task, test_resolve_calls,
     };
     use std::collections::VecDeque;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -4300,6 +4300,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_frame_the_byte_budget_rejects_is_counted() {
+        let unresolved = NetLocation {
+            address: Address::Domain("slow.test".to_owned()),
+            port: 53,
+        };
+        let limiter = XudpSessionLimiter::default();
+        let metrics = limiter.metrics();
+        // Hold the whole resolution budget, so the pending reservation for the
+        // first New cannot succeed. The permit lives until the check ends.
+        let budget = limiter
+            .try_reserve_resolution(DEFAULT_RESOLUTION_QUEUE_BUDGET)
+            .expect("the whole resolution budget must be reservable");
+        let (mut client, task) = start_mux_with_limiter(test_config(), limiter);
+        let mut buffer = Vec::new();
+
+        write_frame(&mut client, new_spec(1, &unresolved, b"x", None)).await;
+        let end = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("a byte-budget rejection must answer with an End");
+        assert_eq!(end.status, SessionStatus::End);
+        assert!(end.option.has_error());
+        assert_eq!(metrics.snapshot().xudp_resolution_rejected, 1);
+
+        drop(budget);
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
     async fn coalesced_waiters_keep_their_arrival_order() {
         let mut resolutions = ResolutionState::new(XudpSessionLimiter::default());
         let destination = NetLocation {
@@ -4326,6 +4354,26 @@ mod tests {
         let waiters = resolutions.take_waiters(&key, generation);
         let order: Vec<u16> = waiters.iter().map(|(id, _)| *id).collect();
         assert_eq!(order, vec![2, 1], "waiters must run in arrival order");
+
+        // A New queued behind its own lookup supersedes the owner without
+        // changing the entry's arrival slot. The replacement must still run
+        // before sessions 1 and 2, which join the lookup later.
+        assert!(resolutions.start(3, destination.clone(), None, make_frames(&resolutions)));
+        assert!(resolutions.push_frame(3, frame.clone()));
+        assert!(resolutions.start(1, destination.clone(), None, make_frames(&resolutions)));
+        assert!(resolutions.start(2, destination.clone(), None, make_frames(&resolutions)));
+        let waiters = resolutions.take_waiters(&key, generation);
+        let order: Vec<u16> = waiters.iter().map(|(id, _)| *id).collect();
+        let seqs: Vec<u64> = waiters.iter().map(|(_, pending)| pending.seq).collect();
+        assert_eq!(
+            order,
+            vec![3, 1, 2],
+            "a superseded owner must keep its arrival slot"
+        );
+        assert!(
+            seqs.windows(2).all(|pair| pair[0] < pair[1]),
+            "waiters must be returned in arrival order, got {seqs:?}"
+        );
     }
 
     #[tokio::test]
@@ -4337,6 +4385,7 @@ mod tests {
         };
         let (mut client, task) = start_mux(test_config());
         let mut buffer = Vec::new();
+        let before = test_resolve_calls();
 
         // Session 3 owns the lookup and a replacement New for the same id is
         // queued behind it, so that owner is superseded. Sessions 1 and 2 then
@@ -4363,6 +4412,11 @@ mod tests {
                 (2, b"third".to_vec()),
             ],
             "a superseded owner must not run and waiters must keep their arrival order"
+        );
+        assert_eq!(
+            test_resolve_calls() - before,
+            1,
+            "the four queued frames must share a single lookup"
         );
 
         for id in 1..=3 {
