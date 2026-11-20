@@ -390,6 +390,14 @@ where
                 continue;
             }
             _ = &mut idle => {
+                // A peer that stalls inside a length-prefixed datagram did not
+                // close cleanly: only a datagram boundary is a normal idle
+                // close, and only that path may send close_notify.
+                if decoder.buffered() > 0 {
+                    break Err(UdpError::Truncated {
+                        buffered: decoder.buffered(),
+                    });
+                }
                 break Ok(UdpClose::Idle);
             }
             read = reader.read(&mut chunk) => {
@@ -561,6 +569,14 @@ where
                 continue;
             }
             _ = &mut idle => {
+                // A peer that stalls inside a length-prefixed datagram did not
+                // close cleanly: only a datagram boundary is a normal idle
+                // close, and only that path may send close_notify.
+                if decoder.buffered() > 0 {
+                    break Err(UdpError::Truncated {
+                        buffered: decoder.buffered(),
+                    });
+                }
                 break Ok(UdpClose::Idle);
             }
             read = reader.read(&mut chunk) => {
@@ -1318,6 +1334,36 @@ mod tests {
             "an idle close must shut the stream down"
         );
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn a_partial_datagram_at_idle_is_not_a_normal_close() {
+        // A peer that stalls inside a length-prefixed datagram did not close
+        // cleanly. The idle clock must not turn that into a normal Idle close,
+        // which would also send close_notify.
+        let echo = spawn_ipv4_echo().await;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut config = test_config(MAX_DATAGRAM_SIZE);
+        config.idle_timeout = Duration::from_millis(100);
+        let task = tokio::spawn(async move {
+            handle_udp_stream(server, net_location(echo.address), &config).await
+        });
+
+        // The length prefix announces 8 bytes; only 3 arrive before the stall.
+        client
+            .write_all(&8u16.to_be_bytes())
+            .await
+            .expect("length prefix");
+        client.write_all(b"abc").await.expect("partial payload");
+
+        let result = timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("legacy idle timeout did not fire")
+            .expect("legacy handler panicked");
+        match result {
+            Err(UdpError::Truncated { buffered }) => assert!(buffered > 0),
+            other => panic!("mid-datagram idle must be an error, got {other:?}"),
+        }
     }
 
     /// Drives the idle close through a real TLS writer and reads the client
