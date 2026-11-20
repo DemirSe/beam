@@ -86,12 +86,13 @@ pub struct MetricsSnapshot {
     /// than a session limit: non-UDP target, missing destination, failed
     /// resolution, conflicting GlobalID, or a socket bind failure. Together
     /// with the admitted and rejected counters it accounts for every
-    /// `xudp_new_frames` count.
+    /// `xudp_new_frames` count. An oversize `New` is rejected before that count
+    /// starts, so it is outside the identity.
     pub xudp_new_failed: u64,
-    /// XUDP drop events at the pending-resolution table, its request queue, or
-    /// the queued-frame byte budget. One event can cover the whole rejected
-    /// suffix of a queue, and only the head `New` of a drop is answered with an
-    /// error `End`.
+    /// XUDP drop events at the pending-resolution table, its request queue, the
+    /// per-id queued-frame bound, or the queued-frame byte budget. One event
+    /// can cover the whole rejected suffix of a queue, and only the head `New`
+    /// of a drop is answered with an error `End`.
     pub xudp_resolution_rejected: u64,
     /// XUDP `End` frames observed.
     pub xudp_end_frames: u64,

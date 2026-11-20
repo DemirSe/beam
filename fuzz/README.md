@@ -41,10 +41,12 @@ validates the checked-in bytes and rebuilds them:
 BEAM_WRITE_FUZZ_SEEDS=1 cargo test -p beam-core --test fuzz_seeds
 ```
 
-The `xudp` target also runs a bounded stateful sequence model
-(`xudp::fuzz_frame_sequence`), so session transitions are exercised instead of
-one frame in isolation. The `client_hello` target runs the assembler with the
-budget derived from the record header and again at the production cap.
+The `xudp` target also runs a bounded multi-frame parser model
+(`xudp::fuzz_frame_sequence`), so frame sequences are exercised instead of one
+frame in isolation. It is not the server's session state machine: `SessionTable`,
+`ResolutionState`, and `MuxState` are out of that harness's scope. The
+`client_hello` target runs the assembler with the budget derived from the record
+header and again at the production cap.
 
 ## Short campaign
 

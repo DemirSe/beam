@@ -257,6 +257,9 @@ keepalive) use the same per-option first-failure warning.
 `tcp_maxseg_round_trips_before_connect` pins that Linux only uses `TCP_MAXSEG`
 before `connect`, and `udp_recv_buffer_reports_the_effective_size` pins the
 effective `SO_RCVBUF` value (doubled by the kernel, clamped by `rmem_max`).
+The XUDP session socket uses the same first-failure warning for `SO_RCVBUF`
+(`UDP_RECV_BUFFER_WARNED`): a capped buffer keeps the socket, and the operator
+sees one `warn` instead of a silent loss of burst tolerance.
 
 ### 3. Pre-auth and authenticated admission (P1)
 
@@ -635,11 +638,11 @@ before the guard it observably leaked three of eight permits.
 phase gauge or empty-timer gauge.
 
 **Tests.** `aborting_the_mux_handler_releases_sessions_and_permits` (D8e),
-`empty_stream_closes_after_the_idle_timeout` (3442),
-`empty_mux_keepalive_does_not_extend_idle` (3458),
-`coalesced_new_end_restarts_the_empty_timer` (3547),
-`shutdown_releases_a_session_whose_reply_task_has_not_run` (3736),
-`truncated_frame_at_eof_is_reported` (5637),
+`empty_stream_closes_after_the_idle_timeout`,
+`empty_mux_keepalive_does_not_extend_idle`,
+`coalesced_new_end_restarts_the_empty_timer`,
+`shutdown_releases_a_session_whose_reply_task_has_not_run`,
+`truncated_frame_at_eof_is_reported`,
 `mux_read_deadline_is_not_extended_by_sweeps` (D1),
 `rejected_tcp_new_does_not_start_a_lookup`,
 `oversize_new_does_not_start_a_lookup`,
@@ -766,7 +769,8 @@ suffix still run and the rejection is handled on its own. A stale result is
 ignored by generation; a suffix that starts with another uncached domain
 re-enters Pending.
 
-**Bounds** (`xudp/server.rs:63,94,97,100,103`): 4 concurrent lookups per mux,
+**Bounds** (`MAX_CONCURRENT_RESOLUTIONS`, `MAX_PENDING_RESOLUTIONS`,
+`MAX_PENDING_FRAMES`): 4 concurrent lookups per mux,
 64 concurrently pending resolutions, up to 64 queued frames per destination
 still resolving, and a 256-entry per-mux cache with a 300 s TTL that clears
 instead of evicting. `next_generation` wraps; a stale match after wrap is
@@ -786,11 +790,13 @@ session existed (non-UDP target, missing destination, failed resolution
 including a queued frame whose lookup failed, conflicting GlobalID, socket
 bind). With `xudp_admitted_{fresh,reattach}` and
 `xudp_rejected_{per_stream,global}` it accounts for every `xudp_new_frames`
-count. `xudp_resolution_rejected` counts drop events at the pending-resolution
-table, its request queue, or the queued-frame byte budget. One event can cover
-the whole rejected suffix of a queue, and only the head `New` of a drop is
-answered with an error `End`. `New` frames dropped before dispatch are outside
-that identity and are documented per path.
+count. An oversize `New` is rejected before that count starts, so it is
+outside the identity. `xudp_resolution_rejected` counts drop events at the
+pending-resolution table, its request queue, the per-id queued-frame bound,
+or the queued-frame byte budget. One event can cover the whole rejected
+suffix of a queue, and only the head `New` of a drop is answered with an
+error `End`. `New` frames dropped before dispatch are outside that identity
+and are documented per path.
 
 **Tests.** `resolver_churn_stays_bounded`,
 `slow_domain_does_not_block_an_unrelated_session`,
@@ -806,10 +812,11 @@ that identity and are documented per path.
 `a_frame_the_byte_budget_rejects_is_counted`.
 
 **Fuzz coverage.** `fuzz/fuzz_targets/xudp.rs` also runs
-`xudp::fuzz_frame_sequence`, which applies a bounded New/Keep/End/KeepAlive
-sequence to a session model, and `fuzz/seeds/xudp/` supplies a synthetic
-multi-frame seed. `crates/beam-core/tests/fuzz_seeds.rs` validates and can
-regenerate the seeds.
+`xudp::fuzz_frame_sequence`, which fuzzes multi-frame parsing against a small
+reference model of open ids. It does not drive `SessionTable`,
+`ResolutionState`, or `MuxState`, so a bug in beam's real session transitions is
+outside this harness; `fuzz/seeds/xudp/` supplies a synthetic multi-frame seed.
+`crates/beam-core/tests/fuzz_seeds.rs` validates and can regenerate the seeds.
 
 **Superseded attachment frames.** When a later acceptable `New` supersedes the
 pending owner and no session owns the id, the frames queued before that `New`
@@ -852,11 +859,14 @@ drops and counts.
 
 **States.** Resolve → Bind → Relay → Idle/EOF/Error → Shutdown. Fixed mode uses
 one destination; packetaddr is selected by the magic domain
-(`is_packetaddr_destination`, `udp/legacy.rs:276`) and uses v4/v6 optional
+(`is_packetaddr_destination`) and uses v4/v6 optional
 sockets plus a bounded
 `DestinationTable`. `FrameDecoder` is its own need-header/need-payload/has-frame
 cursor. A normal close returns `UdpClose::{PeerClosed, Idle}`; `Idle` is a
-normal ending, not a failed stage.
+normal ending, not a failed stage, but only at a datagram boundary. An idle
+expiry with a partially received datagram is `UdpError::Truncated`, so a
+mid-frame stall is never reported as a clean close and never sends
+`close_notify`.
 
 **Port zero.** The packetaddr sentinel is the only destination allowed to carry
 port zero: `RequestHeader` parses it, `is_packetaddr_destination` selects the
@@ -889,8 +899,9 @@ datagrams are skipped. Idle refreshes only on successful sends and accepted repl
 beyond `legacy_udp_limited`.
 
 **Tests.** The `fixed_*`/`packetaddr_*` suites,
-`dropped_legacy_replies_do_not_refresh_idle_clock` (1310),
-`dropped_packetaddr_replies_do_not_refresh_idle_clock` (1353), and the
+`dropped_legacy_replies_do_not_refresh_idle_clock`,
+`dropped_packetaddr_replies_do_not_refresh_idle_clock`,
+`a_partial_datagram_at_idle_is_not_a_normal_close`, and the
 `fuzz/fuzz_targets/legacy_udp.rs` target.
 
 **Cross-machine coupling (protocol-lab P1).** The process-wide
