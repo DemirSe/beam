@@ -469,6 +469,13 @@ async fn apply_resolution(
     // This lookup is no longer in flight. Drop the entry first so a frame
     // queued behind it can start a fresh lookup for the same semantics.
     if let Some(key) = &key {
+        debug_assert!(
+            resolutions
+                .inflight
+                .get(key)
+                .is_none_or(|inflight| *inflight == result.generation),
+            "a stale resolution must not remove a newer in-flight lookup"
+        );
         resolutions.inflight.remove(key);
     }
     // Cache the result before the waiters, even when all of them are
@@ -631,9 +638,10 @@ async fn process_pending_frames(
 /// Test-only entry point for the stateful XUDP fuzz target.
 ///
 /// Consumes a bounded sequence of frames the way the mux read loop does and
-/// applies `New`/`Keep`/`End`/`KeepAlive` to a small session model. No socket,
-/// task, or DNS lookup is created: the point is parser and state-transition
-/// coverage across frames, not one frame in isolation.
+/// applies `New`/`Keep`/`End`/`KeepAlive` to a small reference model of open
+/// ids. No socket, task, or DNS lookup is created, and the real session state
+/// machines are not driven: the point is parser coverage across frames, not one
+/// frame in isolation.
 #[cfg(feature = "fuzz")]
 #[doc(hidden)]
 pub fn fuzz_frame_sequence(data: &[u8]) {
@@ -4420,18 +4428,23 @@ mod tests {
             served.push((reply.session_id, reply.payload));
         }
         assert_eq!(
-            served,
-            vec![
-                (3, b"replacement".to_vec()),
-                (1, b"second".to_vec()),
-                (2, b"third".to_vec()),
-            ],
-            "a superseded owner must not run and waiters must keep their arrival order"
-        );
-        assert_eq!(
             test_resolve_calls() - before,
             1,
             "the four queued frames must share a single lookup"
+        );
+        // Each session has its own reply task, so the order of these three
+        // replies on the mux stream is a scheduling race. Dispatch order is
+        // pinned by the unit test above; here the per-session mapping is what
+        // matters.
+        served.sort_unstable_by_key(|(id, _)| *id);
+        assert_eq!(
+            served,
+            vec![
+                (1, b"second".to_vec()),
+                (2, b"third".to_vec()),
+                (3, b"replacement".to_vec()),
+            ],
+            "a superseded owner must not run and every waiter must keep its own payload"
         );
 
         for id in 1..=3 {
