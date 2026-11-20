@@ -212,6 +212,16 @@ pub enum LegacyUdpConfigError {
     MaxPacketaddrDestinations,
 }
 
+/// How a legacy UDP stream ended normally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UdpClose {
+    /// The peer closed its write side after a complete datagram.
+    PeerClosed,
+    /// No traffic arrived before the idle deadline. This is a normal close,
+    /// not a failed stage.
+    Idle,
+}
+
 /// Errors returned while relaying a legacy UDP connection.
 #[derive(Debug, thiserror::Error)]
 pub enum UdpError {
@@ -227,8 +237,13 @@ pub enum UdpError {
     },
 
     /// A stream or socket operation failed.
-    #[error("legacy UDP I/O error: {0}")]
-    Io(#[from] io::Error),
+    #[error("legacy UDP {stage} I/O error: {source}")]
+    Io {
+        /// The operation that failed.
+        stage: &'static str,
+        /// The error the operation returned.
+        source: io::Error,
+    },
 
     /// A bounded operation timed out.
     #[error("legacy UDP {stage} timed out")]
@@ -272,6 +287,16 @@ pub enum UdpError {
     NoSocket,
 }
 
+impl UdpError {
+    /// Wraps an I/O error with the operation that failed.
+    fn io(stage: &'static str, error: io::Error) -> Self {
+        Self::Io {
+            stage,
+            source: error,
+        }
+    }
+}
+
 /// Relays one VLESS UDP body until the peer closes or a protocol error occurs.
 ///
 /// `destination` is the VLESS request destination. A magic packetaddr domain
@@ -281,7 +306,7 @@ pub async fn handle_udp_stream<S>(
     stream: S,
     destination: NetLocation,
     config: &LegacyUdpConfig,
-) -> Result<(), UdpError>
+) -> Result<UdpClose, UdpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -306,7 +331,7 @@ async fn handle_fixed<S>(
     stream: S,
     destination: &NetLocation,
     config: &LegacyUdpConfig,
-) -> Result<(), UdpError>
+) -> Result<UdpClose, UdpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -316,7 +341,8 @@ where
         .await
         .map_err(|_| UdpError::Timeout {
             stage: "socket bind",
-        })??;
+        })?
+        .map_err(|error| UdpError::io("socket bind", error))?;
 
     let (mut reader, mut writer) = tokio::io::split(stream);
     let payload_limit = framed_payload_limit(config.max_datagram_size);
@@ -347,7 +373,7 @@ where
                     decoder.consume(frame.end);
                     continue;
                 }
-                Ok(Err(error)) => break 'session Err(UdpError::Io(error)),
+                Ok(Err(error)) => break 'session Err(UdpError::io("UDP send", error)),
                 Err(_) => {
                     tracing::debug!("legacy UDP send timed out; dropping datagram");
                     decoder.consume(frame.end);
@@ -364,13 +390,13 @@ where
                 continue;
             }
             _ = &mut idle => {
-                break Err(UdpError::Timeout { stage: "stream idle" });
+                break Ok(UdpClose::Idle);
             }
             read = reader.read(&mut chunk) => {
                 match read {
                     Ok(0) => {
                         if decoder.buffered() == 0 {
-                            break Ok(());
+                            break Ok(UdpClose::PeerClosed);
                         }
                         break Err(UdpError::Truncated {
                             buffered: decoder.buffered(),
@@ -385,7 +411,7 @@ where
                         backoff_after_transient_recv(&error).await;
                         continue 'session;
                     }
-                    Err(error) => break Err(UdpError::Io(error)),
+                    Err(error) => break Err(UdpError::io("stream read", error)),
                 }
             }
             received = socket.recv_from(&mut incoming) => {
@@ -395,7 +421,7 @@ where
                         backoff_after_transient_recv(&error).await;
                         continue 'session;
                     }
-                    Err(error) => break Err(UdpError::Io(error)),
+                    Err(error) => break Err(UdpError::io("UDP receive", error)),
                 };
                 if length == 0 || length > payload_limit {
                     tracing::trace!(
@@ -420,14 +446,25 @@ where
         }
     };
 
-    if outcome.is_ok() {
-        shutdown_writer(&mut writer, shutdown_timeout(config.io_timeout)).await?;
+    // A peer half-close and an idle expiry are both normal closes and both
+    // flush the buffered reply and send `close_notify`. A failed stage drops
+    // the stream without writing to it: its state is unknown.
+    if let Ok(close) = &outcome {
+        match shutdown_writer(&mut writer, shutdown_timeout(config.io_timeout)).await {
+            Ok(()) => {}
+            // The idle close is already decided; a peer that is gone must not
+            // turn it into a failure.
+            Err(error) if *close == UdpClose::Idle => {
+                tracing::debug!(%error, "legacy UDP idle close could not shut the stream down");
+            }
+            Err(error) => return Err(error),
+        }
     }
     outcome
 }
 
 /// Relays a packetaddr session with one socket per address family.
-async fn handle_packetaddr<S>(stream: S, config: &LegacyUdpConfig) -> Result<(), UdpError>
+async fn handle_packetaddr<S>(stream: S, config: &LegacyUdpConfig) -> Result<UdpClose, UdpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -445,7 +482,7 @@ async fn handle_packetaddr_bound<S>(
     config: &LegacyUdpConfig,
     v4: Option<UdpSocket>,
     v6: Option<UdpSocket>,
-) -> Result<(), UdpError>
+) -> Result<UdpClose, UdpError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -524,13 +561,13 @@ where
                 continue;
             }
             _ = &mut idle => {
-                break Err(UdpError::Timeout { stage: "stream idle" });
+                break Ok(UdpClose::Idle);
             }
             read = reader.read(&mut chunk) => {
                 match read {
                     Ok(0) => {
                         if decoder.buffered() == 0 {
-                            break Ok(());
+                            break Ok(UdpClose::PeerClosed);
                         }
                         break Err(UdpError::Truncated {
                             buffered: decoder.buffered(),
@@ -545,7 +582,7 @@ where
                         backoff_after_transient_recv(&error).await;
                         continue;
                     }
-                    Err(error) => break Err(UdpError::Io(error)),
+                    Err(error) => break Err(UdpError::io("stream read", error)),
                 }
             }
             received = recv_optional(v4.as_ref(), &mut v4_incoming) => {
@@ -555,7 +592,7 @@ where
                         backoff_after_transient_recv(&error).await;
                         continue;
                     }
-                    Err(error) => break Err(UdpError::Io(error)),
+                    Err(error) => break Err(UdpError::io("UDP receive", error)),
                 };
                 let reply_limit = packetaddr_reply_limit(config.max_datagram_size, source);
                 if length == 0 || length > reply_limit {
@@ -587,7 +624,7 @@ where
                         backoff_after_transient_recv(&error).await;
                         continue;
                     }
-                    Err(error) => break Err(UdpError::Io(error)),
+                    Err(error) => break Err(UdpError::io("UDP receive", error)),
                 };
                 let reply_limit = packetaddr_reply_limit(config.max_datagram_size, source);
                 if length == 0 || length > reply_limit {
@@ -615,8 +652,19 @@ where
         }
     };
 
-    if outcome.is_ok() {
-        shutdown_writer(&mut writer, shutdown_timeout(config.io_timeout)).await?;
+    // A peer half-close and an idle expiry are both normal closes and both
+    // flush the buffered reply and send `close_notify`. A failed stage drops
+    // the stream without writing to it: its state is unknown.
+    if let Ok(close) = &outcome {
+        match shutdown_writer(&mut writer, shutdown_timeout(config.io_timeout)).await {
+            Ok(()) => {}
+            // The idle close is already decided; a peer that is gone must not
+            // turn it into a failure.
+            Err(error) if *close == UdpClose::Idle => {
+                tracing::debug!(%error, "legacy UDP idle close could not shut the stream down");
+            }
+            Err(error) => return Err(error),
+        }
     }
     outcome
 }
@@ -672,7 +720,7 @@ async fn resolve_fixed(
                 io::ErrorKind::TimedOut => UdpError::Timeout {
                     stage: "destination resolution",
                 },
-                _ => UdpError::Io(error),
+                _ => UdpError::io("destination resolution", error),
             })?;
 
             let mut fallback = None;
@@ -739,7 +787,7 @@ where
     }
     match timeout(io_timeout, writer.write_all(reply)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(UdpError::Io(error)),
+        Ok(Err(error)) => Err(UdpError::io("stream write", error)),
         Err(_) => Err(UdpError::Timeout {
             stage: "stream write",
         }),
@@ -778,7 +826,7 @@ where
     }
     match timeout(io_timeout, writer.write_all(reply)).await {
         Ok(Ok(())) => Ok(true),
-        Ok(Err(error)) => Err(UdpError::Io(error)),
+        Ok(Err(error)) => Err(UdpError::io("stream write", error)),
         Err(_) => Err(UdpError::Timeout {
             stage: "stream write",
         }),
@@ -919,7 +967,7 @@ where
     match timeout(io_timeout, writer.shutdown()).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) if is_peer_closed(&error) => Ok(()),
-        Ok(Err(error)) => Err(UdpError::Io(error)),
+        Ok(Err(error)) => Err(UdpError::io("stream shutdown", error)),
         Err(_) => Err(UdpError::Timeout {
             stage: "stream shutdown",
         }),
@@ -1073,14 +1121,15 @@ impl FrameDecoder {
 mod tests {
     use super::{
         FrameDecoder, LegacyUdpConfig, LegacyUdpConfigError, MAX_DATAGRAM_SIZE,
-        MAX_FRAMED_DATAGRAM_SIZE, MAX_PACKETADDR_HEADER_LEN, PACKETADDR_MAGIC_DOMAIN, UdpError,
-        handle_packetaddr_bound, handle_udp_stream, parse_packetaddr,
+        MAX_FRAMED_DATAGRAM_SIZE, MAX_PACKETADDR_HEADER_LEN, PACKETADDR_MAGIC_DOMAIN, UdpClose,
+        UdpError, handle_packetaddr_bound, handle_udp_stream, parse_packetaddr,
     };
     use crate::address::{Address, NetLocation};
     use proptest::prelude::*;
     use std::io::{self, ErrorKind};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
@@ -1176,6 +1225,76 @@ mod tests {
         }
     }
 
+    struct ShutdownRecorder<S> {
+        inner: S,
+        shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S> ShutdownRecorder<S> {
+        fn new(inner: S, shutdowns: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self { inner, shutdowns }
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for ShutdownRecorder<S> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for ShutdownRecorder<S> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Pin::new(&mut this.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_close_shuts_the_stream_down_once() {
+        // The idle exit runs the same bounded shutdown as a peer close, so the
+        // TLS layer below can send close_notify.
+        let echo = spawn_ipv4_echo().await;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = ShutdownRecorder::new(server, Arc::clone(&shutdowns));
+        let mut config = test_config(MAX_DATAGRAM_SIZE);
+        config.idle_timeout = Duration::from_millis(100);
+        let task = tokio::spawn(async move {
+            handle_udp_stream(server, net_location(echo.address), &config).await
+        });
+
+        write_frame(&mut client, b"start").await;
+        let result = timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("legacy idle timeout did not fire")
+            .expect("legacy handler panicked");
+        assert!(matches!(result, Ok(UdpClose::Idle)), "{result:?}");
+        assert_eq!(
+            shutdowns.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an idle close must shut the stream down"
+        );
+        drop(client);
+    }
+
     #[tokio::test]
     async fn transient_stream_read_errors_do_not_close_fixed_session() {
         let echo = spawn_ipv4_echo().await;
@@ -1223,6 +1342,8 @@ mod tests {
     async fn fatal_stream_read_error_closes_fixed_session() {
         let echo = spawn_ipv4_echo().await;
         let (client, server) = tokio::io::duplex(64 * 1024);
+        let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = ShutdownRecorder::new(server, Arc::clone(&shutdowns));
         let server = InjectedReadError::new(server, ErrorKind::ConnectionReset);
         let task = tokio::spawn(async move {
             handle_udp_stream(
@@ -1235,8 +1356,19 @@ mod tests {
 
         let error = finish_with_error(client, task).await;
         assert!(
-            matches!(error, UdpError::Io(ref source) if source.kind() == ErrorKind::ConnectionReset),
+            matches!(
+                error,
+                UdpError::Io {
+                    stage: "stream read",
+                    ref source,
+                } if source.kind() == ErrorKind::ConnectionReset
+            ),
             "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            shutdowns.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a failed stage must not be written to"
         );
     }
 
@@ -1314,7 +1446,7 @@ mod tests {
     fn start(
         destination: NetLocation,
         config: LegacyUdpConfig,
-    ) -> (DuplexStream, JoinHandle<Result<(), UdpError>>) {
+    ) -> (DuplexStream, JoinHandle<Result<UdpClose, UdpError>>) {
         let (client, server) = tokio::io::duplex(256 * 1024);
         let task =
             tokio::spawn(async move { handle_udp_stream(server, destination, &config).await });
@@ -1426,7 +1558,7 @@ mod tests {
         payload
     }
 
-    async fn finish_clean(client: DuplexStream, task: JoinHandle<Result<(), UdpError>>) {
+    async fn finish_clean(client: DuplexStream, task: JoinHandle<Result<UdpClose, UdpError>>) {
         drop(client);
         let result = timeout(TEST_TIMEOUT, task)
             .await
@@ -1437,7 +1569,7 @@ mod tests {
 
     async fn finish_with_error(
         client: DuplexStream,
-        task: JoinHandle<Result<(), UdpError>>,
+        task: JoinHandle<Result<UdpClose, UdpError>>,
     ) -> UdpError {
         drop(client);
         let result = timeout(TEST_TIMEOUT, task)
@@ -1445,7 +1577,7 @@ mod tests {
             .expect("legacy UDP handler did not finish")
             .expect("legacy UDP handler panicked");
         match result {
-            Ok(()) => panic!("legacy UDP handler unexpectedly succeeded"),
+            Ok(close) => panic!("legacy UDP handler unexpectedly closed: {close:?}"),
             Err(error) => error,
         }
     }
@@ -1581,12 +1713,7 @@ mod tests {
             .expect("legacy idle timeout did not fire")
             .expect("legacy handler panicked");
         assert!(
-            matches!(
-                result,
-                Err(UdpError::Timeout {
-                    stage: "stream idle"
-                })
-            ),
+            matches!(result, Ok(UdpClose::Idle)),
             "dropped replies refreshed the idle clock: {result:?}"
         );
         drop(client);
@@ -1624,12 +1751,7 @@ mod tests {
             .expect("packetaddr idle timeout did not fire")
             .expect("packetaddr handler panicked");
         assert!(
-            matches!(
-                result,
-                Err(UdpError::Timeout {
-                    stage: "stream idle"
-                })
-            ),
+            matches!(result, Ok(UdpClose::Idle)),
             "dropped packetaddr replies refreshed the idle clock: {result:?}"
         );
         drop(client);

@@ -49,7 +49,7 @@ use crate::tls::{
     ClientHello, MAX_CLIENT_HELLO_RECORDS, MAX_RECORD_LEN, TLS_HANDSHAKE_HEADER_LEN,
     TLS_RECORD_HEADER_LEN, client_hello_message_len,
 };
-use crate::udp::{LegacyUdpConfig, UdpError, handle_udp_stream};
+use crate::udp::{LegacyUdpConfig, UdpClose, UdpError, handle_udp_stream};
 use crate::vision::VisionStream;
 use crate::vless::{Command, MAX_REQUEST_HEADER_LEN, RequestHeader, ResponseHeader, VlessError};
 use crate::xudp::{
@@ -488,6 +488,15 @@ pub enum ConnectionOutcome {
     Authenticated {
         /// The VLESS command from the request.
         command: Command,
+    },
+    /// The relay reached its inactivity deadline and closed normally.
+    ///
+    /// This is not a failure: a legacy UDP flow that stops sending, and an
+    /// unauthenticated cover probe that says nothing, are expected to end this
+    /// way.
+    IdleClosed {
+        /// Relay path that expired: `"cover"` or `"udp"`.
+        path: &'static str,
     },
 }
 
@@ -1630,10 +1639,9 @@ async fn handle_authenticated(
                 })??;
 
             let stream = PrependStream::new(tls, request.body);
-            handle_udp_stream(stream, destination, &config.udp).await?;
-            Ok(ConnectionOutcome::Authenticated {
-                command: Command::Udp,
-            })
+            Ok(udp_outcome(
+                handle_udp_stream(stream, destination, &config.udp).await?,
+            ))
         }
         Command::Mux => {
             timeout_at(deadline, tls.write_all(&ResponseHeader::new().to_bytes()))
@@ -1730,8 +1738,20 @@ async fn forward_to_cover(
     // Dropping this future on shutdown cancels the relay promptly, and the
     // relay ends on the first half-close so a disconnected probe cannot pin a
     // cover slot until the idle timeout.
-    relay_cover_bidirectional(client, cover, COVER_IDLE_TIMEOUT, COVER_MAX_LIFETIME).await?;
-    Ok(ConnectionOutcome::CoverForwarded)
+    relay_cover_bidirectional(client, cover, COVER_IDLE_TIMEOUT, COVER_MAX_LIFETIME).await
+}
+
+/// Maps a finished legacy UDP relay to a connection outcome.
+///
+/// An idle expiry is a normal close; a peer half-close keeps the
+/// `Authenticated` outcome it already had.
+fn udp_outcome(close: UdpClose) -> ConnectionOutcome {
+    match close {
+        UdpClose::PeerClosed => ConnectionOutcome::Authenticated {
+            command: Command::Udp,
+        },
+        UdpClose::Idle => ConnectionOutcome::IdleClosed { path: "udp" },
+    }
 }
 
 struct OwnedRequest {
@@ -1974,7 +1994,7 @@ async fn relay_cover_bidirectional<A, B>(
     right: B,
     idle_timeout: Duration,
     max_lifetime: Duration,
-) -> Result<(), TlsServerError>
+) -> Result<ConnectionOutcome, TlsServerError>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -1989,17 +2009,30 @@ where
             &mut right_write,
             idle_timeout,
             Some(&activity),
-        ) => result.map(|_| ()),
+        ) => cover_outcome(result),
         result = copy_direction(
             &mut right_read,
             &mut left_write,
             idle_timeout,
             Some(&activity),
-        ) => result.map(|_| ()),
+        ) => cover_outcome(result),
         () = tokio::time::sleep(max_lifetime) => {
             tracing::debug!(?max_lifetime, "cover relay reached its maximum lifetime; closing");
-            Ok(())
+            Ok(ConnectionOutcome::CoverForwarded)
         }
+    }
+}
+
+/// Classifies one finished cover direction.
+///
+/// A half-close ends the relay normally. A direction that only stopped because
+/// its inactivity deadline elapsed is an idle close, not a failure; any other
+/// error keeps its stage for the connection log.
+fn cover_outcome(result: Result<u64, TlsServerError>) -> Result<ConnectionOutcome, TlsServerError> {
+    match result {
+        Ok(_) => Ok(ConnectionOutcome::CoverForwarded),
+        Err(TlsServerError::Timeout { .. }) => Ok(ConnectionOutcome::IdleClosed { path: "cover" }),
+        Err(error) => Err(error),
     }
 }
 
@@ -3303,6 +3336,37 @@ mod tests {
         assert_eq!(cache.stats(now).in_flight, 1);
         cache.release([2; 32]);
         assert_eq!(cache.phase([2; 32], now), ReplayPhase::Unseen);
+    }
+
+    #[tokio::test]
+    async fn an_idle_cover_relay_closes_normally() {
+        // An unauthenticated probe that stops sending ends at the idle
+        // deadline. That is a normal close, not a failed cover relay.
+        let (client, _client_peer) = tokio::io::duplex(1024);
+        let (cover, _cover_peer) = tokio::io::duplex(1024);
+        let outcome = relay_cover_bidirectional(
+            client,
+            cover,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("an idle cover relay is not a failure");
+        assert_eq!(outcome, ConnectionOutcome::IdleClosed { path: "cover" });
+    }
+
+    #[test]
+    fn idle_udp_close_is_a_normal_outcome() {
+        assert_eq!(
+            udp_outcome(UdpClose::Idle),
+            ConnectionOutcome::IdleClosed { path: "udp" }
+        );
+        assert_eq!(
+            udp_outcome(UdpClose::PeerClosed),
+            ConnectionOutcome::Authenticated {
+                command: Command::Udp
+            }
+        );
     }
 
     #[tokio::test]

@@ -410,7 +410,13 @@ VLESS with `xtls-rprx-vision` is expected to work.
   path drops only that datagram; other send errors close the association.
   A transient receive error (`WouldBlock`, `TimedOut`, `Interrupted`) retries
   after a 1 ms backoff while the idle deadline still bounds the session; other
-  receive errors close the association. A packetaddr reply is admitted only when
+  receive errors close the association. An idle expiry is a normal close, not
+  a failure: like a peer EOF it runs one bounded shutdown that flushes the
+  buffered reply and sends `close_notify` before FIN, and a shutdown that fails
+  keeps the close normal. An association that ends at a failed stage is
+  dropped without writing, because its stream state is unknown. The failing
+  stage (`stream read`, `stream write`, `UDP send`, `UDP receive`, `socket
+  bind`, `destination resolution`, `stream shutdown`) is named in the error. A packetaddr reply is admitted only when
   `2 + source header (7 bytes for IPv4, 19 for IPv6) + payload` fits the
   datagram cap; a v4-mapped source uses the 7-byte header, and a larger reply is
   dropped without refreshing idle time.

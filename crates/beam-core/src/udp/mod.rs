@@ -12,5 +12,5 @@ pub mod legacy;
 pub use legacy::{
     DEFAULT_IDLE_TIMEOUT, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_DATAGRAM_SIZE,
     DEFAULT_MAX_PACKETADDR_DESTINATIONS, LegacyUdpConfig, LegacyUdpConfigError, MAX_DATAGRAM_SIZE,
-    PACKETADDR_MAGIC_DOMAIN, UdpError, handle_udp_stream, is_packetaddr_destination,
+    PACKETADDR_MAGIC_DOMAIN, UdpClose, UdpError, handle_udp_stream, is_packetaddr_destination,
 };

@@ -414,7 +414,11 @@ bidirectional relay → first half-close → return. The permit is held for the
 whole relay. `relay_cover_bidirectional` selects over both copy directions, so
 either side finishing ends the relay (`1673-1713`).
 
-**Illegal / edge.** Dial or ClientHello write failure closes the probe; no TLS
+**Illegal / edge.** A relay direction that ends at its inactivity deadline is
+an idle close, not a failure: `cover_outcome` maps it to
+`ConnectionOutcome::IdleClosed { path: "cover" }`, while a half-close maps to
+`CoverForwarded` and any other error keeps its stage. Dial or ClientHello write
+failure closes the probe; no TLS
 alert is ever synthesized. A full cover limiter closes immediately
 (`CoverLimited`), never queues.
 
@@ -827,7 +831,20 @@ one destination; packetaddr is selected by the magic domain
 (`is_packetaddr_destination`, `udp/legacy.rs:276`) and uses v4/v6 optional
 sockets plus a bounded
 `DestinationTable`. `FrameDecoder` is its own need-header/need-payload/has-frame
-cursor.
+cursor. A normal close returns `UdpClose::{PeerClosed, Idle}`; `Idle` is a
+normal ending, not a failed stage.
+
+**Close and shutdown.** Peer EOF and the idle expiry both run one bounded
+`shutdown_writer` that flushes the buffered reply and lets the TLS layer send
+`close_notify` before FIN; the idle deadline is `io_timeout` capped at 5 s, and
+a failed shutdown does not turn the idle close into an error. An association
+that ends at a failed stage is dropped without writing to it: the stream state
+is unknown. `UdpError::Io` carries the failing stage (`stream read`,
+`stream write`, `UDP send`, `UDP receive`, `socket bind`, `destination
+resolution`, `stream shutdown`). Pinned by
+`idle_close_shuts_the_stream_down_once` and by
+`fatal_stream_read_error_closes_fixed_session`, which requires no shutdown on a
+failed stage.
 
 **Error policy differs by mode.** Fixed: a transient send error drops one
 datagram, anything else closes the association. Packetaddr: table-full and
@@ -835,7 +852,8 @@ missing-family drop one datagram; a malformed inner address closes. A new
 destination uses a table slot after its first successful send. Zero-length
 datagrams are skipped. Idle refreshes only on successful sends and accepted replies.
 
-**Observability.** `UdpError` plus debug/trace logs; no per-association counters
+**Observability.** `UdpError` (with its stage) plus debug/trace logs, and the
+`ConnectionOutcome` on the connection log line; no per-association counters
 beyond `legacy_udp_limited`.
 
 **Tests.** The `fixed_*`/`packetaddr_*` suites,
