@@ -56,6 +56,7 @@ test: test-scripts
 # target, so the Makefile stays the one list of required checks.
 test-scripts:
 	python3 tests/bench/test_report.py
+	python3 tests/bench/test_workflow_budget.py
 	python3 tests/tun/test_protocol_report.py
 	python3 tests/preprod/test_preprod_gate.py
 	python3 tests/test_ipv4_only.py

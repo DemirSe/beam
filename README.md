@@ -206,6 +206,7 @@ before the cargo tests:
 
 ```bash
 python3 tests/bench/test_report.py
+python3 tests/bench/test_workflow_budget.py
 python3 tests/tun/test_protocol_report.py
 python3 tests/preprod/test_preprod_gate.py
 python3 tests/test_ipv4_only.py
@@ -241,6 +242,12 @@ For independent parallel campaigns, select distinct `concurrency_slot` values
 (`parallel-1`, `parallel-2`, `parallel-3`). The default `shared` slot serializes
 runs. `job_timeout_minutes=180` bounds each job. A `10`-minute cap leaves the
 production gate incomplete.
+
+The standard profile sets the inner benchmark timeout to 2400 s. With a
+`reps` override, the timeout becomes the smaller of 6000 s and 800 s
+multiplied by the repetition count. Five repetitions receive 4000 s.
+The smoke and claim profiles keep their fixed 900 s and 6000 s timeouts.
+`reps` must be an integer from 1 to 6000.
 
 The hosted runner requires real TUN, private network namespaces and netem. It
 runs the IPv4/IPv6 client matrix in XUDP, legacy and packetaddr modes, alongside

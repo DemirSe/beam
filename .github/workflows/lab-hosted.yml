@@ -223,6 +223,11 @@ jobs:
               echo "::error::$name must be a non-negative integer"; exit 1
             fi
           done
+          if [ -n "$reps_override" ]; then
+            printf '%s' "$reps_override" | grep -Eq '^0*[1-9][0-9]{0,3}$' \
+              && [ $((10#$reps_override)) -le 6000 ] \
+              || { echo "::error::reps must be 1..6000"; exit 1; }
+          fi
           for pair in "rtt_ms:$rtt_override" "loss_pct:$loss_override"; do
             name=${pair%%:*}; value=${pair#*:}
             if [ -n "$value" ] \
@@ -234,6 +239,12 @@ jobs:
           [ -z "$loss_override" ] || loss="$loss_override"
           [ -z "$reps_override" ] || reps="$reps_override"
           [ -z "$duration_override" ] || duration="$duration_override"
+          # Only the standard inner cap scales. Claim already uses its upper
+          # bound, and smoke keeps its shorter budget.
+          if [ "$INPUT_PROFILE" = standard ] && [ -n "$reps_override" ]; then
+            bench_timeout=$((800 * 10#$reps_override))
+            [ "$bench_timeout" -le 6000 ] || bench_timeout=6000
+          fi
           scenarios="${scenarios:-all}"
           if [ "$scenarios" = all ]; then
             require_complete=1
