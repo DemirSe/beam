@@ -247,14 +247,14 @@ the shortage case, which is the one an operator must act on
 (`accept_errors_separate_a_resource_shortage_from_one_bad_connection`).
 
 **Socket options on accepted sockets.** `TCP_NODELAY` and keepalive failures are
-tuning, not correctness: the connection continues, and the first failure in the
-process logs one `warn` with the option name. Later failures log at `debug` so a
-kernel or sandbox policy that rejects the option cannot flood the log.
-Destination dial options (`TCP_MAXSEG`, `TCP_NODELAY`, keepalive) use the same
-first-failure warning. `tcp_maxseg_round_trips_before_connect` pins that Linux
-only uses `TCP_MAXSEG` before `connect`, and
-`udp_recv_buffer_reports_the_effective_size` pins the effective `SO_RCVBUF`
-value (doubled by the kernel, clamped by `rmem_max`).
+tuning, not correctness: the connection continues, and the first failure of each
+option in the process logs one `warn` with the option name. Later failures of
+that option log at `debug` so a kernel or sandbox policy that rejects the option
+cannot flood the log. Destination dial options (`TCP_MAXSEG`, `TCP_NODELAY`,
+keepalive) use the same per-option first-failure warning.
+`tcp_maxseg_round_trips_before_connect` pins that Linux only uses `TCP_MAXSEG`
+before `connect`, and `udp_recv_buffer_reports_the_effective_size` pins the
+effective `SO_RCVBUF` value (doubled by the kernel, clamped by `rmem_max`).
 
 ### 3. Pre-auth and authenticated admission (P1)
 

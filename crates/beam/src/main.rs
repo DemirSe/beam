@@ -430,7 +430,7 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
             }
             Err(error) => {
                 let failure = beam_sys::AcceptError::classify(&error);
-                metrics.record_accept_error(failure == beam_sys::AcceptError::ResourceShortage);
+                record_accept_failure(&metrics, failure);
                 tracing::warn!(
                     %error,
                     reason = failure.as_str(),
@@ -464,14 +464,14 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
 
         tokio::spawn(async move {
             if let Err(error) = stream.set_nodelay(true) {
-                warn_socket_option_once(&error, "TCP_NODELAY", peer);
+                warn_socket_option_once(&TCP_NODELAY_WARNED, &error, "TCP_NODELAY", peer);
             }
             if let Err(error) = beam_sys::set_tcp_keepalive(
                 stream.as_raw_fd(),
                 Duration::from_secs(60),
                 Duration::from_secs(15),
             ) {
-                warn_socket_option_once(&error, "TCP keepalive", peer);
+                warn_socket_option_once(&TCP_KEEPALIVE_WARNED, &error, "TCP keepalive", peer);
             }
 
             match handle_connection_admitted(stream, tls_config, Some(preauth_permit)).await {
@@ -678,15 +678,28 @@ fn next_accept_backoff(current: Duration) -> Duration {
     (current * 2).min(ACCEPT_BACKOFF_LIMIT)
 }
 
+/// Counts one accept failure, isolating a resource shortage from a failure
+/// that applies to one connection.
+fn record_accept_failure(metrics: &beam_core::metrics::Metrics, failure: beam_sys::AcceptError) {
+    metrics.record_accept_error(failure == beam_sys::AcceptError::ResourceShortage);
+}
+
 /// Warns once per process about a socket option that could not be applied.
 ///
 /// The option is tuning, not correctness, so the connection continues. Warning
 /// on every connection would flood the log when the kernel or a seccomp policy
-/// rejects the option for all of them.
-static SOCKET_OPTION_WARNED: AtomicBool = AtomicBool::new(false);
+/// rejects the option for all of them. Each option has its own flag, so one
+/// failing option does not demote a different option that fails later.
+static TCP_NODELAY_WARNED: AtomicBool = AtomicBool::new(false);
+static TCP_KEEPALIVE_WARNED: AtomicBool = AtomicBool::new(false);
 
-fn warn_socket_option_once(error: &std::io::Error, option: &'static str, peer: SocketAddr) {
-    if SOCKET_OPTION_WARNED.swap(true, Ordering::Relaxed) {
+fn warn_socket_option_once(
+    warned: &AtomicBool,
+    error: &std::io::Error,
+    option: &'static str,
+    peer: SocketAddr,
+) {
+    if warned.swap(true, Ordering::Relaxed) {
         tracing::debug!(%peer, %error, option, "could not apply a socket option");
     } else {
         tracing::warn!(
@@ -1089,6 +1102,27 @@ mod tests {
         assert_eq!(
             next_accept_backoff(ACCEPT_BACKOFF_LIMIT),
             ACCEPT_BACKOFF_LIMIT
+        );
+    }
+
+    #[test]
+    fn a_resource_shortage_is_the_accept_error_that_feeds_the_resource_counter() {
+        let metrics = beam_core::metrics::Metrics::default();
+        record_accept_failure(&metrics, beam_sys::AcceptError::ResourceShortage);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.accept_errors, 1);
+        assert_eq!(
+            snapshot.accept_errors_resource, 1,
+            "a resource shortage must feed the resource counter"
+        );
+
+        let metrics = beam_core::metrics::Metrics::default();
+        record_accept_failure(&metrics, beam_sys::AcceptError::Transient);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.accept_errors, 1);
+        assert_eq!(
+            snapshot.accept_errors_resource, 0,
+            "one bad connection is not a resource shortage"
         );
     }
 

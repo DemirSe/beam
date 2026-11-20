@@ -9,8 +9,7 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcceptError {
     /// The process or the system is short of a resource (`EMFILE`, `ENFILE`,
-    /// `ENOBUFS`, `ENOMEM`). A retry cannot succeed until something is freed,
-    /// so the caller should back off further than for one bad connection.
+    /// `ENOBUFS`, `ENOMEM`). A retry cannot succeed until something is freed.
     ResourceShortage,
     /// The failure applies to one connection (`ECONNABORTED`) or the call was
     /// interrupted. The listener is still usable.
@@ -292,10 +291,10 @@ mod tests {
                 effective, doubled,
                 "a receive buffer below rmem_max reads back doubled"
             ),
-            // The host cannot satisfy the exact value; the bound above is the
-            // only assertable part.
-            Some(_) => {}
-            None => assert_eq!(effective, doubled, "no rmem_max cap is readable"),
+            // The buffer may be capped below the request, or `/proc` may be
+            // unreadable and the cap unknown; the bound above is the only
+            // assertable part.
+            _ => {}
         }
 
         let error = set_udp_recv_buffer(socket.as_raw_fd(), 0).unwrap_err();

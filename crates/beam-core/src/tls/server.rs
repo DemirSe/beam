@@ -1877,11 +1877,14 @@ fn dial_attempt_timeout(remaining: Duration, last: bool) -> Duration {
 ///
 /// The options tune the outbound socket, so the connection continues. A
 /// warning per dial would flood the log when the kernel or a sandbox rejects
-/// the option for every destination.
-static DESTINATION_OPTION_WARNED: AtomicBool = AtomicBool::new(false);
+/// the option for every destination. Each option has its own flag, so one
+/// failing option does not demote a different option that fails later.
+static TCP_MAXSEG_WARNED: AtomicBool = AtomicBool::new(false);
+static TCP_NODELAY_WARNED: AtomicBool = AtomicBool::new(false);
+static TCP_KEEPALIVE_WARNED: AtomicBool = AtomicBool::new(false);
 
-fn warn_destination_option_once(error: &io::Error, option: &'static str) {
-    if DESTINATION_OPTION_WARNED.swap(true, Ordering::Relaxed) {
+fn warn_destination_option_once(warned: &AtomicBool, error: &io::Error, option: &'static str) {
+    if warned.swap(true, Ordering::Relaxed) {
         tracing::debug!(%error, option, "could not apply a destination socket option");
     } else {
         tracing::warn!(
@@ -1923,7 +1926,7 @@ async fn dial_addresses(
         // MSS option in the SYN and the local send limit only when it is set
         // while the socket is still unconnected.
         if let Err(error) = beam_sys::set_tcp_maxseg(socket.as_raw_fd(), TARGET_MSS) {
-            warn_destination_option_once(&error, "TCP_MAXSEG");
+            warn_destination_option_once(&TCP_MAXSEG_WARNED, &error, "TCP_MAXSEG");
         }
         match timeout(attempt, socket.connect(address)).await {
             Ok(Ok(stream)) => {
@@ -1931,14 +1934,14 @@ async fn dial_addresses(
                 // for Nagle/delayed-ACK interaction on the outbound socket.
                 // The accepted client socket already sets this in `main`.
                 if let Err(error) = stream.set_nodelay(true) {
-                    warn_destination_option_once(&error, "TCP_NODELAY");
+                    warn_destination_option_once(&TCP_NODELAY_WARNED, &error, "TCP_NODELAY");
                 }
                 if let Err(error) = beam_sys::set_tcp_keepalive(
                     stream.as_raw_fd(),
                     Duration::from_secs(60),
                     Duration::from_secs(15),
                 ) {
-                    warn_destination_option_once(&error, "TCP keepalive");
+                    warn_destination_option_once(&TCP_KEEPALIVE_WARNED, &error, "TCP keepalive");
                 }
                 return Ok(stream);
             }
