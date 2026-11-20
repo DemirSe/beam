@@ -20,7 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -28,6 +28,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
+
+/// Warns once per process that a UDP socket buffer could not be enlarged.
+///
+/// The buffer is tuning, not correctness, so the socket is still used. Warning
+/// on every XUDP session would flood the log when the kernel caps the request,
+/// so later failures drop to debug.
+static UDP_RECV_BUFFER_WARNED: AtomicBool = AtomicBool::new(false);
 
 use super::session::{
     ActiveSession, DEFAULT_STREAM_REPLY_BUDGET, ExpiringSession, QueuedFrame, ReplyQueueBudget,
@@ -1617,11 +1624,19 @@ impl MuxState {
                             socket.as_raw_fd(),
                             self.config.udp_recv_buffer,
                         ) {
-                            tracing::debug!(
-                                session_id = id,
-                                %error,
-                                "could not enlarge the XUDP socket receive buffer"
-                            );
+                            if UDP_RECV_BUFFER_WARNED.swap(true, Ordering::Relaxed) {
+                                tracing::debug!(
+                                    session_id = id,
+                                    %error,
+                                    "could not enlarge the XUDP socket receive buffer"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    session_id = id,
+                                    %error,
+                                    "could not enlarge the XUDP socket receive buffer; UDP burst tolerance is degraded"
+                                );
+                            }
                         }
                         Arc::new(socket)
                     }
