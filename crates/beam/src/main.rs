@@ -337,6 +337,7 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
                     legacy_udp_limited = pressure.8.saturating_sub(last_pressure.8),
                     replay_rejected = pressure.9.saturating_sub(last_pressure.9),
                     replay_cache_full = pressure.10.saturating_sub(last_pressure.10),
+                    xudp_resolution_rejected = pressure.11.saturating_sub(last_pressure.11),
                     xudp_high_water = xudp.high_water,
                     preauth_active,
                     authenticated_active,
@@ -714,7 +715,7 @@ fn warn_socket_option_once(
 /// Counters that indicate dropped or rejected traffic, in log order.
 fn pressure_counters(
     snapshot: &beam_core::metrics::MetricsSnapshot,
-) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     (
         snapshot.preauth_rejected,
         snapshot.cover_limited,
@@ -727,6 +728,7 @@ fn pressure_counters(
         snapshot.legacy_udp_limited,
         snapshot.replay_rejected,
         snapshot.replay_cache_full,
+        snapshot.xudp_resolution_rejected,
     )
 }
 
@@ -1156,5 +1158,14 @@ mod tests {
         let counters = pressure_counters(&snapshot);
         assert_eq!((counters.5, counters.6, counters.7), (1, 2, 3));
         assert_eq!(counters.8, 4);
+    }
+
+    #[test]
+    fn pressure_counters_includes_resolution_rejections() {
+        let snapshot = beam_core::metrics::MetricsSnapshot {
+            xudp_resolution_rejected: 3,
+            ..Default::default()
+        };
+        assert_eq!(pressure_counters(&snapshot).11, 3);
     }
 }
