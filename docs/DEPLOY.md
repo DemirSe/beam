@@ -66,7 +66,8 @@ Each script has a fixed boundary. Read it before you assume a step is done.
 ## Operations
 
 Set `SSH_KEY` and `SERVER` in the shell before using the examples below.
-`SSH_PORT` defaults to 22 when it is unset. For a
+`SSH_PORT` defaults to 22 when it is unset. The verifier uses it for both the
+connection and the expected sshd port. For a
 first-time host, install AlmaLinux 10 or Debian 13 with key-only access for
 your own account and passwordless sudo; test the `deploy/` nftables/SSH/resolver
 files before enabling them, keeping the provider console available. The

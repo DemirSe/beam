@@ -22,7 +22,8 @@ SSH=(ssh -4 -p "$SSH_PORT" -i "$SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes 
 remote() { "${SSH[@]}" "$@"; }
 
 echo "=== beam production verification ==="
-remote 'set -u
+# SSH does not forward SSH_PORT to the remote shell by default.
+remote "SSH_PORT=$(printf '%q' "$SSH_PORT"); "'set -u
 fail=0
 unverified=0
 READ_VALUE=""

@@ -599,5 +599,47 @@ class VerifierFirewallTest(unittest.TestCase):
         self.assertIn('[ "$firewalld" = "active" ]', text)
 
 
+class VerifierSshPortTest(unittest.TestCase):
+    """SSH must receive the expected port even without environment forwarding."""
+
+    def test_port_is_available_before_remote_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            # Stop before any host check. Ignore assignments until the remote
+            # command starts, then observe its environment rather than its text.
+            guard = base / "guard.sh"
+            guard.write_text("""trap '
+case "$BASH_COMMAND" in *=*) ;; *)
+    printf "%s" "${SSH_PORT-UNSET}" > "$REMOTE_PORT_RESULT"
+    exit 73 ;;
+esac' DEBUG
+""")
+            ssh = base / "ssh"
+            ssh.write_text("""#!/usr/bin/env bash
+exec env -u SSH_PORT BASH_ENV="$REMOTE_GUARD" bash -c "${!#}"
+""")
+            ssh.chmod(0o755)
+            for port in (None, "2222"):
+                with self.subTest(port=port):
+                    result_file = base / "remote-port"
+                    result_file.unlink(missing_ok=True)
+                    env = dict(os.environ)
+                    env.pop("SSH_PORT", None)
+                    env.pop("BASH_ENV", None)
+                    env.update(PATH=f"{base}{os.pathsep}{env.get('PATH', '')}",
+                               SSH_KEY="synthetic-key", SERVER="test.invalid",
+                               REMOTE_PORT_RESULT=str(result_file))
+                    if port is not None:
+                        env["SSH_PORT"] = port
+                    # Only the simulated remote shell uses this guard.
+                    env["REMOTE_GUARD"] = str(guard)
+                    proc = subprocess.run(
+                        ["bash", str(DEPLOY / "verify-production.sh")],
+                        env=env, capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(proc.returncode, 73, proc.stdout + proc.stderr)
+                    self.assertEqual(result_file.read_text(), port or "22")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
