@@ -427,7 +427,10 @@ VLESS with `xtls-rprx-vision` is expected to work.
 - Domain `New`/`Keep` frames are queued per session id while a bounded
   per-mux resolver performs DNS; the lookup owner and suffix are tracked
   separately, results carry a generation, and a newer GlobalID cancels older
-  pending New frames. IP frames, queued suffixes, and rejected replies retain
+  pending New frames. In-flight lookups are coalesced by domain, port, and
+  family, so concurrent sessions for one uncached destination share a single
+  lookup, its waiters are served in arrival order, and its result is cached
+  even when every waiter was superseded. IP frames, queued suffixes, and rejected replies retain
   their ordering. Resolved domains are cached for 300 seconds. A mux runs at
   most four concurrent lookups; the resolver permit is held until the result
   is queued, so a full result channel backpressures the request queue instead

@@ -733,16 +733,37 @@ re-enters Pending.
 **Bounds** (`xudp/server.rs:63,94,97,100,103`): 4 concurrent lookups per mux,
 64 concurrently pending resolutions, up to 64 queued frames per destination
 still resolving, and a 256-entry per-mux cache with a 300 s TTL that clears
-instead of evicting. `next_generation` wraps (`328-329`); a stale match after
-wrap is theoretical. Observability is debug-only: no counter for stale,
-cancelled, or queue-full.
+instead of evicting. `next_generation` wraps; a stale match after wrap is
+theoretical.
+
+**Coalesced lookups.** In-flight work is keyed by the cache key (domain, port,
+requested family), so every session waiting for the same uncached destination
+shares one lookup and one generation. The result is inserted into the cache
+before the waiters run, even when every waiter was superseded, so a cancelled
+lookup is not repeated by the replacement attachment. The generation check still
+decides which pending entry a result belongs to, and the waiters run in arrival
+order, so a shared answer cannot reorder two attachments that name the same
+destination (`coalesced_waiters_keep_their_arrival_order`).
+
+**Observability.** `xudp_new_failed` counts `New` frames that failed before a
+session existed (non-UDP target, missing destination, failed resolution,
+conflicting GlobalID, socket bind). With `xudp_admitted_{fresh,reattach}` and
+`xudp_rejected_{per_stream,global}` it accounts for every `xudp_new_frames`
+count. `xudp_resolution_rejected` counts frames dropped by the pending-resolution
+table or request-queue bounds. `New` frames that never reach the session handler
+(a resolver admission drop, or a superseded pending frame) are outside that
+identity and are documented per path.
 
 **Tests.** `resolver_churn_stays_bounded` (2053),
 `slow_domain_does_not_block_an_unrelated_session` (3122),
 `stale_resolution_does_not_consume_same_id_replacement` (3226),
 `canceled_lookup_owner_does_not_reject_the_suffix` (3336),
 `newer_global_id_attachment_supersedes_pending_domain_new` (3400),
-`rejected_replacement_new_does_not_supersede_a_pending_new`.
+`rejected_replacement_new_does_not_supersede_a_pending_new`,
+`concurrent_sessions_share_one_domain_lookup`,
+`a_superseded_lookup_still_populates_the_cache`,
+`new_failures_are_counted_and_account_for_every_new_frame`,
+`a_full_pending_resolution_table_is_counted`.
 
 **Superseded attachment frames.** When a later acceptable `New` supersedes the
 pending owner and no session owns the id, the frames queued before that `New`

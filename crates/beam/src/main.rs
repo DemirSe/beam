@@ -365,6 +365,8 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
                     splice_fallback = current.splice_fallback,
                     xudp_new_frames = current.xudp_new_frames,
                     xudp_new_global_id = current.xudp_new_global_id,
+                    xudp_new_failed = current.xudp_new_failed,
+                    xudp_resolution_rejected = current.xudp_resolution_rejected,
                     xudp_end_frames = current.xudp_end_frames,
                     xudp_admitted_fresh = current.xudp_admitted_fresh,
                     xudp_admitted_reattach = current.xudp_admitted_reattach,

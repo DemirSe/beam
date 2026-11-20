@@ -570,6 +570,22 @@ pub(crate) enum ResolveError {
     FamilyMismatch,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Name lookups started on this test thread.
+    ///
+    /// Coalescing is observable only through the work it saves, so the mux
+    /// tests count lookups instead of timing them. The mux tests use the
+    /// current-thread runtime, which keeps its tasks on the test thread.
+    static TEST_RESOLVE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns how many name lookups this test thread has started.
+#[cfg(test)]
+pub(super) fn test_resolve_calls() -> u64 {
+    TEST_RESOLVE_CALLS.with(std::cell::Cell::get)
+}
+
 /// Resolves `destination` to a single socket address.
 ///
 /// `family` is `None` for a `New` frame, where the socket family is chosen by
@@ -602,6 +618,8 @@ pub(crate) async fn resolve_destination(
             Ok(resolved)
         }
         Address::Domain(domain) => {
+            #[cfg(test)]
+            TEST_RESOLVE_CALLS.with(|calls| calls.set(calls.get() + 1));
             #[cfg(test)]
             if domain == "slow.test" {
                 // Deterministic slow-failure fixture for the mux HOL tests.

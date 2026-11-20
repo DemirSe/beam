@@ -24,6 +24,8 @@ pub struct Metrics {
     splice_fallback: AtomicU64,
     xudp_new_frames: AtomicU64,
     xudp_new_global_id: AtomicU64,
+    xudp_new_failed: AtomicU64,
+    xudp_resolution_rejected: AtomicU64,
     xudp_end_frames: AtomicU64,
     xudp_admitted_fresh: AtomicU64,
     xudp_admitted_reattach: AtomicU64,
@@ -75,6 +77,15 @@ pub struct MetricsSnapshot {
     pub xudp_new_frames: u64,
     /// XUDP `New` frames carrying a nonzero GlobalID.
     pub xudp_new_global_id: u64,
+    /// XUDP `New` frames handled without creating a session for a reason other
+    /// than a session limit: non-UDP target, missing destination, failed
+    /// resolution, conflicting GlobalID, or a socket bind failure. Together
+    /// with the admitted and rejected counters it accounts for every
+    /// `xudp_new_frames` count.
+    pub xudp_new_failed: u64,
+    /// XUDP frames dropped because the pending-resolution table or its request
+    /// queue was full. A dropped `New` is answered with an error `End`.
+    pub xudp_resolution_rejected: u64,
     /// XUDP `End` frames observed.
     pub xudp_end_frames: u64,
     /// Fresh XUDP sessions inserted into an active table.
@@ -182,6 +193,17 @@ impl Metrics {
         }
     }
 
+    /// Counts one XUDP `New` frame that failed before a session existed.
+    pub fn record_xudp_new_failed(&self) {
+        self.xudp_new_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one frame dropped by the pending-resolution admission bounds.
+    pub fn record_xudp_resolution_rejected(&self) {
+        self.xudp_resolution_rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Counts one XUDP `End` frame.
     pub fn record_xudp_end(&self) {
         self.xudp_end_frames.fetch_add(1, Ordering::Relaxed);
@@ -260,6 +282,8 @@ impl Metrics {
             splice_fallback: self.splice_fallback.load(Ordering::Relaxed),
             xudp_new_frames: self.xudp_new_frames.load(Ordering::Relaxed),
             xudp_new_global_id: self.xudp_new_global_id.load(Ordering::Relaxed),
+            xudp_new_failed: self.xudp_new_failed.load(Ordering::Relaxed),
+            xudp_resolution_rejected: self.xudp_resolution_rejected.load(Ordering::Relaxed),
             xudp_end_frames: self.xudp_end_frames.load(Ordering::Relaxed),
             xudp_admitted_fresh: self.xudp_admitted_fresh.load(Ordering::Relaxed),
             xudp_admitted_reattach: self.xudp_admitted_reattach.load(Ordering::Relaxed),
@@ -298,6 +322,8 @@ mod tests {
         metrics.record_replay_cache_full();
         metrics.record_splice_fallback();
         metrics.record_xudp_new(true);
+        metrics.record_xudp_new_failed();
+        metrics.record_xudp_resolution_rejected();
         metrics.record_xudp_end();
         metrics.record_xudp_admitted_fresh();
         metrics.record_xudp_admitted_reattach();
@@ -325,6 +351,8 @@ mod tests {
         assert_eq!(snapshot.splice_fallback, 1);
         assert_eq!(snapshot.xudp_new_frames, 1);
         assert_eq!(snapshot.xudp_new_global_id, 1);
+        assert_eq!(snapshot.xudp_new_failed, 1);
+        assert_eq!(snapshot.xudp_resolution_rejected, 1);
         assert_eq!(snapshot.xudp_end_frames, 1);
         assert_eq!(snapshot.xudp_admitted_fresh, 1);
         assert_eq!(snapshot.xudp_admitted_reattach, 1);
