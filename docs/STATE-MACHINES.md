@@ -74,40 +74,40 @@ independent variables.
 
 |#|Machine|Kind|Where|Source of truth|
 |---|---|---|---|---|
-|1|Process / listener lifecycle **P1**|implicit|`crates/beam/src/main.rs:76,84,177,286,367,370`|locals in `async_main`, two signal streams, three permit counts|
-|2|Accept backoff|implicit|`main.rs:307-327`|`accept_backoff`|
-|3|Pre-auth + authenticated admission **P1**|mixed|`admission.rs:39-108`, `tls/server.rs:807-862`|`IpLimiter`, `Semaphore`, `Option<IpPermit>` ownership|
-|4|Connection classification|explicit outcome, implicit path|`tls/server.rs:805-862`, `257-273`|`ClientHelloRead`, `Option<(Auth, ReplayReservation)>`, `ConnectionOutcome`|
+|1|Process / listener lifecycle **P1**|implicit|`crates/beam/src/main.rs`|locals in `async_main`, two signal streams, three permit counts|
+|2|Accept backoff|implicit|`main.rs`|`accept_backoff`|
+|3|Pre-auth + authenticated admission **P1**|mixed|`admission.rs`, `tls/server.rs`|`IpLimiter`, `Semaphore`, `Option<IpPermit>` ownership|
+|4|Connection classification|explicit outcome, implicit path|`tls/server.rs`|`ClientHelloRead`, `Option<(Auth, ReplayReservation)>`, `ConnectionOutcome`|
 |5|REALITY replay cache **P1**|explicit|`tls/server.rs` replay section|`ReplayPhase` + `states` + `deadlines`|
-|6|TLS record stream + raw handoff **P1**|implicit|`tls/stream.rs:180-260,490-530`|`read_raw`, `write_raw`, `record`, `pending`, `plaintext`, `outgoing`, `pending_write`, `closed`|
-|7|Cover relay|implicit|`tls/server.rs:1716-1965,2021-2071`|cover permit + first-half-close `select!`|
-|8|Authenticated request pipeline|explicit command, implicit phases|`tls/server.rs:1253-1410`|absolute deadline + `match request.command`|
-|9|Vision TLS detector|implicit|`vision/state.rs:72-257`|`filter_budget`, `is_tls`, `is_tls12_or_above`, `enable_xtls`, `pending_server_hello`|
-|10|Vision writer|implicit|`vision/state.rs:454-660`|`first_block`, `padding_enabled`, `VisionWritePlan` flags|
-|11|Vision reader|**explicit**|`vision/state.rs:665-780`|`VisionReaderMode::{Framed,Ended,Direct}`|
-|12|Vision Direct handoff **P1**|implicit|`vision/stream.rs:56-82,178-260,351-410,433-560,626-808`|4 booleans + 3 watch channels + 5 buffers|
-|13|Relay direction / activity **P1**|implicit|`relay/splice_copy.rs:228-275,440-560,826-832`|`Direction` flags + `RelayActivity`|
-|14|XUDP mux lifecycle **P1**|implicit|`xudp/server.rs:593-697,790-1010`|`empty_since`, task handles, select arms|
-|15|XUDP session lifecycle **P1**|implicit|`xudp/session.rs:841-958`, `xudp/server.rs:1158-1570`|table membership + `closed`/`failed`/`stop` + permit + reply task|
-|16|Retained GlobalID reattachment|implicit|`xudp/session.rs:913-1010`, `xudp/server.rs:1224-1300,1496-1560`|`expiring` map + `expires_at`|
-|17|XUDP resolution generations|implicit|`xudp/server.rs:199-460`|`pending` map + `generation` + owner/suffix|
-|18|Reply/send queue admission|implicit|`xudp/session.rs:106-127,652-720`, `xudp/server.rs:1015-1108,1591-1628`|`SlotGuard` + mpsc capacity + 2 byte semaphores|
-|19|Legacy UDP / packetaddr|implicit|`udp/legacy.rs:259-303,897-990`|split stream + decoder cursor + destination set + idle sleep|
-|20|Config validation / derived budgets|implicit|`config/validate.rs:177-260`, `main.rs:102-105,445-518`|`Raw*` → `Config` → derived configs|
-|21|Client try / DNS helper / Windows supervision|implicit|`clients/linux-tray/tray.c:76-160`, `helper.c:126-280`, `clients/windows-tray/main.c:169-345`|C globals, file presence, process handle|
+|6|TLS record stream + raw handoff **P1**|implicit|`tls/stream.rs`|`read_raw`, `write_raw`, `record`, `pending`, `plaintext`, `outgoing`, `pending_write`, `closed`|
+|7|Cover relay|implicit|`tls/server.rs`|cover permit + first-half-close `select!`|
+|8|Authenticated request pipeline|explicit command, implicit phases|`tls/server.rs`|absolute deadline + `match request.command`|
+|9|Vision TLS detector|implicit|`vision/state.rs`|`filter_budget`, `is_tls`, `is_tls12_or_above`, `enable_xtls`, `pending_server_hello`|
+|10|Vision writer|implicit|`vision/state.rs`|`first_block`, `padding_enabled`, `VisionWritePlan` flags|
+|11|Vision reader|**explicit**|`vision/state.rs`|`VisionReaderMode::{Framed,Ended,Direct}`|
+|12|Vision Direct handoff **P1**|implicit|`vision/stream.rs`|4 booleans + 3 watch channels + 5 buffers|
+|13|Relay direction / activity **P1**|implicit|`relay/splice_copy.rs`|`Direction` flags + `RelayActivity`|
+|14|XUDP mux lifecycle **P1**|implicit|`xudp/server.rs`|`empty_since`, task handles, select arms|
+|15|XUDP session lifecycle **P1**|implicit|`xudp/session.rs`, `xudp/server.rs`|table membership + `closed`/`failed`/`stop` + permit + reply task|
+|16|Retained GlobalID reattachment|implicit|`xudp/session.rs`, `xudp/server.rs`|`expiring` map + `expires_at`|
+|17|XUDP resolution generations|implicit|`xudp/server.rs`|`pending` map + `generation` + owner/suffix|
+|18|Reply/send queue admission|implicit|`xudp/session.rs`, `xudp/server.rs`|`SlotGuard` + mpsc capacity + 2 byte semaphores|
+|19|Legacy UDP / packetaddr|implicit|`udp/legacy.rs`|split stream + decoder cursor + destination set + idle sleep|
+|20|Config validation / derived budgets|implicit|`config/validate.rs`, `main.rs`|`Raw*` → `Config` → derived configs|
+|21|Client try / DNS helper / Windows supervision|implicit|`clients/linux-tray/tray.c`, `helper.c`, `clients/windows-tray/main.c`|C globals, file presence, process handle|
 
 Supporting stateful mechanisms (not separate lifecycle machines):
 
 |ID|Mechanism|Where|Why it is stateful|
 |---|---|---|---|
-|S1|ClientHello assembly|`tls/server.rs:865-890,963-1122`|header/body/fast-complete buffers; partial or extra bytes become `Forward`|
-|S2|VLESS request streaming parse|`tls/server.rs:1472-1512`, `vless/header.rs`|fixed header buffer, retry on `is_truncated`, then body handoff|
-|S3|Metrics counters|`metrics.rs:13-43,95-252`|monotonic atomics, snapshot only|
+|S1|ClientHello assembly|`tls/server.rs`|header/body/fast-complete buffers; partial or extra bytes become `Forward`|
+|S2|VLESS request streaming parse|`tls/server.rs`, `vless/header.rs`|fixed header buffer, retry on `is_truncated`, then body handoff|
+|S3|Metrics counters|`metrics.rs`|monotonic atomics, snapshot only|
 |S4|`PrependStream`|`prepend_stream.rs`|prefix cursor before passthrough|
-|S5|`ReplayStream`|`tls/server.rs:726-794`|replays the pre-read prefix, then the socket|
-|S6|`RecordRead`|`tls/stream.rs:686-803`|header/body fill and readiness|
-|S7|`FrameDecoder`|`udp/legacy.rs:924-990`|need-header/need-payload/has-frame cursor|
-|S8|`DestinationTable`|`udp/legacy.rs:897-923`|admit/new/reject set|
+|S5|`ReplayStream`|`tls/server.rs`|replays the pre-read prefix, then the socket|
+|S6|`RecordRead`|`tls/stream.rs`|header/body fill and readiness|
+|S7|`FrameDecoder`|`udp/legacy.rs`|need-header/need-payload/has-frame cursor|
+|S8|`DestinationTable`|`udp/legacy.rs`|admit/new/reject set|
 |S9|`SlotGuard` / `ReplyQueueBudget`|`xudp/session.rs:106-127,652-720`|counted permits with RAII release|
 |S10|`RelayStopGuard`|`tls/server.rs:2129-2155`|armed/disarmed sibling-stop guard|
 |S11|`IpPermit`|`admission.rs:92-108`|held/released per-IP + global permit|
@@ -578,13 +578,11 @@ unconditionally before returning; the behaviour is correct because `try_join!`
 drops the still-armed sibling on the first error, and that drop calls `stop()`.
 The comment now states that, instead of describing only the success path.
 
-**Tests.** `copies_large_payload_in_both_directions` (941),
-`one_way_copies_and_half_closes` (985),
-`an_idle_relay_polls_within_the_stop_bound` (1056),
-`a_failed_wakeup_still_bounds_a_blocked_relay`,
-`half_close_keeps_the_other_direction_alive` (1153),
-`idle_timeout_returns_timed_out` (1245),
-`shutdown_timeout_bounds_a_half_closed_idle_connection` (1269),
+**Tests.** `one_way_relays_over_tcp_loopback`, `one_way_copies_and_half_closes`,
+`bidirectional_relay_keeps_a_one_way_transfer_alive` (in `tls/server.rs`),
+`an_idle_relay_polls_within_the_stop_bound`,
+`a_failed_wakeup_still_bounds_a_blocked_relay`, `idle_timeout_returns_timed_out`,
+`one_way_drains_after_a_slow_sink`,
 `a_stalled_sink_reports_the_shutdown_deadline`.
 
 ### 14. XUDP mux lifecycle (P1)
@@ -794,16 +792,18 @@ the whole rejected suffix of a queue, and only the head `New` of a drop is
 answered with an error `End`. `New` frames dropped before dispatch are outside
 that identity and are documented per path.
 
-**Tests.** `resolver_churn_stays_bounded` (2053),
-`slow_domain_does_not_block_an_unrelated_session` (3122),
-`stale_resolution_does_not_consume_same_id_replacement` (3226),
-`canceled_lookup_owner_does_not_reject_the_suffix` (3336),
-`newer_global_id_attachment_supersedes_pending_domain_new` (3400),
+**Tests.** `resolver_churn_stays_bounded`,
+`slow_domain_does_not_block_an_unrelated_session`,
+`stale_resolution_does_not_consume_same_id_replacement`,
+`canceled_lookup_owner_does_not_reject_the_suffix`,
+`newer_global_id_attachment_supersedes_pending_domain_new`,
 `rejected_replacement_new_does_not_supersede_a_pending_new`,
 `concurrent_sessions_share_one_domain_lookup`,
 `a_superseded_lookup_still_populates_the_cache`,
 `new_failures_are_counted_and_account_for_every_new_frame`,
-`a_full_pending_resolution_table_is_counted`.
+`a_full_pending_resolution_table_is_counted`,
+`coalesced_waiters_apply_in_order_when_the_first_is_superseded`,
+`a_frame_the_byte_budget_rejects_is_counted`.
 
 **Fuzz coverage.** `fuzz/fuzz_targets/xudp.rs` also runs
 `xudp::fuzz_frame_sequence`, which applies a bounded New/Keep/End/KeepAlive
