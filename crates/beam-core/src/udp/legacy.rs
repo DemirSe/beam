@@ -1125,6 +1125,8 @@ mod tests {
         UdpError, handle_packetaddr_bound, handle_udp_stream, parse_packetaddr,
     };
     use crate::address::{Address, NetLocation};
+    use crate::tls::stream::TlsStream;
+    use crate::tls::test_support::{test_client_config, test_server_config};
     use proptest::prelude::*;
     use std::io::{self, ErrorKind};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -1133,9 +1135,10 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-    use tokio::net::UdpSocket;
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
+    use tokio_rustls::TlsConnector;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1315,6 +1318,54 @@ mod tests {
             "an idle close must shut the stream down"
         );
         drop(client);
+    }
+
+    /// Drives the idle close through a real TLS writer and reads the client
+    /// side with rustls, so a clean EOF proves that a `close_notify` record
+    /// reached the wire and not only that `shutdown` was called.
+    async fn assert_idle_close_sends_close_notify(destination: NetLocation) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let mut config = test_config(MAX_DATAGRAM_SIZE);
+        config.idle_timeout = Duration::from_millis(100);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let connection =
+                rustls::ServerConnection::new(test_server_config()).expect("server connection");
+            let stream = TlsStream::accept(socket, connection, Vec::new())
+                .await
+                .expect("server handshake");
+            handle_udp_stream(stream, destination, &config).await
+        });
+
+        let socket = TcpStream::connect(address).await.expect("client connect");
+        let connector = TlsConnector::from(test_client_config());
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut client = connector
+            .connect(name, socket)
+            .await
+            .expect("client handshake");
+        let mut end = [0u8; 1];
+        let count = timeout(TEST_TIMEOUT, client.read(&mut end))
+            .await
+            .expect("the idle close must not hang")
+            .expect("an idle close must send close_notify before the TCP close");
+        assert_eq!(count, 0, "close_notify is a clean EOF");
+
+        let result = timeout(TEST_TIMEOUT, server)
+            .await
+            .expect("legacy idle timeout did not fire")
+            .expect("legacy handler panicked");
+        assert!(matches!(result, Ok(UdpClose::Idle)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn an_idle_close_sends_close_notify_on_the_wire() {
+        let fixed = net_location(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
+        assert_idle_close_sends_close_notify(fixed).await;
+        assert_idle_close_sends_close_notify(packetaddr_destination()).await;
     }
 
     #[tokio::test]

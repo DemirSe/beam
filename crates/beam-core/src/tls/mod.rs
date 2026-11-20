@@ -8,6 +8,9 @@ pub mod client_hello;
 pub mod server;
 pub mod stream;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use client_hello::{
     Alpn, AlpnIter, ClientHello, ClientHelloError, Extension, ExtensionIter, KeyShareEntry,
     KeyShareGroups, KeyShares, MAX_ALPN_PROTOCOLS, MAX_CIPHER_SUITES, MAX_CLIENT_HELLO_LEN,

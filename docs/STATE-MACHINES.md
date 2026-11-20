@@ -416,13 +416,14 @@ bidirectional relay → first half-close → return. The permit is held for the
 whole relay. `relay_cover_bidirectional` selects over both copy directions, so
 either side finishing ends the relay (`1673-1713`).
 
-**Illegal / edge.** A relay direction that ends at its inactivity deadline is
-an idle close, not a failure: `cover_outcome` maps it to
-`ConnectionOutcome::IdleClosed { path: "cover" }`, while a half-close maps to
-`CoverForwarded` and any other error keeps its stage. Dial or ClientHello write
-failure closes the probe; no TLS
-alert is ever synthesized. A full cover limiter closes immediately
-(`CoverLimited`), never queues.
+**Illegal / edge.** A relay read that ends at its inactivity deadline is an idle
+close, not a failure: `cover_outcome` maps only the `relay read` timeout to
+`ConnectionOutcome::IdleClosed { path: "cover" }`. A write or shutdown timeout
+keeps its stage, because the peer stopped reading mid-record and the probe was
+truncated. A half-close maps to `CoverForwarded` and any other error keeps its
+stage. Dial or ClientHello write failure closes the probe; no TLS alert is ever
+synthesized. A full cover limiter closes immediately (`CoverLimited`), never
+queues.
 
 **Tests.** `cover_relays_with_async_copy` (2680),
 `cover_relay_ends_when_the_probe_half_closes` (2729),
@@ -556,7 +557,10 @@ shutdown_sent` (`relay/splice_copy.rs:272-274`); `maybe_shutdown` sends
 every poll of a shared clock is capped at 250 ms, so a wakeup that the bounded
 eventfd retries gave up on still ends a blocked worker within that bound
 (`440-560`). The cap costs four wakeups per second while a direction is
-blocked; a hosted benchmark comparison of this relay path is pending.
+blocked; a hosted benchmark comparison of this relay path is pending. A
+direction that ends at its shutdown deadline returns an error, so
+`try_join!` drops the sibling: an upload that stalls at the deadline
+truncates a download that was still working for that connection.
 
 **Why implicit.** Flags plus one derived predicate; the idle/shutdown timeout
 decision depends on `shutdown_started` and `direction.read_done` together.

@@ -2051,13 +2051,16 @@ where
 
 /// Classifies one finished cover direction.
 ///
-/// A half-close ends the relay normally. A direction that only stopped because
-/// its inactivity deadline elapsed is an idle close, not a failure; any other
-/// error keeps its stage for the connection log.
+/// A half-close ends the relay normally. A read that only stopped because the
+/// inactivity deadline elapsed is an idle close, not a failure. Any other
+/// error keeps its stage for the connection log: a write or shutdown timeout
+/// means the peer stopped reading mid-record, so the probe was truncated.
 fn cover_outcome(result: Result<u64, TlsServerError>) -> Result<ConnectionOutcome, TlsServerError> {
     match result {
         Ok(_) => Ok(ConnectionOutcome::CoverForwarded),
-        Err(TlsServerError::Timeout { .. }) => Ok(ConnectionOutcome::IdleClosed { path: "cover" }),
+        Err(TlsServerError::Timeout {
+            stage: "relay read",
+        }) => Ok(ConnectionOutcome::IdleClosed { path: "cover" }),
         Err(error) => Err(error),
     }
 }
@@ -3406,6 +3409,53 @@ mod tests {
         .await
         .expect("an idle cover relay is not a failure");
         assert_eq!(outcome, ConnectionOutcome::IdleClosed { path: "cover" });
+    }
+
+    #[test]
+    fn a_cover_read_timeout_is_an_idle_close() {
+        let outcome = cover_outcome(Err(TlsServerError::Timeout {
+            stage: "relay read",
+        }))
+        .expect("a read timeout is an idle close");
+        assert_eq!(outcome, ConnectionOutcome::IdleClosed { path: "cover" });
+    }
+
+    #[test]
+    fn a_cover_write_timeout_keeps_its_stage() {
+        // The sink stopped accepting for the whole idle window: the probe was
+        // truncated, so this is not a normal idle close.
+        let error = cover_outcome(Err(TlsServerError::Timeout {
+            stage: "relay write",
+        }))
+        .expect_err("a write timeout is not an idle close");
+        assert!(
+            matches!(
+                error,
+                TlsServerError::Timeout {
+                    stage: "relay write"
+                }
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_cover_shutdown_timeout_keeps_its_stage() {
+        // The final record could not be flushed: the probe was truncated, so
+        // this is not a normal idle close.
+        let error = cover_outcome(Err(TlsServerError::Timeout {
+            stage: "relay shutdown",
+        }))
+        .expect_err("a shutdown timeout is not an idle close");
+        assert!(
+            matches!(
+                error,
+                TlsServerError::Timeout {
+                    stage: "relay shutdown"
+                }
+            ),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
