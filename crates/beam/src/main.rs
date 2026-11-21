@@ -12,7 +12,7 @@ mod generate;
 use anyhow::Context;
 use beam_core::address::{Address, NetLocation};
 use beam_core::admission::IpLimiter;
-use beam_core::config::{Config, LogLevel};
+use beam_core::config::{Config, LogLevel, format_path};
 use beam_core::tls::{
     MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN, TlsServerConfig, handle_connection_admitted,
 };
@@ -61,6 +61,40 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BEAM_GIT_HA
 /// public test data; the warning prints field names only.
 const SAMPLE_PRIVATE_KEY: [u8; 32] = [0x5a; 32];
 const SAMPLE_SHORT_ID: &str = "0123456789abcdef";
+
+/// Fallback soft pipe-page limit used when `/proc/sys/fs/pipe-user-pages-soft`
+/// cannot be read or parsed.
+const DEFAULT_PIPE_USER_PAGES_SOFT: u64 = 16_384;
+
+/// Fallback page size used when `sysconf(_SC_PAGESIZE)` fails.
+const DEFAULT_PAGE_SIZE: u64 = 4096;
+
+/// Computes the effective pre-auth slot count and per-IP pre-auth cap shared
+/// between `--check` and server startup.
+fn preauth_limits(max_connections: u32, configured_max_preauth_per_ip: u32) -> (usize, u32) {
+    let max_pending_handshakes = (max_connections as usize).clamp(16, 256);
+    let effective_max_preauth_per_ip =
+        configured_max_preauth_per_ip.min(max_pending_handshakes as u32);
+    (max_pending_handshakes, effective_max_preauth_per_ip)
+}
+
+/// Resolves the soft pipe-page limit and identifies whether it came from
+/// sysctl or the fallback default.
+fn resolve_pipe_pages_soft(measured: Option<u64>) -> (u64, &'static str) {
+    match measured {
+        Some(pages) => (pages, "sysctl"),
+        None => (DEFAULT_PIPE_USER_PAGES_SOFT, "fallback"),
+    }
+}
+
+/// Resolves the kernel page size and identifies whether it came from sysconf
+/// or the 4 KiB fallback default.
+fn resolve_page_size(measured: Option<u64>) -> (u64, &'static str) {
+    match measured {
+        Some(size) => (size, "sysconf"),
+        None => (DEFAULT_PAGE_SIZE, "fallback"),
+    }
+}
 
 /// Bounds the exact-replay cache for the configured connection pool.
 ///
@@ -177,8 +211,9 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
             tracing::warn!("SIGHUP ignored; restart the service to reload configuration");
         }
     });
+    let config_path = format_path(&cli.config);
     let config = Config::from_path(&cli.config)
-        .with_context(|| format!("failed to load `{}`", cli.config.display()))?;
+        .with_context(|| format!("failed to load `{config_path}`"))?;
 
     init_logging(config.log.level);
     // The service unit owns the runtime limit (64K). A user-shell `--check`
@@ -188,7 +223,7 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
     let validation_fd_limit = validation_fd_limit(beam_sys::open_file_limit());
     config
         .validate_fd_budget(validation_fd_limit)
-        .context("file descriptor budget")?;
+        .with_context(|| format!("file descriptor budget for `{config_path}`"))?;
     if let Ok(raw) = std::env::var("BEAM_MAX_BLOCKING_THREADS") {
         let valid = raw
             .parse::<usize>()
@@ -208,44 +243,79 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
     // identity silently.
     warn_if_sample_identity(&config);
 
+    let max_connections = config.limits.max_connections as usize;
+    // Pre-auth slots bound ClientHello reads, not data-path relays. Keep this
+    // small enough that a scanner flood cannot pin every permit, but large
+    // enough for a browser's parallel connection burst.
+    let (max_pending_handshakes, max_preauth_per_ip) = preauth_limits(
+        config.limits.max_connections,
+        config.limits.max_preauth_per_ip,
+    );
+    if config.limits.max_preauth_per_ip != max_preauth_per_ip {
+        tracing::warn!(
+            configured = config.limits.max_preauth_per_ip,
+            effective = max_preauth_per_ip,
+            max_pending_handshakes,
+            "max_preauth_per_ip clamped to the pre-auth slot count"
+        );
+    }
+
     if cli.check {
         // `validate_limits` covers syntax and scalar bounds; constructing the
         // same runtime configuration catches derived failures (XUDP/legacy
         // limits, TLS material) before systemd's ExecStartPre says OK and the
         // real start crash-loops. This performs no bind or network I/O.
-        build_tls_config(&config)?;
+        build_tls_config(&config)
+            .with_context(|| format!("invalid runtime configuration in `{config_path}`"))?;
+        let mut stdout = std::io::stdout().lock();
         writeln!(
-            std::io::stdout().lock(),
-            "configuration is valid: {}",
-            cli.config.display()
+            stdout,
+            "configuration is valid: {config_path} (beam {VERSION}; listener {} not bound)",
+            config.server.listen
         )
         .context("could not write configuration check result")?;
+        if config.limits.max_preauth_per_ip != max_preauth_per_ip {
+            writeln!(
+                stdout,
+                "effective limits.max_preauth_per_ip: {max_preauth_per_ip} \
+                 (configured {}, clamped to {max_pending_handshakes} pre-auth slots)",
+                config.limits.max_preauth_per_ip
+            )
+            .context("could not write configuration check result")?;
+        } else {
+            writeln!(
+                stdout,
+                "effective limits.max_preauth_per_ip: {max_preauth_per_ip} \
+                 (pre-auth slots: {max_pending_handshakes})"
+            )
+            .context("could not write configuration check result")?;
+        }
         return Ok(());
     }
 
-    let max_connections = config.limits.max_connections as usize;
-    // Pre-auth slots bound ClientHello reads, not data-path relays. Keep this
-    // small enough that a scanner flood cannot pin every permit, but large
-    // enough for a browser's parallel connection burst.
-    let max_pending_handshakes = max_connections.clamp(16, 256);
-    let max_preauth_per_ip = config
-        .limits
-        .max_preauth_per_ip
-        .min(max_pending_handshakes as u32);
-    if config.limits.max_preauth_per_ip != max_preauth_per_ip {
-        tracing::warn!(
-            configured = config.limits.max_preauth_per_ip,
-            effective = max_preauth_per_ip,
-            "max_preauth_per_ip clamped to the pre-auth slot count"
-        );
-    }
     let authenticated = Arc::new(Semaphore::new(max_connections));
     let preauth = Arc::new(IpLimiter::new(max_pending_handshakes, max_preauth_per_ip));
     // Leave room in the blocking pool for cover relays, DNS resolution, and
     // destination dials. Vision directions above this cap use the async copy
     // path instead of queueing forever in `spawn_blocking`.
-    let pipe_pages_soft = beam_sys::pipe_user_pages_soft().unwrap_or(16_384);
-    let page_size = beam_sys::page_size();
+    let measured_pipe_pages_soft = beam_sys::pipe_user_pages_soft();
+    let (pipe_pages_soft, soft_pages_source) = resolve_pipe_pages_soft(measured_pipe_pages_soft);
+    if measured_pipe_pages_soft.is_none() {
+        tracing::warn!(
+            soft_pages = pipe_pages_soft,
+            soft_pages_source,
+            "could not read /proc/sys/fs/pipe-user-pages-soft; using fallback pipe page budget"
+        );
+    }
+    let measured_page_size = beam_sys::query_page_size();
+    let (page_size, page_size_source) = resolve_page_size(measured_page_size);
+    if measured_page_size.is_none() {
+        tracing::warn!(
+            page_size,
+            page_size_source,
+            "could not query sysconf(_SC_PAGESIZE); using fallback page size"
+        );
+    }
     let requested_splice_tasks = splice_capacity(max_blocking_threads);
     let supported_splice_tasks =
         beam_core::relay::RelayConfig::supported_splice_tasks(pipe_pages_soft, page_size);
@@ -253,6 +323,9 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
     if max_splice_tasks < requested_splice_tasks {
         tracing::warn!(
             soft_pages = pipe_pages_soft,
+            soft_pages_source,
+            page_size,
+            page_size_source,
             tasks_requested = requested_splice_tasks,
             tasks_used = max_splice_tasks,
             "splice task count clamped by pipe budget"
@@ -263,6 +336,9 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
         beam_core::relay::pipe_size_for_budget(pipe_pages_soft, max_splice_tasks, page_size);
     tracing::info!(
         soft_pages = pipe_pages_soft,
+        soft_pages_source,
+        page_size,
+        page_size_source,
         splice_tasks = max_splice_tasks,
         pipe_size = relay_pipe_size,
         "relay pipe budget"
@@ -272,7 +348,8 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
     )));
 
     let tls_config = Arc::new(
-        build_tls_config(&config)?
+        build_tls_config(&config)
+            .with_context(|| format!("invalid runtime configuration in `{config_path}`"))?
             .with_connection_limiter(Arc::clone(&authenticated))
             .with_splice_limiter(splice_permits)
             .with_relay_pipe_size(relay_pipe_size)
@@ -648,7 +725,7 @@ fn warn_if_config_permissions_are_loose(path: &std::path::Path) {
         return;
     };
     tracing::warn!(
-        path = %path.display(),
+        path = %format_path(path),
         mode = format!("{:03o}", mode & 0o777),
         "config file {reason}; only mode bits are checked, verify the owner and group separately"
     );
@@ -1167,5 +1244,50 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(pressure_counters(&snapshot).11, 3);
+    }
+
+    #[test]
+    fn format_path_preserves_utf8_and_distinguishes_non_utf8_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+
+        assert_eq!(
+            format_path(Path::new("/etc/beam/config.toml")),
+            "/etc/beam/config.toml"
+        );
+        let a = Path::new(OsStr::from_bytes(b"/tmp/beam-\xff.toml"));
+        let b = Path::new(OsStr::from_bytes(b"/tmp/beam-\xfe.toml"));
+        let literal = Path::new("/tmp/beam-\\xff.toml");
+        let controls = Path::new("/tmp/beam-\n\x1b[31m.toml");
+        assert_eq!(format_path(a), "/tmp/beam-\\xff.toml");
+        assert_eq!(format_path(b), "/tmp/beam-\\xfe.toml");
+        assert_eq!(format_path(literal), "/tmp/beam-\\\\xff.toml");
+        assert_eq!(format_path(controls), "/tmp/beam-\\n\\u{1b}[31m.toml");
+        assert_ne!(format_path(a), format_path(b));
+        assert_ne!(format_path(a), format_path(literal));
+    }
+
+    #[test]
+    fn preauth_limits_clamp_per_ip_cap_to_pending_slots() {
+        assert_eq!(preauth_limits(1024, 128), (256, 128));
+        assert_eq!(preauth_limits(1024, 512), (256, 256));
+        assert_eq!(preauth_limits(8, 32), (16, 16));
+        assert_eq!(preauth_limits(64, 100), (64, 64));
+    }
+
+    #[test]
+    fn resolve_pipe_pages_soft_distinguishes_sysctl_from_fallback() {
+        assert_eq!(resolve_pipe_pages_soft(Some(32_768)), (32_768, "sysctl"));
+        assert_eq!(
+            resolve_pipe_pages_soft(None),
+            (DEFAULT_PIPE_USER_PAGES_SOFT, "fallback")
+        );
+    }
+
+    #[test]
+    fn resolve_page_size_distinguishes_sysconf_from_fallback() {
+        assert_eq!(resolve_page_size(Some(65_536)), (65_536, "sysconf"));
+        assert_eq!(resolve_page_size(None), (DEFAULT_PAGE_SIZE, "fallback"));
     }
 }

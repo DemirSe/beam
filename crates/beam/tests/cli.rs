@@ -445,3 +445,144 @@ fn startup_ignores_sighup_and_stays_terminable() {
 
     std::fs::remove_dir_all(&directory).expect("remove signal test directory");
 }
+
+#[test]
+fn check_reports_version_unbound_listener_and_effective_preauth_cap() {
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+
+    let version_out = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .arg("--version")
+        .output()
+        .expect("run --version");
+    assert!(version_out.status.success());
+    let version = String::from_utf8_lossy(&version_out.stdout)
+        .trim()
+        .to_owned();
+
+    // Hold a loopback port open while running `--check` to prove validation
+    // succeeds without binding the configured listener.
+    let occupied = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let listen_addr = occupied.local_addr().unwrap();
+
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml");
+    let base_config = std::fs::read_to_string(example).unwrap().replace(
+        "listen = \"0.0.0.0:443\"",
+        &format!("listen = \"{listen_addr}\""),
+    );
+
+    // Case 1: unclamped default limits still report the effective cap.
+    let unclamped_path =
+        std::env::temp_dir().join(format!("beam-check-unclamped-{}", std::process::id()));
+    std::fs::write(&unclamped_path, &base_config).unwrap();
+    std::fs::set_permissions(&unclamped_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let unclamped = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args(["--check", "--config"])
+        .arg(&unclamped_path)
+        .env("RUST_LOG", "error")
+        .output()
+        .unwrap();
+    std::fs::remove_file(&unclamped_path).unwrap();
+
+    assert!(unclamped.status.success(), "{unclamped:?}");
+    let unclamped_stdout = String::from_utf8_lossy(&unclamped.stdout);
+    assert!(
+        unclamped_stdout.contains(&format!("({version}; listener {listen_addr} not bound)")),
+        "missing version or unbound listener note in stdout: {unclamped_stdout}"
+    );
+    assert!(
+        unclamped_stdout.contains("effective limits.max_preauth_per_ip: 128 (pre-auth slots: 256)"),
+        "missing unclamped effective preauth limit in stdout: {unclamped_stdout}"
+    );
+
+    // Case 2: clamped limits report both effective and configured values.
+    let clamped_config = base_config
+        .replace("max_connections = 1024", "max_connections = 32")
+        .replace("max_preauth_per_ip = 128", "max_preauth_per_ip = 64");
+    let clamped_path =
+        std::env::temp_dir().join(format!("beam-check-clamped-{}", std::process::id()));
+    std::fs::write(&clamped_path, clamped_config).unwrap();
+    std::fs::set_permissions(&clamped_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let clamped = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args(["--check", "--config"])
+        .arg(&clamped_path)
+        .env("RUST_LOG", "error")
+        .output()
+        .unwrap();
+    std::fs::remove_file(&clamped_path).unwrap();
+    drop(occupied);
+
+    assert!(clamped.status.success(), "{clamped:?}");
+    let clamped_stdout = String::from_utf8_lossy(&clamped.stdout);
+    assert!(
+        clamped_stdout.contains(
+            "effective limits.max_preauth_per_ip: 32 (configured 64, clamped to 32 pre-auth slots)"
+        ),
+        "missing clamped preauth limit in stdout: {clamped_stdout}"
+    );
+}
+
+#[test]
+fn check_includes_escaped_config_path_in_fd_budget_errors() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml");
+    let config = std::fs::read_to_string(example)
+        .unwrap()
+        .replace("max_connections = 1024", "max_connections = 60000");
+    let dir = std::env::temp_dir().join(format!("beam-fd-path-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(OsStr::from_bytes(b"bad-\xff.toml"));
+    std::fs::write(&path, config).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Lower the child soft RLIMIT_NOFILE only when the inherited limit exceeds
+    // 4096, and fail explicitly if lowering it fails so the test never silently
+    // falls back to a host-dependent limit (for example 1,048,576).
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            "cur=$(ulimit -Sn); if [ \"$cur\" = unlimited ] || [ \"$cur\" -gt 4096 ]; then ulimit -Sn 4096 || exit 99; fi; exec \"$@\"",
+            "--",
+            env!("CARGO_BIN_EXE_beam"),
+            "--check",
+            "--config",
+        ])
+        .arg(&path)
+        .env("RUST_LOG", "error")
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("file descriptor budget for `") && stderr.contains("bad-\\xff.toml"),
+        "expected escaped config path in FD budget error: {stderr}"
+    );
+
+    // Also check a missing path containing non-UTF-8 and control bytes renders
+    // consistently across both the outer context and inner Read error.
+    let missing = std::env::temp_dir().join(OsStr::from_bytes(b"beam-missing-\xff-\n\x1b.toml"));
+    let missing_out = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args(["--check", "--config"])
+        .arg(&missing)
+        .env("RUST_LOG", "error")
+        .output()
+        .unwrap();
+    assert_eq!(missing_out.status.code(), Some(1), "{missing_out:?}");
+    let missing_stderr = String::from_utf8_lossy(&missing_out.stderr);
+    assert!(
+        missing_stderr.contains("beam-missing-\\xff-\\n\\u{1b}.toml"),
+        "expected escaped missing path: {missing_stderr}"
+    );
+    assert!(
+        !missing_stderr.contains('\u{fffd}') && !missing_stderr.contains('\x1b'),
+        "lossy or raw control char in missing-file error chain: {missing_stderr:?}"
+    );
+}
