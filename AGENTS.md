@@ -93,8 +93,11 @@ also require the relevant fuzz target to run locally.
 - When an authorized task depends on a long-running Actions run, use an
   available background completion notification to resume this thread and
   inspect its result automatically. Avoid repeated model polling or recurring
-  timers. If no such notification is available, say so instead of promising
-  automatic continuation. Continue only within the owner's existing approvals.
+  timers. Suppress intermediate `gh run watch` refresh output by running
+  `gh run watch <id> --exit-status >/dev/null && gh run view <id> || gh run view <id> --log-failed`
+  so only the final summary or failed logs enter context. If no such
+  notification is available, say so instead of promising automatic
+  continuation. Continue only within the owner's existing approvals.
 - Locally, run only the short isolated checks: the three commands in
   "Verification before every commit" and the report contract tests in
   `make test`.
