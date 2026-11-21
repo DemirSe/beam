@@ -210,6 +210,7 @@ python3 tests/deploy/test_liveness_check.py
 python3 tests/release/test_release_artifact.py
 bash tests/deploy/test_beam_install.sh
 bash tests/linux-tray/test_dns_state.sh
+bash tests/windows-tray/test_tray_logic.sh
 ```
 
 Parser changes also require the relevant fuzz target; hot-path changes require

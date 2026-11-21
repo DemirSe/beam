@@ -27,7 +27,7 @@ rm -f beam-tray.exe app-res.o
     -Wall -Wextra -Werror -mwindows \
     -Wl,--gc-sections,--nxcompat,--dynamicbase -static -static-libgcc \
     -o beam-tray.exe main.c app-res.o \
-    -lshell32 -luser32 -ladvapi32
+    -liphlpapi -lws2_32 -lshell32 -luser32 -ladvapi32
 
 rm -f app-res.o
 echo "built: $(pwd)/beam-tray.exe"

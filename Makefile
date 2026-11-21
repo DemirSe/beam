@@ -1,5 +1,9 @@
 SHELL := /usr/bin/env bash
 CACHE_DIR ?= $(HOME)/.cache/beam
+# Keep passing test output compact so local and agent verification loops do not
+# flood context with hundreds of passing test lines. Override with
+# `CARGO_TEST_ARGS=""` for per-test verbose output.
+CARGO_TEST_ARGS ?= -- -q
 
 .PHONY: help doctor check fmt clippy test test-scripts build verify smoke acceptance fuzz-smoke stress soak bench-cache
 
@@ -50,7 +54,7 @@ clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
 test: test-scripts
-	cargo test --workspace
+	cargo test --workspace $(CARGO_TEST_ARGS)
 
 # Rootless script suites. The dev-audit and release workflows run this same
 # target, so the Makefile stays the one list of required checks.
@@ -66,6 +70,7 @@ test-scripts:
 	python3 tests/release/test_release_artifact.py
 	bash tests/deploy/test_beam_install.sh
 	bash tests/linux-tray/test_dns_state.sh
+	bash tests/windows-tray/test_tray_logic.sh
 
 build:
 	cargo build --locked --release
