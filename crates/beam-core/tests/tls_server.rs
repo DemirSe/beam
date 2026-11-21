@@ -1062,3 +1062,66 @@ async fn concurrent_duplicates_test() {
     target_task.await.expect("target task");
     drop(cover);
 }
+
+#[tokio::test]
+async fn legacy_udp_limiter_rejects_when_pool_is_exhausted() {
+    timeout(Duration::from_secs(10), legacy_udp_limiter_rejection_test())
+        .await
+        .expect("legacy UDP limiter test timed out");
+}
+
+async fn legacy_udp_limiter_rejection_test() {
+    let capture = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("capture listener");
+    let probe = RealityProbe::capture(&capture, 9).await;
+
+    let cover = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("cover listener");
+    let cover_port = cover.local_addr().expect("cover address").port();
+    let config = Arc::new(
+        reality_server_config(cover_port)
+            .with_legacy_udp_limiter(Arc::new(tokio::sync::Semaphore::new(1))),
+    );
+    let _held = config
+        .legacy_udp_limiter()
+        .try_acquire_owned()
+        .expect("initial legacy UDP permit");
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("beam listener");
+    let address = listener.local_addr().expect("beam address");
+
+    let mut client = RealityClient::connect(address, probe.client_config(11))
+        .await
+        .expect("client connect");
+    let (server_stream, _) = listener.accept().await.expect("server accept");
+    let server = tokio::spawn(handle_connection(server_stream, Arc::clone(&config)));
+
+    client
+        .finish_handshake()
+        .await
+        .expect("REALITY handshake must authenticate");
+    let mut udp_request = vec![0u8];
+    udp_request.extend_from_slice(&[0x22; 16]);
+    udp_request.push(0);
+    udp_request.push(Command::Udp.as_u8());
+    udp_request.extend_from_slice(&53_u16.to_be_bytes());
+    udp_request.push(1);
+    udp_request.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
+    client.send(&udp_request).await.expect("VLESS UDP request");
+
+    let outcome = timeout(Duration::from_secs(5), server)
+        .await
+        .expect("handler did not finish")
+        .expect("handler task");
+    assert!(
+        matches!(outcome, Err(TlsServerError::LegacyUdpLimited)),
+        "exhausted legacy UDP pool must reject with LegacyUdpLimited: {outcome:?}"
+    );
+    assert_eq!(config.metrics().snapshot().legacy_udp_limited, 1);
+    drop(client);
+    drop(cover);
+}

@@ -343,17 +343,12 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
         pipe_size = relay_pipe_size,
         "relay pipe budget"
     );
-    let legacy_udp_permits = Arc::new(Semaphore::new(legacy_udp_stream_limit(
-        config.limits.max_xudp_sessions,
-    )));
-
     let tls_config = Arc::new(
         build_tls_config(&config)
             .with_context(|| format!("invalid runtime configuration in `{config_path}`"))?
             .with_connection_limiter(Arc::clone(&authenticated))
             .with_splice_limiter(splice_permits)
-            .with_relay_pipe_size(relay_pipe_size)
-            .with_legacy_udp_limiter(legacy_udp_permits),
+            .with_relay_pipe_size(relay_pipe_size),
     );
     let listener = bind_listener(config.server.listen, config.limits.listen_backlog)?;
     let metrics = tls_config.metrics();
@@ -385,7 +380,7 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
         let mut last_authenticated_active =
             max_connections.saturating_sub(authenticated_gauge.available_permits());
         let mut last_xudp = xudp_limiter.stats();
-        let mut last_pressure = pressure_counters(&last);
+        let mut last_pressure = PressureCounters::from_snapshot(&last);
         let mut last_replay = replay_config.replay_stats();
         loop {
             ticker.tick().await;
@@ -396,29 +391,15 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
                 max_connections.saturating_sub(authenticated_gauge.available_permits());
             let xudp = xudp_limiter.stats();
             let replay = replay_config.replay_stats();
-            let pressure = pressure_counters(&current);
+            let pressure = PressureCounters::from_snapshot(&current);
             if pressure != last_pressure {
-                // Keep a visible trace at the production `warn` level. The
-                // full counter line is info-only, so without this a DNS burst
-                // could reject traffic without any journal entry an operator
-                // sees by default.
-                tracing::warn!(
-                    preauth_rejected = pressure.0.saturating_sub(last_pressure.0),
-                    cover_limited = pressure.1.saturating_sub(last_pressure.1),
-                    connection_limited = pressure.2.saturating_sub(last_pressure.2),
-                    xudp_rejected_per_stream = pressure.3.saturating_sub(last_pressure.3),
-                    xudp_rejected_global = pressure.4.saturating_sub(last_pressure.4),
-                    xudp_end_dropped = pressure.5.saturating_sub(last_pressure.5),
-                    xudp_replies_dropped = pressure.6.saturating_sub(last_pressure.6),
-                    xudp_send_dropped = pressure.7.saturating_sub(last_pressure.7),
-                    legacy_udp_limited = pressure.8.saturating_sub(last_pressure.8),
-                    replay_rejected = pressure.9.saturating_sub(last_pressure.9),
-                    replay_cache_full = pressure.10.saturating_sub(last_pressure.10),
-                    xudp_resolution_rejected = pressure.11.saturating_sub(last_pressure.11),
-                    xudp_high_water = xudp.high_water,
+                let delta = pressure.delta(last_pressure);
+                emit_pressure_warning(
+                    delta,
+                    replay,
+                    xudp.high_water,
                     preauth_active,
                     authenticated_active,
-                    "runtime pressure counters increased"
                 );
                 last_pressure = pressure;
             }
@@ -430,7 +411,11 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
             {
                 tracing::info!(
                     preauth_rejected = current.preauth_rejected,
+                    preauth_rejected_global = current.preauth_rejected_global,
+                    preauth_rejected_per_ip = current.preauth_rejected_per_ip,
                     cover_limited = current.cover_limited,
+                    cover_limited_global = current.cover_limited_global,
+                    cover_limited_per_ip = current.cover_limited_per_ip,
                     connection_limited = current.connection_limited,
                     accept_errors = current.accept_errors,
                     accept_errors_resource = current.accept_errors_resource,
@@ -531,7 +516,7 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
         let preauth_permit = match preauth.try_acquire(peer.ip()) {
             Ok(permit) => permit,
             Err(reject) => {
-                metrics.record_preauth_rejection();
+                metrics.record_preauth_rejection(reject);
                 tracing::debug!(%peer, ?reject, "pre-auth handshake limit reached; dropping");
                 drop(stream);
                 tokio::task::yield_now().await;
@@ -789,24 +774,151 @@ fn warn_socket_option_once(
     }
 }
 
-/// Counters that indicate dropped or rejected traffic, in log order.
-fn pressure_counters(
-    snapshot: &beam_core::metrics::MetricsSnapshot,
-) -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
-    (
-        snapshot.preauth_rejected,
-        snapshot.cover_limited,
-        snapshot.connection_limited,
-        snapshot.xudp_rejected_per_stream,
-        snapshot.xudp_rejected_global,
-        snapshot.xudp_end_dropped,
-        snapshot.xudp_replies_dropped,
-        snapshot.xudp_send_dropped,
-        snapshot.legacy_udp_limited,
-        snapshot.replay_rejected,
-        snapshot.replay_cache_full,
-        snapshot.xudp_resolution_rejected,
-    )
+/// Named snapshot of counters surfaced by the periodic warn-level summary.
+///
+/// Using named fields prevents positional transposition between `MetricsSnapshot`
+/// and the `tracing::warn!` fields. `splice_fallback` is tracked alongside
+/// pressure counters so operators see fallback activity at the default `warn`
+/// level, even though not every fallback indicates resource exhaustion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PressureCounters {
+    preauth_rejected: u64,
+    preauth_rejected_global: u64,
+    preauth_rejected_per_ip: u64,
+    cover_limited: u64,
+    cover_limited_global: u64,
+    cover_limited_per_ip: u64,
+    connection_limited: u64,
+    xudp_rejected_per_stream: u64,
+    xudp_rejected_global: u64,
+    xudp_end_dropped: u64,
+    xudp_replies_dropped: u64,
+    xudp_send_dropped: u64,
+    legacy_udp_limited: u64,
+    replay_rejected: u64,
+    replay_cache_full: u64,
+    xudp_resolution_rejected: u64,
+    splice_fallback: u64,
+}
+
+impl PressureCounters {
+    fn from_snapshot(snapshot: &beam_core::metrics::MetricsSnapshot) -> Self {
+        Self {
+            preauth_rejected: snapshot.preauth_rejected,
+            preauth_rejected_global: snapshot.preauth_rejected_global,
+            preauth_rejected_per_ip: snapshot.preauth_rejected_per_ip,
+            cover_limited: snapshot.cover_limited,
+            cover_limited_global: snapshot.cover_limited_global,
+            cover_limited_per_ip: snapshot.cover_limited_per_ip,
+            connection_limited: snapshot.connection_limited,
+            xudp_rejected_per_stream: snapshot.xudp_rejected_per_stream,
+            xudp_rejected_global: snapshot.xudp_rejected_global,
+            xudp_end_dropped: snapshot.xudp_end_dropped,
+            xudp_replies_dropped: snapshot.xudp_replies_dropped,
+            xudp_send_dropped: snapshot.xudp_send_dropped,
+            legacy_udp_limited: snapshot.legacy_udp_limited,
+            replay_rejected: snapshot.replay_rejected,
+            replay_cache_full: snapshot.replay_cache_full,
+            xudp_resolution_rejected: snapshot.xudp_resolution_rejected,
+            splice_fallback: snapshot.splice_fallback,
+        }
+    }
+
+    fn delta(self, previous: Self) -> Self {
+        Self {
+            preauth_rejected: self
+                .preauth_rejected
+                .saturating_sub(previous.preauth_rejected),
+            preauth_rejected_global: self
+                .preauth_rejected_global
+                .saturating_sub(previous.preauth_rejected_global),
+            preauth_rejected_per_ip: self
+                .preauth_rejected_per_ip
+                .saturating_sub(previous.preauth_rejected_per_ip),
+            cover_limited: self.cover_limited.saturating_sub(previous.cover_limited),
+            cover_limited_global: self
+                .cover_limited_global
+                .saturating_sub(previous.cover_limited_global),
+            cover_limited_per_ip: self
+                .cover_limited_per_ip
+                .saturating_sub(previous.cover_limited_per_ip),
+            connection_limited: self
+                .connection_limited
+                .saturating_sub(previous.connection_limited),
+            xudp_rejected_per_stream: self
+                .xudp_rejected_per_stream
+                .saturating_sub(previous.xudp_rejected_per_stream),
+            xudp_rejected_global: self
+                .xudp_rejected_global
+                .saturating_sub(previous.xudp_rejected_global),
+            xudp_end_dropped: self
+                .xudp_end_dropped
+                .saturating_sub(previous.xudp_end_dropped),
+            xudp_replies_dropped: self
+                .xudp_replies_dropped
+                .saturating_sub(previous.xudp_replies_dropped),
+            xudp_send_dropped: self
+                .xudp_send_dropped
+                .saturating_sub(previous.xudp_send_dropped),
+            legacy_udp_limited: self
+                .legacy_udp_limited
+                .saturating_sub(previous.legacy_udp_limited),
+            replay_rejected: self
+                .replay_rejected
+                .saturating_sub(previous.replay_rejected),
+            replay_cache_full: self
+                .replay_cache_full
+                .saturating_sub(previous.replay_cache_full),
+            xudp_resolution_rejected: self
+                .xudp_resolution_rejected
+                .saturating_sub(previous.xudp_resolution_rejected),
+            splice_fallback: self
+                .splice_fallback
+                .saturating_sub(previous.splice_fallback),
+        }
+    }
+}
+
+/// Emits the periodic warn-level summary for counter deltas and gauges.
+///
+/// The full counter line is info-only, so without this a DNS burst, replay
+/// pressure, or splice fallback could happen without any journal entry an
+/// operator sees at the default `warn` level. `splice_fallback` can also occur
+/// when a descriptor cannot be duplicated and does not always mean resource
+/// exhaustion.
+fn emit_pressure_warning(
+    delta: PressureCounters,
+    replay: beam_core::tls::ReplayStats,
+    xudp_high_water: usize,
+    preauth_active: usize,
+    authenticated_active: usize,
+) {
+    tracing::warn!(
+        preauth_rejected = delta.preauth_rejected,
+        preauth_rejected_global = delta.preauth_rejected_global,
+        preauth_rejected_per_ip = delta.preauth_rejected_per_ip,
+        cover_limited = delta.cover_limited,
+        cover_limited_global = delta.cover_limited_global,
+        cover_limited_per_ip = delta.cover_limited_per_ip,
+        connection_limited = delta.connection_limited,
+        xudp_rejected_per_stream = delta.xudp_rejected_per_stream,
+        xudp_rejected_global = delta.xudp_rejected_global,
+        xudp_end_dropped = delta.xudp_end_dropped,
+        xudp_replies_dropped = delta.xudp_replies_dropped,
+        xudp_send_dropped = delta.xudp_send_dropped,
+        legacy_udp_limited = delta.legacy_udp_limited,
+        replay_rejected = delta.replay_rejected,
+        replay_cache_full = delta.replay_cache_full,
+        xudp_resolution_rejected = delta.xudp_resolution_rejected,
+        splice_fallback = delta.splice_fallback,
+        replay_cache_entries_snapshot = replay.entries,
+        replay_in_flight_snapshot = replay.in_flight,
+        replay_capacity = replay.capacity,
+        xudp_high_water,
+        preauth_active,
+        authenticated_active,
+        "runtime pressure counters increased"
+    );
 }
 
 fn bind_listener(address: SocketAddr, backlog: u32) -> anyhow::Result<TcpListener> {
@@ -888,6 +1000,10 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
     .context("failed to build the TLS server configuration")?;
     let metrics = tls.metrics();
 
+    let legacy_udp_permits = Arc::new(Semaphore::new(legacy_udp_stream_limit(
+        config.limits.max_xudp_sessions,
+    )));
+
     Ok(tls
         .with_replay_capacity(replay_capacity(config.limits.max_connections))
         .with_xudp(xudp)
@@ -898,6 +1014,7 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
             .with_metrics(metrics),
         )
         .with_udp(udp)
+        .with_legacy_udp_limiter(legacy_udp_permits)
         .with_relay_idle_timeout(Duration::from_millis(config.limits.idle_timeout_ms)))
 }
 
@@ -1116,13 +1233,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_pool_admits_the_p1_burst_shape() {
+    fn legacy_pool_admits_the_p1_burst_shape_through_production_wiring() {
         // P1 regression: 200 short packetaddr flows (10 sequential plus 190
         // across 16 workers) were refused at 142/200 by the old literal pool
-        // of 64 permits. Every supported UDP budget must admit 200
-        // concurrently held streams.
-        for budget in [256, 1024] {
-            let pool = Arc::new(Semaphore::new(legacy_udp_stream_limit(budget)));
+        // of 64 permits. Exercise `build_tls_config` directly so a missing or
+        // mis-sized legacy UDP limiter wiring fails this test.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.toml");
+        for budget in [256_u32, 1024_u32] {
+            let mut config = Config::from_path(path).expect("the example config must load");
+            config.limits.max_xudp_sessions = budget;
+            let tls = build_tls_config(&config).expect("production TLS config must build");
+            let pool = tls.legacy_udp_limiter();
+            assert_eq!(pool.available_permits(), budget as usize);
+
             let mut held = Vec::with_capacity(200);
             for _ in 0..200 {
                 held.push(
@@ -1131,18 +1254,22 @@ mod tests {
                         .expect("P1 burst must fit"),
                 );
             }
+            assert_eq!(pool.available_permits(), budget as usize - 200);
         }
-        // The pre-fix pool shape refuses the same burst after 64 streams.
-        let old = Arc::new(Semaphore::new(64));
-        let mut held = Vec::new();
-        let mut refused = 0;
-        for _ in 0..200 {
-            match Arc::clone(&old).try_acquire_owned() {
-                Ok(guard) => held.push(guard),
-                Err(_) => refused += 1,
-            }
-        }
-        assert_eq!(refused, 200 - 64);
+
+        // Verify a small configured budget actually caps acquisitions at its exact size.
+        let mut small = Config::from_path(path).expect("the example config must load");
+        small.limits.max_xudp_sessions = 2;
+        let tls = build_tls_config(&small).expect("small budget config must build");
+        let pool = tls.legacy_udp_limiter();
+        let _first = Arc::clone(&pool).try_acquire_owned().expect("first permit");
+        let _second = Arc::clone(&pool)
+            .try_acquire_owned()
+            .expect("second permit");
+        assert!(
+            Arc::clone(&pool).try_acquire_owned().is_err(),
+            "third permit must be rejected at the configured cap"
+        );
     }
 
     #[test]
@@ -1206,44 +1333,141 @@ mod tests {
     }
 
     #[test]
-    fn pressure_counters_includes_replay_rejections() {
-        let snapshot = beam_core::metrics::MetricsSnapshot {
-            replay_rejected: 5,
-            ..Default::default()
-        };
-        assert_eq!(pressure_counters(&snapshot).9, 5);
-    }
+    fn pressure_counters_maps_every_field_and_emits_distinct_warning_labels() {
+        #[derive(Clone, Default)]
+        struct BufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
 
-    #[test]
-    fn pressure_counters_includes_replay_cache_full() {
-        let snapshot = beam_core::metrics::MetricsSnapshot {
-            replay_cache_full: 7,
-            ..Default::default()
-        };
-        assert_eq!(pressure_counters(&snapshot).10, 7);
-    }
+        impl std::io::Write for BufferWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
 
-    #[test]
-    fn pressure_counters_includes_send_drops() {
-        let snapshot = beam_core::metrics::MetricsSnapshot {
-            xudp_end_dropped: 1,
-            xudp_replies_dropped: 2,
-            xudp_send_dropped: 3,
-            legacy_udp_limited: 4,
-            ..Default::default()
-        };
-        let counters = pressure_counters(&snapshot);
-        assert_eq!((counters.5, counters.6, counters.7), (1, 2, 3));
-        assert_eq!(counters.8, 4);
-    }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
 
-    #[test]
-    fn pressure_counters_includes_resolution_rejections() {
-        let snapshot = beam_core::metrics::MetricsSnapshot {
-            xudp_resolution_rejected: 3,
+        let previous = beam_core::metrics::MetricsSnapshot {
+            preauth_rejected: 3,
+            preauth_rejected_global: 1,
+            preauth_rejected_per_ip: 2,
+            cover_limited: 9,
+            cover_limited_global: 4,
+            cover_limited_per_ip: 5,
+            connection_limited: 6,
+            xudp_rejected_per_stream: 7,
+            xudp_rejected_global: 8,
+            xudp_end_dropped: 10,
+            xudp_replies_dropped: 11,
+            xudp_send_dropped: 12,
+            legacy_udp_limited: 13,
+            replay_rejected: 14,
+            replay_cache_full: 15,
+            xudp_resolution_rejected: 16,
+            splice_fallback: 17,
             ..Default::default()
         };
-        assert_eq!(pressure_counters(&snapshot).11, 3);
+        // Give every field a distinct delta (with totals equal to global + per_ip).
+        let current = beam_core::metrics::MetricsSnapshot {
+            preauth_rejected: 3 + 31,
+            preauth_rejected_global: 1 + 11,
+            preauth_rejected_per_ip: 2 + 20,
+            cover_limited: 9 + 43,
+            cover_limited_global: 4 + 19,
+            cover_limited_per_ip: 5 + 24,
+            connection_limited: 6 + 37,
+            xudp_rejected_per_stream: 7 + 41,
+            xudp_rejected_global: 8 + 47,
+            xudp_end_dropped: 10 + 53,
+            xudp_replies_dropped: 11 + 59,
+            xudp_send_dropped: 12 + 61,
+            legacy_udp_limited: 13 + 67,
+            replay_rejected: 14 + 71,
+            replay_cache_full: 15 + 73,
+            xudp_resolution_rejected: 16 + 79,
+            splice_fallback: 17 + 83,
+            ..Default::default()
+        };
+
+        let prev_counters = PressureCounters::from_snapshot(&previous);
+        let cur_counters = PressureCounters::from_snapshot(&current);
+        assert_ne!(cur_counters, prev_counters);
+        let delta = cur_counters.delta(prev_counters);
+        assert_eq!(
+            delta,
+            PressureCounters {
+                preauth_rejected: 31,
+                preauth_rejected_global: 11,
+                preauth_rejected_per_ip: 20,
+                cover_limited: 43,
+                cover_limited_global: 19,
+                cover_limited_per_ip: 24,
+                connection_limited: 37,
+                xudp_rejected_per_stream: 41,
+                xudp_rejected_global: 47,
+                xudp_end_dropped: 53,
+                xudp_replies_dropped: 59,
+                xudp_send_dropped: 61,
+                legacy_udp_limited: 67,
+                replay_rejected: 71,
+                replay_cache_full: 73,
+                xudp_resolution_rejected: 79,
+                splice_fallback: 83,
+            }
+        );
+
+        let buffer = BufferWriter::default();
+        let make_writer = {
+            let buffer = buffer.clone();
+            move || buffer.clone()
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(make_writer)
+            .finish();
+        let replay = beam_core::tls::ReplayStats {
+            entries: 89,
+            in_flight: 97,
+            capacity: 4096,
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            emit_pressure_warning(delta, replay, 101, 103, 107);
+        });
+
+        let rendered = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        for expected in [
+            "runtime pressure counters increased",
+            "preauth_rejected=31",
+            "preauth_rejected_global=11",
+            "preauth_rejected_per_ip=20",
+            "cover_limited=43",
+            "cover_limited_global=19",
+            "cover_limited_per_ip=24",
+            "connection_limited=37",
+            "xudp_rejected_per_stream=41",
+            "xudp_rejected_global=47",
+            "xudp_end_dropped=53",
+            "xudp_replies_dropped=59",
+            "xudp_send_dropped=61",
+            "legacy_udp_limited=67",
+            "replay_rejected=71",
+            "replay_cache_full=73",
+            "xudp_resolution_rejected=79",
+            "splice_fallback=83",
+            "replay_cache_entries_snapshot=89",
+            "replay_in_flight_snapshot=97",
+            "replay_capacity=4096",
+            "xudp_high_water=101",
+            "preauth_active=103",
+            "authenticated_active=107",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing `{expected}` in pressure warning: {rendered}"
+            );
+        }
     }
 
     #[test]

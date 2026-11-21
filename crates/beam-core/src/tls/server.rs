@@ -767,6 +767,12 @@ impl TlsServerConfig {
         self
     }
 
+    /// Returns the shared process-wide legacy UDP stream limiter.
+    #[must_use]
+    pub fn legacy_udp_limiter(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.legacy_udp_permits)
+    }
+
     /// Overrides the process-wide XUDP session limiter.
     #[must_use]
     pub fn with_xudp_limiter(mut self, limiter: XudpSessionLimiter) -> Self {
@@ -1727,7 +1733,7 @@ async fn forward_to_cover(
     let _cover_permit = match config.cover_limiter.try_acquire(peer.ip()) {
         Ok(permit) => permit,
         Err(reject) => {
-            config.metrics.record_cover_limit();
+            config.metrics.record_cover_limit(reject);
             tracing::debug!(%peer, ?reject, "cover limit reached; closing probe");
             return Ok(ConnectionOutcome::CoverLimited);
         }

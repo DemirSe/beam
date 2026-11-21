@@ -42,7 +42,10 @@ impl IpLimiter {
         }
     }
 
-    /// Reserves one global and one per-IP permit.
+    /// Reserves one per-IP and one global permit.
+    ///
+    /// Per-IP capacity is checked before acquiring a global permit so a source
+    /// at its per-IP cap never briefly holds a global slot from other peers.
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Result<IpPermit, IpLimitReject> {
         if self.max_per_ip == 0 {
             return Err(IpLimitReject::PerIp);
@@ -50,23 +53,17 @@ impl IpLimiter {
         // A dual-stack listener can report the same IPv4 source as either
         // `1.2.3.4` or `::ffff:1.2.3.4`; both must share one per-IP bucket.
         let ip = ip.to_canonical();
+        let mut counts = lock(&self.per_ip);
+        if counts.get(&ip).copied().unwrap_or(0) >= self.max_per_ip {
+            return Err(IpLimitReject::PerIp);
+        }
         let global = self
             .global
             .clone()
             .try_acquire_owned()
             .map_err(|_| IpLimitReject::Global)?;
-        {
-            let mut counts = lock(&self.per_ip);
-            match counts.get_mut(&ip) {
-                Some(count) if *count >= self.max_per_ip => {
-                    return Err(IpLimitReject::PerIp);
-                }
-                Some(count) => *count += 1,
-                None => {
-                    counts.insert(ip, 1);
-                }
-            }
-        }
+        *counts.entry(ip).or_insert(0) += 1;
+        drop(counts);
         Ok(IpPermit {
             limiter: Arc::clone(self),
             ip,
@@ -199,5 +196,27 @@ mod tests {
         assert_eq!(limiter.available_permits(), 1);
         drop(permit);
         assert_eq!(limiter.available_permits(), 2);
+    }
+
+    #[test]
+    fn per_ip_limit_is_checked_before_global_capacity() {
+        let limiter = Arc::new(IpLimiter::new(2, 2));
+        let first = limiter.try_acquire(ip(1)).expect("first permit");
+        let second = limiter.try_acquire(ip(1)).expect("second permit");
+        assert_eq!(limiter.available_permits(), 0);
+
+        // Even when the global pool is exhausted, the same source is still
+        // rejected for exceeding its per-IP cap, while a distinct source sees
+        // global exhaustion.
+        assert_eq!(
+            limiter.try_acquire(ip(1)).expect_err("per-IP limit"),
+            IpLimitReject::PerIp
+        );
+        assert_eq!(
+            limiter.try_acquire(ip(2)).expect_err("global limit"),
+            IpLimitReject::Global
+        );
+        drop(first);
+        drop(second);
     }
 }

@@ -263,31 +263,37 @@ sees one `warn` instead of a silent loss of burst tolerance.
 
 ### 3. Pre-auth and authenticated admission (P1)
 
-**States.** Unheld → pre-auth global+per-IP held → released at classification;
-separately unheld → authenticated permit held for the whole session. Cover has
-its own `IpLimiter` (32 global / 8 per source) held through the relay.
+**States.** Unheld → per-IP checked then global+per-IP held → released at
+classification; separately unheld → authenticated permit held for the whole
+session. Cover has its own `IpLimiter` (32 global / 8 per source) held through
+the relay.
 
-- `preauth.try_acquire(peer.ip())` `main.rs:333-343`; rejection records
-  `preauth_rejected` and drops the socket. The permit moves into the task.
-- Authenticated permit: `try_acquire_owned` `tls/server.rs:847`; rejection
+- `preauth.try_acquire(peer.ip())`; rejection records `preauth_rejected`
+  (derived from `preauth_rejected_global` + `preauth_rejected_per_ip`) and drops
+  the socket without holding a global permit on per-IP rejection. The permit
+  moves into the task.
+- Authenticated permit: `try_acquire_owned` (`tls/server.rs`); rejection
   records `connection_limited` and returns `ConnectionLimited` without cover
-  fallback. Pre-auth is dropped only after the permit is acquired (`855`).
+  fallback. Pre-auth is dropped only after the permit is acquired.
 
 **Illegal / edge.** Pre-auth bounds handshakes, not data path:
 `max_pending_handshakes = clamp(max_connections, 16, 256)`, and
-`max_preauth_per_ip = min(configured, pending)` (`main.rs:136-145`). Cover is
-bounded separately so a scanner cannot consume authenticated capacity.
+`max_preauth_per_ip = min(configured, pending)`. Cover is bounded separately so
+a scanner cannot consume authenticated capacity.
 
 **Why implicit.** Phase is permit ownership. `IpLimiter` canonicalizes IPv4 to
-match a dual-stack listener (`admission.rs:52-54`) and drops the per-IP entry
-when the last permit is released.
+match a dual-stack listener (`admission.rs`), checks the per-IP bound before
+taking a global permit, and drops the per-IP entry when the last permit is
+released.
 
-**Observability.** `preauth_rejected`, `cover_limited`, `connection_limited`,
-plus `preauth_active` / `authenticated_active` in the periodic line.
+**Observability.** `preauth_rejected`, `preauth_rejected_global`,
+`preauth_rejected_per_ip`, `cover_limited`, `cover_limited_global`,
+`cover_limited_per_ip`, `connection_limited`, plus `preauth_active` /
+`authenticated_active` in the periodic line.
 
-**Tests.** `admission.rs:122-203` (global, per-IP, zero limit, mapped v4, idle
-removal); `cover_limit_is_global_and_bounded` (2821),
-`cover_limit_is_bounded_per_source` (2851).
+**Tests.** `admission.rs` (global, per-IP, per-IP-before-global, zero limit,
+mapped v4, idle removal); `cover_limit_is_global_and_bounded`,
+`cover_limit_is_bounded_per_source`.
 
 ### 4. Connection classification
 

@@ -5,11 +5,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::admission::IpLimitReject;
+
 /// Counters for admission, XUDP pressure, and relay fallbacks.
 #[derive(Debug, Default)]
 pub struct Metrics {
-    preauth_rejected: AtomicU64,
-    cover_limited: AtomicU64,
+    preauth_rejected_global: AtomicU64,
+    preauth_rejected_per_ip: AtomicU64,
+    cover_limited_global: AtomicU64,
+    cover_limited_per_ip: AtomicU64,
     connection_limited: AtomicU64,
     accept_errors: AtomicU64,
     accept_errors_resource: AtomicU64,
@@ -45,8 +49,16 @@ pub struct Metrics {
 pub struct MetricsSnapshot {
     /// Connections dropped because no pre-auth permit was available.
     pub preauth_rejected: u64,
+    /// Connections dropped because the global pre-auth permit pool was full.
+    pub preauth_rejected_global: u64,
+    /// Connections dropped because one source reached its per-IP pre-auth cap.
+    pub preauth_rejected_per_ip: u64,
     /// Probes closed because the cover limiter was full.
     pub cover_limited: u64,
+    /// Probes closed because the global cover permit pool was full.
+    pub cover_limited_global: u64,
+    /// Probes closed because one source reached its per-IP cover cap.
+    pub cover_limited_per_ip: u64,
     /// Authenticated connections closed because the connection limit was full.
     pub connection_limited: u64,
     /// Listener accept errors.
@@ -120,14 +132,20 @@ pub struct MetricsSnapshot {
 }
 
 impl Metrics {
-    /// Counts one pre-auth rejection.
-    pub fn record_preauth_rejection(&self) {
-        self.preauth_rejected.fetch_add(1, Ordering::Relaxed);
+    /// Counts one pre-auth rejection and its admission limit reason.
+    pub fn record_preauth_rejection(&self, reject: IpLimitReject) {
+        match reject {
+            IpLimitReject::Global => self.preauth_rejected_global.fetch_add(1, Ordering::Relaxed),
+            IpLimitReject::PerIp => self.preauth_rejected_per_ip.fetch_add(1, Ordering::Relaxed),
+        };
     }
 
-    /// Counts one cover-limit rejection.
-    pub fn record_cover_limit(&self) {
-        self.cover_limited.fetch_add(1, Ordering::Relaxed);
+    /// Counts one cover-limit rejection and its admission limit reason.
+    pub fn record_cover_limit(&self, reject: IpLimitReject) {
+        match reject {
+            IpLimitReject::Global => self.cover_limited_global.fetch_add(1, Ordering::Relaxed),
+            IpLimitReject::PerIp => self.cover_limited_per_ip.fetch_add(1, Ordering::Relaxed),
+        };
     }
 
     /// Counts one authenticated-connection limit rejection.
@@ -277,9 +295,17 @@ impl Metrics {
     /// Returns a snapshot of all counters.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
+        let preauth_rejected_global = self.preauth_rejected_global.load(Ordering::Relaxed);
+        let preauth_rejected_per_ip = self.preauth_rejected_per_ip.load(Ordering::Relaxed);
+        let cover_limited_global = self.cover_limited_global.load(Ordering::Relaxed);
+        let cover_limited_per_ip = self.cover_limited_per_ip.load(Ordering::Relaxed);
         MetricsSnapshot {
-            preauth_rejected: self.preauth_rejected.load(Ordering::Relaxed),
-            cover_limited: self.cover_limited.load(Ordering::Relaxed),
+            preauth_rejected: preauth_rejected_global.saturating_add(preauth_rejected_per_ip),
+            preauth_rejected_global,
+            preauth_rejected_per_ip,
+            cover_limited: cover_limited_global.saturating_add(cover_limited_per_ip),
+            cover_limited_global,
+            cover_limited_per_ip,
             connection_limited: self.connection_limited.load(Ordering::Relaxed),
             accept_errors: self.accept_errors.load(Ordering::Relaxed),
             accept_errors_resource: self.accept_errors_resource.load(Ordering::Relaxed),
@@ -320,9 +346,10 @@ mod tests {
     fn counters_accumulate() {
         let metrics = Metrics::default();
         assert_eq!(metrics.snapshot(), MetricsSnapshot::default());
-        metrics.record_preauth_rejection();
-        metrics.record_preauth_rejection();
-        metrics.record_cover_limit();
+        metrics.record_preauth_rejection(IpLimitReject::Global);
+        metrics.record_preauth_rejection(IpLimitReject::PerIp);
+        metrics.record_cover_limit(IpLimitReject::Global);
+        metrics.record_cover_limit(IpLimitReject::PerIp);
         metrics.record_connection_limit();
         metrics.record_accept_error(false);
         metrics.record_accept_error(true);
@@ -351,7 +378,11 @@ mod tests {
         metrics.record_xudp_retained_discarded();
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.preauth_rejected, 2);
-        assert_eq!(snapshot.cover_limited, 1);
+        assert_eq!(snapshot.preauth_rejected_global, 1);
+        assert_eq!(snapshot.preauth_rejected_per_ip, 1);
+        assert_eq!(snapshot.cover_limited, 2);
+        assert_eq!(snapshot.cover_limited_global, 1);
+        assert_eq!(snapshot.cover_limited_per_ip, 1);
         assert_eq!(snapshot.connection_limited, 1);
         assert_eq!(snapshot.accept_errors, 2);
         assert_eq!(snapshot.accept_errors_resource, 1);

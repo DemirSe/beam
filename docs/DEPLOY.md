@@ -204,7 +204,13 @@ sudo journalctl -u beam --since "24 hours ago" -p warning --no-pager
 
 Expect `active (running)`, `NRestarts=0`, `:443` owned by `beam`, and a quiet
 warn-level journal. `runtime pressure counters increased` is actionable;
-inspect its deltas.
+inspect its deltas. Counter fields in that warning are deltas over the sampling
+window, while `replay_cache_entries_snapshot`, `replay_in_flight_snapshot`,
+`preauth_active`, and `authenticated_active` are periodic snapshots and
+`xudp_high_water` is a lifetime high-water mark. A warning where only
+`splice_fallback` increased means the splice task budget or descriptor limit
+was hit and traffic continued over the async-copy fallback (under sustained
+Vision load above the splice budget, this warning repeats once per interval).
 
 To roll back to a previous release:
 
