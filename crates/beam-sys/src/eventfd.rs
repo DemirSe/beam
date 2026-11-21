@@ -121,7 +121,7 @@ mod tests {
     use crate::poll::{PollEvents, PollFd, poll};
     use std::io;
     use std::os::fd::AsRawFd;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn notify_makes_the_descriptor_readable() {
@@ -172,28 +172,140 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
+    fn current_tid() -> libc::c_long {
+        // SAFETY: `SYS_gettid` takes no arguments and returns the caller's
+        // kernel thread id.
+        unsafe { libc::syscall(libc::SYS_gettid) }
+    }
+
+    fn is_poll_syscall_number(number: libc::c_long) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if number == libc::SYS_poll {
+            return true;
+        }
+        number == libc::SYS_ppoll
+    }
+
+    fn thread_in_poll_syscall(tid: libc::c_long) -> Option<bool> {
+        let syscall = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")).ok()?;
+        let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+        let Some(first) = syscall.split_whitespace().next() else {
+            return Some(false);
+        };
+        // Linux writes "running" when a thread is on-CPU in userspace; treat
+        // that as not-yet-blocked rather than unreadable `/proc`.
+        let Ok(number) = first.parse::<libc::c_long>() else {
+            return Some(false);
+        };
+        if !is_poll_syscall_number(number) {
+            return Some(false);
+        }
+        let Some((_, rest)) = stat.rsplit_once(") ") else {
+            return Some(false);
+        };
+        Some(rest.starts_with('S'))
+    }
+
+    /// Waits until `tid` is observed sleeping inside `poll(2)`/`ppoll(2)`.
+    ///
+    /// Returns `false` if `/proc/self/task/<tid>/syscall` is unreadable in the
+    /// current environment so callers can avoid claiming blocked-poll wakeup
+    /// when kernel syscall state cannot be observed.
+    fn wait_until_blocked_in_poll(tid: libc::c_long) -> bool {
+        if thread_in_poll_syscall(tid).is_none() {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if thread_in_poll_syscall(tid) == Some(true) {
+                return true;
+            }
+            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("waiter thread {tid} did not enter interruptible sleep in poll(2)");
+    }
+
     #[test]
     fn notify_wakes_a_blocked_poll() {
-        let event = EventFd::new().unwrap();
-        let fd = event.as_raw_fd();
+        let event = std::sync::Arc::new(EventFd::new().unwrap());
+        let waiter_event = std::sync::Arc::clone(&event);
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let waiter_ready = std::sync::Arc::clone(&ready);
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut fds = [PollFd::new(fd, PollEvents::READ)];
-            let result = poll(&mut fds, Some(Duration::from_secs(5)));
-            let _ = sender.send(result);
+        let handle = std::thread::spawn(move || {
+            let mut fds = [PollFd::new(waiter_event.as_raw_fd(), PollEvents::READ)];
+            let _ = tid_tx.send(current_tid());
+            waiter_ready.wait();
+            let result = poll(&mut fds, Some(Duration::from_secs(10)));
+            let _ = sender.send((result, fds[0].revents()));
         });
 
-        std::thread::sleep(Duration::from_millis(50));
-        let started = Instant::now();
+        let tid = tid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        ready.wait();
+        let observed_blocked = wait_until_blocked_in_poll(tid);
+        if observed_blocked {
+            assert!(
+                receiver.try_recv().is_err(),
+                "poll returned before eventfd notify"
+            );
+        }
         event.notify().unwrap();
-        let result = receiver
-            .recv_timeout(Duration::from_secs(2))
+        let (result, revents) = receiver
+            .recv_timeout(Duration::from_secs(5))
             .expect("blocked poll did not wake");
         assert_eq!(result.unwrap(), 1);
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "eventfd wake took {:?}",
-            started.elapsed()
-        );
+        assert!(revents.contains(PollEvents::READ));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn notify_wakes_two_simultaneous_waiters() {
+        let event = std::sync::Arc::new(EventFd::new().unwrap());
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut tids = Vec::with_capacity(2);
+        let mut receivers = Vec::with_capacity(2);
+        let mut handles = Vec::with_capacity(2);
+
+        for _ in 0..2 {
+            let waiter_event = std::sync::Arc::clone(&event);
+            let waiter_ready = std::sync::Arc::clone(&ready);
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let mut fds = [PollFd::new(waiter_event.as_raw_fd(), PollEvents::READ)];
+                let _ = tid_tx.send(current_tid());
+                waiter_ready.wait();
+                let result = poll(&mut fds, Some(Duration::from_secs(10)));
+                let _ = sender.send((result, fds[0].revents()));
+            });
+            tids.push(tid_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            receivers.push(receiver);
+            handles.push(handle);
+        }
+
+        ready.wait();
+        let observed_all_blocked = tids.into_iter().all(wait_until_blocked_in_poll);
+        if observed_all_blocked {
+            for receiver in &receivers {
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "shared-event waiter returned before notify"
+                );
+            }
+        }
+        event.notify().unwrap();
+
+        for receiver in receivers {
+            let (result, revents) = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("shared-event waiter did not wake");
+            assert_eq!(result.unwrap(), 1);
+            assert!(revents.contains(PollEvents::READ));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

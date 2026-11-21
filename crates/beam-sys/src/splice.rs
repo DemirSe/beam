@@ -69,7 +69,9 @@ pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 
 /// Moves up to `len` bytes from `fd_in` to `fd_out`.
 ///
-/// A return value of `Ok(0)` means end of input. `EAGAIN` is mapped to
+/// When `len > 0`, a return value of `Ok(0)` means end of input. A zero-length
+/// call (`len == 0`) returns `Ok(0)` even on open input without consuming
+/// bytes, matching Linux `splice(2)`. `EAGAIN` is mapped to
 /// [`io::ErrorKind::WouldBlock`].
 pub fn splice(fd_in: RawFd, fd_out: RawFd, len: usize, flags: SpliceFlags) -> io::Result<usize> {
     // SAFETY: Both descriptors are supplied by the caller; the kernel
@@ -191,5 +193,50 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn splice_zero_length_returns_zero_on_open_input() {
+        let (source, mut sink) = socket_pair();
+        crate::fd::set_nonblocking(source.as_raw_fd()).unwrap();
+        let (pipe_read, pipe_write) = pipe().unwrap();
+
+        // Even with no data available on an open nonblocking socket, len == 0
+        // returns Ok(0) rather than WouldBlock or EOF.
+        let count = splice(
+            source.as_raw_fd(),
+            pipe_write.as_raw_fd(),
+            0,
+            SpliceFlags::NONBLOCK,
+        )
+        .unwrap();
+        assert_eq!(count, 0);
+
+        // With queued input present, len == 0 still returns Ok(0) without
+        // consuming the queued payload.
+        let payload = b"untouched";
+        sink.write_all(payload).unwrap();
+        let count = splice(
+            source.as_raw_fd(),
+            pipe_write.as_raw_fd(),
+            0,
+            SpliceFlags::NONBLOCK,
+        )
+        .unwrap();
+        assert_eq!(count, 0);
+
+        let moved = splice(
+            source.as_raw_fd(),
+            pipe_write.as_raw_fd(),
+            payload.len(),
+            SpliceFlags::NONBLOCK,
+        )
+        .unwrap();
+        assert_eq!(moved, payload.len());
+        drop(pipe_write);
+        let mut pipe_read = File::from(pipe_read);
+        let mut received = Vec::new();
+        pipe_read.read_to_end(&mut received).unwrap();
+        assert_eq!(received, payload);
     }
 }

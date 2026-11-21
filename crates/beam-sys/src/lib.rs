@@ -147,3 +147,125 @@ pub fn shutdown_write(fd: RawFd) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn try_clone_fd_returns_distinct_cloexec_fd_and_keeps_original_usable() {
+        let (read_end, write_end) = pipe().unwrap();
+        let orig_fd = write_end.as_raw_fd();
+        let cloned = try_clone_fd(orig_fd).unwrap();
+        let cloned_fd = cloned.as_raw_fd();
+
+        assert_ne!(cloned_fd, orig_fd, "clone must be a distinct descriptor");
+
+        // SAFETY: `F_GETFD` takes no pointer argument and queries descriptor
+        // flags on the live owned `cloned_fd`.
+        let flags = unsafe { libc::fcntl(cloned_fd, libc::F_GETFD) };
+        assert_ne!(flags, -1, "F_GETFD failed: {}", io::Error::last_os_error());
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "cloned descriptor must have FD_CLOEXEC set"
+        );
+
+        // Dropping the clone must not close or invalidate the original.
+        drop(cloned);
+        let mut writer = File::from(write_end);
+        writer.write_all(b"still open").unwrap();
+        drop(writer);
+
+        let mut reader = File::from(read_end);
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, b"still open");
+    }
+
+    #[test]
+    fn try_clone_fd_stays_usable_after_original_is_dropped() {
+        let (read_end, write_end) = pipe().unwrap();
+        let cloned = try_clone_fd(write_end.as_raw_fd()).unwrap();
+
+        // Dropping the original must not close or invalidate the clone.
+        drop(write_end);
+        let mut writer = File::from(cloned);
+        writer.write_all(b"clone alive").unwrap();
+        drop(writer);
+
+        let mut reader = File::from(read_end);
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, b"clone alive");
+    }
+
+    #[test]
+    fn try_clone_fd_rejects_invalid_descriptor() {
+        let error = try_clone_fd(-1).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn shutdown_write_treats_unconnected_socket_as_success() {
+        // An unconnected TCP socket causes `shutdown(2)` to return ENOTCONN.
+        // SAFETY: `socket` takes no pointers and returns a new fd or -1.
+        let raw_fd =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(
+            raw_fd >= 0,
+            "socket creation failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: `raw_fd` was just returned by `socket` and is uniquely owned.
+        let sock = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        shutdown_write(sock.as_raw_fd()).expect("ENOTCONN must be treated as success");
+    }
+
+    #[test]
+    fn shutdown_write_treats_disconnected_tcp_socket_as_success() {
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        // Force an immediate RST on close so the client socket transitions to
+        // a disconnected state where `shutdown(SHUT_WR)` returns ENOTCONN.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: `linger` is a live `libc::linger` value and its exact byte
+        // size is passed to `setsockopt` for `SO_LINGER`.
+        let set = unsafe {
+            libc::setsockopt(
+                server.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&raw const linger).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "SO_LINGER failed: {}", io::Error::last_os_error());
+        drop(server);
+
+        // Observe the reset so the kernel marks the client socket disconnected.
+        let mut byte = [0_u8; 1];
+        let _ = client.read(&mut byte);
+
+        shutdown_write(client.as_raw_fd())
+            .expect("disconnected TCP socket must be treated as success");
+    }
+
+    #[test]
+    fn shutdown_write_propagates_invalid_descriptor_error() {
+        let error = shutdown_write(-1).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+}
