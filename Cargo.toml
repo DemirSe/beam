@@ -12,3 +12,8 @@ license = "MIT"
 [workspace.dependencies]
 beam-core = { path = "crates/beam-core" }
 beam-sys = { path = "crates/beam-sys" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -9,6 +9,11 @@ Type=oneshot
 # leaves no margin for that case.
 TimeoutStartSec=150
 ExecStart=/usr/local/lib/beam/liveness-check.py
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
 
 [Install]
 WantedBy=multi-user.target
