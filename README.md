@@ -63,14 +63,15 @@ scripts. The example config contains placeholder values only.
 ## Configure
 
 Start from [`config.example.toml`](config.example.toml). Unknown fields are
-errors, and `--check` validates scalar and derived limits before the server
-binds a socket. The important keys are:
+errors, and `--check` validates scalar and derived limits (including the
+effective `max_preauth_per_ip` cap) without binding `server.listen` or testing
+port availability. The important keys are:
 
 | Section | Keys |
 |---|---|
 | `[server]` | `listen` — listener address and port. |
 | `[user]` | `id` — client UUID; `flow` — must be `xtls-rprx-vision` for configuration compatibility. |
-| `[reality]` | `private_key`, `short_ids`, `server_names`, `dest` — server identity, accepted short IDs and SNI values, and cover destination. |
+| `[reality]` | `private_key`, `short_ids`, `server_names` (DNS hostnames; IP literals are rejected), `dest` (`host:port`, DNS name or IP literal) — server identity, accepted short IDs and SNI values, and cover destination. |
 | `[log]` | `level` — log level. |
 | `[limits]` | `max_connections`, `max_udp_destinations`, `max_preauth_per_ip`, `max_xudp_sessions`, `xudp_recv_buffer_bytes`, `listen_backlog`, `shutdown_drain_ms`, `handshake_timeout_ms`, `idle_timeout_ms`. |
 
@@ -316,6 +317,12 @@ VLESS with `xtls-rprx-vision` is expected to work.
 - Check SNI exactly, then the share, AEAD, client version range, optional
   timestamp skew, and constant-time short-ID membership. Never expose an
   authentication oracle: unauthenticated or failed probes go to the cover.
+  `reality.server_names` and `beam generate --sni` require DNS hostnames and
+  reject IP literals (RFC 6066); an existing configuration that lists an IPv4
+  literal in `reality.server_names` will fail validation and startup.
+  `reality.dest` and `beam generate --host` continue to accept IPv4 and IPv6
+  literals (`beam generate --host` rejects malformed dotted-numeric IPv4-like
+  values while still allowing non-IP hostnames such as `node.123`).
 - Short IDs are validated and decoded at startup into fixed 8-byte values;
   comparisons are constant-time.
 - Stock has no replay cache. beam reserves in-flight handshakes before TLS and

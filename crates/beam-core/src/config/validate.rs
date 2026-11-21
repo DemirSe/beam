@@ -4,6 +4,7 @@
 //! types, then every value is validated before the public [`Config`] is
 //! constructed. Errors never include secret values.
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
@@ -207,11 +208,56 @@ impl Config {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.display().to_string(),
+            path: format_path(path),
             source,
         })?;
         let contents = Zeroizing::new(contents);
         Self::from_toml_str(contents.as_str())
+    }
+}
+
+/// Formats a filesystem path for diagnostics with an injective escape so that
+/// non-UTF-8 Unix paths (escaped as `\xNN`), control characters (`\n`, `\r`,
+/// `\t`, `\u{...}`), and literal backslashes (`\\`) never collide or inject
+/// terminal/log control sequences.
+#[must_use]
+pub fn format_path(path: &Path) -> String {
+    fn push_escaped_str(out: &mut String, text: &str) {
+        for ch in text.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c.is_control() => {
+                    let _ = write!(out, "\\u{{{:x}}}", c as u32);
+                }
+                other => out.push(other),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = path.as_os_str().as_bytes();
+        let mut out = String::with_capacity(bytes.len());
+        for chunk in bytes.utf8_chunks() {
+            push_escaped_str(&mut out, chunk.valid());
+            for &byte in chunk.invalid() {
+                let _ = write!(out, "\\x{byte:02x}");
+            }
+        }
+        out
+    }
+
+    #[cfg(not(unix))]
+    {
+        let display = path.display().to_string();
+        let mut out = String::with_capacity(display.len());
+        push_escaped_str(&mut out, &display);
+        out
     }
 }
 
@@ -341,8 +387,10 @@ fn validate_server_names(server_names: Vec<String>) -> Result<Vec<String>, Valid
 ///
 /// This is the rule `reality.server_names` uses. `beam generate` applies it to
 /// `--sni`, so a generated fragment never carries a name that `--check` rejects.
+/// IP literals are rejected because TLS SNI only permits DNS hostnames (RFC 6066).
 pub fn is_plausible_dns_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > MAX_DNS_NAME_LEN {
+    if name.is_empty() || name.len() > MAX_DNS_NAME_LEN || name.parse::<std::net::IpAddr>().is_ok()
+    {
         return false;
     }
 
@@ -825,15 +873,29 @@ idle_timeout_ms = 300000
 
     #[test]
     fn rejects_implausible_server_names() {
-        let input = config_toml(&private_key()).replace(
-            "server_names = [\"whatsapp.net\"]",
-            "server_names = [\"bad..example\"]",
-        );
-        let error = Config::from_toml_str(&input).unwrap_err();
-        assert!(matches!(
-            error,
-            ConfigError::Validation(ValidationError::ServerName { index: 0 })
-        ));
+        for bad in [
+            "bad..example",
+            "127.0.0.1",
+            "203.0.113.10",
+            "::1",
+            "2001:db8::1",
+        ] {
+            let input = config_toml(&private_key()).replace(
+                "server_names = [\"whatsapp.net\"]",
+                &format!("server_names = [\"{bad}\"]"),
+            );
+            let error = Config::from_toml_str(&input).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::Validation(ValidationError::ServerName { index: 0 })
+                ),
+                "server_name {bad:?} must be rejected, got {error:?}"
+            );
+        }
+        for good in ["whatsapp.net", "123.example.com", "node.123", "localhost"] {
+            assert!(is_plausible_dns_name(good), "{good:?} must be accepted");
+        }
     }
 
     #[test]
@@ -1008,5 +1070,24 @@ idle_timeout_ms = 300000
         );
         assert!(!debug.contains("0123456789abcdef"), "{debug}");
         assert!(debug.contains("redacted"), "{debug}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_path_read_error_escapes_non_utf8_and_control_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let missing = Path::new(OsStr::from_bytes(b"/nonexistent/beam-\xff-\n\x1b.toml"));
+        let err = Config::from_path(missing).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("/nonexistent/beam-\\xff-\\n\\u{1b}.toml"),
+            "unexpected rendered error: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\u{fffd}') && !rendered.contains('\x1b'),
+            "lossy or raw control char in error: {rendered:?}"
+        );
     }
 }

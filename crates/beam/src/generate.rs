@@ -89,6 +89,16 @@ pub fn run(args: &GenerateArgs) -> Result<()> {
     Ok(())
 }
 
+/// True when `value` consists solely of non-empty ASCII-digit labels separated
+/// by dots, such as `203.0.113.999` or `192.168.1`, which is almost certainly a
+/// mistyped IPv4 address rather than a DNS name.
+fn looks_like_malformed_ipv4(value: &str) -> bool {
+    value.contains('.')
+        && value
+            .split('.')
+            .all(|label| !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// Accepts a DNS name or an IP literal, and returns it in link form.
 ///
 /// An IPv6 literal may be bracketed on input; the link renderer adds exactly
@@ -115,6 +125,14 @@ fn parse_host(value: &str) -> Result<String, String> {
         return Ok(address.to_string());
     }
 
+    if looks_like_malformed_ipv4(value) {
+        return Err(
+            "host looks like a malformed IPv4 address; use four 0..=255 octets \
+             (for example 203.0.113.10) or a DNS name"
+                .to_owned(),
+        );
+    }
+
     if is_plausible_dns_name(value) {
         return Ok(value.to_owned());
     }
@@ -123,6 +141,17 @@ fn parse_host(value: &str) -> Result<String, String> {
 
 /// Accepts the same DNS names as `reality.server_names`.
 fn parse_server_name(value: &str) -> Result<String, String> {
+    if value.parse::<IpAddr>().is_ok()
+        || value
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|inner| inner.parse::<std::net::Ipv6Addr>().is_ok())
+    {
+        return Err(
+            "sni must be a DNS hostname, not an IP literal (TLS SNI does not carry IP addresses)"
+                .to_owned(),
+        );
+    }
     if is_plausible_dns_name(value) {
         Ok(value.to_owned())
     } else {
@@ -387,5 +416,38 @@ mod tests {
                 .expect("IPv6 host must parse");
             assert_eq!(args.args.host, "2001:db8::1");
         }
+    }
+
+    #[test]
+    fn parse_server_name_rejects_ip_literals() {
+        for literal in ["203.0.113.10", "127.0.0.1", "2001:db8::1", "[2001:db8::1]"] {
+            let error = parse_server_name(literal).expect_err("IP literal must be rejected as SNI");
+            assert!(
+                error.contains("not an IP literal"),
+                "unexpected error for {literal}: {error}"
+            );
+        }
+        assert_eq!(
+            parse_server_name("123.example.com").unwrap(),
+            "123.example.com"
+        );
+    }
+
+    #[test]
+    fn parse_host_rejects_malformed_ipv4_literals_with_guidance() {
+        for bad in ["203.0.113.999", "192.168.1", "1.2.3.4.5", "999.999.999.999"] {
+            let error = parse_host(bad).expect_err("malformed IPv4-like host must be rejected");
+            assert!(
+                error.contains("malformed IPv4"),
+                "unexpected error for {bad}: {error}"
+            );
+        }
+        assert_eq!(parse_host("203.0.113.10").unwrap(), "203.0.113.10");
+        assert_eq!(parse_host("123.example.com").unwrap(), "123.example.com");
+        assert_eq!(
+            parse_host("server1.example.com").unwrap(),
+            "server1.example.com"
+        );
+        assert_eq!(parse_host("node.123").unwrap(), "node.123");
     }
 }

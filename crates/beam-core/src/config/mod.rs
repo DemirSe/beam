@@ -10,4 +10,4 @@ pub use types::{
     Config, Flow, HostPort, LimitsConfig, LogConfig, LogLevel, RealityConfig, ServerConfig,
     UserConfig,
 };
-pub use validate::{ConfigError, ValidationError, is_plausible_dns_name};
+pub use validate::{ConfigError, ValidationError, format_path, is_plausible_dns_name};
