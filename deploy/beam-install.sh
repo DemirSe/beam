@@ -556,9 +556,14 @@ install_or_update() {
         [ "$WAS_TIMER_ENABLED" = enabled ] ||
         [ "$WAS_TIMER_ENABLED" = enabled-runtime ]; then
         TIMER_TOUCHED=1
-        systemctl disable --now beam-liveness.timer >/dev/null 2>&1 || true
+        if systemctl disable --now beam-liveness.timer >/dev/null 2>&1; then
+          say "warning: python3 3.11+ (tomllib) is required for beam-liveness.timer; disabled the timer"
+        else
+          say "warning: python3 3.11+ (tomllib) is required for beam-liveness.timer, and disabling the timer failed; disable it manually"
+        fi
+      else
+        say "warning: python3 3.11+ (tomllib) is required for beam-liveness.timer; leaving timer disabled"
       fi
-      say "warning: python3 3.11+ (tomllib) is required for beam-liveness.timer; leaving timer disabled"
     fi
   elif [ "$WAS_TIMER_ACTIVE" = active ]; then
     systemctl start beam-liveness.timer >/dev/null 2>&1 ||

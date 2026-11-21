@@ -60,6 +60,9 @@ case "${1:-}" in
     exit 0
     ;;
   disable)
+    if [ "$unit" = beam-liveness.timer ] && [ -e "$STATE/fail-timer-disable" ]; then
+      exit 1
+    fi
     rm -f "$STATE/enabled.$unit"
     [ "${2:-}" = "--now" ] && rm -f "$STATE/active.$unit"
     exit 0
@@ -849,6 +852,25 @@ check "update no tomllib: previously enabled timer is disabled" \
   "$([ ! -e "$STATE/enabled.beam-liveness.timer" ] && [ ! -e "$STATE/active.beam-liveness.timer" ] && echo 0 || echo 1)"
 check "update no tomllib: warns about python3 3.11+" \
   "$(grep -q 'python3 3.11+ (tomllib) is required' "$LOGS/err" && echo 0 || echo 1)"
+
+setup_case liveness_update_no_tomllib_disable_fail
+seed_live
+seed_liveness
+: >"$STATE/fail-timer-disable"
+cat >"$STUBS/python3" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod 0755 "$STUBS/python3"
+ARTIFACT="$(make_artifact liveness_update_no_tomllib_disable_fail)"
+BEAM_ARTIFACT="$ARTIFACT" run_script update
+rc=$?
+rm -f "$STUBS/python3"
+check "update no tomllib disable fail: update succeeds" "$([ "$rc" = 0 ] && echo 0 || echo 1)"
+check "update no tomllib disable fail: reports disable failure" \
+  "$(grep -q 'disabling the timer failed; disable it manually' "$LOGS/err" && echo 0 || echo 1)"
+check "update no tomllib disable fail: does not claim disabled" \
+  "$(! grep -q 'disabled the timer' "$LOGS/err" && echo 0 || echo 1)"
 
 # ---- case 12: host-wide state is out of scope --------------------------
 SCOPE="$REPO/deploy/beam-install.sh"
