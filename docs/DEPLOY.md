@@ -16,11 +16,11 @@ Download the release archive (`beam-<version>-<commit>-<target>.tar.gz`) and
 its `.sha256` pin into one directory, or build one from a clean checkout with
 `bash scripts/release-artifact.sh`.
 
-1. Verify the archive and extract it (set `ARCHIVE` to the exact downloaded
-   filename):
+1. Verify the archive and extract it (replace the example filename with your
+   downloaded archive):
 
    ```bash
-   ARCHIVE=beam-<version>-<commit>-<target>.tar.gz
+   ARCHIVE="beam-0.1.0-0123456789ab-x86_64-unknown-linux-gnu.tar.gz"
    sha256sum -c "$ARCHIVE.sha256"
    tar -xzf "$ARCHIVE"
    ```
@@ -64,7 +64,7 @@ By default `beam-install.sh` preserves `/etc/beam/config.toml` and stops
 `beam-liveness.timer` while swapping files:
 
 ```bash
-ARCHIVE=beam-<version>-<commit>-<target>.tar.gz
+ARCHIVE="beam-0.1.0-0123456789ab-x86_64-unknown-linux-gnu.tar.gz"
 sha256sum -c "$ARCHIVE.sha256"
 tar -xzf "$ARCHIVE" beam-install.sh
 sudo env BEAM_ARTIFACT="$ARCHIVE" bash beam-install.sh update

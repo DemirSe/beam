@@ -831,6 +831,25 @@ check "no tomllib: liveness timer not enabled" "$([ ! -e "$STATE/enabled.beam-li
 check "no tomllib: warns about python3 3.11+" \
   "$(grep -q 'python3 3.11+ (tomllib) is required' "$LOGS/err" && echo 0 || echo 1)"
 
+setup_case liveness_update_no_tomllib
+seed_live
+seed_liveness
+cat >"$STUBS/python3" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod 0755 "$STUBS/python3"
+ARTIFACT="$(make_artifact liveness_update_no_tomllib)"
+BEAM_ARTIFACT="$ARTIFACT" run_script update
+rc=$?
+rm -f "$STUBS/python3"
+check "update no tomllib: update succeeds" "$([ "$rc" = 0 ] && echo 0 || echo 1)"
+check "update no tomllib: beam is active" "$([ -e "$STATE/active.beam.service" ] && echo 0 || echo 1)"
+check "update no tomllib: previously enabled timer is disabled" \
+  "$([ ! -e "$STATE/enabled.beam-liveness.timer" ] && [ ! -e "$STATE/active.beam-liveness.timer" ] && echo 0 || echo 1)"
+check "update no tomllib: warns about python3 3.11+" \
+  "$(grep -q 'python3 3.11+ (tomllib) is required' "$LOGS/err" && echo 0 || echo 1)"
+
 # ---- case 12: host-wide state is out of scope --------------------------
 SCOPE="$REPO/deploy/beam-install.sh"
 check "scope: no ssh, firewall, sysctl, or ipv6 command" \
