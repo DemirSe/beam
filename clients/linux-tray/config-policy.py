@@ -5,8 +5,7 @@ The default stock-client policy is private destinations direct, then a
 pre-match public UDP/443 reject, then sniffing, then DNS hijack. The reject
 must precede sniff so sing-box can synthesize ICMP port unreachable.
 
-This file is the only copy of that policy: install.sh runs it and
-update-client.py loads it by path.
+This file is the single copy of that policy; install.sh runs it.
 """
 import json
 import sys

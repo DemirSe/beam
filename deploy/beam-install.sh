@@ -31,11 +31,11 @@
 # never becomes the live config. This path installs the binary, the unit, the
 # example, the account, the config, and the liveness probe when the release
 # carries it. It never changes SSH, the firewall, sysctls, IPv6, or the clock;
-# deploy/bootstrap.sh and deploy/bootstrap-alma.sh own those host decisions.
+# host-level policy stays with the operator (see docs/DEPLOY.md).
 #
 # The liveness timer restarts beam after three failed probes, so this script
-# stops it around a rollout and a planned stop must stop it first; see README
-# "Self recovery" and deploy/maintenance-rules.md.
+# stops it around a rollout and a planned stop must stop it first; see
+# docs/DEPLOY.md.
 #
 # Usage:
 #   sudo env BEAM_ARTIFACT=<tar.gz> BEAM_CONFIG=<toml> bash beam-install.sh install

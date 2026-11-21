@@ -138,20 +138,19 @@ stops accepting and drains for at most `shutdown_drain_ms`. A further
 `SIGTERM` or `SIGINT` delivered during drain ends it early. Runtime shutdown
 has a separate three-second bound.
 
-Before you run an installer, read [Deploy](#deploy) below. The deploy scripts
-make host policy changes. Do not run an installer unless you can reach the
-host's provider console. The step-by-step mechanics are in
+Before you install the service, read [Deploy](#deploy) below. Step-by-step
+install, update, rollback, and recommended host tuning are in
 [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ## Deploy
 
-Read this section before you change a host. It gives the choices and checks
-that must exist before you run any command in the runbook. If you cannot meet a
-requirement, stop.
+Read this section before you deploy beam on a server. The repository ships a
+distribution-agnostic systemd installer and unit; host policy (SSH, firewall,
+sysctls, NTP, IPv6) stays with the operator.
 
 ### Choose the host
 
-- Use the smallest dedicated server that fits one tunnel.
+- Use the smallest dedicated Linux server that fits one tunnel.
 - Choose a provider that allows the traffic you intend to send and receive.
 - Choose a region that makes your cover name plausible.
 - Choose a provider console or rescue mode that you tested.
@@ -160,35 +159,29 @@ requirement, stop.
 
 ### Prepare the host
 
-1. Use your own account with key-only SSH and passwordless sudo. The scripts
-   need root.
-2. Use AlmaLinux 10 for `bootstrap-alma.sh` or Debian 13 for `bootstrap.sh`.
-   Both scripts also require x86_64. `beam-install.sh` checks systemd, not a
-   distribution.
-3. Keep the provider console reachable while you work.
-4. Take a snapshot or a backup that you can restore.
-5. Install the required tools before you run a script. None of the three
-   scripts installs OS packages. `bootstrap.sh` needs `/usr/sbin/sshd`,
-   `ssh.service`, the `sshd_config.d` Include, `ip`, `ss`, `sysctl`, and
-   `runuser`. When present, it uses `modprobe` and `tc`. `bootstrap-alma.sh`
-   needs `ip`, `ss`, `sysctl`, `nft`, `chronyc`, `systemctl`, `runuser`, and
-   `restorecon`. `beam-install.sh` needs `systemctl`, `sha256sum`, `getent`,
-   `groupadd`, `useradd`, `runuser`, and `install`. It also needs `tar` with
-   `BEAM_ARTIFACT`.
+1. Use Linux x86_64 with systemd, your own account with key-only SSH, and root
+   or sudo access.
+2. Keep the provider console reachable while you work.
+3. Take a snapshot or backup before changing host firewall or SSH settings.
+4. `deploy/beam-install.sh` checks systemd, not a distribution. It requires
+   `systemctl`, `sha256sum`, `getent`, `groupadd`, `useradd`, `runuser`, and
+   `install` (plus `tar` when using `BEAM_ARTIFACT`, and `python3` if you run
+   the optional `beam-liveness.timer`).
 
 ### Recommended minimum posture
 
-- Keep the provider console open until the last verification passes.
-- Take the snapshot before the first change.
-- Pin the release artifact by hash with `BEAM_SHA256` or its sidecar file.
-- Keep the config at 0600 and out of git.
-- Change one thing at a time.
-- Keep a rollback path for each changed file and for each host policy.
-- Watch the journal after each step.
+- Pin the release artifact by SHA-256 with `BEAM_SHA256` or its `.sha256`
+  sidecar file.
+- Keep `/etc/beam/config.toml` at `root:beam 0640` (and local copies at `0600`)
+  and out of git.
+- Keep the host clock synchronized with NTP (REALITY rejects timestamps more
+  than 300 seconds off).
+- Restrict inbound firewall traffic to SSH and beam's listening port (default
+  TCP 443).
+- Watch `journalctl -u beam` after each install or update.
 
-Each script has a fixed boundary. [`docs/DEPLOY.md`](docs/DEPLOY.md) lists what
-it changes and what it leaves to you, and gives the order of operations with a
-safe stopping point after each step.
+[`docs/DEPLOY.md`](docs/DEPLOY.md) covers `beam-install.sh` install/update/uninstall,
+optional recommended sysctl/firewall/clock settings, and troubleshooting.
 
 ## Verify
 
@@ -214,7 +207,6 @@ python3 tests/deploy/test_deploy_contracts.py
 python3 tests/deploy/test_restart_policy.py
 python3 tests/deploy/test_liveness_check.py
 python3 tests/release/test_release_artifact.py
-bash tests/deploy/test_alma_install.sh
 bash tests/deploy/test_beam_install.sh
 bash tests/linux-tray/test_dns_state.sh
 ```
@@ -290,7 +282,7 @@ process-wide session limiter.
 | Path | Holds |
 |---|---|
 | `crates/` | The Rust workspace: `beam`, `beam-core`, `beam-sys`. |
-| `deploy/` | Files installed on a host: systemd units, sysctl and nftables drops, sshd and DNS drop-ins, installers. |
+| `deploy/` | Distribution-agnostic systemd service install: `beam.service`, `beam-install.sh`, and the optional liveness probe/timer. |
 | `scripts/` | Developer tooling that runs on your machine and is never installed. |
 | `bench/` | The TUN A/B benchmark and soak harness. Its own test is `tests/bench/`. |
 | `tests/` | Rootless suites, plus the TUN harness and its Rust origin in `tests/tun/`. |

@@ -185,7 +185,7 @@ seed_live() {
   : >"$STATE/enabled.beam.service"
 }
 
-# A host that already runs the liveness timer, as bootstrap.sh leaves it.
+# A host that already runs the liveness timer.
 seed_liveness() {
   mkdir -p "$ROOT/usr/local/lib/beam"
   printf 'OLD-PROBE\n' >"$ROOT/usr/local/lib/beam/liveness-check.py"

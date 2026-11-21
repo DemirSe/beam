@@ -64,7 +64,6 @@ test-scripts:
 	python3 tests/deploy/test_restart_policy.py
 	python3 tests/deploy/test_liveness_check.py
 	python3 tests/release/test_release_artifact.py
-	bash tests/deploy/test_alma_install.sh
 	bash tests/deploy/test_beam_install.sh
 	bash tests/linux-tray/test_dns_state.sh
 
