@@ -1,0 +1,31 @@
+name: security-audit
+
+# Weekly RustSec advisory check on Cargo.lock, plus on lockfile changes.
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  push:
+    branches: [main, prod]
+    paths:
+      - Cargo.lock
+      - .github/workflows/security-audit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ github.token }}

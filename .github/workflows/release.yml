@@ -161,7 +161,8 @@ jobs:
             echo "beam \`$version\` from \`$commit\` for \`$target\`."
             echo
             echo 'The archive holds `beam`, `beam.service`, `beam-install.sh`,'
-            echo '`config.example.toml`, and `SHA256SUMS`.'
+            echo '`config.example.toml`, `liveness-check.py`, `beam-liveness.service`,'
+            echo '`beam-liveness.timer`, and `SHA256SUMS`.'
             echo
             echo '```'
             sed "s|^artifact=.*|artifact=$archive|" "$report"
