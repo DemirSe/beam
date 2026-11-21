@@ -16,11 +16,13 @@ Download the release archive (`beam-<version>-<commit>-<target>.tar.gz`) and
 its `.sha256` pin into one directory, or build one from a clean checkout with
 `bash scripts/release-artifact.sh`.
 
-1. Verify the archive and extract it:
+1. Verify the archive and extract it (set `ARCHIVE` to the exact downloaded
+   filename):
 
    ```bash
-   sha256sum -c beam-*.tar.gz.sha256
-   tar -xzf beam-*.tar.gz
+   ARCHIVE=beam-<version>-<commit>-<target>.tar.gz
+   sha256sum -c "$ARCHIVE.sha256"
+   tar -xzf "$ARCHIVE"
    ```
 
 2. Generate an identity and prepare your configuration:
@@ -42,7 +44,7 @@ its `.sha256` pin into one directory, or build one from a clean checkout with
 3. Install the service, unprivileged `beam` account, unit, and liveness timer:
 
    ```bash
-   sudo env BEAM_ARTIFACT=beam-*.tar.gz BEAM_CONFIG=config.toml \
+   sudo env BEAM_ARTIFACT="$ARCHIVE" BEAM_CONFIG=config.toml \
      bash beam-install.sh install
    ```
 
@@ -50,8 +52,8 @@ its `.sha256` pin into one directory, or build one from a clean checkout with
    `SHA256SUMS` binary hash, validates the staged binary as the `beam` user
    before replacing live files, creates `/etc/beam/config.toml` as
    `root:beam 0640`, runs `restorecon` when SELinux tools are present, enables
-   and starts `beam.service` and `beam-liveness.timer`, and rolls back if the
-   new binary fails readiness.
+   and starts `beam.service` (and `beam-liveness.timer` when Python 3.11+ is
+   available), and rolls back if the new binary fails readiness.
 
 4. Remove any temporary secret-bearing files (`config.toml`, `identity.txt`)
    from the staging directory once the service is running.
@@ -62,9 +64,10 @@ By default `beam-install.sh` preserves `/etc/beam/config.toml` and stops
 `beam-liveness.timer` while swapping files:
 
 ```bash
-sha256sum -c beam-*.tar.gz.sha256
-tar -xzf beam-*.tar.gz beam-install.sh
-sudo env BEAM_ARTIFACT=beam-*.tar.gz bash beam-install.sh update
+ARCHIVE=beam-<version>-<commit>-<target>.tar.gz
+sha256sum -c "$ARCHIVE.sha256"
+tar -xzf "$ARCHIVE" beam-install.sh
+sudo env BEAM_ARTIFACT="$ARCHIVE" bash beam-install.sh update
 ```
 
 Set `BEAM_KEEP_CONFIG=0` and `BEAM_CONFIG=<path>` explicitly only when you
@@ -86,14 +89,19 @@ and the `beam` system user/group.
 
 - **`beam.service`** runs with `Restart=always`, `RestartSec=3s`,
   `RestartSteps=4`, `RestartMaxDelaySec=60s` (requires systemd 254+), and
-  `StartLimitIntervalSec=300` / `StartLimitBurst=10`. Crashes recover
-  automatically with exponential backoff without hitting a hot restart loop.
+  `StartLimitIntervalSec=300` / `StartLimitBurst=10`. On systemd 254+, crashes
+  recover automatically with exponential backoff without hitting the start
+  limit. On older systemd versions, `RestartSteps=` and `RestartMaxDelaySec=`
+  are ignored, so a persistent crash loop retries every 3 seconds and can hit
+  `StartLimitBurst=10` (requiring `systemctl reset-failed beam` after fixing
+  the cause).
 - **`beam-liveness.timer`** runs `/usr/local/lib/beam/liveness-check.py` every
-  5 minutes. It reads `[server].listen` and `reality.server_names[0]` from
-  `/etc/beam/config.toml`, completes a TLS handshake through `beam`, and
-  restarts `beam.service` after three consecutive unresponsive probes (15
-  minutes). Cover-side resets/TLS errors are logged as `SKIP` so a cover outage
-  never drops live sessions.
+  5 minutes (requires Python 3.11+ for stdlib `tomllib`; `beam-install.sh`
+  skips enabling the timer with a warning on older Python). It reads
+  `[server].listen` and `reality.server_names[0]` from `/etc/beam/config.toml`,
+  completes a TLS handshake through `beam`, and restarts `beam.service` after
+  three consecutive unresponsive probes (15 minutes). Cover-side resets/TLS
+  errors are logged as `SKIP` so a cover outage never drops live sessions.
 - If you stop `beam.service` intentionally for maintenance, stop
   `beam-liveness.timer` first so it does not restart the service after 15
   minutes.

@@ -13,6 +13,8 @@ on:
 
 permissions:
   contents: read
+  checks: write
+  issues: write
 
 concurrency:
   group: security-audit-${{ github.ref }}

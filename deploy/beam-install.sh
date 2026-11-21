@@ -542,11 +542,18 @@ install_or_update() {
 
   # Enable and start only after the service is proven healthy, so the first
   # probe reaches the new process and a failing rollout never enables a timer
-  # that would restart the service underneath the rollback.
+  # that would restart the service underneath the rollback. The probe uses
+  # stdlib `tomllib` (Python 3.11+); skip enabling it on older Python instead
+  # of leaving a broken timer running.
   if [ -n "$LIVENESS_SCRIPT" ]; then
-    TIMER_TOUCHED=1
-    systemctl enable --now beam-liveness.timer ||
-      fail_rollback "beam-liveness.timer did not start"
+    if command -v python3 >/dev/null 2>&1 &&
+      python3 -c 'import tomllib' >/dev/null 2>&1; then
+      TIMER_TOUCHED=1
+      systemctl enable --now beam-liveness.timer ||
+        fail_rollback "beam-liveness.timer did not start"
+    else
+      say "warning: python3 3.11+ (tomllib) is required for beam-liveness.timer; skipping timer enable"
+    fi
   elif [ "$WAS_TIMER_ACTIVE" = active ]; then
     systemctl start beam-liveness.timer >/dev/null 2>&1 ||
       say "warning: could not restart beam-liveness.timer"

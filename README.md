@@ -165,8 +165,8 @@ sysctls, NTP, IPv6) stays with the operator.
 3. Take a snapshot or backup before changing host firewall or SSH settings.
 4. `deploy/beam-install.sh` checks systemd, not a distribution. It requires
    `systemctl`, `sha256sum`, `getent`, `groupadd`, `useradd`, `runuser`, and
-   `install` (plus `tar` when using `BEAM_ARTIFACT`, and `python3` if you run
-   the optional `beam-liveness.timer`).
+   `install` (plus `tar` when using `BEAM_ARTIFACT`, and `python3` 3.11+ for
+   stdlib `tomllib` if you run the optional `beam-liveness.timer`).
 
 ### Recommended minimum posture
 

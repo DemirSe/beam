@@ -812,7 +812,26 @@ check "bundle with BEAM_SHA256: fails" "$([ "$rc" != 0 ] && echo 0 || echo 1)"
 check "bundle with BEAM_SHA256: needs BEAM_ARTIFACT" \
   "$(grep -q 'BEAM_SHA256 pins the archive' "$LOGS/err" && echo 0 || echo 1)"
 
-# ---- case 11: host-wide state is out of scope --------------------------
+# ---- case 11: liveness timer skipped without python3 3.11+ (tomllib) ---
+setup_case liveness_no_tomllib
+cat >"$STUBS/python3" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod 0755 "$STUBS/python3"
+ARTIFACT="$(make_artifact liveness_no_tomllib)"
+printf 'CONFIG\n' >"$CASE/config.toml"
+chmod 0600 "$CASE/config.toml"
+BEAM_ARTIFACT="$ARTIFACT" BEAM_CONFIG="$CASE/config.toml" run_script install
+rc=$?
+rm -f "$STUBS/python3"
+check "no tomllib: install succeeds" "$([ "$rc" = 0 ] && echo 0 || echo 1)"
+check "no tomllib: beam is active" "$([ -e "$STATE/active.beam.service" ] && echo 0 || echo 1)"
+check "no tomllib: liveness timer not enabled" "$([ ! -e "$STATE/enabled.beam-liveness.timer" ] && echo 0 || echo 1)"
+check "no tomllib: warns about python3 3.11+" \
+  "$(grep -q 'python3 3.11+ (tomllib) is required' "$LOGS/err" && echo 0 || echo 1)"
+
+# ---- case 12: host-wide state is out of scope --------------------------
 SCOPE="$REPO/deploy/beam-install.sh"
 check "scope: no ssh, firewall, sysctl, or ipv6 command" \
   "$(! grep -Eq '^[[:space:]]*(nft|iptables|ip6tables|ufw|firewall-cmd|sysctl|sshd|ip)[[:space:]]' "$SCOPE" && echo 0 || echo 1)"
