@@ -84,8 +84,9 @@ pub fn generate_uuid() -> Result<Uuid, IdentityError> {
 
 /// Generates a REALITY short id: 8 random bytes as 16 hex characters.
 ///
-/// Xray and beam accept 2 to 16 hex characters. Eight bytes is the largest
-/// value, and it is the length the README documents.
+/// Xray and beam accept an even number of 2 to 16 hex characters (1 to 8
+/// bytes). Eight bytes is the largest value, and it is the length the README
+/// documents.
 pub fn generate_short_id() -> Result<String, IdentityError> {
     let mut bytes = Zeroizing::new([0u8; SHORT_ID_LEN]);
     fill_random(&mut bytes[..])?;

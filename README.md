@@ -321,9 +321,15 @@ VLESS with `xtls-rprx-vision` is expected to work.
   `reality.server_names` and `beam generate --sni` require DNS hostnames and
   reject IP literals (RFC 6066); an existing configuration that lists an IPv4
   literal in `reality.server_names` will fail validation and startup.
-  `reality.dest` and `beam generate --host` continue to accept IPv4 and IPv6
-  literals (`beam generate --host` rejects malformed dotted-numeric IPv4-like
-  values while still allowing non-IP hostnames such as `node.123`).
+  `reality.dest` accepts canonical IPv4 literals, bracketed IPv6 literals
+  (brackets are reserved for IPv6), and DNS hostnames (including FQDNs with a
+  trailing dot); it rejects empty labels and legacy decimal, octal, or
+  hexadecimal numeric IPv4 forms (such as `999.0.0.1`, `127.1`, `2130706433`,
+  `0177.0.0.1`, and `0x7f000001`), while allowing non-IP hostnames such as
+  `node.123`; an existing configuration that uses those rejected forms will
+  fail validation and startup. `beam generate --host` continues to accept IPv4
+  and IPv6 literals and DNS hostnames while rejecting malformed dotted-numeric
+  IPv4-like values and allowing non-IP hostnames such as `node.123`.
 - Short IDs are validated and decoded at startup into fixed 8-byte values;
   comparisons are constant-time.
 - Stock has no replay cache. beam reserves in-flight handshakes before TLS and

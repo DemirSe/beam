@@ -85,7 +85,7 @@ pub enum ValidationError {
     #[error("reality.short_ids must not be empty")]
     ShortIdsEmpty,
     /// A `reality.short_ids` entry is malformed.
-    #[error("reality.short_ids[{index}] must be 2 to 16 hexadecimal characters")]
+    #[error("reality.short_ids[{index}] must be an even number of 2 to 16 hexadecimal characters")]
     ShortId {
         /// Zero-based position of the invalid entry.
         index: usize,
@@ -100,7 +100,9 @@ pub enum ValidationError {
         index: usize,
     },
     /// `reality.dest` is not a usable `host:port` pair.
-    #[error("reality.dest must be host:port with a non-empty host and port 1..=65535")]
+    #[error(
+        "reality.dest must be host:port with a valid DNS name or IP literal and port 1..=65535 (IPv6 literals must use brackets, and brackets are reserved for IPv6)"
+    )]
     Dest,
     /// `log.level` is unknown.
     #[error("log.level must be one of: error, warn, info, debug, trace")]
@@ -269,15 +271,33 @@ impl FromStr for Config {
     }
 }
 
-/// Returns a location-only TOML error message.
+/// Returns a sanitized TOML error message without copying user values.
 ///
-/// `toml::de::Error::message()` is not safe to print for type mismatches: it
-/// renders the offending value (for example a secret pasted into a numeric
-/// field). The span gives operators enough information to find the typo
-/// without copying source text into logs.
+/// `toml::de::Error::message()` is not safe to print in general: type
+/// mismatches render the offending value (for example a secret pasted into a
+/// numeric field). The span gives operators enough information to find a typo
+/// without copying source text into logs, and a missing required root section
+/// is matched against a fixed schema allowlist so only static section names
+/// are ever reported.
 fn sanitized_toml_error(error: &toml::de::Error, input: &str) -> String {
+    const ROOT_SECTIONS: [&str; 5] = ["server", "user", "reality", "log", "limits"];
+
+    let missing_section = error
+        .message()
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'))
+        .and_then(|name| {
+            ROOT_SECTIONS
+                .iter()
+                .copied()
+                .find(|section| *section == name)
+        });
+
     let Some(span) = error.span() else {
-        return "TOML syntax or schema error".to_owned();
+        return match missing_section {
+            Some(section) => format!("TOML schema error: missing required section `[{section}]`"),
+            None => "TOML syntax or schema error".to_owned(),
+        };
     };
     let offset = span.start.min(input.len());
     let prefix = &input[..offset];
@@ -286,7 +306,14 @@ fn sanitized_toml_error(error: &toml::de::Error, input: &str) -> String {
         .rsplit_once('\n')
         .map_or(offset, |(_, tail)| tail.len())
         + 1;
-    format!("TOML syntax or schema error at line {line}, column {column}")
+    match missing_section {
+        Some(section) => {
+            format!(
+                "TOML schema error: missing required section `[{section}]` at line {line}, column {column}"
+            )
+        }
+        None => format!("TOML syntax or schema error at line {line}, column {column}"),
+    }
 }
 
 impl TryFrom<RawConfig> for Config {
@@ -405,6 +432,28 @@ pub fn is_plausible_dns_name(name: &str) -> bool {
     })
 }
 
+/// Returns true when `name` consists solely of legacy numeric IPv4 parts
+/// separated by dots (decimal, octal, or `0x`/`0X` hexadecimal such as
+/// `999.0.0.1`, `127.1`, `0177.0.0.1`, `0x7f.0.0.1`, or `0x7f000001`).
+///
+/// `std::net::Ipv4Addr` accepts only canonical dotted-decimal addresses, while
+/// `getaddrinfo`/`inet_aton` can interpret shorthand or hexadecimal forms as
+/// numeric IPv4 literals. Rejecting them here keeps `reality.dest` aligned
+/// with canonical IPv4 syntax and avoids accepting mistyped numeric addresses.
+fn looks_like_legacy_numeric_ipv4(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|label| {
+            if let Some(hex) = label
+                .strip_prefix("0x")
+                .or_else(|| label.strip_prefix("0X"))
+            {
+                !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            } else {
+                !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit())
+            }
+        })
+}
+
 fn parse_dest(value: &str) -> Result<HostPort, ValidationError> {
     let (host, port, bracketed) = if let Some(rest) = value.strip_prefix('[') {
         let (host, rest) = rest.split_once(']').ok_or(ValidationError::Dest)?;
@@ -426,8 +475,15 @@ fn parse_dest(value: &str) -> Result<HostPort, ValidationError> {
         return Err(ValidationError::Dest);
     }
 
-    if bracketed && host.parse::<std::net::Ipv6Addr>().is_err() {
-        return Err(ValidationError::Dest);
+    if bracketed {
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(ValidationError::Dest);
+        }
+    } else if host.parse::<std::net::Ipv4Addr>().is_err() {
+        let dns_name = host.strip_suffix('.').unwrap_or(host);
+        if looks_like_legacy_numeric_ipv4(dns_name) || !is_plausible_dns_name(dns_name) {
+            return Err(ValidationError::Dest);
+        }
     }
 
     let port: u16 = port.parse().map_err(|_| ValidationError::Dest)?;
@@ -907,6 +963,27 @@ idle_timeout_ms = 300000
             "whatsapp.net:65536",
             ":443",
             "[::1:443",
+            "2001:db8::1:443",
+            "[127.0.0.1]:443",
+            "[whatsapp.net]:443",
+            "bad..example:443",
+            ".example.com:443",
+            "example.com..:443",
+            ".:443",
+            "-bad.example:443",
+            "bad-.example:443",
+            "bad_host:443",
+            "bad/host:443",
+            "127.0.0.1.:443",
+            "999.0.0.1:443",
+            "127.1:443",
+            "192.168.1:443",
+            "2130706433:443",
+            "127.1.:443",
+            "0x7f.0.0.1:443",
+            "0x7f000001:443",
+            "0X7F.1:443",
+            "0177.0.0.1:443",
         ] {
             let input = config_toml(&key)
                 .replace("dest = \"whatsapp.net:443\"", &format!("dest = \"{dest}\""));
@@ -915,19 +992,100 @@ idle_timeout_ms = 300000
                 matches!(error, ConfigError::Validation(ValidationError::Dest)),
                 "destination {dest:?} was accepted"
             );
+            let message = error.to_string();
+            assert!(
+                message.contains("IPv6 literals must use brackets")
+                    && message.contains("brackets are reserved for IPv6"),
+                "dest error message should explain bracket rules: {message}"
+            );
         }
     }
 
     #[test]
-    fn accepts_bracketed_ipv6_destination() {
-        let input = config_toml(&private_key()).replace(
-            "dest = \"whatsapp.net:443\"",
-            "dest = \"[2001:db8::1]:443\"",
+    fn accepts_valid_ipv4_ipv6_dns_and_fqdn_destinations() {
+        let key = private_key();
+        for (dest, expected_host, expected_port, expected_display) in [
+            ("127.0.0.1:443", "127.0.0.1", 443, "127.0.0.1:443"),
+            ("[2001:db8::1]:443", "2001:db8::1", 443, "[2001:db8::1]:443"),
+            ("whatsapp.net:443", "whatsapp.net", 443, "whatsapp.net:443"),
+            (
+                "whatsapp.net.:443",
+                "whatsapp.net.",
+                443,
+                "whatsapp.net.:443",
+            ),
+            ("localhost:8443", "localhost", 8443, "localhost:8443"),
+            ("node.123:443", "node.123", 443, "node.123:443"),
+            (
+                "0xdead.example.com:443",
+                "0xdead.example.com",
+                443,
+                "0xdead.example.com:443",
+            ),
+        ] {
+            let input = config_toml(&key)
+                .replace("dest = \"whatsapp.net:443\"", &format!("dest = \"{dest}\""));
+            let config = Config::from_toml_str(&input)
+                .unwrap_or_else(|error| panic!("destination {dest:?} should be accepted: {error}"));
+            assert_eq!(config.reality.dest.host, expected_host);
+            assert_eq!(config.reality.dest.port, expected_port);
+            assert_eq!(config.reality.dest.to_string(), expected_display);
+        }
+    }
+
+    #[test]
+    fn missing_root_section_reports_section_without_leaking_secrets() {
+        const CANARY: &str = "SUPERSECRET-CANARY-MISSING-SECTION";
+        let full = config_toml(&private_key()).replace("0123456789abcdef", CANARY);
+        let sections = [
+            ("server", "[server]\nlisten = \"127.0.0.1:443\"\n"),
+            (
+                "user",
+                "[user]\nid = \"00000000-0000-0000-0000-000000000000\"\nflow = \"xtls-rprx-vision\"\n",
+            ),
+            ("log", "[log]\nlevel = \"warn\"\n"),
+            (
+                "limits",
+                "[limits]\nmax_connections = 1024\nmax_udp_destinations = 2048\nmax_preauth_per_ip = 128\nmax_xudp_sessions = 256\nlisten_backlog = 1024\nshutdown_drain_ms = 2000\nhandshake_timeout_ms = 60000\nidle_timeout_ms = 300000\n",
+            ),
+        ];
+        for (name, block) in sections {
+            let without = full.replace(block, "");
+            assert_ne!(without, full, "failed to remove section [{name}]");
+            let error = Config::from_toml_str(&without).unwrap_err();
+            let rendered = error.to_string();
+            assert!(
+                matches!(error, ConfigError::Toml { .. }),
+                "expected Toml error for missing [{name}], got {error:?}"
+            );
+            assert!(
+                rendered.contains(&format!("missing required section `[{name}]`")),
+                "error for missing [{name}] should identify the section: {rendered}"
+            );
+            assert!(!rendered.contains(CANARY), "{rendered}");
+        }
+
+        // Also test missing [reality] with a canary in [user].
+        let without_reality = format!(
+            "[server]\nlisten = \"127.0.0.1:443\"\n\n[user]\nid = \"{CANARY}\"\nflow = \"xtls-rprx-vision\"\n\n[log]\nlevel = \"warn\"\n\n[limits]\nmax_connections = 1024\nmax_udp_destinations = 2048\nhandshake_timeout_ms = 60000\nidle_timeout_ms = 300000\n"
         );
-        let config = Config::from_toml_str(&input).unwrap();
-        assert_eq!(config.reality.dest.host, "2001:db8::1");
-        assert_eq!(config.reality.dest.port, 443);
-        assert_eq!(config.reality.dest.to_string(), "[2001:db8::1]:443");
+        let error = Config::from_toml_str(&without_reality).unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("missing required section `[reality]`"),
+            "error for missing [reality] should identify the section: {rendered}"
+        );
+        assert!(!rendered.contains(CANARY), "{rendered}");
+    }
+
+    #[test]
+    fn short_id_error_message_states_even_length_requirement() {
+        let error = ValidationError::ShortId { index: 0 };
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("even number") && rendered.contains("2 to 16"),
+            "unexpected ShortId message: {rendered}"
+        );
     }
 
     #[test]
