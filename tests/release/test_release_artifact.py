@@ -22,20 +22,35 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "release-artifact.sh"
+WIN_SCRIPT = ROOT / "scripts" / "release-windows-tray.sh"
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 MAKEFILE = ROOT / "Makefile"
 DEPLOY = ROOT / "deploy"
+WIN_CLIENT = ROOT / "clients" / "windows-tray"
 EXAMPLE_CONFIG = ROOT / "config.example.toml"
 
 VERSION = "9.9.9"
 COMMIT = "abcdef123456"
 TARGET = "x86_64-unknown-linux-gnu"
+WIN_TARGET = "x86_64-pc-windows-gnu"
 NAME = f"beam-{VERSION}-{COMMIT}-{TARGET}"
+WIN_NAME = f"beam-windows-tray-{VERSION}-{COMMIT}-{WIN_TARGET}"
 FULL_SHA = COMMIT + "0123456789abcdef0123456789abcdef01234567"
+
+WIN_MEMBERS = [
+    "README.md",
+    "SHA256SUMS",
+    "beam-tray.exe",
+    "config.example.json",
+    "install.cmd",
+    "install.ps1",
+    "uninstall.cmd",
+]
 
 # Every member the archive must carry, with the mode the installer relies on.
 MEMBERS = {
@@ -81,8 +96,12 @@ case "${2:-}" in
   create)
     mkdir -p "$GH_STORE" || exit 1
     n=${#args[@]}
-    cp -- "${args[$((n - 2))]}" "${args[$((n - 1))]}" "$GH_STORE"/ || exit 1
+    cp -- "${args[$((n - 4))]}" "${args[$((n - 3))]}" \
+          "${args[$((n - 2))]}" "${args[$((n - 1))]}" "$GH_STORE"/ || exit 1
     if [ "${GH_CORRUPT:-0}" = 1 ]; then
+      echo corrupt >>"$GH_STORE/$(basename "${args[$((n - 4))]}")"
+    fi
+    if [ "${GH_CORRUPT_WIN:-0}" = 1 ]; then
       echo corrupt >>"$GH_STORE/$(basename "${args[$((n - 2))]}")"
     fi
     exit 0 ;;
@@ -379,6 +398,88 @@ class ReleaseArtifactTest(unittest.TestCase):
         self.assertEqual(list(self.tmp.rglob("*.tar.gz")), [])
 
 
+class WindowsTrayReleaseArtifactTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.out = self.tmp / "out"
+        self.bin = self.tmp / "beam-tray.exe"
+        self.bin.write_bytes(b"MZstub-beam-tray-binary")
+
+    def run_script(self, **env_over):
+        env = os.environ.copy()
+        env.update(
+            {
+                "BEAM_WINDOWS_TRAY_BIN": str(self.bin),
+                "BEAM_RELEASE_VERSION": VERSION,
+                "BEAM_RELEASE_COMMIT": COMMIT,
+                "BEAM_WINDOWS_TARGET": WIN_TARGET,
+                "BEAM_RELEASE_OUT": str(self.out),
+            }
+        )
+        env.update(env_over)
+        return subprocess.run(
+            ["bash", str(WIN_SCRIPT)], capture_output=True, text=True, env=env
+        )
+
+    def test_zip_and_checksums(self):
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        archive = self.out / f"{WIN_NAME}.zip"
+        pin = self.out / f"{WIN_NAME}.zip.sha256"
+        self.assertTrue(archive.is_file())
+        self.assertTrue(pin.is_file())
+
+        with zipfile.ZipFile(archive) as zf:
+            self.assertEqual(sorted(zf.namelist()), sorted(WIN_MEMBERS))
+            self.assertEqual(zf.read("beam-tray.exe"), self.bin.read_bytes())
+            self.assertEqual(
+                zf.read("install.ps1"), (WIN_CLIENT / "install.ps1").read_bytes()
+            )
+            self.assertEqual(
+                zf.read("install.cmd"), (WIN_CLIENT / "install.cmd").read_bytes()
+            )
+            self.assertEqual(
+                zf.read("uninstall.cmd"), (WIN_CLIENT / "uninstall.cmd").read_bytes()
+            )
+            self.assertEqual(
+                zf.read("config.example.json"),
+                (WIN_CLIENT / "config.example.json").read_bytes(),
+            )
+            self.assertEqual(
+                zf.read("SHA256SUMS").decode(),
+                f"{sha256(self.bin)}  beam-tray.exe\n",
+            )
+
+        self.assertEqual(pin.read_text(), f"{sha256(archive)}  {WIN_NAME}.zip\n")
+        pin_check = subprocess.run(
+            ["sha256sum", "-c", pin.name], cwd=self.out, capture_output=True, text=True
+        )
+        self.assertEqual(pin_check.returncode, 0, pin_check.stdout + pin_check.stderr)
+
+        reported = dict(
+            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+        )
+        self.assertEqual(reported["win_artifact"], str(archive))
+        self.assertEqual(reported["win_artifact_sha256"], sha256(archive))
+        self.assertEqual(reported["win_binary_sha256"], sha256(self.bin))
+        self.assertEqual(reported["win_version"], VERSION)
+        self.assertEqual(reported["win_commit"], COMMIT)
+        self.assertEqual(reported["win_target"], WIN_TARGET)
+
+    def test_refuses_to_replace_and_needs_commit(self):
+        self.assertEqual(self.run_script().returncode, 0)
+        second = self.run_script()
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("refusing to replace", second.stderr)
+
+        no_commit = self.run_script(BEAM_RELEASE_COMMIT="")
+        self.assertNotEqual(no_commit.returncode, 0)
+        self.assertIn("BEAM_RELEASE_COMMIT", no_commit.stderr)
+
+
 class ReleaseWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.code = workflow_code()
@@ -558,7 +659,10 @@ class ReleasePublishStepTest(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.out = self.tmp / "out"
         self.bin = write_stub(self.tmp / "beam")
+        self.win_bin = self.tmp / "beam-tray.exe"
+        self.win_bin.write_bytes(b"MZstub-beam-tray-binary")
         self.archive = self.out / f"{NAME}.tar.gz"
+        self.win_archive = self.out / f"{WIN_NAME}.zip"
 
         stub_dir = self.tmp / "bin"
         stub_dir.mkdir()
@@ -570,6 +674,8 @@ class ReleasePublishStepTest(unittest.TestCase):
         self.runner_temp.mkdir()
         self.report = self.runner_temp / "release-artifact.txt"
         self.report.write_text(self.build_artifact().stdout)
+        self.win_report = self.runner_temp / "release-windows-tray.txt"
+        self.win_report.write_text(self.build_win_artifact().stdout)
         self.summary = self.tmp / "summary.md"
         self.summary.write_text("")
         self.store = self.tmp / "store"
@@ -608,6 +714,23 @@ class ReleasePublishStepTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
+    def build_win_artifact(self):
+        env = os.environ.copy()
+        env.update(
+            {
+                "BEAM_WINDOWS_TRAY_BIN": str(self.win_bin),
+                "BEAM_RELEASE_VERSION": VERSION,
+                "BEAM_RELEASE_COMMIT": COMMIT,
+                "BEAM_WINDOWS_TARGET": WIN_TARGET,
+                "BEAM_RELEASE_OUT": str(self.out),
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(WIN_SCRIPT)], capture_output=True, text=True, env=env
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
     def run_publish(self, **env_over):
         env = dict(self.env)
         env.update(env_over)
@@ -632,7 +755,11 @@ class ReleasePublishStepTest(unittest.TestCase):
         self.assertIn(f" {tag} ", create)
         self.assertIn("--draft", create)
         self.assertIn(f"--target {FULL_SHA}", create)
-        self.assertTrue(create.endswith(f" {self.archive} {self.archive}.sha256"))
+        self.assertTrue(
+            create.endswith(
+                f" {self.archive} {self.archive}.sha256 {self.win_archive} {self.win_archive}.sha256"
+            )
+        )
         # Draft, then verify its download, then publish, then print the URL.
         self.assertLess(joined.index("release create "), joined.index("release download "))
         self.assertLess(joined.index("release download "), joined.index("release edit "))
@@ -644,6 +771,8 @@ class ReleasePublishStepTest(unittest.TestCase):
         self.assertIn(f"tar -xzf {NAME}.tar.gz", notes)
         self.assertIn("bash beam-install.sh install", notes)
         self.assertIn("chmod 600 config.example.toml", notes)
+        self.assertIn(f"{WIN_NAME}.zip", notes)
+        self.assertIn("install.cmd", notes)
 
     def test_refuses_an_existing_release(self):
         result = self.run_publish(GH_HAVE_RELEASE="1")
@@ -694,11 +823,26 @@ class ReleasePublishStepTest(unittest.TestCase):
         self.assertIn("release delete ", joined)
         self.assertNotIn("release edit", joined)
 
+    def test_deletes_the_draft_when_the_windows_download_does_not_match(self):
+        result = self.run_publish(GH_CORRUPT_WIN="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("downloaded asset does not match", result.stderr)
+        joined = "\n".join(self.gh_calls())
+        self.assertIn("release delete ", joined)
+        self.assertNotIn("release edit", joined)
+
     def test_refuses_a_missing_report(self):
         self.report.unlink()
         result = self.run_publish()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no artifact report", result.stderr)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_refuses_a_missing_windows_report(self):
+        self.win_report.unlink()
+        result = self.run_publish()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no windows tray report", result.stderr)
         self.assertEqual(self.gh_calls(), [])
 
 

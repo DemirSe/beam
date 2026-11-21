@@ -91,6 +91,11 @@ jobs:
           workspaces: . -> target
       - name: Verify
         run: make verify
+      - name: Install MinGW-w64 for Windows tray
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
       - name: Build and package
         # Outside target/: a restored build cache must not make a rerun refuse
         # to replace a stale archive.
@@ -99,6 +104,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/release-artifact.sh | tee "$RUNNER_TEMP/release-artifact.txt"
+          bash scripts/release-windows-tray.sh | tee "$RUNNER_TEMP/release-windows-tray.txt"
       - name: Record the artifact
         run: |
           set -euo pipefail
@@ -107,6 +113,7 @@ jobs:
             echo ''
             echo '```'
             cat "$RUNNER_TEMP/release-artifact.txt"
+            cat "$RUNNER_TEMP/release-windows-tray.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Publish the GitHub Release
@@ -149,6 +156,29 @@ jobs:
           esac
           pin="$artifact.sha256"
           [ -f "$pin" ] || die "no checksum pin next to $archive"
+          win_report="$RUNNER_TEMP/release-windows-tray.txt"
+          [ -f "$win_report" ] || die "no windows tray report; the build step did not run"
+          win_field() { sed -n "s/^$1=//p" "$win_report" | tail -n 1; }
+          win_version="$(win_field win_version)"
+          win_commit="$(win_field win_commit)"
+          win_target="$(win_field win_target)"
+          win_artifact="$(win_field win_artifact)"
+          win_archive_sha="$(win_field win_artifact_sha256)"
+          [ "$win_version" = "$version" ] ||
+            die "windows tray version '$win_version' does not match '$version'"
+          [ "$win_commit" = "$commit" ] ||
+            die "windows tray commit '$win_commit' does not match '$commit'"
+          [[ "$win_target" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+            die "bad windows target '$win_target'"
+          [ -f "$win_artifact" ] && [ ! -L "$win_artifact" ] ||
+            die "windows artifact not found: '$win_artifact'"
+          win_archive="$(basename "$win_artifact")"
+          [ "$win_archive" = "beam-windows-tray-$version-$commit-$win_target.zip" ] ||
+            die "windows artifact '$win_archive' is not beam-windows-tray-$version-$commit-$win_target.zip"
+          [ "$win_archive_sha" = "$(sha256sum "$win_artifact" | cut -d' ' -f1)" ] ||
+            die "$win_archive does not match the reported SHA-256"
+          win_pin="$win_artifact.sha256"
+          [ -f "$win_pin" ] || die "no checksum pin next to $win_archive"
           tag="v$version-$commit"
           # A release or tag is never replaced. A failed run leaves a draft, so
           # the owner removes it before a retry.
@@ -160,15 +190,16 @@ jobs:
           {
             echo "beam \`$version\` from \`$commit\` for \`$target\`."
             echo
-            echo 'The archive holds `beam`, `beam.service`, `beam-install.sh`,'
+            echo 'The server archive holds `beam`, `beam.service`, `beam-install.sh`,'
             echo '`config.example.toml`, `liveness-check.py`, `beam-liveness.service`,'
             echo '`beam-liveness.timer`, and `SHA256SUMS`.'
             echo
             echo '```'
             sed "s|^artifact=.*|artifact=$archive|" "$report"
+            sed "s|^win_artifact=.*|win_artifact=$win_archive|" "$win_report"
             echo '```'
             echo
-            echo '## Install'
+            echo '## Install (Linux server)'
             echo
             echo 'Download the archive and its `.sha256` pin into one directory, then:'
             echo
@@ -180,19 +211,25 @@ jobs:
             echo "sudo env BEAM_ARTIFACT=$archive BEAM_CONFIG=config.example.toml \\"
             echo '  bash beam-install.sh install'
             echo '```'
+            echo
+            echo '## Windows tray client (optional)'
+            echo
+            echo "Download \`$win_archive\` and \`$win_archive.sha256\`, extract the zip,"
+            echo 'place `sing-box.exe` (1.15+) and your filled-in `config.json` in the'
+            echo 'same folder, then double-click `install.cmd`.'
           } > "$notes"
           # Draft first: the release becomes public only after the downloaded
-          # bytes match the pin.
+          # bytes match both pins.
           gh release create "$tag" --draft --target "$GITHUB_SHA" \
             --title "beam $version ($commit)" --notes-file "$notes" \
-            "$artifact" "$pin"
+            "$artifact" "$pin" "$win_artifact" "$win_pin"
           download="$RUNNER_TEMP/release-download"
           mkdir -p "$download"
           gh release download "$tag" --dir "$download"
-          if ! ( cd "$download" && sha256sum -c "$(basename "$pin")" ); then
+          if ! ( cd "$download" && sha256sum -c "$(basename "$pin")" && sha256sum -c "$(basename "$win_pin")" ); then
             gh release delete "$tag" --yes >/dev/null 2>&1 ||
               echo "release: delete the draft $tag by hand" >&2
-            die "downloaded asset does not match $archive"
+            die "downloaded asset does not match $archive or $win_archive"
           fi
           gh release edit "$tag" --draft=false
           {
