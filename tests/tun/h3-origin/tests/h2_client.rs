@@ -153,3 +153,69 @@ fn stalled_tls_handshake_reports_the_tls_stage() {
     assert!(error.contains("TLS handshake"), "unexpected error: {error}");
     assert!(error.contains("timed out"), "unexpected error: {error}");
 }
+
+#[test]
+fn unbracketed_ipv6_authority_fails_with_bracket_guidance_before_dns() {
+    let output = Command::new(env!("CARGO_BIN_EXE_h2-client"))
+        .args(["--url", "HTTPS://fd00:2::2:8443/", "--streams", "2"])
+        .output()
+        .expect("run h2-client");
+
+    assert_eq!(output.status.code(), Some(1));
+    let value = verdict(&output.stdout);
+    assert_failure(&value);
+    let error = value["errors"][0].as_str().expect("error text");
+    assert!(
+        error.contains("unbracketed IPv6") && error.contains("brackets"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn userinfo_authority_fails_without_leaking_credentials_in_verdict() {
+    let output = Command::new(env!("CARGO_BIN_EXE_h2-client"))
+        .args([
+            "--url",
+            "https://user:dummy@lab.invalid:8443/",
+            "--streams",
+            "2",
+        ])
+        .output()
+        .expect("run h2-client");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value = verdict(&output.stdout);
+    assert_failure(&value);
+    let error = value["errors"][0].as_str().expect("error text");
+    assert!(error.contains("userinfo"), "unexpected error: {error}");
+    assert!(
+        !stdout.contains("dummy") && !stdout.contains("user:dummy"),
+        "verdict leaked userinfo: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_output_path_writes_verdict_without_panicking() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = std::env::temp_dir().join(format!("beam-h2-nonutf8-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir(&directory).expect("create test output directory");
+    let path = directory.join(OsStr::from_bytes(b"verdict-\xff.json"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_h2-client"))
+        .args(["--url", UNREACHABLE, "--out"])
+        .arg(&path)
+        .output()
+        .expect("run h2-client");
+    let file = fs::read(&path);
+    fs::remove_dir_all(&directory).expect("remove test output directory");
+    let file = file.expect("read non-UTF-8 verdict file");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, file);
+    assert_failure(&verdict(&output.stdout));
+}

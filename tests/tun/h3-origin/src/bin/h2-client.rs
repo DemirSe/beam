@@ -11,9 +11,12 @@
 //! connection id.
 
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{self, Write},
-    net::{SocketAddr, ToSocketAddrs},
+    net::{Ipv6Addr, SocketAddr, ToSocketAddrs},
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc,
@@ -105,27 +108,54 @@ impl ServerCertVerifier for AcceptAnyCertificate {
     }
 }
 
+#[derive(Debug)]
 struct Args {
     url: String,
     streams: usize,
-    out: Option<String>,
+    out: Option<PathBuf>,
+}
+
+/// Validates the `https://` scheme case-insensitively and normalizes it to
+/// lowercase `https://`.
+fn normalize_https_url(raw: &str) -> Result<String> {
+    if !raw
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        bail!("--url must start with https://");
+    }
+    Ok(format!("https://{}", &raw[8..]))
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = env::args().skip(1);
+    parse_args_from(env::args_os().skip(1))
+}
+
+fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Args> {
+    let mut args = args.into_iter();
     let mut url: Option<String> = None;
     let mut streams = 16usize;
-    let mut out: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        let Some(flag) = arg.to_str() else {
+            bail!("invalid non-UTF-8 argument: {arg:?}");
+        };
+        match flag {
             "--url" => {
+                let raw = args.next().context(
+                    "--url requires an https:// URL, for example https://10.10.2.2:8443/?bytes=65536",
+                )?;
                 url = Some(
-                    args.next()
-                        .context("--url requires an https:// URL, for example https://10.10.2.2:8443/?bytes=65536")?,
+                    raw.to_str()
+                        .context("--url value must be valid UTF-8")?
+                        .to_owned(),
                 );
             }
             "--streams" => {
                 let raw = args.next().context("--streams requires a count")?;
+                let raw = raw
+                    .to_str()
+                    .with_context(|| format!("--streams value must be valid UTF-8: {raw:?}"))?;
                 streams = raw
                     .parse()
                     .with_context(|| format!("invalid stream count: {raw}"))?;
@@ -134,7 +164,9 @@ fn parse_args() -> Result<Args> {
                 }
             }
             "--out" => {
-                out = Some(args.next().context("--out requires a file path")?);
+                out = Some(PathBuf::from(
+                    args.next().context("--out requires a file path")?,
+                ));
             }
             "-h" | "--help" => {
                 println!("usage: h2-client --url URL [--streams N] [--out FILE]");
@@ -143,27 +175,30 @@ fn parse_args() -> Result<Args> {
             other => bail!("unknown argument: {other}"),
         }
     }
-    let url = url.context("--url is required")?;
-    if !url.starts_with("https://") {
-        bail!("--url must start with https://");
-    }
+    let url = normalize_https_url(&url.context("--url is required")?)?;
     Ok(Args { url, streams, out })
 }
 
-/// Splits `https://host:port/path?query` into the authority and a socket
-/// address. Bare IPv6 hosts are accepted in brackets.
-fn split_url(url: &str) -> Result<(String, SocketAddr)> {
-    let rest = url
+/// Parses and validates the `https://` authority before any DNS lookup or
+/// connection work. Bare IPv6 literals must be enclosed in brackets.
+fn parse_https_authority(url: &str) -> Result<(String, u16)> {
+    let normalized = normalize_https_url(url)?;
+    let rest = normalized
         .strip_prefix("https://")
         .context("URL must start with https://")?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() {
         bail!("URL has no host");
     }
+    if authority.contains('@') {
+        bail!("URL authority must not contain userinfo (`user@`)");
+    }
     let (host, port) = if let Some(remainder) = authority.strip_prefix('[') {
         let (host, tail) = remainder
             .split_once(']')
             .context("unterminated IPv6 literal in URL")?;
+        host.parse::<Ipv6Addr>()
+            .with_context(|| format!("invalid IPv6 literal in URL: [{host}]"))?;
         let port = match tail {
             "" => 443,
             value => value
@@ -174,17 +209,30 @@ fn split_url(url: &str) -> Result<(String, SocketAddr)> {
         };
         (host.to_string(), port)
     } else {
+        if authority.matches(':').count() > 1 {
+            bail!(
+                "unbracketed IPv6 literal in URL authority `{authority}`; enclose IPv6 addresses in brackets, for example https://[::1]:8443/"
+            );
+        }
         match authority.rsplit_once(':') {
-            Some((host, port)) => (host.to_string(), port.parse().context("invalid port")?),
+            Some((host, port)) => {
+                if host.is_empty() {
+                    bail!("URL has no host");
+                }
+                (host.to_string(), port.parse().context("invalid port")?)
+            }
             None => (authority.to_string(), 443),
         }
     };
-    let addr = (host.as_str(), port)
+    Ok((host, port))
+}
+
+fn resolve_authority(host: &str, port: u16) -> Result<SocketAddr> {
+    (host, port)
         .to_socket_addrs()
         .with_context(|| format!("could not resolve {host}:{port}"))?
         .next()
-        .context("host resolved to no address")?;
-    Ok((host, addr))
+        .context("host resolved to no address")
 }
 
 /// Expected body size from the URL's `?bytes=` parameter.
@@ -259,10 +307,14 @@ struct Verdict {
 }
 
 async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
+    let url = normalize_https_url(url)?;
+    let (host, port) = parse_https_authority(&url)?;
     let uri: http::Uri = url.parse().with_context(|| format!("invalid URL: {url}"))?;
-    let (host, addr) = split_url(url)?;
-    let per_stream = expected_len(url)?;
+    let per_stream = expected_len(&url)?;
     check_aggregate_budget(streams, per_stream)?;
+    let server_name = ServerName::try_from(host.clone())
+        .with_context(|| format!("invalid server name: {host}"))?;
+    let addr = resolve_authority(&host, port)?;
     // One shared body: cloning it per stream would multiply a large
     // allocation across every concurrent stream.
     let expected: Arc<Vec<u8>> = Arc::new(expected_body(per_stream));
@@ -273,8 +325,6 @@ async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
         .with_no_client_auth();
     client.alpn_protocols = vec![b"h2".to_vec()];
     let connector = TlsConnector::from(Arc::new(client));
-    let server_name = ServerName::try_from(host.clone())
-        .with_context(|| format!("invalid server name: {host}"))?;
 
     let tcp = match timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
@@ -434,12 +484,13 @@ async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
     Ok(verdict)
 }
 
-fn write_verdict(mut stdout: impl Write, out: Option<&str>, result: &str) -> Result<()> {
+fn write_verdict(mut stdout: impl Write, out: Option<&Path>, result: &str) -> Result<()> {
     let console = writeln!(stdout, "{result}")
         .and_then(|()| stdout.flush())
         .context("could not write verdict to stdout");
     let file = out.map_or(Ok(()), |path| {
-        fs::write(path, format!("{result}\n")).with_context(|| format!("could not write {path}"))
+        fs::write(path, format!("{result}\n"))
+            .with_context(|| format!("could not write {}", path.display()))
     });
     console.and(file)
 }
@@ -522,5 +573,78 @@ mod tests {
     #[test]
     fn expected_len_rejects_over_max_body() {
         assert!(expected_len("https://example.com/?bytes=67108865").is_err());
+    }
+
+    #[test]
+    fn normalize_https_url_handles_case_insensitive_scheme() {
+        assert_eq!(
+            normalize_https_url("HTTPS://127.0.0.1:8443/path").unwrap(),
+            "https://127.0.0.1:8443/path"
+        );
+        assert_eq!(
+            normalize_https_url("Https://[::1]:8443/").unwrap(),
+            "https://[::1]:8443/"
+        );
+        assert!(normalize_https_url("http://127.0.0.1:8443/").is_err());
+    }
+
+    #[test]
+    fn parse_https_authority_rejects_unbracketed_ipv6_and_accepts_bracketed() {
+        for bad in [
+            "https://fd00:2::2/",
+            "https://::1/",
+            "https://2001:db8::1:8443/",
+            "HTTPS://fd00:2::2:8443/?bytes=64",
+        ] {
+            let err = parse_https_authority(bad).expect_err("unbracketed IPv6 must fail");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("unbracketed IPv6") && msg.contains("brackets"),
+                "unexpected error for {bad}: {msg}"
+            );
+        }
+        assert_eq!(
+            parse_https_authority("https://[fd00:2::2]:8443/").unwrap(),
+            ("fd00:2::2".to_string(), 8443)
+        );
+        assert_eq!(
+            parse_https_authority("HTTPS://[::1]/").unwrap(),
+            ("::1".to_string(), 443)
+        );
+        let userinfo_err = parse_https_authority("https://user:dummy@lab.invalid:8443/")
+            .expect_err("userinfo must be rejected");
+        let userinfo_msg = format!("{userinfo_err:#}");
+        assert!(
+            userinfo_msg.contains("userinfo")
+                && !userinfo_msg.contains("user:dummy")
+                && !userinfo_msg.contains("dummy"),
+            "userinfo error must not leak credentials: {userinfo_msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_args_preserves_non_utf8_out_path_and_rejects_non_utf8_url() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw_out = OsString::from_vec(b"/tmp/h2-out-\xff.json".to_vec());
+        let parsed = parse_args_from([
+            OsString::from("--url"),
+            OsString::from("https://127.0.0.1:8443/"),
+            OsString::from("--out"),
+            raw_out.clone(),
+        ])
+        .expect("non-UTF-8 --out path must be accepted");
+        assert_eq!(parsed.out, Some(PathBuf::from(raw_out)));
+
+        let raw_url = OsString::from_vec(b"https://user:dummy@127.0.0.1/\xff".to_vec());
+        let err = parse_args_from([OsString::from("--url"), raw_url])
+            .expect_err("non-UTF-8 --url must fail without panicking");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("valid UTF-8"), "unexpected error: {msg}");
+        assert!(
+            !msg.contains("dummy") && !msg.contains("user:dummy"),
+            "non-UTF-8 --url error leaked credentials: {msg}"
+        );
     }
 }

@@ -16,6 +16,7 @@
 use std::{
     convert::Infallible,
     env,
+    ffi::OsString,
     net::SocketAddr,
     process::ExitCode,
     sync::{
@@ -193,26 +194,42 @@ impl ConnState {
     }
 }
 
+#[derive(Debug)]
 struct Args {
     listen: SocketAddr,
     h2_listen: Option<SocketAddr>,
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = env::args().skip(1);
+    parse_args_from(env::args_os().skip(1))
+}
+
+fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Args> {
+    let mut args = args.into_iter();
     let mut listen = "10.10.2.2:4443".to_string();
     let mut h2_listen: Option<String> = None;
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        let Some(flag) = arg.to_str() else {
+            bail!("invalid non-UTF-8 argument: {arg:?}");
+        };
+        match flag {
             "--listen" => {
-                listen = args
+                let raw = args
                     .next()
                     .context("--listen requires an address, for example 10.10.2.2:4443")?;
+                listen = raw
+                    .to_str()
+                    .with_context(|| format!("--listen value must be valid UTF-8: {raw:?}"))?
+                    .to_owned();
             }
             "--h2-listen" => {
+                let raw = args
+                    .next()
+                    .context("--h2-listen requires an address, for example 10.10.2.2:8443")?;
                 h2_listen = Some(
-                    args.next()
-                        .context("--h2-listen requires an address, for example 10.10.2.2:8443")?,
+                    raw.to_str()
+                        .with_context(|| format!("--h2-listen value must be valid UTF-8: {raw:?}"))?
+                        .to_owned(),
                 );
             }
             "-h" | "--help" => {
@@ -696,5 +713,20 @@ mod tests {
         assert!(requested_body_len(&uri).is_err());
         let uri: http::Uri = "https://example.com/?bytes=1024".parse().expect("URI");
         assert_eq!(requested_body_len(&uri).expect("valid"), 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_args_rejects_non_utf8_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let bad_flag = OsString::from_vec(vec![b'-', b'-', 0xff]);
+        let err = parse_args_from([bad_flag]).expect_err("non-UTF-8 flag must fail");
+        assert!(format!("{err:#}").contains("non-UTF-8"));
+
+        let bad_addr = OsString::from_vec(vec![b'1', b'2', b'7', 0xff]);
+        let err = parse_args_from([OsString::from("--listen"), bad_addr])
+            .expect_err("non-UTF-8 listen addr must fail");
+        assert!(format!("{err:#}").contains("valid UTF-8"));
     }
 }
