@@ -24,23 +24,28 @@ static inline bool tray_state_is_active(TrayState state)
     return state == TRAY_STATE_CONNECTING || state == TRAY_STATE_CONNECTED;
 }
 
-static inline bool tray_state_can_start(TrayState state)
+static inline bool tray_state_can_start(TrayState state, bool process_alive)
 {
-    return state == TRAY_STATE_DISCONNECTED || state == TRAY_STATE_ERROR;
+    return !process_alive &&
+           (state == TRAY_STATE_DISCONNECTED || state == TRAY_STATE_ERROR);
 }
 
-static inline bool tray_state_can_stop(TrayState state)
+static inline bool tray_state_can_stop(TrayState state, bool process_alive)
 {
-    return state == TRAY_STATE_CONNECTING || state == TRAY_STATE_CONNECTED;
+    return process_alive && state != TRAY_STATE_STOPPING;
 }
 
 /*
  * Compute the next state after an interface change or connectivity check while
- * the core process is alive.
+ * the core process is alive. A late TUN coming up after a startup timeout
+ * recovers from ERROR back to CONNECTED.
  */
-static inline TrayState tray_state_on_tun_status(TrayState current, bool tun_up)
+static inline TrayState tray_state_on_tun_status(TrayState current, bool tun_up,
+                                                 bool process_alive)
 {
-    if (current == TRAY_STATE_CONNECTING && tun_up)
+    if (!process_alive || current == TRAY_STATE_STOPPING)
+        return current;
+    if ((current == TRAY_STATE_CONNECTING || current == TRAY_STATE_ERROR) && tun_up)
         return TRAY_STATE_CONNECTED;
     if (current == TRAY_STATE_CONNECTED && !tun_up)
         return TRAY_STATE_CONNECTING;

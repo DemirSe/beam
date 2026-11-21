@@ -75,7 +75,8 @@ for required in (
     "S-1-5-32-544",
     "Register-ScheduledTask",
     "Unregister-ScheduledTask",
-    "Invoke-SelfElevate",
+    "Invoke-SelfElevate -BoundParameters $PSBoundParameters",
+    '"--stop"',
     "-Uninstall",
 ):
     assert required in install_ps1, f"install.ps1 missing required contract token: {required}"

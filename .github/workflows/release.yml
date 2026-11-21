@@ -225,8 +225,15 @@ jobs:
             "$artifact" "$pin" "$win_artifact" "$win_pin"
           download="$RUNNER_TEMP/release-download"
           mkdir -p "$download"
-          gh release download "$tag" --dir "$download"
-          if ! ( cd "$download" && sha256sum -c "$(basename "$pin")" && sha256sum -c "$(basename "$win_pin")" ); then
+          verify_download() {
+            gh release download "$tag" --dir "$download" || return 1
+            cmp -s "$pin" "$download/$(basename "$pin")" || return 1
+            cmp -s "$win_pin" "$download/$(basename "$win_pin")" || return 1
+            [ "$(sha256sum "$download/$archive" | cut -d' ' -f1)" = "$archive_sha" ] || return 1
+            [ "$(sha256sum "$download/$win_archive" | cut -d' ' -f1)" = "$win_archive_sha" ] || return 1
+            ( cd "$download" && sha256sum -c "$(basename "$pin")" && sha256sum -c "$(basename "$win_pin")" )
+          }
+          if ! verify_download; then
             gh release delete "$tag" --yes >/dev/null 2>&1 ||
               echo "release: delete the draft $tag by hand" >&2
             die "downloaded asset does not match $archive or $win_archive"

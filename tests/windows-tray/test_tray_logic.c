@@ -35,17 +35,22 @@ static char *read_entire_file(const char *path, size_t *out_len)
 
 static void test_state_machine(void)
 {
-    assert(tray_state_can_start(TRAY_STATE_DISCONNECTED));
-    assert(tray_state_can_start(TRAY_STATE_ERROR));
-    assert(!tray_state_can_start(TRAY_STATE_CONNECTING));
-    assert(!tray_state_can_start(TRAY_STATE_CONNECTED));
-    assert(!tray_state_can_start(TRAY_STATE_STOPPING));
+    /* When no process is running */
+    assert(tray_state_can_start(TRAY_STATE_DISCONNECTED, false));
+    assert(tray_state_can_start(TRAY_STATE_ERROR, false));
+    assert(!tray_state_can_stop(TRAY_STATE_DISCONNECTED, false));
+    assert(!tray_state_can_stop(TRAY_STATE_ERROR, false));
 
-    assert(tray_state_can_stop(TRAY_STATE_CONNECTING));
-    assert(tray_state_can_stop(TRAY_STATE_CONNECTED));
-    assert(!tray_state_can_stop(TRAY_STATE_DISCONNECTED));
-    assert(!tray_state_can_stop(TRAY_STATE_STOPPING));
-    assert(!tray_state_can_stop(TRAY_STATE_ERROR));
+    /* When process is still alive (including ERROR after startup timeout) */
+    assert(!tray_state_can_start(TRAY_STATE_CONNECTING, true));
+    assert(!tray_state_can_start(TRAY_STATE_CONNECTED, true));
+    assert(!tray_state_can_start(TRAY_STATE_ERROR, true));
+    assert(!tray_state_can_start(TRAY_STATE_STOPPING, true));
+
+    assert(tray_state_can_stop(TRAY_STATE_CONNECTING, true));
+    assert(tray_state_can_stop(TRAY_STATE_CONNECTED, true));
+    assert(tray_state_can_stop(TRAY_STATE_ERROR, true));
+    assert(!tray_state_can_stop(TRAY_STATE_STOPPING, true));
 
     assert(tray_state_is_active(TRAY_STATE_CONNECTING));
     assert(tray_state_is_active(TRAY_STATE_CONNECTED));
@@ -53,14 +58,16 @@ static void test_state_machine(void)
     assert(!tray_state_is_active(TRAY_STATE_STOPPING));
     assert(!tray_state_is_active(TRAY_STATE_ERROR));
 
-    /* TUN up/down transitions */
-    assert(tray_state_on_tun_status(TRAY_STATE_CONNECTING, true) == TRAY_STATE_CONNECTED);
-    assert(tray_state_on_tun_status(TRAY_STATE_CONNECTING, false) == TRAY_STATE_CONNECTING);
-    assert(tray_state_on_tun_status(TRAY_STATE_CONNECTED, true) == TRAY_STATE_CONNECTED);
-    assert(tray_state_on_tun_status(TRAY_STATE_CONNECTED, false) == TRAY_STATE_CONNECTING);
-    assert(tray_state_on_tun_status(TRAY_STATE_DISCONNECTED, true) == TRAY_STATE_DISCONNECTED);
-    assert(tray_state_on_tun_status(TRAY_STATE_STOPPING, false) == TRAY_STATE_STOPPING);
-    assert(tray_state_on_tun_status(TRAY_STATE_ERROR, true) == TRAY_STATE_ERROR);
+    /* TUN up/down transitions, including late TUN recovery from ERROR */
+    assert(tray_state_on_tun_status(TRAY_STATE_CONNECTING, true, true) == TRAY_STATE_CONNECTED);
+    assert(tray_state_on_tun_status(TRAY_STATE_CONNECTING, false, true) == TRAY_STATE_CONNECTING);
+    assert(tray_state_on_tun_status(TRAY_STATE_CONNECTED, true, true) == TRAY_STATE_CONNECTED);
+    assert(tray_state_on_tun_status(TRAY_STATE_CONNECTED, false, true) == TRAY_STATE_CONNECTING);
+    assert(tray_state_on_tun_status(TRAY_STATE_ERROR, true, true) == TRAY_STATE_CONNECTED);
+    assert(tray_state_on_tun_status(TRAY_STATE_ERROR, false, true) == TRAY_STATE_ERROR);
+    assert(tray_state_on_tun_status(TRAY_STATE_ERROR, true, false) == TRAY_STATE_ERROR);
+    assert(tray_state_on_tun_status(TRAY_STATE_DISCONNECTED, true, false) == TRAY_STATE_DISCONNECTED);
+    assert(tray_state_on_tun_status(TRAY_STATE_STOPPING, false, true) == TRAY_STATE_STOPPING);
 
     /* Process exit transitions */
     assert(tray_state_on_process_exit(TRAY_STATE_STOPPING, true) == TRAY_STATE_DISCONNECTED);

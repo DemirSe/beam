@@ -59,12 +59,15 @@ function Test-IsAdmin {
 }
 
 function Invoke-SelfElevate {
+    param(
+        [System.Collections.IDictionary]$BoundParameters
+    )
     $argList = @(
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
         "-File", "`"$PSCommandPath`""
     )
-    foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+    foreach ($kv in $BoundParameters.GetEnumerator()) {
         if ($kv.Value -is [switch]) {
             if ($kv.Value.IsPresent) {
                 $argList += "-$($kv.Key)"
@@ -101,14 +104,15 @@ function Stop-InstalledProcesses {
 
     $resolvedDir = $TargetDir.TrimEnd('\').ToLowerInvariant()
 
-    # Close beam-tray first so it gracefully shuts down sing-box (WFP + TUN DNS cleanup).
+    # Signal beam-tray via --stop (posts WM_CLOSE to the hidden BeamTrayWindow)
+    # so it gracefully shuts down sing-box (WFP + TUN DNS cleanup).
     $trays = Get-Process -Name "beam-tray" -ErrorAction SilentlyContinue
     foreach ($p in $trays) {
         try {
             $pPath = $p.MainModule.FileName
             if ($pPath -and (Split-Path -Parent $pPath).TrimEnd('\').ToLowerInvariant() -eq $resolvedDir) {
                 Write-Host "Stopping running beam-tray (PID $($p.Id))..."
-                $null = $p.CloseMainWindow()
+                $null = Start-Process -FilePath $pPath -ArgumentList "--stop" -NoNewWindow -Wait -PassThru
                 if (-not $p.WaitForExit(6000)) {
                     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
                 }
@@ -358,7 +362,7 @@ function Invoke-Install {
 }
 
 if (-not (Test-IsAdmin)) {
-    Invoke-SelfElevate
+    Invoke-SelfElevate -BoundParameters $PSBoundParameters
 }
 
 try {

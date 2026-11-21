@@ -104,8 +104,15 @@ case "${2:-}" in
     if [ "${GH_CORRUPT_WIN:-0}" = 1 ]; then
       echo corrupt >>"$GH_STORE/$(basename "${args[$((n - 2))]}")"
     fi
+    if [ "${GH_CORRUPT_PIN:-0}" = 1 ]; then
+      # Tamper both the archive and its downloaded pin so pin-only checks would
+      # miss it unless compared against the build report and local pin.
+      echo corrupt >>"$GH_STORE/$(basename "${args[$((n - 4))]}")"
+      ( cd "$GH_STORE" && sha256sum "$(basename "${args[$((n - 4))]}")" > "$(basename "${args[$((n - 3))]}")" )
+    fi
     exit 0 ;;
   download)
+    [ "${GH_DOWNLOAD_FAIL:-0}" = 1 ] && exit 1
     dir=""
     for ((i = 0; i < ${#args[@]}; i++)); do
       [ "${args[i]}" = --dir ] && dir="${args[$((i + 1))]}"
@@ -825,6 +832,22 @@ class ReleasePublishStepTest(unittest.TestCase):
 
     def test_deletes_the_draft_when_the_windows_download_does_not_match(self):
         result = self.run_publish(GH_CORRUPT_WIN="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("downloaded asset does not match", result.stderr)
+        joined = "\n".join(self.gh_calls())
+        self.assertIn("release delete ", joined)
+        self.assertNotIn("release edit", joined)
+
+    def test_deletes_the_draft_when_pin_and_archive_are_both_tampered(self):
+        result = self.run_publish(GH_CORRUPT_PIN="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("downloaded asset does not match", result.stderr)
+        joined = "\n".join(self.gh_calls())
+        self.assertIn("release delete ", joined)
+        self.assertNotIn("release edit", joined)
+
+    def test_deletes_the_draft_when_download_fails(self):
+        result = self.run_publish(GH_DOWNLOAD_FAIL="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("downloaded asset does not match", result.stderr)
         joined = "\n".join(self.gh_calls())

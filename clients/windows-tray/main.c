@@ -514,7 +514,13 @@ static void release_process_handles(void)
     }
 }
 
-static BOOL send_ctrl_break(HANDLE process)
+static BOOL WINAPI ignore_ctrl_handler(DWORD ctrl_type)
+{
+    (void)ctrl_type;
+    return TRUE;
+}
+
+static BOOL send_graceful_stop_signal(HANDLE process)
 {
     DWORD pid = GetProcessId(process);
     BOOL signalled = FALSE;
@@ -524,8 +530,14 @@ static BOOL send_ctrl_break(HANDLE process)
 
     FreeConsole();
     if (AttachConsole(pid)) {
-        signalled = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
+        SetConsoleCtrlHandler(ignore_ctrl_handler, TRUE);
+        signalled = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) != 0;
+        if (!signalled)
+            signalled = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) != 0;
+        if (signalled)
+            Sleep(50);
         FreeConsole();
+        SetConsoleCtrlHandler(ignore_ctrl_handler, FALSE);
     }
     return signalled;
 }
@@ -598,8 +610,7 @@ static BOOL start_core(void)
     startup.wShowWindow = SW_HIDE;
 
     if (!CreateProcessW(g_core, command, NULL, NULL, inherit_handles,
-                        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP |
-                            CREATE_SUSPENDED,
+                        CREATE_NEW_CONSOLE | CREATE_SUSPENDED,
                         NULL, g_dir, &startup, &process)) {
         DWORD error = GetLastError();
 
@@ -702,7 +713,7 @@ static void begin_stop_core(BOOL restart_after, BOOL exit_after)
     set_state(TRAY_STATE_STOPPING);
     start_cooldown();
 
-    if (!send_ctrl_break(g_process)) {
+    if (!send_graceful_stop_signal(g_process)) {
         TerminateProcess(g_process, 0);
     }
 
@@ -725,7 +736,7 @@ static void stop_core_sync(DWORD grace_ms)
         g_stopping = TRUE;
         unregister_process_wait(TRUE);
 
-        signalled = send_ctrl_break(g_process);
+        signalled = send_graceful_stop_signal(g_process);
         if (!signalled || WaitForSingleObject(g_process, grace_ms) != WAIT_OBJECT_0) {
             TerminateProcess(g_process, 0);
             WaitForSingleObject(g_process, 2000);
@@ -760,10 +771,11 @@ static void refresh_tunnel_state(void)
     }
 
     tun_up = is_tun_interface_up();
-    next = tray_state_on_tun_status(g_state, tun_up);
+    next = tray_state_on_tun_status(g_state, tun_up, g_process != NULL);
 
     if (next == TRAY_STATE_CONNECTED) {
         KillTimer(g_window, TIMER_CONNECT_WATCH);
+        g_error_detail[0] = L'\0';
         set_state(TRAY_STATE_CONNECTED);
         return;
     }
@@ -863,8 +875,9 @@ static void show_menu(void)
     POINT point;
     int command;
     wchar_t status_label[128];
-    BOOL can_start = !g_cooldown && tray_state_can_start(g_state);
-    BOOL can_stop  = !g_cooldown && tray_state_can_stop(g_state);
+    BOOL alive     = g_process != NULL;
+    BOOL can_start = !g_cooldown && tray_state_can_start(g_state, alive);
+    BOOL can_stop  = !g_cooldown && tray_state_can_stop(g_state, alive);
 
     menu = CreatePopupMenu();
     if (!menu)
@@ -1014,6 +1027,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line,
     (void)show_command;
 
     g_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+
+    if (command_line && strstr(command_line, "--stop") != NULL) {
+        HWND existing = FindWindowW(L"BeamTrayWindow", NULL);
+        if (existing)
+            PostMessageW(existing, WM_CLOSE, 0, 0);
+        return 0;
+    }
 
     mutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
