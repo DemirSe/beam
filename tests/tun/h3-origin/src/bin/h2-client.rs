@@ -12,7 +12,7 @@
 
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Write},
     net::{Ipv6Addr, SocketAddr, ToSocketAddrs},
@@ -46,12 +46,18 @@ const MAX_BODY_LEN: usize = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 /// Hard cap on concurrent streams; bounds the spawned task count.
 const MAX_STREAMS: usize = 1024;
+/// Upper bound on resolved addresses attempted per run.
+const MAX_RESOLVED_ADDRS: usize = 16;
 // Per-stage waits: a stalled stage reports its own name instead of hanging
 // on the external runner deadline. The overall bound below covers their sum.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-address TCP connect cap when alternate resolved addresses remain.
+const PER_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TLS_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounded wait for clean HTTP/2 connection-driver teardown after streams end.
+const DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// No single body frame may stall longer than this; steady multi-frame
 /// progress of a large body is unaffected.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(15);
@@ -227,16 +233,81 @@ fn parse_https_authority(url: &str) -> Result<(String, u16)> {
     Ok((host, port))
 }
 
-fn resolve_authority(host: &str, port: u16) -> Result<SocketAddr> {
-    (host, port)
+fn resolve_authority(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .with_context(|| format!("could not resolve {host}:{port}"))?
-        .next()
-        .context("host resolved to no address")
+        .take(MAX_RESOLVED_ADDRS)
+        .collect();
+    if addrs.is_empty() {
+        bail!("host resolved to no address");
+    }
+    Ok(addrs)
 }
 
-/// Expected body size from the URL's `?bytes=` parameter.
+/// Attempts TCP connections across resolved addresses in order within a bounded
+/// total budget so a dual-stack hostname can fall back when the first address
+/// is unreachable.
+async fn connect_any(
+    addresses: &[SocketAddr],
+    total_budget: Duration,
+    per_addr_cap: Duration,
+) -> Result<(tokio::net::TcpStream, SocketAddr)> {
+    let deadline = Instant::now() + total_budget;
+    let mut errors = Vec::new();
+    for (index, &addr) in addresses.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            errors.push(format!(
+                "{addr}: overall connect budget ({}s) exhausted",
+                total_budget.as_secs()
+            ));
+            break;
+        }
+        let is_last = index + 1 == addresses.len();
+        let attempt_budget = if is_last {
+            remaining
+        } else {
+            remaining.min(per_addr_cap)
+        };
+        match timeout(attempt_budget, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok((stream, addr)),
+            Ok(Err(error)) => errors.push(format!("{addr}: {error}")),
+            Err(_) => errors.push(format!(
+                "{addr}: timed out after {}ms",
+                attempt_budget.as_millis()
+            )),
+        }
+    }
+    bail!(
+        "could not connect to any resolved address: {}",
+        errors.join("; ")
+    );
+}
+
+/// Default body size when `?bytes=` is omitted, matching `h3-origin`'s
+/// `H3_BODY_BYTES` convention.
+fn default_body_len_from(raw: Option<&OsStr>) -> Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(MARKER.len());
+    };
+    let raw = raw.to_str().context("H3_BODY_BYTES must be valid UTF-8")?;
+    let len: usize = raw
+        .parse()
+        .with_context(|| format!("invalid H3_BODY_BYTES: {raw}"))?;
+    if !(1..=MAX_BODY_LEN).contains(&len) {
+        bail!("H3_BODY_BYTES must be between 1 and {MAX_BODY_LEN}");
+    }
+    Ok(len)
+}
+
+/// Expected body size from the URL's `?bytes=` parameter, falling back to
+/// `H3_BODY_BYTES` or `MARKER.len()` so client and origin agree by default.
 fn expected_len(url: &str) -> Result<usize> {
+    expected_len_with_default(url, env::var_os("H3_BODY_BYTES").as_deref())
+}
+
+fn expected_len_with_default(url: &str, default_env: Option<&OsStr>) -> Result<usize> {
     if let Some(query) = url.split_once('?').map(|(_, query)| query) {
         let query = query.split('#').next().unwrap_or(query);
         for pair in query.split('&') {
@@ -252,7 +323,7 @@ fn expected_len(url: &str) -> Result<usize> {
             }
         }
     }
-    Ok(MARKER.len())
+    default_body_len_from(default_env)
 }
 
 /// Rejects runs whose streams times body size would exceed the aggregate
@@ -314,7 +385,7 @@ async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
     check_aggregate_budget(streams, per_stream)?;
     let server_name = ServerName::try_from(host.clone())
         .with_context(|| format!("invalid server name: {host}"))?;
-    let addr = resolve_authority(&host, port)?;
+    let addresses = resolve_authority(&host, port)?;
     // One shared body: cloning it per stream would multiply a large
     // allocation across every concurrent stream.
     let expected: Arc<Vec<u8>> = Arc::new(expected_body(per_stream));
@@ -326,18 +397,7 @@ async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
     client.alpn_protocols = vec![b"h2".to_vec()];
     let connector = TlsConnector::from(Arc::new(client));
 
-    let tcp = match timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => {
-            bail!("could not connect to {addr}: {error}");
-        }
-        Err(_) => {
-            bail!(
-                "could not connect to {addr}: timed out after {}s",
-                CONNECT_TIMEOUT.as_secs()
-            );
-        }
-    };
+    let (tcp, addr) = connect_any(&addresses, CONNECT_TIMEOUT, PER_ADDR_CONNECT_TIMEOUT).await?;
     let _ = tcp.set_nodelay(true);
     let tls = match timeout(TLS_TIMEOUT, connector.connect(server_name, tcp)).await {
         Ok(Ok(stream)) => stream,
@@ -367,10 +427,11 @@ async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
             HANDSHAKE_TIMEOUT.as_secs()
         ),
     };
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
+    let mut driver_handle = tokio::spawn(async move {
+        connection.await.map_err(|error| {
             eprintln!("h2-client: connection driver ended: {error}");
-        }
+            format!("connection driver failed: {error}")
+        })
     });
 
     let active = Arc::new(AtomicUsize::new(0));
@@ -464,6 +525,9 @@ async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
     }
 
     barrier.wait().await;
+    // Drop the template sender once every stream task owns its clone so that
+    // finishing all streams lets the HTTP/2 driver observe clean shutdown.
+    drop(sender);
 
     let mut verdict = Verdict {
         connections: 1,
@@ -480,8 +544,35 @@ async fn run_requests(url: &str, streams: usize) -> Result<Verdict> {
             Err(error) => verdict.errors.push(format!("stream task failed: {error}")),
         }
     }
+    collect_driver_outcome(
+        &mut driver_handle,
+        DRIVER_SHUTDOWN_TIMEOUT,
+        &mut verdict.errors,
+    )
+    .await;
     verdict.peak_active = peak.load(Ordering::SeqCst);
     Ok(verdict)
+}
+
+/// Awaits bounded HTTP/2 connection-driver teardown and records any driver
+/// failure or stalled shutdown in `errors` so it surfaces in the verdict.
+async fn collect_driver_outcome(
+    driver_handle: &mut tokio::task::JoinHandle<std::result::Result<(), String>>,
+    shutdown_budget: Duration,
+    errors: &mut Vec<String>,
+) {
+    match timeout(shutdown_budget, &mut *driver_handle).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => errors.push(error),
+        Ok(Err(error)) => errors.push(format!("connection driver task failed: {error}")),
+        Err(_) => {
+            driver_handle.abort();
+            errors.push(format!(
+                "connection driver teardown timed out after {}s",
+                shutdown_budget.as_secs()
+            ));
+        }
+    }
 }
 
 fn write_verdict(mut stdout: impl Write, out: Option<&Path>, result: &str) -> Result<()> {
@@ -646,5 +737,74 @@ mod tests {
             !msg.contains("dummy") && !msg.contains("user:dummy"),
             "non-UTF-8 --url error leaked credentials: {msg}"
         );
+    }
+
+    #[test]
+    fn expected_len_honors_h3_body_bytes_default_and_explicit_query_override() {
+        assert_eq!(
+            expected_len_with_default("https://127.0.0.1:8443/", None).unwrap(),
+            MARKER.len()
+        );
+        assert_eq!(
+            expected_len_with_default("https://127.0.0.1:8443/", Some(OsStr::new("4096"))).unwrap(),
+            4096
+        );
+        assert_eq!(
+            expected_len_with_default(
+                "https://127.0.0.1:8443/?bytes=128",
+                Some(OsStr::new("4096"))
+            )
+            .unwrap(),
+            128
+        );
+        assert!(
+            expected_len_with_default("https://127.0.0.1:8443/", Some(OsStr::new("0"))).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_any_falls_back_to_second_resolved_address() {
+        // Reserve and immediately close a loopback listener so the first
+        // address refuses connection while the second accepts.
+        let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_addr = refused.local_addr().unwrap();
+        drop(refused);
+
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move { live.accept().await });
+
+        let (_stream, chosen) = connect_any(
+            &[refused_addr, live_addr],
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("must fall back to second usable address");
+        assert_eq!(chosen, live_addr);
+        accept_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn collect_driver_outcome_surfaces_errors_and_accepts_clean_teardown() {
+        let mut clean = tokio::spawn(async { Ok::<(), String>(()) });
+        let mut errors = Vec::new();
+        collect_driver_outcome(&mut clean, Duration::from_secs(1), &mut errors).await;
+        assert!(errors.is_empty());
+
+        let mut failed = tokio::spawn(async {
+            Err::<(), String>("connection driver failed: protocol error".to_string())
+        });
+        collect_driver_outcome(&mut failed, Duration::from_secs(1), &mut errors).await;
+        assert_eq!(errors, vec!["connection driver failed: protocol error"]);
+
+        let mut stalled = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok::<(), String>(())
+        });
+        let mut stall_errors = Vec::new();
+        collect_driver_outcome(&mut stalled, Duration::from_millis(50), &mut stall_errors).await;
+        assert_eq!(stall_errors.len(), 1);
+        assert!(stall_errors[0].contains("timed out"));
     }
 }

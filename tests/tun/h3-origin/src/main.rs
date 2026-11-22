@@ -16,13 +16,15 @@
 use std::{
     convert::Infallible,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     net::SocketAddr,
+    pin::Pin,
     process::ExitCode,
     sync::{
         Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 
@@ -30,12 +32,13 @@ use anyhow::{Context, Result, bail};
 use bytes::{Buf, Bytes};
 use http::{Response, StatusCode};
 use http_body_util::Full;
+use hyper::body::{Body, Frame, SizeHint};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::rustls;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::sync::Semaphore;
-use tokio::time::timeout;
+use tokio::sync::{Semaphore, watch};
+use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
 const MARKER: &[u8] = b"beam-tun-h3-ok\n";
@@ -57,6 +60,8 @@ const H3_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 const H3_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const H3_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const H3_IDLE_ACCEPT: Duration = Duration::from_secs(120);
+const H2_ACCEPT_BACKOFF_START: Duration = Duration::from_millis(10);
+const H2_ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Bytes currently owned by response bodies and by HTTP/2 send queues.
 static INFLIGHT_BYTES: LazyLock<Arc<ByteBudget>> =
@@ -142,12 +147,13 @@ impl AsRef<[u8]> for BudgetedBody {
     }
 }
 
-fn busy_response(message: String) -> Response<Full<Bytes>> {
+fn busy_response(message: String, guard: RequestGuard) -> Response<TrackedBody> {
+    let len = message.len();
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .header("content-type", "text/plain")
-        .header("content-length", message.len())
-        .body(Full::new(Bytes::from(message)))
+        .header("content-length", len)
+        .body(TrackedBody::new(Full::new(Bytes::from(message)), guard))
         .expect("static response is always valid")
 }
 
@@ -156,6 +162,10 @@ static CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Per-connection request counters. The `active` counter is the multiplexing
 /// evidence: the harness takes the peak of the values logged at request start.
+///
+/// Both HTTP/2 and HTTP/3 hold a [`RequestGuard`] until the response body has
+/// finished delivering (or the request fails/cancels early), so `active`
+/// reflects live in-flight response delivery symmetrically on both protocols.
 struct ConnState {
     label: &'static str,
     id: u64,
@@ -175,22 +185,110 @@ impl ConnState {
         })
     }
 
-    fn start(&self, path: &str) -> u64 {
+    fn start(self: &Arc<Self>, path: String) -> RequestGuard {
         let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let active = self.active.fetch_add(1, Ordering::Relaxed) + 1;
         eprintln!(
             "{}: request conn={} req={request} active={active} start path={path}",
             self.label, self.id
         );
-        request
+        RequestGuard {
+            state: Arc::clone(self),
+            request,
+            path,
+            status: 500,
+            bytes: 0,
+            finished: false,
+        }
     }
 
-    fn end(&self, request: u64, path: &str, status: u16, bytes: usize) {
+    fn finish_request(&self, request: u64, path: &str, status: u16, bytes: usize) {
         eprintln!(
             "{}: request conn={} req={request} end path={path} status={status} bytes={bytes}",
             self.label, self.id
         );
         self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// RAII guard that keeps `ConnState::active` balanced across normal delivery,
+/// early errors, timeouts, and stream cancellation.
+struct RequestGuard {
+    state: Arc<ConnState>,
+    request: u64,
+    path: String,
+    status: u16,
+    bytes: usize,
+    finished: bool,
+}
+
+impl RequestGuard {
+    fn set_outcome(&mut self, status: u16, bytes: usize) {
+        self.status = status;
+        self.bytes = bytes;
+    }
+
+    fn finish(mut self, status: u16, bytes: usize) {
+        self.status = status;
+        self.bytes = bytes;
+        self.complete_once();
+    }
+
+    fn complete_once(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.state
+                .finish_request(self.request, &self.path, self.status, self.bytes);
+        }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.complete_once();
+    }
+}
+
+/// Wraps an HTTP/2 response body so `RequestGuard` completes only once hyper
+/// finishes streaming the body (or drops the stream on cancellation), matching
+/// HTTP/3's post-delivery completion semantics.
+struct TrackedBody {
+    inner: Full<Bytes>,
+    guard: Option<RequestGuard>,
+}
+
+impl TrackedBody {
+    fn new(inner: Full<Bytes>, guard: RequestGuard) -> Self {
+        Self {
+            inner,
+            guard: Some(guard),
+        }
+    }
+}
+
+impl Body for TrackedBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let result = Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(result, Poll::Ready(None))
+            && let Some(mut guard) = self.guard.take()
+        {
+            guard.complete_once();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -287,7 +385,11 @@ fn server_config(material: &TlsMaterial, alpn: &[u8]) -> Result<rustls::ServerCo
 /// Body size when the request carries no `?bytes=` parameter. The historical
 /// `H3_BODY_BYTES` environment variable stays the default.
 fn default_body_len() -> Result<usize> {
-    let Some(raw) = env::var_os("H3_BODY_BYTES") else {
+    default_body_len_from(env::var_os("H3_BODY_BYTES").as_deref())
+}
+
+fn default_body_len_from(raw: Option<&OsStr>) -> Result<usize> {
+    let Some(raw) = raw else {
         return Ok(MARKER.len());
     };
     let raw = raw.to_str().context("H3_BODY_BYTES must be valid UTF-8")?;
@@ -367,42 +469,123 @@ async fn run() -> Result<()> {
         args.listen
     );
 
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
     if let Some(addr) = args.h2_listen {
         let config = Arc::new(server_config(&material, b"h2")?);
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("could not bind HTTP/2 origin on {addr}"))?;
         eprintln!("h2-origin: READY on {addr} (HTTP/2, self-signed certificate)");
-        tokio::spawn(serve_h2(listener, config));
-    }
-
-    serve_h3(endpoint).await
-}
-
-async fn serve_h3(endpoint: quinn::Endpoint) -> Result<()> {
-    while let Some(incoming) = endpoint.accept().await {
-        tokio::spawn(async move {
-            match incoming.await {
-                Ok(connection) => {
-                    let state = ConnState::new("h3-origin", connection.remote_address());
-                    if let Err(error) = serve_h3_connection(connection, state.clone()).await {
-                        eprintln!("h3-origin: connection conn={} ended: {error:#}", state.id);
-                    }
-                }
-                Err(error) => eprintln!("h3-origin: QUIC handshake failed: {error}"),
+        let h2_shutdown = shutdown_rx.clone();
+        let mut h2_task = tokio::spawn(serve_h2(listener, config, h2_shutdown));
+        let h3_task = serve_h3(endpoint, shutdown_rx);
+        tokio::select! {
+            h3_result = h3_task => {
+                h2_task.abort();
+                return h3_result;
             }
-        });
+            h2_result = &mut h2_task => {
+                match h2_result {
+                    Ok(Ok(())) => bail!("HTTP/2 origin listener stopped unexpectedly"),
+                    Ok(Err(error)) => return Err(error).context("HTTP/2 origin listener failed"),
+                    Err(error) => bail!("HTTP/2 origin listener task failed: {error}"),
+                }
+            }
+        }
     }
-    Ok(())
+
+    serve_h3(endpoint, shutdown_rx).await
 }
 
-async fn serve_h2(listener: tokio::net::TcpListener, config: Arc<rustls::ServerConfig>) {
-    let acceptor = TlsAcceptor::from(config);
+async fn serve_h3(endpoint: quinn::Endpoint, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     loop {
-        let (socket, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    if *shutdown.borrow() {
+                        return Ok(());
+                    }
+                    bail!("HTTP/3 endpoint accept loop terminated unexpectedly");
+                };
+                tokio::spawn(async move {
+                    match incoming.await {
+                        Ok(connection) => {
+                            let state = ConnState::new("h3-origin", connection.remote_address());
+                            if let Err(error) = serve_h3_connection(connection, state.clone()).await {
+                                eprintln!("h3-origin: connection conn={} ended: {error:#}", state.id);
+                            }
+                        }
+                        Err(error) => eprintln!("h3-origin: QUIC handshake failed: {error}"),
+                    }
+                });
+            }
+        }
+    }
+}
+
+fn next_accept_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(H2_ACCEPT_BACKOFF_MAX)
+}
+
+fn is_fatal_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::PermissionDenied
+    ) || matches!(
+        error.raw_os_error(),
+        // Linux: EBADF (9), EINVAL (22), ENOTSOCK (88)
+        Some(9 | 22 | 88)
+    )
+}
+
+async fn serve_h2(
+    listener: tokio::net::TcpListener,
+    config: Arc<rustls::ServerConfig>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let acceptor = TlsAcceptor::from(config);
+    let mut backoff = H2_ACCEPT_BACKOFF_START;
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (socket, peer) = match accepted {
+            Ok(accepted) => {
+                backoff = H2_ACCEPT_BACKOFF_START;
+                accepted
+            }
             Err(error) => {
-                eprintln!("h2-origin: accept failed: {error}");
+                if is_fatal_accept_error(&error) {
+                    return Err(error).context("h2-origin: unrecoverable accept error");
+                }
+                eprintln!(
+                    "h2-origin: accept failed: {error} (backing off {}ms)",
+                    backoff.as_millis()
+                );
+                tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            return Ok(());
+                        }
+                    }
+                    _ = sleep(backoff) => {}
+                }
+                backoff = next_accept_backoff(backoff);
                 continue;
             }
         };
@@ -450,9 +633,9 @@ async fn serve_h2(listener: tokio::net::TcpListener, config: Arc<rustls::ServerC
 fn handle_h2_request(
     state: Arc<ConnState>,
     request: http::Request<hyper::body::Incoming>,
-) -> Response<Full<Bytes>> {
+) -> Response<TrackedBody> {
     let path = request.uri().path().to_string();
-    let request_id = state.start(&path);
+    let mut guard = state.start(path);
     // Bound concurrent handler work and aggregate allocations before asking
     // for memory: excess load gets 503, never an unbounded allocation.
     let _permit = match REQUEST_SEMAPHORE.try_acquire() {
@@ -461,8 +644,8 @@ fn handle_h2_request(
             let message = format!(
                 "server busy: too many concurrent requests (cap {MAX_CONCURRENT_REQUESTS})\n"
             );
-            state.end(request_id, &path, 503, message.len());
-            return busy_response(message);
+            guard.set_outcome(503, message.len());
+            return busy_response(message, guard);
         }
     };
     let body = match requested_body_len(request.uri()) {
@@ -470,27 +653,29 @@ fn handle_h2_request(
             Ok(body) => body,
             Err(error) => {
                 let message = format!("server busy: {error:#}\n");
-                state.end(request_id, &path, 503, message.len());
-                return busy_response(message);
+                guard.set_outcome(503, message.len());
+                return busy_response(message, guard);
             }
         },
         Err(error) => {
             let text = format!("bad request: {error:#}\n");
-            state.end(request_id, &path, 400, text.len());
+            let len = text.len();
+            guard.set_outcome(400, len);
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header("content-type", "text/plain")
-                .header("content-length", text.len())
-                .body(Full::new(Bytes::from(text)))
+                .header("content-length", len)
+                .body(TrackedBody::new(Full::new(Bytes::from(text)), guard))
                 .expect("static response is always valid");
         }
     };
-    state.end(request_id, &path, 200, body.len());
+    let len = body.len();
+    guard.set_outcome(200, len);
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain")
-        .header("content-length", body.len())
-        .body(Full::new(body))
+        .header("content-length", len)
+        .body(TrackedBody::new(Full::new(body), guard))
         .expect("static response is always valid")
 }
 
@@ -551,13 +736,16 @@ async fn serve_h3_request(
         }
     };
     let path = request.uri().path().to_string();
-    let request_id = state.start(&path);
+    let mut guard = state.start(path);
     let _permit = REQUEST_SEMAPHORE.try_acquire().map_err(|_| {
+        guard.set_outcome(503, 0);
         anyhow::anyhow!("server busy: too many concurrent requests (cap {MAX_CONCURRENT_REQUESTS})")
     })?;
-    let len = requested_body_len(request.uri())?;
+    let len = requested_body_len(request.uri()).inspect_err(|_| guard.set_outcome(400, 0))?;
     // Held across every send below, so live response bytes count exactly.
-    let _reservation = INFLIGHT_BYTES.try_reserve(len)?;
+    let _reservation = INFLIGHT_BYTES
+        .try_reserve(len)
+        .inspect_err(|_| guard.set_outcome(503, 0))?;
     let body = marker_body(len);
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -614,7 +802,7 @@ async fn serve_h3_request(
             );
         }
     }
-    state.end(request_id, &path, 200, len);
+    guard.finish(200, len);
     // The harness only sends bodyless GETs. Read the request receive half to
     // EOF before dropping it: an open receive half dropped without reading
     // sends QUIC STOP_SENDING, which clients report as "stream reset by
@@ -728,5 +916,81 @@ mod tests {
         let err = parse_args_from([OsString::from("--listen"), bad_addr])
             .expect_err("non-UTF-8 listen addr must fail");
         assert!(format!("{err:#}").contains("valid UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn tracked_body_and_guard_keep_active_counts_balanced() {
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let state = ConnState::new("h2-origin", peer);
+
+        // Request remains active until the H2 response body finishes streaming.
+        let mut guard = state.start("/body".to_string());
+        guard.set_outcome(200, 4);
+        assert_eq!(state.active.load(Ordering::Relaxed), 1);
+        let mut body = TrackedBody::new(Full::new(Bytes::from_static(b"test")), guard);
+        assert_eq!(state.active.load(Ordering::Relaxed), 1);
+        let frame = body.frame().await.expect("data frame").expect("ok");
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"test"));
+        assert!(body.frame().await.is_none());
+        assert_eq!(state.active.load(Ordering::Relaxed), 0);
+
+        // Early drop (for example, an H3 error or cancelled H2 stream) still
+        // decrements active back to zero.
+        let early = state.start("/early-error".to_string());
+        assert_eq!(state.active.load(Ordering::Relaxed), 1);
+        drop(early);
+        assert_eq!(state.active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn h2_accept_backoff_is_bounded_and_classifies_fatal_errors() {
+        let mut backoff = H2_ACCEPT_BACKOFF_START;
+        for _ in 0..16 {
+            let next = next_accept_backoff(backoff);
+            assert!(next >= backoff);
+            backoff = next;
+        }
+        assert_eq!(backoff, H2_ACCEPT_BACKOFF_MAX);
+        assert!(is_fatal_accept_error(&std::io::Error::from_raw_os_error(9)));
+        assert!(is_fatal_accept_error(&std::io::Error::from_raw_os_error(
+            22
+        )));
+        assert!(!is_fatal_accept_error(&std::io::Error::from_raw_os_error(
+            24
+        )));
+    }
+
+    #[tokio::test]
+    async fn serve_h3_distinguishes_unexpected_closure_from_shutdown() {
+        let material = tls_material().unwrap();
+        let crypto = QuicServerConfig::try_from(server_config(&material, b"h3").unwrap()).unwrap();
+        let quic = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+
+        // Closing the endpoint without signalling shutdown must return Err.
+        let endpoint =
+            quinn::Endpoint::server(quic.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (_tx, rx) = watch::channel(false);
+        endpoint.close(0u32.into(), b"unexpected");
+        let err = serve_h3(endpoint, rx)
+            .await
+            .expect_err("unexpected endpoint close must fail");
+        assert!(format!("{err:#}").contains("terminated unexpectedly"));
+
+        // Signalling shutdown returns Ok(()).
+        let endpoint = quinn::Endpoint::server(quic, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(serve_h3(endpoint, rx));
+        tx.send(true).unwrap();
+        task.await.unwrap().expect("expected shutdown returns Ok");
+    }
+
+    #[test]
+    fn default_body_len_from_reads_override_and_falls_back_to_marker() {
+        assert_eq!(default_body_len_from(None).unwrap(), MARKER.len());
+        assert_eq!(
+            default_body_len_from(Some(OsStr::new("4096"))).unwrap(),
+            4096
+        );
+        assert!(default_body_len_from(Some(OsStr::new("0"))).is_err());
     }
 }
