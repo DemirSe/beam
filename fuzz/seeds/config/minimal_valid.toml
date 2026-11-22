@@ -1,0 +1,26 @@
+[server]
+listen = "127.0.0.1:443"
+
+[user]
+id = "00112233-4455-6677-8899-aabbccddeeff"
+flow = "xtls-rprx-vision"
+
+[reality]
+private_key = "ERERERERERERERERERERERERERERERERERERERERERE"
+short_ids = ["0123456789abcdef"]
+server_names = ["example.com"]
+dest = "example.com:443"
+
+[log]
+level = "warn"
+
+[limits]
+max_connections = 64
+max_udp_destinations = 64
+max_preauth_per_ip = 16
+max_xudp_sessions = 64
+xudp_recv_buffer_bytes = 65536
+listen_backlog = 128
+shutdown_drain_ms = 1000
+handshake_timeout_ms = 5000
+idle_timeout_ms = 10000
