@@ -662,6 +662,11 @@ impl TlsServerConfig {
                 reason: "timestamp window exceeds the supported bound",
             });
         }
+        if max_time_diff.is_some_and(|window| window.subsec_nanos() != 0) {
+            return Err(TlsServerError::InvalidConfig {
+                reason: "timestamp window must use whole seconds",
+            });
+        }
         if !(TLS_RECORD_HEADER_LEN..=TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN)
             .contains(&max_client_hello_bytes)
         {
@@ -1068,8 +1073,11 @@ pub async fn handle_connection_admitted(
     preauth: Option<IpPermit>,
 ) -> Result<ConnectionOutcome, TlsServerError> {
     let read = read_client_hello_record(&mut stream, &config).await?;
-    let (record, wire) = match read {
-        ClientHelloRead::Complete { record, wire } => (record, wire),
+    let payload = match read {
+        ClientHelloRead::SingleRecord(record) => ClientHelloPayload::Single(record),
+        ClientHelloRead::Complete { record, wire } => {
+            ClientHelloPayload::Assembled { record, wire }
+        }
         ClientHelloRead::Forward(prefix) => {
             if prefix.is_empty() {
                 drop(preauth);
@@ -1078,7 +1086,7 @@ pub async fn handle_connection_admitted(
             return forward_to_cover(stream, &prefix, preauth, &config).await;
         }
     };
-    let auth = match ClientHello::parse(&record) {
+    let auth = match ClientHello::parse(payload.record()) {
         Ok(hello) => match authenticate(&hello, &config.reality_config()) {
             Ok(auth) => match config.replay_reserve(auth.session_id) {
                 Some(reservation) => Some((auth, reservation)),
@@ -1115,17 +1123,63 @@ pub async fn handle_connection_admitted(
                 }
             };
             drop(preauth);
-            handle_authenticated(stream, record, auth, &config, permit, reservation).await
+            handle_authenticated(
+                stream,
+                payload.into_record(),
+                auth,
+                &config,
+                permit,
+                reservation,
+            )
+            .await
         }
-        None => forward_to_cover(stream, &wire, preauth, &config).await,
+        None => {
+            let wire = payload.into_wire();
+            forward_to_cover(stream, &wire, preauth, &config).await
+        }
+    }
+}
+
+/// Owns the ClientHello bytes until authentication decides between the TLS
+/// handshake and cover forwarding, avoiding a buffer clone on the common
+/// single-record path.
+enum ClientHelloPayload {
+    Single(Vec<u8>),
+    Assembled { record: Vec<u8>, wire: Vec<u8> },
+}
+
+impl ClientHelloPayload {
+    fn record(&self) -> &[u8] {
+        match self {
+            Self::Single(record) => record,
+            Self::Assembled { record, .. } => record,
+        }
+    }
+
+    fn into_record(self) -> Vec<u8> {
+        match self {
+            Self::Single(record) => record,
+            Self::Assembled { record, .. } => record,
+        }
+    }
+
+    fn into_wire(self) -> Vec<u8> {
+        match self {
+            Self::Single(wire) => wire,
+            Self::Assembled { wire, .. } => wire,
+        }
     }
 }
 
 /// Result of reading the initial bytes from a connection.
 enum ClientHelloRead {
-    /// A complete ClientHello was assembled. `record` is a normalized
-    /// single-record form for the parser/rustls; `wire` is the original bytes
-    /// to forward byte-for-byte if authentication fails.
+    /// A single TLS record carried the complete ClientHello. The same buffer
+    /// serves parsing, rustls, or cover forwarding with no clone.
+    SingleRecord(Vec<u8>),
+    /// A fragmented ClientHello was assembled across multiple records.
+    /// `record` is a normalized single-record form for the parser/rustls;
+    /// `wire` is the original bytes to forward byte-for-byte if authentication
+    /// fails.
     Complete { record: Vec<u8>, wire: Vec<u8> },
     /// The peer did not send a plausible, complete ClientHello. Forward the
     /// bytes already read (possibly only the five-byte header) to the cover,
@@ -1307,15 +1361,12 @@ where
     }
 
     let first_body_len = record.len() - TLS_RECORD_HEADER_LEN;
-    // Fast path: the common one-record ClientHello needs no assembly.
+    // Fast path: the common one-record ClientHello needs no assembly or copy.
     if first_body_len >= TLS_HANDSHAKE_HEADER_LEN
         && let Ok(message_len) = client_hello_message_len(&record[TLS_RECORD_HEADER_LEN..])
         && first_body_len >= message_len
     {
-        return Ok(ClientHelloRead::Complete {
-            record: record.clone(),
-            wire: record,
-        });
+        return Ok(ClientHelloRead::SingleRecord(record));
     }
 
     // A ClientHello may span several TLS records, and even its four-byte
@@ -1349,10 +1400,7 @@ where
 
         if target_len == TLS_HANDSHAKE_HEADER_LEN {
             let Ok(message_len) = client_hello_message_len(&handshake) else {
-                return Ok(ClientHelloRead::Complete {
-                    record: wire.clone(),
-                    wire,
-                });
+                return Ok(ClientHelloRead::Forward(wire));
             };
             // The normalized record must fit the configured logical bound.
             if TLS_RECORD_HEADER_LEN.saturating_add(message_len) > max_client_hello_bytes {
@@ -1482,7 +1530,8 @@ pub fn fuzz_client_hello_assembler(data: &[u8]) {
                 budget,
             ));
             match result {
-                Ok(ClientHelloRead::Complete { wire, .. }) => {
+                Ok(ClientHelloRead::SingleRecord(wire))
+                | Ok(ClientHelloRead::Complete { wire, .. }) => {
                     assert!(
                         data.starts_with(&wire),
                         "complete wire must be an input prefix"
@@ -1838,30 +1887,37 @@ async fn dial(
             reason: "port must be non-zero",
         });
     }
-    let host = match &destination.address {
-        Address::Ipv4(address) => address.to_string(),
-        Address::Ipv6(address) => address.to_string(),
-        Address::Domain(domain) => domain.clone(),
-    };
     let deadline = tokio::time::Instant::now() + dial_timeout;
-    // The shared lookup keeps its admission permit until the blocking resolver
-    // job finishes, even when this deadline elapses first.
-    let addresses = crate::dns::lookup_host_until(host.as_str(), destination.port, deadline)
-        .await
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => TlsServerError::Timeout {
-                stage: "destination dial",
-            },
-            _ => TlsServerError::Io(error),
-        })?;
-    if addresses.is_empty() {
-        return Err(TlsServerError::Io(io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "destination resolved to no addresses",
-        )));
+    match &destination.address {
+        Address::Ipv4(address) => {
+            let target = SocketAddr::from((*address, destination.port));
+            dial_addresses(&[target], deadline).await
+        }
+        Address::Ipv6(address) => {
+            let target = SocketAddr::from((*address, destination.port));
+            dial_addresses(&[target], deadline).await
+        }
+        Address::Domain(domain) => {
+            // The shared lookup keeps its admission permit until the blocking
+            // resolver job finishes, even when this deadline elapses first.
+            let addresses =
+                crate::dns::lookup_host_until(domain.as_str(), destination.port, deadline)
+                    .await
+                    .map_err(|error| match error.kind() {
+                        io::ErrorKind::TimedOut => TlsServerError::Timeout {
+                            stage: "destination dial",
+                        },
+                        _ => TlsServerError::Io(error),
+                    })?;
+            if addresses.is_empty() {
+                return Err(TlsServerError::Io(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "destination resolved to no addresses",
+                )));
+            }
+            dial_addresses(&addresses, deadline).await
+        }
     }
-
-    dial_addresses(&addresses, deadline).await
 }
 
 /// Per-address connect budget when more than one resolved address remains.
@@ -4219,5 +4275,276 @@ mod tests {
         replay.read_exact(&mut buffer).await.expect("replay read");
         assert_eq!(&buffer, b"prefixsock");
         server.await.expect("server task");
+    }
+
+    #[test]
+    fn rejects_fractional_timestamp_window() {
+        for window in [
+            Duration::from_millis(500),
+            Duration::from_millis(1_500),
+            Duration::from_nanos(1),
+        ] {
+            let result = TlsServerConfig::new(
+                [0x11; 32],
+                vec!["0123456789abcdef".to_string()],
+                vec!["whatsapp.net".to_string()],
+                [0, 0, 0],
+                [255, 255, 255],
+                Some(window),
+                NetLocation {
+                    address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    port: 9,
+                },
+                Duration::from_secs(5),
+                TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+                [0x22; 16],
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(TlsServerError::InvalidConfig {
+                        reason: "timestamp window must use whole seconds"
+                    })
+                ),
+                "fractional window {window:?} must be rejected"
+            );
+        }
+
+        // Whole-second windows (including zero and production 300s) succeed.
+        for window in [Duration::ZERO, Duration::from_secs(300)] {
+            TlsServerConfig::new(
+                [0x11; 32],
+                vec!["0123456789abcdef".to_string()],
+                vec!["whatsapp.net".to_string()],
+                [0, 0, 0],
+                [255, 255, 255],
+                Some(window),
+                NetLocation {
+                    address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    port: 9,
+                },
+                Duration::from_secs(5),
+                TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+                [0x22; 16],
+            )
+            .expect("whole-second window must be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn single_record_client_hello_uses_zero_copy_variant() {
+        const HELLO: &[u8] = include_bytes!("../../tests/fixtures/stock-client-hello.bin");
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let write = async move {
+            writer.write_all(HELLO).await.expect("write single record");
+            writer.shutdown().await.expect("shutdown");
+        };
+        let read = async {
+            read_client_hello_record(&mut reader, &test_config())
+                .await
+                .expect("single-record ClientHello read")
+        };
+        let (_, read) = tokio::join!(write, read);
+        match read {
+            ClientHelloRead::SingleRecord(record) => assert_eq!(record, HELLO),
+            _ => panic!("single-record ClientHello must avoid cloning into Complete"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_tls_replay_lifecycle_stays_consistent_across_outcomes() {
+        use base64::Engine as _;
+
+        const HELLO: &[u8] = include_bytes!("../../tests/fixtures/stock-client-hello.bin");
+        let key: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode("YLxrYleugiQ4iDDvCtbKHw3SNGAlEHJO6PR-BN6ypH4")
+            .expect("test key")
+            .try_into()
+            .expect("32-byte key");
+
+        // Cover listener echoes back what it receives and closes immediately.
+        let cover_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("cover listener");
+        let cover_port = cover_listener.local_addr().unwrap().port();
+        let cover_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = cover_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let front_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("front listener");
+        let front_port = front_listener.local_addr().unwrap().port();
+
+        let conn_permits = Arc::new(Semaphore::new(8));
+        let preauth_limiter = Arc::new(IpLimiter::new(8, 8));
+        let config = Arc::new(
+            TlsServerConfig::new(
+                key,
+                vec!["0123456789abcdef".to_string()],
+                vec!["whatsapp.net".to_string()],
+                [0, 0, 0],
+                [255, 255, 255],
+                None,
+                NetLocation {
+                    address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    port: cover_port,
+                },
+                Duration::from_secs(2),
+                TLS_RECORD_HEADER_LEN + MAX_RECORD_LEN,
+                [0x22; 16],
+            )
+            .expect("config")
+            .with_connection_limiter(Arc::clone(&conn_permits)),
+        );
+
+        let hello = ClientHello::parse(HELLO).expect("fixture parses");
+        let auth = authenticate(&hello, &config.reality_config()).expect("fixture authenticates");
+
+        // 1. Aborted TLS handshake before Finished must release its in-flight
+        //    replay reservation and permits without settling the id.
+        let connect = tokio::spawn(async move {
+            let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("client connect");
+            client.write_all(HELLO).await.expect("send ClientHello");
+            client.shutdown().await.expect("close before Finished");
+        });
+        let (server, _) = front_listener.accept().await.expect("accept");
+        let preauth = preauth_limiter
+            .try_acquire(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("preauth permit");
+        let first_outcome =
+            handle_connection_admitted(server, Arc::clone(&config), Some(preauth)).await;
+        connect.await.expect("client task");
+        assert!(
+            first_outcome.is_err(),
+            "aborted TLS handshake must fail before Finished: {first_outcome:?}"
+        );
+        assert_eq!(config.replay_stats().in_flight, 0);
+        assert_eq!(config.replay_stats().entries, 0);
+        assert_eq!(config.metrics().snapshot().replay_rejected, 0);
+        assert_eq!(conn_permits.available_permits(), 8);
+        assert_eq!(preauth_limiter.available_permits(), 8);
+
+        // 2. Concurrent copies up to REPLAY_MAX_IN_FLIGHT_PER_ID are admitted
+        //    into TLS; an extra copy beyond the cap is rejected as a replay
+        //    and forwarded to the cover; closing the stalled copies restores
+        //    in_flight and all permits to clean baseline.
+        let mut stalled_clients = Vec::new();
+        let mut stalled_servers = Vec::new();
+        for _ in 0..REPLAY_MAX_IN_FLIGHT_PER_ID {
+            let client_task = tokio::spawn(async move {
+                let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                    .await
+                    .expect("stalled client connect");
+                client.write_all(HELLO).await.expect("send ClientHello");
+                client
+            });
+            let (server, _) = front_listener.accept().await.expect("accept stalled");
+            let preauth = preauth_limiter
+                .try_acquire(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .expect("preauth permit");
+            let cfg = Arc::clone(&config);
+            stalled_servers.push(tokio::spawn(async move {
+                handle_connection_admitted(server, cfg, Some(preauth)).await
+            }));
+            stalled_clients.push(client_task.await.expect("stalled client"));
+        }
+
+        // Wait until all in-flight reservations have been acquired.
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while conn_permits.available_permits() > 8 - REPLAY_MAX_IN_FLIGHT_PER_ID
+            && tokio::time::Instant::now() < wait_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(config.replay_stats().in_flight, 1);
+        assert_eq!(config.replay_stats().entries, 0);
+
+        // Fifth concurrent copy hits the per-id in-flight cap and goes to cover.
+        let overflow_client = tokio::spawn(async move {
+            let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("overflow client connect");
+            client
+                .write_all(HELLO)
+                .await
+                .expect("send overflow ClientHello");
+            client.shutdown().await.expect("shutdown overflow client");
+        });
+        let (overflow_server, _) = front_listener.accept().await.expect("accept overflow");
+        let overflow_preauth = preauth_limiter
+            .try_acquire(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("overflow preauth");
+        let overflow_outcome = handle_connection_admitted(
+            overflow_server,
+            Arc::clone(&config),
+            Some(overflow_preauth),
+        )
+        .await
+        .expect("overflow replay must forward to cover cleanly");
+        overflow_client.await.expect("overflow client task");
+        assert_eq!(overflow_outcome, ConnectionOutcome::CoverForwarded);
+        assert_eq!(config.metrics().snapshot().replay_rejected, 1);
+
+        // Drop stalled clients so their handshakes fail and release reservations.
+        drop(stalled_clients);
+        for task in stalled_servers {
+            let _ = timeout(Duration::from_secs(3), task)
+                .await
+                .expect("stalled server must exit");
+        }
+        assert_eq!(config.replay_stats().in_flight, 0);
+        assert_eq!(config.replay_stats().entries, 0);
+        assert_eq!(conn_permits.available_permits(), 8);
+        assert_eq!(preauth_limiter.available_permits(), 8);
+
+        // 3. Settling the id via replay completion rejects subsequent copies
+        //    through handle_connection_admitted and forwards them to cover.
+        let res = config
+            .replay_reserve(auth.session_id)
+            .expect("reservation must succeed after earlier failures released");
+        assert_eq!(
+            config.replay_insert(auth.session_id, auth.timestamp),
+            ReplayInsert::Inserted
+        );
+        res.commit();
+        assert_eq!(config.replay_stats().entries, 1);
+        assert_eq!(config.replay_stats().in_flight, 0);
+
+        let replay_client = tokio::spawn(async move {
+            let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, front_port))
+                .await
+                .expect("replay client connect");
+            client
+                .write_all(HELLO)
+                .await
+                .expect("send replayed ClientHello");
+            client.shutdown().await.expect("shutdown replay client");
+        });
+        let (replay_server, _) = front_listener.accept().await.expect("accept replay");
+        let replay_preauth = preauth_limiter
+            .try_acquire(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("replay preauth");
+        let replay_outcome =
+            handle_connection_admitted(replay_server, Arc::clone(&config), Some(replay_preauth))
+                .await
+                .expect("settled replay must forward to cover");
+        replay_client.await.expect("replay client task");
+        assert_eq!(replay_outcome, ConnectionOutcome::CoverForwarded);
+        assert_eq!(config.metrics().snapshot().replay_rejected, 2);
+        assert_eq!(config.replay_stats().entries, 1);
+        assert_eq!(config.replay_stats().in_flight, 0);
+        assert_eq!(conn_permits.available_permits(), 8);
+        assert_eq!(preauth_limiter.available_permits(), 8);
+
+        cover_task.abort();
     }
 }

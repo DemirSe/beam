@@ -41,7 +41,10 @@ pub struct RealityAuthConfig<'a> {
     pub max_client_version: [u8; 3],
     /// Optional maximum clock difference for the client timestamp.
     ///
-    /// `None` disables the timestamp check.
+    /// Validation operates at whole-second granularity because the REALITY
+    /// wire timestamp is a 32-bit Unix second count; any sub-second component
+    /// on `Duration` is truncated by [`check_timestamp`]. `None` disables the
+    /// timestamp check.
     pub max_time_diff: Option<Duration>,
 }
 
@@ -456,6 +459,37 @@ mod tests {
             Err(AuthError::TimestampOutOfRange)
         ));
         assert!(check_timestamp(now - 301, None).is_ok());
+    }
+
+    #[test]
+    fn timestamp_window_truncates_subsecond_duration() {
+        let now: u32 = 1_700_000_000;
+        // 1.9 seconds truncates to 1 whole second against the wire u32 timestamp.
+        let fractional = Duration::from_millis(1_900);
+        assert!(check_timestamp_at(now + 1, fractional, u64::from(now)).is_ok());
+        assert!(matches!(
+            check_timestamp_at(now + 2, fractional, u64::from(now)),
+            Err(AuthError::TimestampOutOfRange)
+        ));
+        // A sub-second-only duration truncates to 0 whole seconds (exact second match only).
+        let subsecond = Duration::from_millis(500);
+        assert!(check_timestamp_at(now, subsecond, u64::from(now)).is_ok());
+        assert!(matches!(
+            check_timestamp_at(now + 1, subsecond, u64::from(now)),
+            Err(AuthError::TimestampOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn rejects_server_name_case_mismatch() {
+        let hello = ClientHello::parse(STOCK_CLIENT_HELLO).expect("fixture must parse");
+        let mut config = TestConfig::new();
+        config.server_names = vec!["WhatsApp.net".to_string()];
+
+        assert!(matches!(
+            authenticate(&hello, &config.auth_config()),
+            Err(AuthError::ServerNameMismatch)
+        ));
     }
 
     #[test]
