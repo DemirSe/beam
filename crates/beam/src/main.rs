@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
@@ -62,12 +63,70 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BEAM_GIT_HA
 const SAMPLE_PRIVATE_KEY: [u8; 32] = [0x5a; 32];
 const SAMPLE_SHORT_ID: &str = "0123456789abcdef";
 
+/// Default Tokio blocking thread pool size when `BEAM_MAX_BLOCKING_THREADS` is
+/// unset or invalid.
+const DEFAULT_MAX_BLOCKING_THREADS: usize = 160;
+const MIN_MAX_BLOCKING_THREADS: usize = 1;
+const MAX_MAX_BLOCKING_THREADS: usize = 512;
+
 /// Fallback soft pipe-page limit used when `/proc/sys/fs/pipe-user-pages-soft`
 /// cannot be read or parsed.
 const DEFAULT_PIPE_USER_PAGES_SOFT: u64 = 16_384;
 
 /// Fallback page size used when `sysconf(_SC_PAGESIZE)` fails.
 const DEFAULT_PAGE_SIZE: u64 = 4096;
+
+/// Reason `BEAM_MAX_BLOCKING_THREADS` fell back to the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockingThreadsFallback {
+    NotUtf8,
+    Invalid(String),
+}
+
+/// Parses `BEAM_MAX_BLOCKING_THREADS` once so runtime creation and startup
+/// diagnostics always agree, including on non-UTF-8 values.
+fn parse_max_blocking_threads(raw: Option<OsString>) -> (usize, Option<BlockingThreadsFallback>) {
+    let Some(raw) = raw else {
+        return (DEFAULT_MAX_BLOCKING_THREADS, None);
+    };
+    let Ok(text) = raw.into_string() else {
+        return (
+            DEFAULT_MAX_BLOCKING_THREADS,
+            Some(BlockingThreadsFallback::NotUtf8),
+        );
+    };
+    match text.parse::<usize>() {
+        Ok(value) if (MIN_MAX_BLOCKING_THREADS..=MAX_MAX_BLOCKING_THREADS).contains(&value) => {
+            (value, None)
+        }
+        _ => (
+            DEFAULT_MAX_BLOCKING_THREADS,
+            Some(BlockingThreadsFallback::Invalid(text)),
+        ),
+    }
+}
+
+/// Computes the effective per-mux XUDP active session cap and identifies which
+/// configured limit binds it (`max_xudp_sessions`, `max_udp_destinations`, or
+/// `both`).
+fn effective_xudp_per_mux_limit(
+    max_xudp_sessions: u32,
+    max_udp_destinations: u32,
+) -> (usize, &'static str) {
+    let global_half = (usize::try_from(max_xudp_sessions).unwrap_or(usize::MAX) / 2).max(1);
+    let per_mux_table = usize::try_from(max_udp_destinations)
+        .unwrap_or(usize::MAX)
+        .clamp(1, usize::from(u16::MAX) + 1);
+    let effective = global_half.min(per_mux_table);
+    let binding = if per_mux_table < global_half {
+        "max_udp_destinations"
+    } else if global_half < per_mux_table {
+        "max_xudp_sessions"
+    } else {
+        "both"
+    };
+    (effective, binding)
+}
 
 /// Computes the effective pre-auth slot count and per-IP pre-auth cap shared
 /// between `--check` and server startup.
@@ -182,17 +241,18 @@ fn main() -> anyhow::Result<()> {
     // concurrent bulk relays. Directions above the splice cap use the async
     // copy path. Operators can raise the pool for a burst-heavy host without
     // changing the admission limit.
-    let max_blocking_threads = std::env::var("BEAM_MAX_BLOCKING_THREADS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (1..=512).contains(value))
-        .unwrap_or(160);
+    let (max_blocking_threads, blocking_threads_fallback) =
+        parse_max_blocking_threads(std::env::var_os("BEAM_MAX_BLOCKING_THREADS"));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .max_blocking_threads(max_blocking_threads)
         .enable_all()
         .build()
         .context("failed to build the Tokio runtime")?;
-    let result = runtime.block_on(async_main(cli, max_blocking_threads));
+    let result = runtime.block_on(async_main(
+        cli,
+        max_blocking_threads,
+        blocking_threads_fallback,
+    ));
     // A blocking splice cannot be aborted once it has started. The shutdown
     // path drains normal connections briefly; this bound is the final backstop
     // for a wedged relay so systemd can restart the service.
@@ -200,7 +260,11 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()> {
+async fn async_main(
+    cli: Cli,
+    max_blocking_threads: usize,
+    blocking_threads_fallback: Option<BlockingThreadsFallback>,
+) -> anyhow::Result<()> {
     // Install SIGHUP before any blocking startup work so an operator's hangup
     // cannot kill the service mid-start. SIGTERM and SIGINT keep their default
     // disposition until the accept loop can observe them, so a stuck config
@@ -216,27 +280,46 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
         .with_context(|| format!("failed to load `{config_path}`"))?;
 
     init_logging(config.log.level);
+    if let Some(fallback) = &blocking_threads_fallback {
+        emit_operator_warning(|| match fallback {
+            BlockingThreadsFallback::NotUtf8 => tracing::warn!(
+                effective = max_blocking_threads,
+                "invalid non-UTF-8 BEAM_MAX_BLOCKING_THREADS; using the default"
+            ),
+            BlockingThreadsFallback::Invalid(raw) => tracing::warn!(
+                value = %raw,
+                effective = max_blocking_threads,
+                min = MIN_MAX_BLOCKING_THREADS,
+                max = MAX_MAX_BLOCKING_THREADS,
+                "invalid BEAM_MAX_BLOCKING_THREADS; using the default"
+            ),
+        });
+    }
     // The service unit owns the runtime limit (64K). A user-shell `--check`
     // or a lab install may inherit a smaller soft limit; validate against the
     // deployment floor and make the mismatch visible instead of rejecting a
     // configuration that the service can serve.
-    let validation_fd_limit = validation_fd_limit(beam_sys::open_file_limit());
-    config
-        .validate_fd_budget(validation_fd_limit)
-        .with_context(|| format!("file descriptor budget for `{config_path}`"))?;
-    if let Ok(raw) = std::env::var("BEAM_MAX_BLOCKING_THREADS") {
-        let valid = raw
-            .parse::<usize>()
-            .ok()
-            .is_some_and(|value| (1..=512).contains(&value));
-        if !valid {
+    let fd_basis = resolve_fd_limit(beam_sys::open_file_limit());
+    match &fd_basis.source {
+        FdLimitSource::Floored { observed, floor } => {
             tracing::warn!(
-                value = %raw,
-                effective = max_blocking_threads,
-                "invalid BEAM_MAX_BLOCKING_THREADS; using the default"
+                actual_fd_limit = observed,
+                deployment_floor = floor,
+                "process soft fd limit is below the deployment floor; validate the service limit"
             );
         }
+        FdLimitSource::QueryFailed { error, floor } => {
+            tracing::warn!(
+                %error,
+                deployment_floor = floor,
+                "could not query the process fd limit; using the deployment floor"
+            );
+        }
+        FdLimitSource::Observed(_) | FdLimitSource::Unlimited => {}
     }
+    config
+        .validate_fd_budget(fd_basis.effective)
+        .with_context(|| format!("file descriptor budget for `{config_path}`"))?;
     warn_if_config_permissions_are_loose(&cli.config);
     // A direct start must warn too: after a successful copy of the example
     // file, the first start would otherwise serve the published sample
@@ -257,6 +340,20 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
             effective = max_preauth_per_ip,
             max_pending_handshakes,
             "max_preauth_per_ip clamped to the pre-auth slot count"
+        );
+    }
+    let (xudp_per_mux_limit, xudp_per_mux_binding) = effective_xudp_per_mux_limit(
+        config.limits.max_xudp_sessions,
+        config.limits.max_udp_destinations,
+    );
+    let host_somaxconn = beam_sys::tcp_somaxconn();
+    if let Some(cap) = host_somaxconn
+        && config.limits.listen_backlog > cap
+    {
+        tracing::warn!(
+            requested = config.limits.listen_backlog,
+            host_somaxconn = cap,
+            "limits.listen_backlog exceeds host net.core.somaxconn; Linux will cap the active queue"
         );
     }
 
@@ -289,6 +386,41 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
                  (pre-auth slots: {max_pending_handshakes})"
             )
             .context("could not write configuration check result")?;
+        }
+        writeln!(stdout, "effective fd budget basis: {}", fd_basis.describe())
+            .context("could not write configuration check result")?;
+        writeln!(
+            stdout,
+            "effective xudp per-mux sessions: {xudp_per_mux_limit} \
+             (binding limit: {xudp_per_mux_binding}; max_xudp_sessions={}, max_udp_destinations={})",
+            config.limits.max_xudp_sessions, config.limits.max_udp_destinations
+        )
+        .context("could not write configuration check result")?;
+        match host_somaxconn {
+            Some(cap) if config.limits.listen_backlog > cap => {
+                writeln!(
+                    stdout,
+                    "listen_backlog: requested {} (host net.core.somaxconn cap: {cap}; effective: {cap})",
+                    config.limits.listen_backlog
+                )
+                .context("could not write configuration check result")?;
+            }
+            Some(cap) => {
+                writeln!(
+                    stdout,
+                    "listen_backlog: requested {} (host net.core.somaxconn cap: {cap})",
+                    config.limits.listen_backlog
+                )
+                .context("could not write configuration check result")?;
+            }
+            None => {
+                writeln!(
+                    stdout,
+                    "listen_backlog: requested {} (host net.core.somaxconn unreadable)",
+                    config.limits.listen_backlog
+                )
+                .context("could not write configuration check result")?;
+            }
         }
         return Ok(());
     }
@@ -351,18 +483,23 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
             .with_relay_pipe_size(relay_pipe_size),
     );
     let listener = bind_listener(config.server.listen, config.limits.listen_backlog)?;
+    let ipv6_only = listener_ipv6_only_label(&listener, config.server.listen);
     let metrics = tls_config.metrics();
     let xudp_limiter = tls_config.xudp_limiter();
 
     tracing::info!(
         version = VERSION,
         listen = %config.server.listen,
+        ipv6_only,
         max_connections,
         max_pending_handshakes,
         max_preauth_per_ip,
         max_xudp_sessions = config.limits.max_xudp_sessions,
+        xudp_per_mux_limit,
+        xudp_per_mux_binding,
         max_legacy_udp_streams = legacy_udp_stream_limit(config.limits.max_xudp_sessions),
-        listen_backlog = config.limits.listen_backlog,
+        listen_backlog_requested = config.limits.listen_backlog,
+        listen_backlog_host_cap = ?host_somaxconn,
         shutdown_drain_ms = config.limits.shutdown_drain_ms,
         "beam listening"
     );
@@ -440,12 +577,15 @@ async fn async_main(cli: Cli, max_blocking_threads: usize) -> anyhow::Result<()>
                     xudp_admitted_fresh = current.xudp_admitted_fresh,
                     xudp_admitted_reattach = current.xudp_admitted_reattach,
                     xudp_closed_end = current.xudp_closed_end,
+                    xudp_closed_replaced = current.xudp_closed_replaced,
                     xudp_closed_idle = current.xudp_closed_idle,
                     xudp_closed_error = current.xudp_closed_error,
                     xudp_closed_mux = current.xudp_closed_mux,
                     xudp_retained_inserted = current.xudp_retained_inserted,
                     xudp_retained_reattached = current.xudp_retained_reattached,
                     xudp_retained_expired = current.xudp_retained_expired,
+                    xudp_retained_cleared_mux = current.xudp_retained_cleared_mux,
+                    xudp_retained_replaced = current.xudp_retained_replaced,
                     xudp_retained_discarded = current.xudp_retained_discarded,
                     xudp_active = xudp.active,
                     xudp_retained = xudp.retained,
@@ -614,24 +754,91 @@ fn splice_capacity(blocking_threads: usize) -> usize {
     blocking_threads.saturating_sub(40)
 }
 
-fn validation_fd_limit(soft_limit: std::io::Result<Option<u64>>) -> u64 {
-    const DEPLOYMENT_FD_FLOOR: u64 = 65_536;
-    match soft_limit {
-        Ok(None) => u64::MAX,
-        Ok(Some(actual_fd_limit)) => {
-            if actual_fd_limit < DEPLOYMENT_FD_FLOOR {
-                tracing::warn!(
-                    actual_fd_limit,
-                    deployment_floor = DEPLOYMENT_FD_FLOOR,
-                    "process soft fd limit is below the deployment floor; validate the service limit"
-                );
+const DEPLOYMENT_FD_FLOOR: u64 = 65_536;
+
+/// How the file-descriptor budget validation limit was derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FdLimitSource {
+    Unlimited,
+    Observed(u64),
+    Floored { observed: u64, floor: u64 },
+    QueryFailed { error: String, floor: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FdLimitBasis {
+    effective: u64,
+    source: FdLimitSource,
+}
+
+impl FdLimitBasis {
+    fn describe(&self) -> String {
+        match &self.source {
+            FdLimitSource::Unlimited => {
+                "unlimited (observed process soft RLIMIT_NOFILE)".to_owned()
             }
-            actual_fd_limit.max(DEPLOYMENT_FD_FLOOR)
+            FdLimitSource::Observed(observed) => {
+                format!("{observed} (observed process soft RLIMIT_NOFILE)")
+            }
+            FdLimitSource::Floored { observed, floor } => format!(
+                "{floor} (deployment floor; observed process soft RLIMIT_NOFILE is {observed})"
+            ),
+            FdLimitSource::QueryFailed { error, floor } => format!(
+                "{floor} (deployment floor; could not query process soft RLIMIT_NOFILE: {error})"
+            ),
         }
-        Err(error) => {
-            tracing::warn!(%error, deployment_floor = DEPLOYMENT_FD_FLOOR, "could not query the process fd limit; using the deployment floor");
-            DEPLOYMENT_FD_FLOOR
-        }
+    }
+}
+
+fn resolve_fd_limit(soft_limit: std::io::Result<Option<u64>>) -> FdLimitBasis {
+    match soft_limit {
+        Ok(None) => FdLimitBasis {
+            effective: u64::MAX,
+            source: FdLimitSource::Unlimited,
+        },
+        Ok(Some(observed)) if observed < DEPLOYMENT_FD_FLOOR => FdLimitBasis {
+            effective: DEPLOYMENT_FD_FLOOR,
+            source: FdLimitSource::Floored {
+                observed,
+                floor: DEPLOYMENT_FD_FLOOR,
+            },
+        },
+        Ok(Some(observed)) => FdLimitBasis {
+            effective: observed,
+            source: FdLimitSource::Observed(observed),
+        },
+        Err(error) => FdLimitBasis {
+            effective: DEPLOYMENT_FD_FLOOR,
+            source: FdLimitSource::QueryFailed {
+                error: error.to_string(),
+                floor: DEPLOYMENT_FD_FLOOR,
+            },
+        },
+    }
+}
+
+/// Emits one operator-facing startup warning on stderr using a scoped WARN
+/// subscriber so a restrictive `RUST_LOG` or `[log] level = "error"` cannot
+/// suppress critical startup notices. Best-effort: a closed or full stderr
+/// never panics or turns into a startup failure.
+fn emit_operator_warning(emit: impl FnOnce()) {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .log_internal_errors(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, emit);
+}
+
+fn listener_ipv6_only_label(listener: &TcpListener, address: SocketAddr) -> &'static str {
+    if !address.is_ipv6() {
+        return "n/a";
+    }
+    match beam_sys::get_ipv6_v6only(listener.as_raw_fd()) {
+        Ok(true) => "true",
+        Ok(false) => "false",
+        Err(_) => "unknown",
     }
 }
 
@@ -681,13 +888,7 @@ fn warn_if_sample_identity(config: &Config) {
     if fields.is_empty() {
         return;
     }
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_ansi(false)
-        .with_writer(std::io::stderr)
-        .log_internal_errors(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
+    emit_operator_warning(|| {
         tracing::warn!(
             fields = %fields.join(", "),
             "sample identity values are unchanged; replace them before deployment"
@@ -1018,29 +1219,88 @@ fn build_tls_config(config: &Config) -> anyhow::Result<TlsServerConfig> {
         .with_relay_idle_timeout(Duration::from_millis(config.limits.idle_timeout_ms)))
 }
 
-fn init_logging(level: LogLevel) {
-    let env_override = std::env::var_os("RUST_LOG").is_some();
-    let (filter, env_error) = match tracing_subscriber::EnvFilter::try_from_default_env() {
-        Ok(filter) => (filter, None),
-        Err(error) if env_override => (
+/// Outcome of resolving the logging filter from `[log] level` and `RUST_LOG`.
+#[derive(Debug, PartialEq, Eq)]
+enum LogFilterNotice {
+    None,
+    Overridden,
+    EmptyFallback,
+    InvalidFallback(String),
+}
+
+fn resolve_log_filter(
+    level: LogLevel,
+    raw_env: Option<OsString>,
+) -> (tracing_subscriber::EnvFilter, LogFilterNotice) {
+    let Some(raw) = raw_env else {
+        return (
             tracing_subscriber::EnvFilter::new(level.as_str()),
-            Some(error),
-        ),
-        Err(_) => (tracing_subscriber::EnvFilter::new(level.as_str()), None),
+            LogFilterNotice::None,
+        );
     };
+    let Ok(text) = raw.into_string() else {
+        return (
+            tracing_subscriber::EnvFilter::new(level.as_str()),
+            LogFilterNotice::InvalidFallback("RUST_LOG is not valid UTF-8".to_owned()),
+        );
+    };
+    if text.trim().is_empty() {
+        return (
+            tracing_subscriber::EnvFilter::new(level.as_str()),
+            LogFilterNotice::EmptyFallback,
+        );
+    }
+    match tracing_subscriber::EnvFilter::try_new(&text) {
+        Ok(filter) => (filter, LogFilterNotice::Overridden),
+        Err(error) => (
+            tracing_subscriber::EnvFilter::new(level.as_str()),
+            LogFilterNotice::InvalidFallback(error.to_string()),
+        ),
+    }
+}
+
+fn init_logging(level: LogLevel) {
+    let (filter, notice) = resolve_log_filter(level, std::env::var_os("RUST_LOG"));
+    let diagnostic_logging_enabled = filter
+        .max_level_hint()
+        .is_none_or(|max| max >= tracing::level_filters::LevelFilter::DEBUG);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
         .init();
-    if let Some(error) = env_error {
-        tracing::warn!(%error, "invalid RUST_LOG; using the configured log level");
-    } else if env_override {
-        tracing::warn!("RUST_LOG is set and overrides the configured log level");
+    // Emit override/fallback and diagnostic-privacy notices via a scoped
+    // stderr subscriber so a restrictive `RUST_LOG` cannot suppress the notice
+    // about `RUST_LOG` itself, and check the *effective* filter (including
+    // target-scoped directives such as `warn,beam_core=debug`) for debug/trace
+    // privacy warnings.
+    match notice {
+        LogFilterNotice::None => {}
+        LogFilterNotice::Overridden => emit_operator_warning(|| {
+            tracing::warn!(
+                configured_level = level.as_str(),
+                "RUST_LOG is set and overrides the configured log level"
+            );
+        }),
+        LogFilterNotice::EmptyFallback => emit_operator_warning(|| {
+            tracing::warn!(
+                configured_level = level.as_str(),
+                "RUST_LOG is set but empty; using the configured log level"
+            );
+        }),
+        LogFilterNotice::InvalidFallback(error) => emit_operator_warning(|| {
+            tracing::warn!(
+                %error,
+                configured_level = level.as_str(),
+                "invalid RUST_LOG; using the configured log level"
+            );
+        }),
     }
-    if matches!(level, LogLevel::Debug | LogLevel::Trace) {
-        tracing::warn!(
-            "diagnostic logging is enabled; peer addresses and destinations may be recorded"
-        );
+    if diagnostic_logging_enabled {
+        emit_operator_warning(|| {
+            tracing::warn!(
+                "diagnostic logging is enabled; peer addresses and destinations may be recorded"
+            );
+        });
     }
 }
 
@@ -1191,13 +1451,152 @@ mod tests {
 
     #[test]
     fn fd_validation_distinguishes_unlimited_from_query_failure() {
-        assert_eq!(validation_fd_limit(Ok(None)), u64::MAX);
-        assert_eq!(validation_fd_limit(Ok(Some(256))), 65_536);
-        assert_eq!(validation_fd_limit(Ok(Some(131_072))), 131_072);
+        let unlimited = resolve_fd_limit(Ok(None));
+        assert_eq!(unlimited.effective, u64::MAX);
+        assert_eq!(unlimited.source, FdLimitSource::Unlimited);
+        assert!(unlimited.describe().contains("unlimited"));
+
+        let floored = resolve_fd_limit(Ok(Some(256)));
+        assert_eq!(floored.effective, 65_536);
         assert_eq!(
-            validation_fd_limit(Err(std::io::Error::other("test"))),
-            65_536
+            floored.source,
+            FdLimitSource::Floored {
+                observed: 256,
+                floor: 65_536,
+            }
         );
+        assert!(floored.describe().contains("256"));
+        assert!(floored.describe().contains("deployment floor"));
+
+        let observed = resolve_fd_limit(Ok(Some(131_072)));
+        assert_eq!(observed.effective, 131_072);
+        assert_eq!(observed.source, FdLimitSource::Observed(131_072));
+        assert!(observed.describe().contains("131072"));
+
+        let failed = resolve_fd_limit(Err(std::io::Error::other("test")));
+        assert_eq!(failed.effective, 65_536);
+        assert!(matches!(failed.source, FdLimitSource::QueryFailed { .. }));
+        assert!(failed.describe().contains("could not query"));
+    }
+
+    #[test]
+    fn parse_max_blocking_threads_handles_valid_invalid_and_non_utf8_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        assert_eq!(
+            parse_max_blocking_threads(None),
+            (DEFAULT_MAX_BLOCKING_THREADS, None)
+        );
+        assert_eq!(
+            parse_max_blocking_threads(Some(OsString::from("1"))),
+            (1, None)
+        );
+        assert_eq!(
+            parse_max_blocking_threads(Some(OsString::from("256"))),
+            (256, None)
+        );
+        assert_eq!(
+            parse_max_blocking_threads(Some(OsString::from("512"))),
+            (512, None)
+        );
+        assert_eq!(
+            parse_max_blocking_threads(Some(OsString::from("0"))),
+            (
+                DEFAULT_MAX_BLOCKING_THREADS,
+                Some(BlockingThreadsFallback::Invalid("0".to_owned()))
+            )
+        );
+        assert_eq!(
+            parse_max_blocking_threads(Some(OsString::from("513"))),
+            (
+                DEFAULT_MAX_BLOCKING_THREADS,
+                Some(BlockingThreadsFallback::Invalid("513".to_owned()))
+            )
+        );
+        assert_eq!(
+            parse_max_blocking_threads(Some(OsString::from("abc"))),
+            (
+                DEFAULT_MAX_BLOCKING_THREADS,
+                Some(BlockingThreadsFallback::Invalid("abc".to_owned()))
+            )
+        );
+        assert_eq!(
+            parse_max_blocking_threads(Some(OsString::from_vec(vec![0xff, 0xfe]))),
+            (
+                DEFAULT_MAX_BLOCKING_THREADS,
+                Some(BlockingThreadsFallback::NotUtf8)
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_log_filter_handles_empty_invalid_and_override_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (_, notice) = resolve_log_filter(LogLevel::Warn, None);
+        assert_eq!(notice, LogFilterNotice::None);
+
+        let (_, notice) = resolve_log_filter(LogLevel::Warn, Some(OsString::from("debug")));
+        assert_eq!(notice, LogFilterNotice::Overridden);
+
+        let (_, notice) = resolve_log_filter(LogLevel::Warn, Some(OsString::from("")));
+        assert_eq!(notice, LogFilterNotice::EmptyFallback);
+
+        let (_, notice) = resolve_log_filter(LogLevel::Warn, Some(OsString::from("   ")));
+        assert_eq!(notice, LogFilterNotice::EmptyFallback);
+
+        let (_, notice) = resolve_log_filter(LogLevel::Warn, Some(OsString::from_vec(vec![0xff])));
+        assert!(matches!(notice, LogFilterNotice::InvalidFallback(_)));
+    }
+
+    #[test]
+    fn effective_xudp_per_mux_limit_identifies_binding_key() {
+        assert_eq!(
+            effective_xudp_per_mux_limit(256, 2048),
+            (128, "max_xudp_sessions")
+        );
+        assert_eq!(
+            effective_xudp_per_mux_limit(256, 64),
+            (64, "max_udp_destinations")
+        );
+        assert_eq!(effective_xudp_per_mux_limit(256, 128), (128, "both"));
+    }
+
+    #[tokio::test]
+    async fn bind_listener_reports_effective_ipv6_v6only_mode() {
+        let required = std::env::var_os("BEAM_REQUIRE_IPV6_TESTS").is_some();
+        let addr: SocketAddr = "[::1]:0".parse().unwrap();
+        let listener = match bind_listener(addr, 128) {
+            Ok(listener) => listener,
+            Err(error)
+                if !required
+                    && error
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::raw_os_error)
+                        // Linux: EAFNOSUPPORT (97), EADDRNOTAVAIL (99)
+                        .is_some_and(|code| code == 97 || code == 99) =>
+            {
+                return;
+            }
+            Err(error) => panic!("IPv6 loopback bind_listener failed: {error:#}"),
+        };
+        // Linux marks non-wildcard IPv6 binds (like ::1) as IPv6-only.
+        assert_eq!(listener_ipv6_only_label(&listener, addr), "true");
+
+        // Wildcard [::] inherits the host `net.ipv6.bindv6only` default.
+        let wildcard_addr: SocketAddr = "[::]:0".parse().unwrap();
+        if let Ok(wildcard) = bind_listener(wildcard_addr, 128) {
+            let label = listener_ipv6_only_label(&wildcard, wildcard_addr);
+            assert!(
+                label == "true" || label == "false",
+                "expected effective IPV6_V6ONLY bool label, got {label}"
+            );
+            if let Ok(raw) = std::fs::read_to_string("/proc/sys/net/ipv6/bindv6only")
+                && let Ok(sysctl) = raw.trim().parse::<u8>()
+            {
+                assert_eq!(label == "true", sysctl != 0);
+            }
+        }
     }
 
     #[tokio::test]

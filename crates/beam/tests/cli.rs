@@ -586,3 +586,172 @@ fn check_includes_escaped_config_path_in_fd_budget_errors() {
         "lossy or raw control char in missing-file error chain: {missing_stderr:?}"
     );
 }
+
+/// Startup override and fallback diagnostics must stay visible on stderr even
+/// when `RUST_LOG` is restrictive or empty, and the diagnostic privacy warning
+/// must follow the *effective* filter (including `RUST_LOG=debug` over a quiet
+/// config file).
+#[test]
+fn startup_override_and_fallback_diagnostics_stay_visible() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml");
+
+    // 1. RUST_LOG=off must not suppress the RUST_LOG override notice itself.
+    let off = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args(["--check", "--config"])
+        .arg(&config)
+        .env("RUST_LOG", "off")
+        .output()
+        .unwrap();
+    assert!(off.status.success(), "{off:?}");
+    let off_stderr = String::from_utf8_lossy(&off.stderr);
+    assert!(
+        off_stderr.contains("RUST_LOG is set and overrides the configured log level"),
+        "RUST_LOG=off hid the override notice: {off_stderr}"
+    );
+    assert!(
+        !off_stderr.contains("diagnostic logging is enabled"),
+        "RUST_LOG=off should not trigger privacy warning: {off_stderr}"
+    );
+
+    // 2. Empty RUST_LOG="" falls back with a visible warning.
+    let empty = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args(["--check", "--config"])
+        .arg(&config)
+        .env("RUST_LOG", "")
+        .output()
+        .unwrap();
+    assert!(empty.status.success(), "{empty:?}");
+    let empty_stderr = String::from_utf8_lossy(&empty.stderr);
+    assert!(
+        empty_stderr.contains("RUST_LOG is set but empty"),
+        "empty RUST_LOG did not warn: {empty_stderr}"
+    );
+
+    // 3. RUST_LOG=debug and target-scoped RUST_LOG=warn,beam_core=debug over
+    //    config.example.toml (`level = "warn"`) both emit the diagnostic
+    //    privacy warning.
+    for filter in ["debug", "warn,beam_core=debug"] {
+        let verbose = Command::new(env!("CARGO_BIN_EXE_beam"))
+            .args(["--check", "--config"])
+            .arg(&config)
+            .env("RUST_LOG", filter)
+            .output()
+            .unwrap();
+        assert!(verbose.status.success(), "{verbose:?}");
+        let verbose_stderr = String::from_utf8_lossy(&verbose.stderr);
+        assert!(
+            verbose_stderr.contains("diagnostic logging is enabled"),
+            "RUST_LOG={filter} did not emit privacy warning: {verbose_stderr}"
+        );
+    }
+
+    // 4. Valid BEAM_MAX_BLOCKING_THREADS emits no fallback warning; out-of-range
+    //    and non-UTF-8 values emit visible fallback warnings even under RUST_LOG=error.
+    let valid_threads = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args(["--check", "--config"])
+        .arg(&config)
+        .env("RUST_LOG", "error")
+        .env("BEAM_MAX_BLOCKING_THREADS", "200")
+        .output()
+        .unwrap();
+    assert!(valid_threads.status.success(), "{valid_threads:?}");
+    assert!(
+        !String::from_utf8_lossy(&valid_threads.stderr).contains("BEAM_MAX_BLOCKING_THREADS"),
+        "valid override warned unexpectedly"
+    );
+
+    let bad_threads = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args(["--check", "--config"])
+        .arg(&config)
+        .env("RUST_LOG", "error")
+        .env("BEAM_MAX_BLOCKING_THREADS", "9999")
+        .output()
+        .unwrap();
+    assert!(bad_threads.status.success(), "{bad_threads:?}");
+    assert!(
+        String::from_utf8_lossy(&bad_threads.stderr).contains("invalid BEAM_MAX_BLOCKING_THREADS"),
+        "out-of-range BEAM_MAX_BLOCKING_THREADS did not warn"
+    );
+
+    let non_utf8_threads = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args(["--check", "--config"])
+        .arg(&config)
+        .env("RUST_LOG", "error")
+        .env("BEAM_MAX_BLOCKING_THREADS", OsStr::from_bytes(b"\xff\xfe"))
+        .output()
+        .unwrap();
+    assert!(non_utf8_threads.status.success(), "{non_utf8_threads:?}");
+    assert!(
+        String::from_utf8_lossy(&non_utf8_threads.stderr)
+            .contains("invalid non-UTF-8 BEAM_MAX_BLOCKING_THREADS"),
+        "non-UTF-8 BEAM_MAX_BLOCKING_THREADS did not warn"
+    );
+}
+
+#[test]
+fn check_reports_fd_basis_xudp_per_mux_cap_and_listen_backlog() {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args(["--check", "--config"])
+        .arg(&config)
+        .env("RUST_LOG", "error")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("effective fd budget basis:"),
+        "missing fd budget basis in --check output: {stdout}"
+    );
+    assert!(
+        stdout.contains("effective xudp per-mux sessions: 128 (binding limit: max_xudp_sessions"),
+        "missing xudp per-mux limit in --check output: {stdout}"
+    );
+    assert!(
+        stdout.contains("listen_backlog: requested 1024"),
+        "missing listen_backlog line in --check output: {stdout}"
+    );
+}
+
+#[test]
+fn generate_supports_server_toml_client_link_and_warns_on_uppercase_sni() {
+    let server_only = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args([
+            "generate",
+            "--host",
+            "example.com",
+            "--sni",
+            "Example.COM",
+            "--format",
+            "server-toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(server_only.status.success(), "{server_only:?}");
+    let stdout = String::from_utf8_lossy(&server_only.stdout);
+    let stderr = String::from_utf8_lossy(&server_only.stderr);
+    assert!(stdout.contains("[user]") && stdout.contains("[reality]"));
+    assert!(stdout.contains("server_names = [\"Example.COM\"]"));
+    assert!(!stdout.contains("vless://"));
+    assert!(stderr.contains("case-sensitively"));
+
+    let link_only = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args([
+            "generate",
+            "--host",
+            "example.com",
+            "--sni",
+            "example.com",
+            "--format",
+            "client-link",
+        ])
+        .output()
+        .unwrap();
+    assert!(link_only.status.success(), "{link_only:?}");
+    let link_stdout = String::from_utf8_lossy(&link_only.stdout);
+    assert!(link_stdout.starts_with("vless://"));
+    assert!(!link_stdout.contains("[reality]"));
+}

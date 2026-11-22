@@ -9,12 +9,28 @@ use beam_core::config::is_plausible_dns_name;
 use beam_core::identity::{
     ClientLink, RealityKeyPair, client_link, generate_short_id, generate_uuid,
 };
-use clap::Args;
+use clap::{Args, ValueEnum};
 use zeroize::Zeroizing;
+
+/// Output selection for `beam generate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum GenerateFormat {
+    /// Emit the delimited server TOML fragment followed by the client VLESS link.
+    #[default]
+    All,
+    /// Emit only the standalone server TOML fragment (`[user]` and `[reality]`).
+    ServerToml,
+    /// Emit only the Xray-compatible client `vless://` link.
+    ClientLink,
+}
 
 /// Message used for every rejected `--host` value.
 const HOST_HINT: &str = "host must be a DNS name or an IP address; pass the TCP \
                         port with --port and omit any scheme or path";
+
+/// Delimiter lines wrapping the server TOML fragment in `--format all` output.
+const SERVER_CONFIG_BEGIN: &str = "# --- BEGIN BEAM SERVER CONFIG ---";
+const SERVER_CONFIG_END: &str = "# --- END BEAM SERVER CONFIG ---";
 
 /// Generates a UUID, REALITY keypair, short id, and client VLESS link.
 #[derive(Debug, Args)]
@@ -28,12 +44,18 @@ pub struct GenerateArgs {
     port: u16,
 
     /// REALITY server name (SNI) for the link and `reality.server_names`.
+    /// REALITY matches SNI case-sensitively, so use the exact letter case the
+    /// client will send (typically lowercase).
     #[arg(long, value_parser = parse_server_name)]
     sni: String,
 
     /// Display name shown by the client.
     #[arg(long, default_value = "beam")]
     remark: String,
+
+    /// Output format: `all` (default), `server-toml`, or `client-link`.
+    #[arg(long, value_enum, default_value_t = GenerateFormat::All)]
+    format: GenerateFormat,
 }
 
 /// True when a regular-file stdout is readable by group or other users.
@@ -72,7 +94,8 @@ pub fn run(args: &GenerateArgs) -> Result<()> {
         remark: &args.remark,
     });
 
-    let rendered = render(
+    let rendered = render_with_format(
+        args.format,
         &user_id.to_string(),
         private_key.as_str(),
         &short_id,
@@ -82,10 +105,18 @@ pub fn run(args: &GenerateArgs) -> Result<()> {
     // Propagate a closed or full stdout as an error instead of panicking.
     std::io::stdout().lock().write_all(rendered.as_bytes())?;
     // A closed or full stderr must not panic after the identity is emitted.
-    let _ = std::io::stderr().write_all(
-        b"warning: this output contains the REALITY private key; set umask 077, \
-          keep the config mode 0600, and never commit or paste it\n",
-    );
+    if args.format != GenerateFormat::ClientLink {
+        let _ = std::io::stderr().write_all(
+            b"warning: this output contains the REALITY private key; set umask 077, \
+              keep the config mode 0600, and never commit or paste it\n",
+        );
+    }
+    if args.sni.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        let _ = std::io::stderr().write_all(
+            b"note: REALITY compares SNI case-sensitively; keep the exact spelling in \
+              both server_names and client configuration (lowercase is recommended)\n",
+        );
+    }
     Ok(())
 }
 
@@ -162,13 +193,12 @@ fn parse_server_name(value: &str) -> Result<String, String> {
     }
 }
 
-/// Formats the server configuration fragment and the client link.
-fn render(
+/// Formats the standalone server TOML fragment (`[user]` and `[reality]`).
+fn render_server_toml(
     user_id: &str,
     private_key: &str,
     short_id: &str,
     server_name: &str,
-    link: &str,
 ) -> Zeroizing<String> {
     Zeroizing::new(format!(
         "# Generated identity. Keep it secret and never commit it.\n\
@@ -180,10 +210,56 @@ fn render(
          short_ids = [\"{short_id}\"]\n\
          server_names = [\"{server_name}\"]\n\
          # Cover: set reality.dest to a host:port whose certificate is valid for\n\
-         # {server_name} (for example \"{server_name}:443\"), not an unrelated sample dest.\n\
-         \n# Xray-compatible client link, public key only:\n\
-         {link}\n"
+         # {server_name} (for example \"{server_name}:443\"), not an unrelated sample dest.\n"
     ))
+}
+
+/// Formats the server configuration fragment and/or the client link according
+/// to `format`.
+fn render_with_format(
+    format: GenerateFormat,
+    user_id: &str,
+    private_key: &str,
+    short_id: &str,
+    server_name: &str,
+    link: &str,
+) -> Zeroizing<String> {
+    match format {
+        GenerateFormat::All => {
+            let server_toml = render_server_toml(user_id, private_key, short_id, server_name);
+            Zeroizing::new(format!(
+                "{SERVER_CONFIG_BEGIN}\n\
+                 {server}\
+                 {SERVER_CONFIG_END}\n\
+                 \n# Xray-compatible client link, public key only:\n\
+                 {link}\n",
+                server = server_toml.as_str()
+            ))
+        }
+        GenerateFormat::ServerToml => {
+            render_server_toml(user_id, private_key, short_id, server_name)
+        }
+        GenerateFormat::ClientLink => Zeroizing::new(format!("{link}\n")),
+    }
+}
+
+/// Formats the default combined output (server fragment + client link).
+#[cfg(test)]
+fn render(
+    user_id: &str,
+    private_key: &str,
+    short_id: &str,
+    server_name: &str,
+    link: &str,
+) -> Zeroizing<String> {
+    render_with_format(
+        GenerateFormat::All,
+        user_id,
+        private_key,
+        short_id,
+        server_name,
+        link,
+    )
 }
 
 #[cfg(test)]
@@ -449,5 +525,122 @@ mod tests {
             "server1.example.com"
         );
         assert_eq!(parse_host("node.123").unwrap(), "node.123");
+    }
+
+    #[test]
+    fn render_formats_support_delimited_server_toml_and_client_link_modes() {
+        let (keys, user_id, short_id, public_key) = generate();
+        let private_key = keys.private_key();
+        let link = client_link(&ClientLink {
+            user_id: user_id.parse().expect("generated uuid parses"),
+            host: "203.0.113.10",
+            port: 443,
+            server_name: "example.com",
+            public_key: &public_key,
+            short_id: &short_id,
+            remark: "beam",
+        });
+
+        let all = render_with_format(
+            GenerateFormat::All,
+            &user_id,
+            private_key.as_str(),
+            &short_id,
+            "example.com",
+            &link,
+        );
+        let begin = all
+            .find(SERVER_CONFIG_BEGIN)
+            .expect("missing server config begin marker");
+        let end = all
+            .find(SERVER_CONFIG_END)
+            .expect("missing server config end marker");
+        assert!(begin < end);
+        let extracted = &all[begin + SERVER_CONFIG_BEGIN.len()..end];
+
+        let server_only = render_with_format(
+            GenerateFormat::ServerToml,
+            &user_id,
+            private_key.as_str(),
+            &short_id,
+            "example.com",
+            &link,
+        );
+        assert_eq!(extracted.trim(), server_only.trim());
+        assert!(!server_only.contains("vless://"));
+        assert!(server_only.contains("[user]"));
+        assert!(server_only.contains("[reality]"));
+
+        // Verify the extracted server-only fragment parses as valid TOML when
+        // combined with the remaining required sections.
+        let full_toml = format!(
+            "[server]\nlisten = \"127.0.0.1:443\"\n\n\
+             {server}\n\
+             dest = \"example.com:443\"\n\n\
+             [log]\nlevel = \"warn\"\n\n\
+             [limits]\n\
+             max_connections = 64\n\
+             max_udp_destinations = 64\n\
+             max_preauth_per_ip = 16\n\
+             max_xudp_sessions = 64\n\
+             xudp_recv_buffer_bytes = 65536\n\
+             listen_backlog = 128\n\
+             shutdown_drain_ms = 1000\n\
+             handshake_timeout_ms = 5000\n\
+             idle_timeout_ms = 10000\n",
+            server = server_only.as_str()
+        );
+        let parsed = beam_core::config::Config::from_toml_str(&full_toml)
+            .expect("server-toml fragment must form a valid config");
+        assert_eq!(parsed.user.id.to_string(), user_id);
+        assert_eq!(parsed.reality.server_names, vec!["example.com"]);
+
+        let link_only = render_with_format(
+            GenerateFormat::ClientLink,
+            &user_id,
+            private_key.as_str(),
+            &short_id,
+            "example.com",
+            &link,
+        );
+        assert_eq!(link_only.as_str(), format!("{link}\n"));
+        assert!(!link_only.contains(private_key.as_str()));
+    }
+
+    #[test]
+    fn generate_args_accept_format_flag() {
+        use clap::Parser;
+
+        #[derive(Debug, Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: GenerateArgs,
+        }
+
+        let default_args =
+            Wrapper::parse_from(["test", "--host", "203.0.113.10", "--sni", "example.com"]);
+        assert_eq!(default_args.args.format, GenerateFormat::All);
+
+        let server_args = Wrapper::parse_from([
+            "test",
+            "--host",
+            "203.0.113.10",
+            "--sni",
+            "example.com",
+            "--format",
+            "server-toml",
+        ]);
+        assert_eq!(server_args.args.format, GenerateFormat::ServerToml);
+
+        let link_args = Wrapper::parse_from([
+            "test",
+            "--host",
+            "203.0.113.10",
+            "--sni",
+            "example.com",
+            "--format",
+            "client-link",
+        ]);
+        assert_eq!(link_args.args.format, GenerateFormat::ClientLink);
     }
 }

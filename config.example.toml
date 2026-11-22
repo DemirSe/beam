@@ -21,13 +21,18 @@ level = "warn"
 
 [limits]
 max_connections = 1024
+# Caps packetaddr destination tables and also bounds per-mux XUDP sessions
+# together with `max_xudp_sessions / 2` (effective per-mux cap is the smaller).
 max_udp_destinations = 2048
 max_preauth_per_ip = 128
 # Also sizes the legacy/packetaddr UDP stream pool; keep it at 200 or more when
 # such a client bursts short flows.
 max_xudp_sessions = 256
 xudp_recv_buffer_bytes = 131072
+# Requested TCP listen backlog; Linux caps the active queue at net.core.somaxconn.
 listen_backlog = 1024
 shutdown_drain_ms = 2000
+# Overall authenticated handshake budget. Individual stages apply tighter caps:
+# pre-auth ClientHello read (5 s), TCP/cover dial (5 s), and XUDP DNS lookup (2 s).
 handshake_timeout_ms = 60000
 idle_timeout_ms = 300000

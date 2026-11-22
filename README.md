@@ -64,23 +64,55 @@ scripts. The example config contains placeholder values only.
 
 Start from [`config.example.toml`](config.example.toml). Unknown fields are
 errors, and `--check` validates scalar and derived limits (including the
-effective `max_preauth_per_ip` cap) without binding `server.listen` or testing
-port availability. The important keys are:
+effective `max_preauth_per_ip` cap, the effective per-mux XUDP session limit,
+the FD budget basis and observed soft `RLIMIT_NOFILE`, and the requested
+`listen_backlog` against the host `net.core.somaxconn` cap when readable)
+without binding `server.listen` or testing port availability. The important
+keys are:
 
 | Section | Keys |
 |---|---|
-| `[server]` | `listen` — listener address and port. |
+| `[server]` | `listen` — listener address and port. IPv6 binds keep the host `net.ipv6.bindv6only` default and log the effective `IPV6_V6ONLY` mode at startup. |
 | `[user]` | `id` — client UUID; `flow` — must be `xtls-rprx-vision` for configuration compatibility. |
-| `[reality]` | `private_key`, `short_ids`, `server_names` (DNS hostnames; IP literals are rejected), `dest` (`host:port`, DNS name or IP literal) — server identity, accepted short IDs and SNI values, and cover destination. |
+| `[reality]` | `private_key`, `short_ids`, `server_names` (DNS hostnames; IP literals are rejected; matched case-sensitively), `dest` (`host:port`, DNS name or IP literal) — server identity, accepted short IDs and SNI values, and cover destination. |
 | `[log]` | `level` — log level. |
 | `[limits]` | `max_connections`, `max_udp_destinations`, `max_preauth_per_ip`, `max_xudp_sessions`, `xudp_recv_buffer_bytes`, `listen_backlog`, `shutdown_drain_ms`, `handshake_timeout_ms`, `idle_timeout_ms`. |
 
 `handshake_timeout_ms` must be at least 100 and `idle_timeout_ms` at least
-1000; both are capped at 24 hours. `max_xudp_sessions` also sizes the legacy
-UDP stream pool and the XUDP kernel buffer budget. The derived packetaddr
-budget also limits `max_udp_destinations * max_xudp_sessions` to 4,194,304
-entries (512 MiB at an estimated 128 bytes per table entry). Keep it at 200 or
-more when a legacy or packetaddr client bursts short UDP flows.
+1000; both are capped at 24 hours. `handshake_timeout_ms` is the overall
+authenticated handshake deadline, while individual stages enforce tighter
+ceilings: the pre-auth ClientHello read and destination/cover TCP dials are
+capped at 5 seconds (`min(handshake_timeout_ms, 5 s)`), and XUDP domain
+resolution is capped at 2 seconds. `listen_backlog` is passed to `listen(2)` as
+configured, but Linux silently caps the kernel accept queue at
+`/proc/sys/net/core/somaxconn`; both `--check` and the startup log report the
+requested value alongside the host cap when readable. `max_xudp_sessions` also
+sizes the legacy UDP stream pool and the XUDP kernel buffer budget, and the
+effective per-mux XUDP session cap is
+`min(max_udp_destinations.clamp(1, 65536), max(1, max_xudp_sessions / 2))`
+(so lowering `max_udp_destinations` to shrink packetaddr tables can also lower
+the per-mux XUDP cap; `--check` and startup logs report the binding limit). The
+derived packetaddr budget also limits `max_udp_destinations * max_xudp_sessions`
+to 4,194,304 entries (512 MiB at an estimated 128 bytes per table entry). Keep
+`max_xudp_sessions` at 200 or more when a legacy or packetaddr client bursts
+short UDP flows.
+
+Supported environment overrides:
+
+- `RUST_LOG` — overrides `[log] level` with a `tracing_subscriber` filter
+  expression. Startup emits an operator-facing notice on stderr whenever
+  `RUST_LOG` overrides or fails to parse (and a privacy notice whenever the
+  effective filter enables `debug` or `trace`), independent of the active log
+  filter. An empty `RUST_LOG=""` is ignored with a warning and falls back to
+  `[log] level`.
+- `BEAM_MAX_BLOCKING_THREADS` — overrides Tokio's blocking-thread pool size
+  (valid range `1..=512`, default `160`; splice permits are
+  `max_blocking_threads.saturating_sub(40)`). Invalid, out-of-range, or
+  non-UTF-8 values emit an operator-facing warning on stderr and fall back to
+  the default.
+- `BEAM_BUILD_GIT_HASH` (build-time) — overrides the Git revision stamped into
+  `beam --version`. Must be 7–40 hexadecimal characters with an optional
+  `-dirty` suffix; malformed or non-UTF-8 values fail the build.
 
 Generate a new identity under a restrictive umask, then put the server fragment
 into a copy of the example config:
@@ -91,6 +123,11 @@ cp config.example.toml config.toml
 chmod 600 config.toml identity.txt
 target/release/beam --check -c config.toml
 ```
+
+The default `--format all` output wraps the server TOML fragment in
+`# --- BEGIN BEAM SERVER CONFIG ---` / `# --- END BEAM SERVER CONFIG ---`
+markers before the client `vless://` link. Pass `--format server-toml` for the
+standalone TOML fragment or `--format client-link` for the client URI alone.
 
 The umask applies only to the subshell, so later build and test commands keep
 their normal modes. Both files hold secrets and are git-ignored.
@@ -315,8 +352,11 @@ VLESS with `xtls-rprx-vision` is expected to work.
 - Prefer a standalone X25519 key share; otherwise use the final 32 bytes of
   an exact 1216-byte `X25519MLKEM768` share. Reject low-order/non-contributory
   X25519 shares.
-- Check SNI exactly, then the share, AEAD, client version range, optional
-  timestamp skew, and constant-time short-ID membership. Never expose an
+- Check SNI exactly (case-sensitive byte-for-byte match against configured
+  `reality.server_names`, preserving the spelling from `beam generate --sni`),
+  then the share, AEAD, client version range, optional
+  timestamp skew (whole-second granularity), and constant-time short-ID
+  membership. Never expose an
   authentication oracle: unauthenticated or failed probes go to the cover.
   `reality.server_names` and `beam generate --sni` require DNS hostnames and
   reject IP literals (RFC 6066); an existing configuration that lists an IPv4
@@ -376,8 +416,10 @@ VLESS with `xtls-rprx-vision` is expected to work.
   symmetric in both directions.
 - Direct is enabled only for a complete inner TLS application-data record
   after the expected TLS 1.3 ServerHello: TLS detected and the stock enable
-  condition satisfied. The last padded block is Direct; subsequent raw reads
-  and writes bypass Vision framing for that direction only.
+  condition satisfied. A ServerHello record that fails structural validation is
+  treated as non-TLS so filtering continues and the `End` fallback still
+  applies. The last padded block is Direct; subsequent raw reads and writes
+  bypass Vision framing for that direction only.
 - Direct handoff preserves bytes already read ahead and same-record leftovers;
   write pending outer TLS ciphertext before raw data. Each direction can be
   raw independently. There is no outer `close_notify` after Direct; FIN ends
