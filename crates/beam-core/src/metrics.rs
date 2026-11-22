@@ -35,12 +35,15 @@ pub struct Metrics {
     xudp_admitted_fresh: AtomicU64,
     xudp_admitted_reattach: AtomicU64,
     xudp_closed_end: AtomicU64,
+    xudp_closed_replaced: AtomicU64,
     xudp_closed_idle: AtomicU64,
     xudp_closed_error: AtomicU64,
     xudp_closed_mux: AtomicU64,
     xudp_retained_inserted: AtomicU64,
     xudp_retained_reattached: AtomicU64,
     xudp_retained_expired: AtomicU64,
+    xudp_retained_cleared_mux: AtomicU64,
+    xudp_retained_replaced: AtomicU64,
     xudp_retained_discarded: AtomicU64,
 }
 
@@ -112,8 +115,11 @@ pub struct MetricsSnapshot {
     pub xudp_admitted_fresh: u64,
     /// Retained XUDP sockets successfully reattached and inserted.
     pub xudp_admitted_reattach: u64,
-    /// Active sessions closed after an `End` frame.
+    /// Active sessions closed after an explicit client `End` frame.
     pub xudp_closed_end: u64,
+    /// Active sessions closed because a newer `New` frame replaced the session
+    /// id or migrated its GlobalID.
+    pub xudp_closed_replaced: u64,
     /// Active sessions selected for idle expiry.
     pub xudp_closed_idle: u64,
     /// Active sessions closed after a relay/socket error.
@@ -124,10 +130,15 @@ pub struct MetricsSnapshot {
     pub xudp_retained_inserted: u64,
     /// Retained sockets successfully reattached.
     pub xudp_retained_reattached: u64,
-    /// Retained sockets removed by expiry.
+    /// Retained sockets removed because their retention deadline expired.
     pub xudp_retained_expired: u64,
-    /// Retained sockets discarded because the family changed or reattachment
-    /// failed before the first datagram was sent.
+    /// Retained sockets cleared when the owning mux stream ended or dropped.
+    pub xudp_retained_cleared_mux: u64,
+    /// Retained sockets overwritten by a newer retained socket for the same GlobalID.
+    pub xudp_retained_replaced: u64,
+    /// Retained sockets discarded because the family changed, reattachment
+    /// failed before the first datagram was sent, or a late socket error retired
+    /// the retained entry.
     pub xudp_retained_discarded: u64,
 }
 
@@ -249,9 +260,14 @@ impl Metrics {
         self.xudp_admitted_reattach.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Counts a session closure for the given reason.
+    /// Counts an active session closed by an explicit client `End` frame.
     pub fn record_xudp_closed_end(&self) {
         self.xudp_closed_end.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts an active session closed because a newer `New` frame replaced it.
+    pub fn record_xudp_closed_replaced(&self) {
+        self.xudp_closed_replaced.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Counts one idle-selected session.
@@ -280,14 +296,26 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Counts retained sockets removed by expiry.
+    /// Counts retained sockets removed because their retention deadline expired.
     pub fn record_xudp_retained_expired(&self, count: usize) {
         self.xudp_retained_expired
             .fetch_add(count as u64, Ordering::Relaxed);
     }
 
-    /// Counts retained sockets discarded on a family change or failed
-    /// reattachment.
+    /// Counts retained sockets cleared during mux teardown.
+    pub fn record_xudp_retained_cleared_mux(&self, count: usize) {
+        self.xudp_retained_cleared_mux
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    /// Counts one retained socket overwritten by a newer retained entry for the
+    /// same GlobalID.
+    pub fn record_xudp_retained_replaced(&self) {
+        self.xudp_retained_replaced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts retained sockets discarded on a family change, failed
+    /// reattachment, or late socket failure.
     pub fn record_xudp_retained_discarded(&self) {
         self.xudp_retained_discarded.fetch_add(1, Ordering::Relaxed);
     }
@@ -327,12 +355,15 @@ impl Metrics {
             xudp_admitted_fresh: self.xudp_admitted_fresh.load(Ordering::Relaxed),
             xudp_admitted_reattach: self.xudp_admitted_reattach.load(Ordering::Relaxed),
             xudp_closed_end: self.xudp_closed_end.load(Ordering::Relaxed),
+            xudp_closed_replaced: self.xudp_closed_replaced.load(Ordering::Relaxed),
             xudp_closed_idle: self.xudp_closed_idle.load(Ordering::Relaxed),
             xudp_closed_error: self.xudp_closed_error.load(Ordering::Relaxed),
             xudp_closed_mux: self.xudp_closed_mux.load(Ordering::Relaxed),
             xudp_retained_inserted: self.xudp_retained_inserted.load(Ordering::Relaxed),
             xudp_retained_reattached: self.xudp_retained_reattached.load(Ordering::Relaxed),
             xudp_retained_expired: self.xudp_retained_expired.load(Ordering::Relaxed),
+            xudp_retained_cleared_mux: self.xudp_retained_cleared_mux.load(Ordering::Relaxed),
+            xudp_retained_replaced: self.xudp_retained_replaced.load(Ordering::Relaxed),
             xudp_retained_discarded: self.xudp_retained_discarded.load(Ordering::Relaxed),
         }
     }
@@ -369,12 +400,15 @@ mod tests {
         metrics.record_xudp_admitted_fresh();
         metrics.record_xudp_admitted_reattach();
         metrics.record_xudp_closed_end();
+        metrics.record_xudp_closed_replaced();
         metrics.record_xudp_closed_idle();
         metrics.record_xudp_closed_error();
         metrics.record_xudp_closed_mux();
         metrics.record_xudp_retained_inserted();
         metrics.record_xudp_retained_reattached();
         metrics.record_xudp_retained_expired(2);
+        metrics.record_xudp_retained_cleared_mux(3);
+        metrics.record_xudp_retained_replaced();
         metrics.record_xudp_retained_discarded();
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.preauth_rejected, 2);
@@ -403,12 +437,15 @@ mod tests {
         assert_eq!(snapshot.xudp_admitted_fresh, 1);
         assert_eq!(snapshot.xudp_admitted_reattach, 1);
         assert_eq!(snapshot.xudp_closed_end, 1);
+        assert_eq!(snapshot.xudp_closed_replaced, 1);
         assert_eq!(snapshot.xudp_closed_idle, 1);
         assert_eq!(snapshot.xudp_closed_error, 1);
         assert_eq!(snapshot.xudp_closed_mux, 1);
         assert_eq!(snapshot.xudp_retained_inserted, 1);
         assert_eq!(snapshot.xudp_retained_reattached, 1);
         assert_eq!(snapshot.xudp_retained_expired, 2);
+        assert_eq!(snapshot.xudp_retained_cleared_mux, 3);
+        assert_eq!(snapshot.xudp_retained_replaced, 1);
         assert_eq!(snapshot.xudp_retained_discarded, 1);
     }
 }

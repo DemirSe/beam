@@ -224,7 +224,80 @@ struct PendingResolution {
 }
 
 /// Cache and in-flight key: domain, port, and requested address family.
-type LookupKey = (String, u16, Option<SocketFamily>);
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LookupKey {
+    domain: String,
+    port: u16,
+    family: Option<SocketFamily>,
+}
+
+/// Borrowed view used to query `HashMap<LookupKey, _>` without allocating a
+/// `String` on every XUDP DNS cache lookup.
+trait LookupKeyView {
+    fn key_parts(&self) -> (&str, u16, Option<SocketFamily>);
+}
+
+impl LookupKeyView for LookupKey {
+    fn key_parts(&self) -> (&str, u16, Option<SocketFamily>) {
+        (self.domain.as_str(), self.port, self.family)
+    }
+}
+
+struct BorrowedLookupKey<'a> {
+    domain: &'a str,
+    port: u16,
+    family: Option<SocketFamily>,
+}
+
+impl LookupKeyView for BorrowedLookupKey<'_> {
+    fn key_parts(&self) -> (&str, u16, Option<SocketFamily>) {
+        (self.domain, self.port, self.family)
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn LookupKeyView + 'a> for LookupKey {
+    fn borrow(&self) -> &(dyn LookupKeyView + 'a) {
+        self
+    }
+}
+
+impl PartialEq for dyn LookupKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.key_parts() == other.key_parts()
+    }
+}
+
+impl Eq for dyn LookupKeyView + '_ {}
+
+impl std::hash::Hash for dyn LookupKeyView + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key_parts().hash(state);
+    }
+}
+
+/// Specific admission reason when a pending XUDP resolution frame is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingRejectReason {
+    ByteBudget,
+    NoPendingEntry,
+    PerIdFrameLimit,
+    TableFull,
+    RequestQueueFull,
+    InvalidInput,
+}
+
+impl PendingRejectReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ByteBudget => "byte_budget",
+            Self::NoPendingEntry => "no_pending_entry",
+            Self::PerIdFrameLimit => "per_id_frame_limit",
+            Self::TableFull => "table_full",
+            Self::RequestQueueFull => "request_queue_full",
+            Self::InvalidInput => "invalid_input",
+        }
+    }
+}
 
 /// Moves domain lookups off the shared mux read loop.
 ///
@@ -297,7 +370,25 @@ impl ResolutionState {
     /// an entry stored for one caller must not answer the other.
     fn cache_key(destination: &NetLocation, family: Option<SocketFamily>) -> Option<LookupKey> {
         match &destination.address {
-            Address::Domain(domain) => Some((domain.clone(), destination.port, family)),
+            Address::Domain(domain) => Some(LookupKey {
+                domain: domain.clone(),
+                port: destination.port,
+                family,
+            }),
+            Address::Ipv4(_) | Address::Ipv6(_) => None,
+        }
+    }
+
+    fn borrowed_key(
+        destination: &NetLocation,
+        family: Option<SocketFamily>,
+    ) -> Option<BorrowedLookupKey<'_>> {
+        match &destination.address {
+            Address::Domain(domain) => Some(BorrowedLookupKey {
+                domain: domain.as_str(),
+                port: destination.port,
+                family,
+            }),
             Address::Ipv4(_) | Address::Ipv6(_) => None,
         }
     }
@@ -307,10 +398,11 @@ impl ResolutionState {
         destination: &NetLocation,
         family: Option<SocketFamily>,
     ) -> Option<SocketAddr> {
-        let key = Self::cache_key(destination, family)?;
-        let (address, inserted) = self.cache.get(&key)?;
+        let key = Self::borrowed_key(destination, family)?;
+        let key_ref: &dyn LookupKeyView = &key;
+        let (address, inserted) = self.cache.get(key_ref)?;
         if inserted.elapsed() > RESOLUTION_CACHE_TTL {
-            self.cache.remove(&key);
+            self.cache.remove(key_ref);
             return None;
         }
         if family.is_some_and(|family| !family.matches(*address)) {
@@ -338,18 +430,18 @@ impl ResolutionState {
         self.pending.contains_key(&id)
     }
 
-    fn push_frame(&mut self, id: u16, frame: OwnedFrame) -> bool {
+    fn push_frame(&mut self, id: u16, frame: OwnedFrame) -> Result<(), PendingRejectReason> {
         let Some(frame) = PendingFrame::new(frame, &self.limiter) else {
-            return false;
+            return Err(PendingRejectReason::ByteBudget);
         };
         let Some(pending) = self.pending.get_mut(&id) else {
-            return false;
+            return Err(PendingRejectReason::NoPendingEntry);
         };
         if pending.frames.len() >= MAX_PENDING_FRAMES {
-            return false;
+            return Err(PendingRejectReason::PerIdFrameLimit);
         }
         pending.frames.push_back(frame);
-        true
+        Ok(())
     }
 
     fn start(
@@ -358,12 +450,15 @@ impl ResolutionState {
         destination: NetLocation,
         family: Option<SocketFamily>,
         frames: VecDeque<PendingFrame>,
-    ) -> bool {
-        if self.pending.len() >= MAX_PENDING_RESOLUTIONS || frames.is_empty() {
-            return false;
+    ) -> Result<(), PendingRejectReason> {
+        if self.pending.len() >= MAX_PENDING_RESOLUTIONS {
+            return Err(PendingRejectReason::TableFull);
+        }
+        if frames.is_empty() {
+            return Err(PendingRejectReason::InvalidInput);
         }
         let Some(key) = Self::cache_key(&destination, family) else {
-            return false;
+            return Err(PendingRejectReason::InvalidInput);
         };
         // Reuse a lookup that is already in flight for the same semantics. The
         // result is shared after it lands in the cache; only one resolver job
@@ -382,7 +477,7 @@ impl ResolutionState {
                     })
                     .is_err()
                 {
-                    return false;
+                    return Err(PendingRejectReason::RequestQueueFull);
                 }
                 self.inflight.insert(key.clone(), generation);
                 generation
@@ -390,7 +485,7 @@ impl ResolutionState {
         };
         let mut frames = frames;
         let Some(owner) = frames.pop_front() else {
-            return false;
+            return Err(PendingRejectReason::InvalidInput);
         };
         let seq = self.next_pending_seq;
         self.next_pending_seq = self.next_pending_seq.wrapping_add(1);
@@ -404,7 +499,7 @@ impl ResolutionState {
                 seq,
             },
         );
-        true
+        Ok(())
     }
 
     fn cancel_global(&mut self, global_id: [u8; GLOBAL_ID_LEN]) {
@@ -623,8 +718,13 @@ async fn process_pending_frames(
                 let next_id = parsed.session_id;
                 let reject = parsed.status == SessionStatus::New;
                 frames.push_front(frame);
-                if !resolutions.start(next_id, location, family, frames) {
+                if let Err(reason) = resolutions.start(next_id, location, family, frames) {
                     state.limiter.metrics().record_xudp_resolution_rejected();
+                    tracing::debug!(
+                        session_id = next_id,
+                        reason = reason.as_str(),
+                        "XUDP pending-resolution admission rejected; dropping queued frames"
+                    );
                     state.try_send_reject_end(next_id, reject);
                 }
                 return Ok(session_activity);
@@ -747,6 +847,8 @@ pub enum MuxError {
 enum CloseReason {
     /// The client sent `End`.
     ClientEnd,
+    /// A newer `New` frame replaced this active session or migrated its GlobalID.
+    Replaced,
     /// The idle timeout elapsed.
     Idle,
     /// The UDP relay failed.
@@ -787,7 +889,7 @@ impl Drop for MuxTeardown {
             (active, table.clear_expiring())
         };
         if retained > 0 {
-            self.metrics.record_xudp_retained_expired(retained);
+            self.metrics.record_xudp_retained_cleared_mux(retained);
         }
         for entry in active {
             // The entry removed here owns its terminal report. A reply failure
@@ -917,7 +1019,7 @@ where
     }
     let cleared = lock_table(&table).clear_expiring();
     if cleared > 0 {
-        metrics.record_xudp_retained_expired(cleared);
+        metrics.record_xudp_retained_cleared_mux(cleared);
     }
 
     drop(state);
@@ -1083,11 +1185,14 @@ where
                         resolutions.cancel_global(global_id);
                     }
                     if resolutions.has_pending(id) {
-                        if !resolutions.push_frame(id, OwnedFrame::from_borrowed(&parsed)) {
+                        if let Err(reason) =
+                            resolutions.push_frame(id, OwnedFrame::from_borrowed(&parsed))
+                        {
                             state.limiter.metrics().record_xudp_resolution_rejected();
                             tracing::debug!(
                                 session_id = id,
-                                "XUDP pending-resolution queue is full; dropping frame"
+                                reason = reason.as_str(),
+                                "XUDP pending-resolution admission rejected; dropping frame"
                             );
                             if parsed.status == SessionStatus::New {
                                 state.try_send_reject_end(id, true);
@@ -1100,10 +1205,13 @@ where
 
                     if let Some((destination, family)) = state.domain_resolution(&parsed) {
                         if let Some(cached) = resolutions.cache_get(destination, family) {
-                            let mut owned = OwnedFrame::from_borrowed(&parsed);
-                            owned.rewrite_destination(cached);
+                            // Dispatch directly using the borrowed payload slice
+                            // and resolved SocketAddr without cloning domain or
+                            // payload into an owned frame.
+                            let mut resolved = parsed;
+                            resolved.destination = Some(socket_addr_to_location(cached));
                             batch_session_activity |= state
-                                .handle_frame_with_session_transition(&owned.as_borrowed())
+                                .handle_frame_with_session_transition(&resolved)
                                 .await?;
                         } else {
                             let Some(frame) = PendingFrame::new(
@@ -1114,6 +1222,11 @@ where
                                 // dropped the same way as one the table or the
                                 // queue rejects.
                                 state.limiter.metrics().record_xudp_resolution_rejected();
+                                tracing::debug!(
+                                    session_id = id,
+                                    reason = PendingRejectReason::ByteBudget.as_str(),
+                                    "XUDP pending-resolution admission rejected; dropping frame"
+                                );
                                 if parsed.status == SessionStatus::New {
                                     state.try_send_reject_end(id, true);
                                 }
@@ -1122,11 +1235,14 @@ where
                                 continue;
                             };
                             let frames = VecDeque::from([frame]);
-                            if !resolutions.start(id, destination.clone(), family, frames) {
+                            if let Err(reason) =
+                                resolutions.start(id, destination.clone(), family, frames)
+                            {
                                 state.limiter.metrics().record_xudp_resolution_rejected();
                                 tracing::debug!(
                                     session_id = id,
-                                    "XUDP pending-resolution limit reached; rejecting frame"
+                                    reason = reason.as_str(),
+                                    "XUDP pending-resolution admission rejected; dropping frame"
                                 );
                                 if parsed.status == SessionStatus::New {
                                     state.try_send_reject_end(id, true);
@@ -1523,7 +1639,7 @@ impl MuxState {
             DuplicateStatus::SameGlobalId => {
                 let taken = { lock_table(&self.table).take(id) };
                 if let Some(active) = taken {
-                    self.close_active(active, CloseReason::ClientEnd).await?;
+                    self.close_active(active, CloseReason::Replaced).await?;
                 }
             }
             DuplicateStatus::None => {}
@@ -1534,7 +1650,7 @@ impl MuxState {
         if let Some(global_id) = global_id {
             let old = { lock_table(&self.table).take_by_global_id(global_id) };
             if let Some(old) = old {
-                self.close_active(old, CloseReason::ClientEnd).await?;
+                self.close_active(old, CloseReason::Replaced).await?;
             }
         }
 
@@ -1872,9 +1988,14 @@ impl MuxState {
         // close itself was clean.
         let error = reason.is_error() || session.failed();
         match (error, reason) {
-            (true, _) => self.limiter.metrics().record_xudp_closed_error(),
+            (true, _) | (false, CloseReason::RelayError) => {
+                self.limiter.metrics().record_xudp_closed_error();
+            }
             (false, CloseReason::Idle) => self.limiter.metrics().record_xudp_closed_idle(),
-            (false, _) => self.limiter.metrics().record_xudp_closed_end(),
+            (false, CloseReason::Replaced) => self.limiter.metrics().record_xudp_closed_replaced(),
+            (false, CloseReason::ClientEnd) => {
+                self.limiter.metrics().record_xudp_closed_end();
+            }
         }
         if reason == CloseReason::Idle {
             // A sweep can expire many sessions at once. Waiting for each idle
@@ -1911,7 +2032,7 @@ impl MuxState {
             let replaced = lock_table(&self.table).insert_expiring(global_id, retained);
             self.limiter.metrics().record_xudp_retained_inserted();
             if replaced.is_some() {
-                self.limiter.metrics().record_xudp_retained_expired(1);
+                self.limiter.metrics().record_xudp_retained_replaced();
             }
             drop(replaced);
         }
@@ -1949,7 +2070,7 @@ impl MuxState {
                     lock_table(&self.table).remove_expiring_if_same(global_id, &session.socket)
                 });
                 if retired {
-                    self.limiter.metrics().record_xudp_retained_expired(1);
+                    self.limiter.metrics().record_xudp_retained_discarded();
                 }
                 Ok(())
             }
@@ -2426,7 +2547,8 @@ mod tests {
             2,
             "the retained permit is released once"
         );
-        assert_eq!(metrics.snapshot().xudp_retained_expired, 1);
+        assert_eq!(metrics.snapshot().xudp_retained_discarded, 1);
+        assert_eq!(metrics.snapshot().xudp_retained_expired, 0);
     }
 
     #[tokio::test]
@@ -3978,10 +4100,11 @@ mod tests {
         assert_eq!(reply.session_id, 2);
         assert_eq!(reply.payload, b"second");
         assert_eq!(
-            limiter.metrics().snapshot().xudp_closed_end,
+            limiter.metrics().snapshot().xudp_closed_replaced,
             1,
-            "migration must count the replaced client session"
+            "migration must count the replaced client session separately from End"
         );
+        assert_eq!(limiter.metrics().snapshot().xudp_closed_end, 0);
 
         write_frame(&mut client, keep_spec(1, None, b"stale")).await;
         let stale_end = read_frame(&mut client, &mut buffer)
@@ -4001,7 +4124,8 @@ mod tests {
         let _ = read_frame(&mut client, &mut buffer)
             .await
             .expect("End must be acknowledged");
-        assert_eq!(limiter.metrics().snapshot().xudp_closed_end, 2);
+        assert_eq!(limiter.metrics().snapshot().xudp_closed_end, 1);
+        assert_eq!(limiter.metrics().snapshot().xudp_closed_replaced, 1);
         finish(client, task).await;
     }
 
@@ -4370,8 +4494,16 @@ mod tests {
             VecDeque::from([PendingFrame::new(frame.clone(), &resolutions.limiter)
                 .expect("test frame fits the pending budget")])
         };
-        assert!(resolutions.start(2, destination.clone(), None, make_frames(&resolutions)));
-        assert!(resolutions.start(1, destination.clone(), None, make_frames(&resolutions)));
+        assert!(
+            resolutions
+                .start(2, destination.clone(), None, make_frames(&resolutions))
+                .is_ok()
+        );
+        assert!(
+            resolutions
+                .start(1, destination.clone(), None, make_frames(&resolutions))
+                .is_ok()
+        );
         let key = ResolutionState::cache_key(&destination, None).expect("domain key");
         let generation = resolutions.inflight[&key];
         let waiters = resolutions.take_waiters(&key, generation);
@@ -4381,10 +4513,22 @@ mod tests {
         // A New queued behind its own lookup supersedes the owner without
         // changing the entry's arrival slot. The replacement must still run
         // before sessions 1 and 2, which join the lookup later.
-        assert!(resolutions.start(3, destination.clone(), None, make_frames(&resolutions)));
-        assert!(resolutions.push_frame(3, frame.clone()));
-        assert!(resolutions.start(1, destination.clone(), None, make_frames(&resolutions)));
-        assert!(resolutions.start(2, destination.clone(), None, make_frames(&resolutions)));
+        assert!(
+            resolutions
+                .start(3, destination.clone(), None, make_frames(&resolutions))
+                .is_ok()
+        );
+        assert!(resolutions.push_frame(3, frame.clone()).is_ok());
+        assert!(
+            resolutions
+                .start(1, destination.clone(), None, make_frames(&resolutions))
+                .is_ok()
+        );
+        assert!(
+            resolutions
+                .start(2, destination.clone(), None, make_frames(&resolutions))
+                .is_ok()
+        );
         let waiters = resolutions.take_waiters(&key, generation);
         let order: Vec<u16> = waiters.iter().map(|(id, _)| *id).collect();
         let seqs: Vec<u64> = waiters.iter().map(|(_, pending)| pending.seq).collect();
@@ -6115,22 +6259,32 @@ mod tests {
                 .expect("each session must get a reply");
             assert_eq!(reply.status, SessionStatus::Keep);
             assert!(reply.session_id >= 20 && reply.session_id < 24);
-            seen.push(reply.payload);
+            seen.push((reply.session_id, reply.payload));
         }
         seen.sort();
-        let mut expected: Vec<Vec<u8>> = payloads.iter().map(|payload| payload.to_vec()).collect();
-        expected.sort();
-        assert_eq!(seen, expected);
+        let expected: Vec<(u16, Vec<u8>)> = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| (20 + u16::try_from(index).unwrap(), payload.to_vec()))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "each session id must receive its own reply payload"
+        );
 
         for session_id in 20..24 {
             write_frame(&mut client, FrameSpec::new(session_id, SessionStatus::End)).await;
         }
+        let mut ended_ids = Vec::new();
         for _ in 20..24 {
             let end = read_frame(&mut client, &mut buffer)
                 .await
-                .expect("End must be acknowledged");
+                .expect("End must be acknowledged after data");
             assert_eq!(end.status, SessionStatus::End);
+            ended_ids.push(end.session_id);
         }
+        ended_ids.sort();
+        assert_eq!(ended_ids, vec![20, 21, 22, 23]);
 
         finish(client, task).await;
     }
@@ -6401,6 +6555,182 @@ mod tests {
             !end.option.has_error(),
             "the live session's own End is clean"
         );
+
+        finish(client, task).await;
+    }
+
+    #[tokio::test]
+    async fn retained_counters_separate_mux_teardown_replacement_and_expiry() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = net_location(echo.address);
+        let limiter = XudpSessionLimiter::new(8);
+        let metrics = limiter.metrics();
+        let config = Arc::new(XudpConfig {
+            close_expiry: Duration::from_secs(60),
+            ..*test_config()
+        });
+
+        let (mut client, task) = start_mux_with_limiter(config, limiter.clone());
+        let mut buffer = Vec::new();
+        let gid = [0x92; GLOBAL_ID_LEN];
+
+        // Opening a second session with the same GlobalID supersedes session 1
+        // (`xudp_closed_replaced`), then cleanly closing session 2 retains its
+        // socket (`xudp_retained_inserted`).
+        write_frame(&mut client, new_spec(1, &destination, b"first", Some(gid))).await;
+        let reply1 = read_frame(&mut client, &mut buffer).await.expect("echo 1");
+        assert_eq!(reply1.payload, b"first");
+        write_frame(&mut client, new_spec(2, &destination, b"second", Some(gid))).await;
+        let mut saw_replaced_end = false;
+        let mut saw_second_reply = false;
+        while !(saw_replaced_end && saw_second_reply) {
+            let frame = read_frame(&mut client, &mut buffer)
+                .await
+                .expect("replaced End or session 2 echo");
+            if frame.session_id == 1 && frame.status == SessionStatus::End {
+                saw_replaced_end = true;
+            } else if frame.session_id == 2 && frame.payload == b"second" {
+                saw_second_reply = true;
+            } else {
+                panic!("unexpected frame: {frame:?}");
+            }
+        }
+
+        write_frame(&mut client, FrameSpec::new(2, SessionStatus::End)).await;
+        let end2 = read_frame(&mut client, &mut buffer).await.expect("end 2");
+        assert_eq!(end2.status, SessionStatus::End);
+
+        // Ending the mux while the retained entry is still live must count
+        // `xudp_retained_cleared_mux`, NOT `xudp_retained_expired`.
+        finish(client, task).await;
+        let snap = metrics.snapshot();
+        assert_eq!(snap.xudp_closed_replaced, 1);
+        assert_eq!(snap.xudp_closed_end, 1);
+        assert_eq!(snap.xudp_retained_inserted, 2);
+        assert_eq!(snap.xudp_retained_cleared_mux, 1);
+        assert_eq!(snap.xudp_retained_expired, 0);
+        assert_eq!(snap.xudp_retained_replaced, 0);
+
+        // Behaviorally exercise PendingRejectReason causes on ResolutionState.
+        use super::{
+            MAX_PENDING_FRAMES, MAX_PENDING_RESOLUTIONS, PendingFrame, PendingRejectReason,
+        };
+        let make_frame = |id: u16, payload: Vec<u8>| OwnedFrame {
+            session_id: id,
+            status: SessionStatus::Keep,
+            option: FrameOption::DATA,
+            network: None,
+            destination: None,
+            global_id: None,
+            payload,
+        };
+        let domain_dest = NetLocation {
+            address: Address::Domain("pending-reason.test".to_owned()),
+            port: 53,
+        };
+        let res_limiter = XudpSessionLimiter::new(4);
+        let mut resolutions = ResolutionState::new(res_limiter.clone());
+        assert_eq!(
+            resolutions.push_frame(99, make_frame(99, b"x".to_vec())),
+            Err(PendingRejectReason::NoPendingEntry)
+        );
+
+        let owner = PendingFrame::new(make_frame(1, b"o".to_vec()), &res_limiter).unwrap();
+        let mut initial = VecDeque::new();
+        initial.push_back(owner);
+        resolutions
+            .start(1, domain_dest.clone(), None, initial)
+            .expect("first pending entry starts");
+
+        for _ in 0..MAX_PENDING_FRAMES {
+            resolutions
+                .push_frame(1, make_frame(1, b"k".to_vec()))
+                .expect("within per-id frame limit");
+        }
+        assert_eq!(
+            resolutions.push_frame(1, make_frame(1, b"overflow".to_vec())),
+            Err(PendingRejectReason::PerIdFrameLimit)
+        );
+
+        for id in 2..=u16::try_from(MAX_PENDING_RESOLUTIONS).unwrap() {
+            let owner = PendingFrame::new(make_frame(id, b"o".to_vec()), &res_limiter).unwrap();
+            let mut frames = VecDeque::new();
+            frames.push_back(owner);
+            resolutions
+                .start(id, domain_dest.clone(), None, frames)
+                .expect("within pending resolution table limit");
+        }
+        let extra = PendingFrame::new(make_frame(500, b"o".to_vec()), &res_limiter).unwrap();
+        let mut extra_frames = VecDeque::new();
+        extra_frames.push_back(extra);
+        assert_eq!(
+            resolutions.start(500, domain_dest, None, extra_frames),
+            Err(PendingRejectReason::TableFull)
+        );
+
+        // Exhausting the global pending byte budget reports ByteBudget.
+        let budget_limiter = XudpSessionLimiter::new(1);
+        let mut held = Vec::new();
+        while let Some(permit) = budget_limiter.try_reserve_resolution(4096) {
+            held.push(permit);
+        }
+        let mut budget_res = ResolutionState::new(budget_limiter);
+        assert_eq!(
+            budget_res.push_frame(1, make_frame(1, vec![0u8; 4096])),
+            Err(PendingRejectReason::ByteBudget)
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn cached_domain_dispatch_reuses_entry_without_repeating_lookup() {
+        let echo = spawn_ipv4_echo().await;
+        let destination = NetLocation {
+            address: Address::Domain("slow-ok.test".to_owned()),
+            port: echo.address.port(),
+        };
+        let (mut client, task) = start_mux(test_config());
+        let mut buffer = Vec::new();
+        let before = test_resolve_calls();
+
+        // First New resolves and populates the cache.
+        write_frame(&mut client, new_spec(1, &destination, b"cold", None)).await;
+        let cold = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("cold echo");
+        assert_eq!(cold.session_id, 1);
+        assert_eq!(cold.payload, b"cold");
+        let after_cold = test_resolve_calls();
+        assert_eq!(after_cold - before, 1);
+
+        // Second New hits the borrowed `family = None` cache key without
+        // starting another resolver job.
+        write_frame(&mut client, new_spec(2, &destination, b"warm-new", None)).await;
+        let warm_new = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("warm New echo");
+        assert_eq!(warm_new.session_id, 2);
+        assert_eq!(warm_new.payload, b"warm-new");
+        assert_eq!(test_resolve_calls(), after_cold);
+
+        // First Keep populates the family-constrained (`Some(V4)`) cache key,
+        // and the subsequent Keep hits that borrowed cache key directly.
+        write_frame(&mut client, keep_spec(2, Some(&destination), b"keep-prime")).await;
+        let keep_prime = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("first Keep echo");
+        assert_eq!(keep_prime.session_id, 2);
+        assert_eq!(keep_prime.payload, b"keep-prime");
+        let after_keep_prime = test_resolve_calls();
+        assert_eq!(after_keep_prime, after_cold + 1);
+
+        write_frame(&mut client, keep_spec(2, Some(&destination), b"warm-keep")).await;
+        let warm_keep = read_frame(&mut client, &mut buffer)
+            .await
+            .expect("warm Keep echo");
+        assert_eq!(warm_keep.session_id, 2);
+        assert_eq!(warm_keep.payload, b"warm-keep");
+        assert_eq!(test_resolve_calls(), after_keep_prime);
 
         finish(client, task).await;
     }

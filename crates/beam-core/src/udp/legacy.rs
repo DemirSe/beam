@@ -349,7 +349,10 @@ where
     let mut decoder = FrameDecoder::new(payload_limit);
     let mut chunk = vec![0u8; READ_CHUNK_LEN];
     let mut incoming = vec![0u8; config.max_datagram_size.saturating_add(1)];
-    let mut reply = Vec::with_capacity(LENGTH_PREFIX_LEN + payload_limit);
+    // Defer reply-buffer allocation until the first reply arrives; sessions
+    // that receive small or zero replies avoid reserving ~8 KiB upfront at the
+    // cost of a one-time growth if a large reply arrives later.
+    let mut reply = Vec::new();
     let idle = sleep(config.idle_timeout);
     tokio::pin!(idle);
 
@@ -501,7 +504,9 @@ where
     let mut chunk = vec![0u8; READ_CHUNK_LEN];
     let mut v4_incoming = vec![0u8; config.max_datagram_size.saturating_add(1)];
     let mut v6_incoming = vec![0u8; config.max_datagram_size.saturating_add(1)];
-    let mut reply = Vec::with_capacity(LENGTH_PREFIX_LEN + payload_limit);
+    // Defer reply-buffer allocation until the first reply arrives so silent or
+    // small-reply packetaddr streams avoid reserving ~8 KiB upfront.
+    let mut reply = Vec::new();
     let idle = sleep(config.idle_timeout);
     tokio::pin!(idle);
 
@@ -999,14 +1004,12 @@ fn is_peer_closed(error: &io::Error) -> bool {
     )
 }
 
-/// Test-only entry point for the legacy UDP parser fuzz target.
-///
-/// This is compiled only with the `fuzz` feature and is not part of the
-/// production API. It exercises frame reassembly and packetaddr parsing
-/// without opening a socket.
-#[cfg(feature = "fuzz")]
-#[doc(hidden)]
-pub fn fuzz_legacy_parser(data: &[u8]) {
+/// Exercises chunked frame reassembly (compaction + carry-over across reads),
+/// packetaddr parsing, and bounded reply-encoding round trips across IPv4,
+/// IPv6, and IPv4-mapped IPv6 source addresses.
+#[cfg(any(feature = "fuzz", test))]
+fn fuzz_legacy_model(data: &[u8]) {
+    // 1. Single-push decode + raw packetaddr parse.
     let mut decoder = FrameDecoder::new(MAX_FRAMED_DATAGRAM_SIZE);
     if decoder.push(data).is_ok() {
         while let Ok(Some(frame)) = decoder.next_frame() {
@@ -1014,6 +1017,93 @@ pub fn fuzz_legacy_parser(data: &[u8]) {
         }
     }
     let _ = parse_packetaddr(data);
+
+    // 2. Bounded multi-chunk pushes into one decoder to exercise compaction
+    //    and carry-over state across successive reads.
+    const MAX_CHUNKS: usize = 32;
+    let mut chunked = FrameDecoder::new(MAX_FRAMED_DATAGRAM_SIZE);
+    let mut rest = data;
+    for _ in 0..MAX_CHUNKS {
+        let Some((&len_hint, tail)) = rest.split_first() else {
+            break;
+        };
+        let take = usize::from(len_hint).min(tail.len());
+        let (piece, next) = tail.split_at(take);
+        rest = next;
+        if chunked.push(piece).is_err() {
+            break;
+        }
+        while let Ok(Some(frame)) = chunked.next_frame() {
+            chunked.consume(frame.end);
+        }
+    }
+    if !rest.is_empty() && chunked.push(rest).is_ok() {
+        while let Ok(Some(frame)) = chunked.next_frame() {
+            chunked.consume(frame.end);
+        }
+    }
+
+    // 3. Round-trip fixed and packetaddr reply encoding across IPv4, IPv6, and
+    //    v4-mapped IPv6 sources, asserting normalized source preservation.
+    let payload = &data[..data.len().min(MAX_FRAMED_DATAGRAM_SIZE)];
+    let mut out = Vec::new();
+    if !payload.is_empty() && encode_fixed_reply(payload, &mut out) {
+        let mut check = FrameDecoder::new(MAX_FRAMED_DATAGRAM_SIZE);
+        if check.push(&out).is_ok()
+            && let Ok(Some(frame)) = check.next_frame()
+        {
+            assert_eq!(&check.buffer[frame], payload);
+        }
+    }
+
+    let port = data
+        .get(..2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]).max(1))
+        .unwrap_or(53);
+    let v4_octets = [
+        data.first().copied().unwrap_or(192),
+        data.get(1).copied().unwrap_or(0),
+        data.get(2).copied().unwrap_or(2),
+        data.get(3).copied().unwrap_or(1),
+    ];
+    let mut v6_octets = [0u8; 16];
+    for (idx, slot) in v6_octets.iter_mut().enumerate() {
+        *slot = data.get(idx).copied().unwrap_or(idx as u8);
+    }
+    // Ensure v6_octets is not v4-mapped for the pure IPv6 case.
+    v6_octets[0] = 0x20;
+    v6_octets[1] = 0x01;
+    let sources = [
+        SocketAddr::from((Ipv4Addr::from(v4_octets), port)),
+        SocketAddr::from((Ipv6Addr::from(v6_octets), port)),
+        SocketAddr::from((Ipv4Addr::from(v4_octets).to_ipv6_mapped(), port)),
+    ];
+    for source in sources {
+        let limit = packetaddr_reply_limit(MAX_FRAMED_DATAGRAM_SIZE, source);
+        let bounded = &payload[..payload.len().min(limit)];
+        if encode_packetaddr_reply(source, bounded, &mut out) {
+            let mut check = FrameDecoder::new(MAX_FRAMED_DATAGRAM_SIZE);
+            if check.push(&out).is_ok()
+                && let Ok(Some(frame)) = check.next_frame()
+                && let Ok((decoded_source, decoded_payload)) =
+                    parse_packetaddr(&check.buffer[frame])
+            {
+                assert_eq!(decoded_source, normalize_address(source));
+                assert_eq!(decoded_payload, bounded);
+            }
+        }
+    }
+}
+
+/// Test-only entry point for the legacy UDP parser fuzz target.
+///
+/// This is compiled only with the `fuzz` feature and is not part of the
+/// production API. It exercises multi-read frame reassembly, packetaddr
+/// parsing, and IPv4/IPv6 reply round-tripping without opening a socket.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub fn fuzz_legacy_parser(data: &[u8]) {
+    fuzz_legacy_model(data);
 }
 
 /// Bounded packetaddr destination table.
@@ -2339,5 +2429,30 @@ mod tests {
         fn arbitrary_packetaddr_bytes_never_panic(data in prop::collection::vec(any::<u8>(), 0..=128)) {
             let _ = parse_packetaddr(&data);
         }
+    }
+
+    #[test]
+    fn fuzz_legacy_model_covers_chunked_compaction_and_reply_roundtrips() {
+        // Multi-frame payload fed through chunked decoding + reply encoding
+        // across IPv4, IPv6, and v4-mapped IPv6 sources.
+        let mut framed = Vec::new();
+        for payload in [
+            b"one".as_slice(),
+            b"two-bytes".as_slice(),
+            b"three".as_slice(),
+        ] {
+            framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            framed.extend_from_slice(payload);
+        }
+        // Prefix length hints so the chunked loop splits mid-frame and triggers compaction.
+        let mut chunked_input = vec![3];
+        chunked_input.extend_from_slice(&framed[..3]);
+        chunked_input.push(4);
+        chunked_input.extend_from_slice(&framed[3..7]);
+        chunked_input.push(framed.len() as u8);
+        chunked_input.extend_from_slice(&framed[7..]);
+        super::fuzz_legacy_model(&chunked_input);
+        super::fuzz_legacy_model(b"");
+        super::fuzz_legacy_model(b"x");
     }
 }
