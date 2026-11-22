@@ -22,7 +22,9 @@ use crate::tls::stream::RawTlsHandoff;
 use super::frame::{
     Command, MAX_BLOCK_LEN, MAX_CONTENT_LEN, VisionError, encode_block, parse_block,
 };
-use super::state::{VisionReaderMode, VisionReaderState, VisionStateError, VisionWriterState};
+use super::state::{
+    VisionReaderMode, VisionReaderState, VisionStateError, VisionWritePlan, VisionWriterState,
+};
 
 /// Chunk size used when reading framing bytes from the inner stream.
 const READ_CHUNK: usize = 4096;
@@ -38,9 +40,16 @@ const MAX_INNER_TLS_BODY: usize = 16_384 + 256;
 /// trigger sees the same record boundary as the stock writer.
 const MAX_WRITE_BATCH: usize = 5 + MAX_INNER_TLS_BODY;
 
-/// Maximum consecutive empty Vision blocks accepted in one `poll_read` call.
-/// Reaching this with no coalesced content is treated as malformed input; a
-/// self-wake here would busy-spin an authenticated connection.
+/// Upper bound on Vision chunks produced from a single `MAX_WRITE_BATCH` slice.
+const MAX_WRITE_CHUNKS: usize = MAX_WRITE_BATCH.div_ceil(MAX_CONTENT_LEN);
+
+/// Maximum empty Vision blocks processed in one `poll_read` call.
+///
+/// This is a per-poll work budget across the poll loop (not reset by
+/// interleaved non-empty blocks). If content has already been coalesced into
+/// `read_out`, hitting the budget flushes that batch instead of failing; only
+/// reaching the budget with zero coalesced content returns `InvalidData`,
+/// preventing a hostile peer from spinning a poll with padding-only blocks.
 const MAX_EMPTY_BLOCKS_PER_POLL: usize = 64;
 
 /// Maximum plaintext coalesced from complete Vision blocks in one poll.
@@ -78,6 +87,8 @@ pub struct VisionStream<S, R = SmallRng> {
     write_queue_offset: usize,
     /// Tail of an inner TLS record that arrived split across two writes.
     write_carry: Vec<u8>,
+    /// Reusable planning scratch buffer to avoid per-write metadata allocations.
+    write_plan: VisionWritePlan,
     pending_accept: Option<usize>,
 }
 
@@ -115,6 +126,7 @@ where
             write_queue: Vec::new(),
             write_queue_offset: 0,
             write_carry: Vec::new(),
+            write_plan: VisionWritePlan::default(),
             pending_accept: None,
         }
     }
@@ -260,27 +272,44 @@ where
         accepted: &[u8],
         complete_app_data_records: bool,
     ) -> io::Result<bool> {
-        let chunks: Vec<&[u8]> = accepted.chunks(MAX_CONTENT_LEN).collect();
-        let plan = self
-            .writer
-            .plan_write(&chunks, complete_app_data_records, &mut self.rng);
+        let mut chunk_slots: [&[u8]; MAX_WRITE_CHUNKS] = [&[]; MAX_WRITE_CHUNKS];
+        let mut chunk_count = 0usize;
+        for chunk in accepted.chunks(MAX_CONTENT_LEN) {
+            if chunk_count >= MAX_WRITE_CHUNKS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Vision write batch exceeded chunk scratch bound",
+                ));
+            }
+            chunk_slots[chunk_count] = chunk;
+            chunk_count += 1;
+        }
+        let chunks = &chunk_slots[..chunk_count];
+        self.writer.plan_write_into(
+            chunks,
+            complete_app_data_records,
+            &mut self.rng,
+            &mut self.write_plan,
+        );
 
-        for (index, block_plan) in plan.blocks.iter().enumerate() {
+        let block_count = self.write_plan.blocks.len();
+        for index in 0..block_count {
+            let block_plan = self.write_plan.blocks[index];
             let Some(content) = chunks.get(index) else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Vision writer planned more blocks than input chunks",
                 ));
             };
-            self.queue_block(block_plan, content)?;
+            self.queue_block(&block_plan, content)?;
         }
 
-        if let Some(raw_from) = plan.raw_from {
+        if let Some(raw_from) = self.write_plan.raw_from {
             for chunk in chunks.iter().skip(raw_from) {
                 self.write_queue.extend_from_slice(chunk);
             }
         }
-        Ok(plan.switch_to_direct)
+        Ok(self.write_plan.switch_to_direct)
     }
 
     fn finish_pending_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
@@ -517,7 +546,7 @@ where
                         }
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "too many consecutive empty Vision blocks",
+                            "too many empty Vision blocks without content in one poll",
                         )));
                     }
                 }
@@ -911,7 +940,10 @@ mod tests {
                 Poll::Pending => {}
             }
             polls += 1;
-            assert!(polls < 8 * data.len() + 64, "short inner write stuck");
+            assert!(
+                polls < 8 * (data.len() + MAX_BLOCK_LEN) + 64,
+                "short inner write stuck"
+            );
         }
     }
 
@@ -1598,7 +1630,13 @@ mod tests {
             match Pin::new(&mut vision).poll_write(&mut cx, &first) {
                 Poll::Pending => {
                     assert!(!*handoff.borrow(), "published on a blocked write");
-                    saw_blocked_raw_tail |= vision.write_is_raw();
+                    if vision.write_is_raw() {
+                        assert!(
+                            !vision.write_carry.is_empty(),
+                            "watch stayed false only while write_carry remained pending"
+                        );
+                        saw_blocked_raw_tail = true;
+                    }
                 }
                 Poll::Ready(result) => {
                     assert_eq!(result.expect("Vision write"), first.len());
@@ -1668,5 +1706,141 @@ mod tests {
         assert_eq!(block.content, app);
         assert_eq!(&raw[used..], b"raw-tail");
         assert!(vision.write_is_raw());
+    }
+
+    #[tokio::test]
+    async fn mixed_empty_and_nonempty_blocks_drain_without_error() {
+        // Interleave empty blocks with tiny non-empty blocks exceeding
+        // MAX_EMPTY_BLOCKS_PER_POLL overall. The per-poll budget flushes
+        // coalesced content instead of erroring, and subsequent polls continue
+        // cleanly.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block_bytes(Some(USER_ID), Command::Continue, b"A", 0));
+        for _ in 0..40 {
+            raw.extend_from_slice(&block_bytes(None, Command::Continue, b"", 0));
+        }
+        raw.extend_from_slice(&block_bytes(None, Command::Continue, b"B", 0));
+        for _ in 0..40 {
+            raw.extend_from_slice(&block_bytes(None, Command::Continue, b"", 0));
+        }
+        raw.extend_from_slice(&block_bytes(None, Command::End, b"C", 0));
+
+        let (mut peer, client) = duplex(64 * 1024);
+        peer.shutdown().await.expect("shutdown writer");
+        let mut vision = VisionStream::new(client, USER_ID, raw, rng(32));
+        let mut output = Vec::new();
+        vision
+            .read_to_end(&mut output)
+            .await
+            .expect("mixed empty and non-empty blocks must succeed");
+        assert_eq!(output, b"ABC");
+    }
+
+    #[tokio::test]
+    async fn writer_short_inner_writes_preserve_direct_and_end_transitions() {
+        // Direct transition with split app-data + raw tail through a 5-byte
+        // short/Pending writer.
+        let mut vision = VisionStream::new(ShortInner::new(5), USER_ID, Vec::new(), rng(98));
+        let hello = server_hello();
+        let app = app_data_record(b"direct-short-payload");
+        let tail = b"after-direct-raw";
+        write_through_short_inner(&mut vision, &hello).await;
+        let mut combined = app.clone();
+        combined.extend_from_slice(&tail[..4]);
+        write_through_short_inner(&mut vision, &combined).await;
+        write_through_short_inner(&mut vision, &tail[4..]).await;
+        shutdown_short_inner(&mut vision).await;
+
+        let raw = std::mem::take(&mut vision.inner.output);
+        let (b0, u0) = parse_block(&raw, true).unwrap().unwrap();
+        assert_eq!(b0.uuid, Some(USER_ID));
+        assert_eq!(b0.command, Command::Continue);
+        assert_eq!(b0.content, hello);
+        let (b1, u1) = parse_block(&raw[u0..], false).unwrap().unwrap();
+        assert_eq!(b1.uuid, None);
+        assert_eq!(b1.command, Command::Direct);
+        assert_eq!(b1.content, app);
+        assert_eq!(&raw[u0 + u1..], tail);
+
+        // End transition (non-XTLS cipher 0x1305) through a 4-byte short writer.
+        let mut vision = VisionStream::new(ShortInner::new(4), USER_ID, Vec::new(), rng(99));
+        let mut non_xtls_hello = server_hello();
+        non_xtls_hello[76..78].copy_from_slice(&[0x13, 0x05]);
+        write_through_short_inner(&mut vision, &non_xtls_hello).await;
+        let mut end_combined = app.clone();
+        end_combined.extend_from_slice(b"end-tail");
+        write_through_short_inner(&mut vision, &end_combined).await;
+        shutdown_short_inner(&mut vision).await;
+
+        let raw = std::mem::take(&mut vision.inner.output);
+        let (b0, u0) = parse_block(&raw, true).unwrap().unwrap();
+        assert_eq!(b0.command, Command::Continue);
+        assert_eq!(b0.content, non_xtls_hello);
+        let (b1, u1) = parse_block(&raw[u0..], false).unwrap().unwrap();
+        assert_eq!(b1.command, Command::End);
+        assert_eq!(b1.content, app);
+        assert_eq!(&raw[u0 + u1..], b"end-tail");
+    }
+
+    #[tokio::test]
+    async fn real_tls_stream_splits_first_vision_block_across_initial_body_and_plaintext() {
+        use std::sync::Arc;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()),
+        );
+        let server_cfg = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .unwrap(),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let client_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let first_block = block_bytes(Some(USER_ID), Command::Continue, b"hello-over-tls", 7);
+        let second_block = block_bytes(None, Command::End, b"-tail", 3);
+        let split_at = 12; // Splits inside the first block's UUID/header boundary.
+        let initial_body = first_block[..split_at].to_vec();
+        let remaining_first = first_block[split_at..].to_vec();
+
+        let client_task = tokio::spawn(async move {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let connector = tokio_rustls::TlsConnector::from(client_cfg);
+            let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let mut tls = connector.connect(server_name, tcp).await.unwrap();
+            tls.write_all(&remaining_first).await.unwrap();
+            tls.write_all(&second_block).await.unwrap();
+            tls.write_all(b"-raw").await.unwrap();
+            tls.flush().await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let (server_tcp, _) = listener.accept().await.unwrap();
+        let conn = rustls::ServerConnection::new(server_cfg).unwrap();
+        let tls_stream = crate::tls::stream::TlsStream::accept(server_tcp, conn, Vec::new())
+            .await
+            .expect("real TLS handshake must complete");
+
+        let mut vision = VisionStream::new(tls_stream, USER_ID, initial_body, rng(97));
+        let mut output = Vec::new();
+        vision
+            .read_to_end(&mut output)
+            .await
+            .expect("Vision over real TlsStream must decode split first block");
+        client_task.await.unwrap();
+        assert_eq!(output, b"hello-over-tls-tail-raw");
     }
 }

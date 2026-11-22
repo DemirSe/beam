@@ -189,21 +189,17 @@ impl TlsDetector {
 
         if header.starts_with(TLS_SERVER_HELLO_START) && header[5] == HANDSHAKE_SERVER_HELLO {
             observation.server_hello = true;
-            self.is_tls = true;
-            self.is_tls12_or_above = true;
 
             let record_len =
                 usize::from(u16::from_be_bytes([header[3], header[4]])) + TLS_RECORD_HEADER_LEN;
-            if record_len < MIN_SERVER_HELLO_LEN {
-                // Stock cannot enable Direct from a short ServerHello.
-                self.filter_budget = 0;
-            } else if record_len > MAX_TLS_RECORD_LEN {
+            if record_len > MAX_TLS_RECORD_LEN {
                 // A record larger than the TLS plaintext limit is malformed;
-                // never buffer it and never let it enable Direct.
-                self.filter_budget = 0;
+                // never buffer it, never poison `is_tls12_or_above`, and keep
+                // remaining filter budget so a real ServerHello or End fallback
+                // can still proceed.
             } else if buffer.len() >= record_len {
                 self.apply_server_hello(buffer);
-            } else {
+            } else if server_hello_header_is_plausible(buffer, record_len) {
                 self.pending_server_hello = Some(buffer.to_vec());
                 self.pending_server_hello_len = record_len;
             }
@@ -225,6 +221,12 @@ impl TlsDetector {
         let take = needed.min(buffer.len());
         pending.extend_from_slice(&buffer[..take]);
 
+        if !server_hello_header_is_plausible(pending, self.pending_server_hello_len) {
+            self.pending_server_hello = None;
+            self.pending_server_hello_len = 0;
+            return;
+        }
+
         if pending.len() < self.pending_server_hello_len {
             return;
         }
@@ -235,24 +237,49 @@ impl TlsDetector {
         self.pending_server_hello_len = 0;
     }
 
-    /// Parses a complete ServerHello and makes the filtering decision final.
+    /// Parses a complete ServerHello candidate.
+    ///
+    /// Only a structurally valid ServerHello commits `is_tls` /
+    /// `is_tls12_or_above` and ends filtering. A rejected candidate leaves the
+    /// remaining filter budget and TLS flags intact so a later valid
+    /// ServerHello can still enable Direct and non-TLS streams still reach the
+    /// `End` fallback when the budget expires.
     fn apply_server_hello(&mut self, record: &[u8]) {
+        let Some(info) = parse_server_hello(record) else {
+            return;
+        };
+
+        self.is_tls = true;
+        self.is_tls12_or_above = true;
+        self.cipher = Some(info.cipher);
         if record.len() >= MIN_SERVER_HELLO_LEN
-            && let Some(info) = parse_server_hello(record)
+            && info.supports_tls13
+            && is_tls13_cipher(info.cipher)
+            && info.cipher != TLS_AES_128_CCM_8_SHA256
         {
-            self.cipher = Some(info.cipher);
-            if info.supports_tls13
-                && is_tls13_cipher(info.cipher)
-                && info.cipher != TLS_AES_128_CCM_8_SHA256
-            {
-                self.enable_xtls = true;
-            }
+            self.enable_xtls = true;
         }
 
-        // A complete ServerHello is conclusive: stock stops filtering even
-        // when it turns out to be TLS 1.2 or an unknown cipher.
+        // A valid ServerHello is conclusive: stock stops filtering even when
+        // it turns out to be TLS 1.2, too short for XTLS, or an unknown cipher.
         self.filter_budget = 0;
     }
+}
+
+/// Rejects an incomplete ServerHello candidate early as soon as its 9-byte
+/// record+handshake header shows an impossible handshake length.
+fn server_hello_header_is_plausible(prefix: &[u8], record_len: usize) -> bool {
+    let Some(handshake_len_bytes) = prefix.get(6..9) else {
+        return true;
+    };
+    let handshake_len = usize::try_from(u32::from_be_bytes([
+        0,
+        handshake_len_bytes[0],
+        handshake_len_bytes[1],
+        handshake_len_bytes[2],
+    ]))
+    .unwrap_or(usize::MAX);
+    record_len == TLS_RECORD_HEADER_LEN + TLS_HANDSHAKE_HEADER_LEN + handshake_len
 }
 
 /// ServerHello fields needed for the Direct decision.
@@ -552,15 +579,35 @@ impl VisionWriterState {
         rng: &mut R,
     ) -> VisionWritePlan {
         let mut plan = VisionWritePlan::default();
+        self.plan_write_into(chunks, complete_app_data_records, rng, &mut plan);
+        plan
+    }
+
+    /// Plans the Vision blocks for one plaintext write into a reusable `plan`
+    /// buffer, avoiding per-write metadata allocations on hot framed writes.
+    pub fn plan_write_into<R: Rng + ?Sized>(
+        &mut self,
+        chunks: &[&[u8]],
+        complete_app_data_records: bool,
+        rng: &mut R,
+        plan: &mut VisionWritePlan,
+    ) {
+        plan.blocks.clear();
+        plan.raw_from = None;
+        plan.switch_to_raw = false;
+        plan.switch_to_direct = false;
+
         if chunks.is_empty() {
-            return plan;
+            return;
         }
         if !self.padding_enabled {
             plan.raw_from = Some(0);
             plan.switch_to_raw = true;
-            return plan;
+            return;
         }
-        plan.blocks.reserve(chunks.len());
+        if plan.blocks.capacity() < chunks.len() {
+            plan.blocks.reserve(chunks.len() - plan.blocks.len());
+        }
 
         // Inspect the whole write before shaping it, like the stock writer.
         // Remember which buffer consumed the last filter credit so End lands on
@@ -602,7 +649,7 @@ impl VisionWriterState {
             self.padding_enabled = false;
             plan.switch_to_raw = true;
             plan.switch_to_direct = true;
-            return plan;
+            return;
         }
 
         if complete_app_data_records
@@ -633,7 +680,7 @@ impl VisionWriterState {
             if end_index + 1 < chunks.len() {
                 plan.raw_from = Some(end_index + 1);
             }
-            return plan;
+            return;
         }
 
         let last_framed = budget_end.unwrap_or(chunks.len().saturating_sub(1));
@@ -658,7 +705,6 @@ impl VisionWriterState {
                 plan.raw_from = Some(end_index + 1);
             }
         }
-        plan
     }
 }
 
@@ -919,11 +965,15 @@ mod tests {
         let mut detector = TlsDetector::new();
         let first = detector.inspect(&hello[..split]);
         assert!(first.server_hello);
-        assert!(detector.is_tls12_or_above());
+        // TLS 1.2+ state is committed only after structural validation passes,
+        // so an aborted or malformed candidate cannot poison the End fallback.
+        assert!(!detector.is_tls12_or_above());
         assert!(!detector.enable_xtls());
 
         let second = detector.inspect(&hello[split..]);
         assert!(!second.server_hello);
+        assert!(detector.is_tls());
+        assert!(detector.is_tls12_or_above());
         assert!(detector.enable_xtls());
         assert_eq!(detector.cipher(), Some(0x1301));
         assert_eq!(detector.filter_budget(), 0);
@@ -941,6 +991,7 @@ mod tests {
 
         let second = detector.inspect(&record[6..]);
         assert!(!second.server_hello);
+        assert!(detector.is_tls12_or_above());
         assert!(detector.enable_xtls());
         assert_eq!(detector.cipher(), Some(0x1301));
         assert_eq!(detector.filter_budget(), 0);
@@ -949,7 +1000,7 @@ mod tests {
     #[test]
     fn complete_oversized_server_hello_cannot_enable_direct() {
         // `record.len() == 9 + handshake_len`, so the fixture is internally
-        // consistent and only the new length cap can reject it.
+        // consistent and only the record length cap rejects it.
         let record = server_hello(0x1301, 32, true, 16_384);
         assert!(record.len() > MAX_TLS_RECORD_LEN);
         assert!(parse_server_hello(&record).is_some());
@@ -958,27 +1009,86 @@ mod tests {
         let observation = detector.inspect(&record);
 
         assert!(observation.server_hello);
+        assert!(!detector.is_tls12_or_above());
         assert!(!detector.enable_xtls());
         assert_eq!(detector.cipher(), None);
-        assert_eq!(detector.filter_budget(), 0);
+        assert_eq!(detector.filter_budget(), DEFAULT_FILTER_BUDGET - 1);
     }
 
     #[test]
-    fn oversized_server_hello_is_rejected_without_buffering_it() {
+    fn oversized_server_hello_is_rejected_without_buffering_and_allows_recovery() {
         let mut oversized = [0u8; 6];
         oversized[..6].copy_from_slice(&[0x16, 0x03, 0x03, 0xff, 0xff, 0x02]);
 
         let mut detector = TlsDetector::new();
         let observation = detector.inspect(&oversized);
         assert!(observation.server_hello);
-        assert!(detector.is_tls12_or_above());
+        assert!(!detector.is_tls12_or_above());
         assert!(!detector.enable_xtls());
-        assert_eq!(detector.filter_budget(), 0);
+        assert_eq!(detector.filter_budget(), DEFAULT_FILTER_BUDGET - 1);
 
-        // Filtering is over, so even a valid ServerHello is ignored.
+        // Because the oversized candidate was not buffered and did not exhaust
+        // the filter budget, a subsequent valid ServerHello still enables Direct.
         let observation = detector.inspect(&server_hello(0x1301, 32, true, 0));
-        assert!(observation.is_empty());
+        assert!(observation.server_hello);
+        assert!(detector.is_tls12_or_above());
+        assert!(detector.enable_xtls());
+        assert_eq!(detector.filter_budget(), 0);
+    }
+
+    #[test]
+    fn rejected_fragmented_server_hello_recovers_and_preserves_end_fallback() {
+        // Case 1: fragmented malformed ServerHello (bad session_id length = 33)
+        // is discarded without setting `is_tls12_or_above`, so a real
+        // ServerHello arriving next still enables Direct.
+        let mut malformed = server_hello(0x1301, 32, true, 0);
+        malformed[43] = 33;
+        let mut detector = TlsDetector::new();
+        detector.inspect(&malformed[..20]);
+        assert!(!detector.is_tls12_or_above());
+        detector.inspect(&malformed[20..]);
+        assert!(!detector.is_tls12_or_above());
         assert!(!detector.enable_xtls());
+        assert_eq!(detector.filter_budget(), DEFAULT_FILTER_BUDGET - 1);
+
+        detector.inspect(&server_hello(0x1301, 32, true, 0));
+        assert!(detector.is_tls12_or_above());
+        assert!(detector.enable_xtls());
+
+        // Case 2: rejected candidate followed by plain non-TLS writes does NOT
+        // suppress the `End` fallback when the remaining filter budget expires.
+        let mut writer = VisionWriterState::new();
+        let mut rng = seeded(31);
+        let plan = writer.plan_write(&[&malformed[..20]], false, &mut rng);
+        assert_eq!(plan.blocks[0].command, Command::Continue);
+        let plan = writer.plan_write(&[&malformed[20..]], false, &mut rng);
+        assert_eq!(plan.blocks[0].command, Command::Continue);
+        assert!(!writer.is_tls12_or_above());
+
+        let plain = [0x5a_u8; 32];
+        let mut saw_end = false;
+        for _ in 0..DEFAULT_FILTER_BUDGET {
+            let plan = writer.plan_write(&[&plain], false, &mut rng);
+            if plan.blocks.iter().any(|b| b.command == Command::End) {
+                saw_end = true;
+                break;
+            }
+        }
+        assert!(
+            saw_end,
+            "rejected ServerHello candidate must not suppress End fallback"
+        );
+        assert!(!writer.padding_enabled());
+
+        // Case 3: a non-TLS prefix with an inconsistent 9-byte handshake length
+        // is rejected immediately instead of buffering across subsequent reads.
+        let mut bogus_header = vec![0x16, 0x03, 0x03, 0x01, 0x00, 0x02, 0x00, 0x00, 0x05];
+        bogus_header.extend_from_slice(b"not-tls");
+        let mut detector = TlsDetector::new();
+        detector.inspect(&bogus_header);
+        assert!(!detector.is_tls12_or_above());
+        detector.inspect(&server_hello(0x1301, 32, true, 0));
+        assert!(detector.enable_xtls());
     }
 
     #[test]
