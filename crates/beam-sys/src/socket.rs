@@ -93,6 +93,11 @@ pub fn set_reuse_addr(fd: RawFd) -> io::Result<()> {
     setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)
 }
 
+/// Returns whether `IPV6_V6ONLY` is enabled on an IPv6 socket descriptor.
+pub fn get_ipv6_v6only(fd: RawFd) -> io::Result<bool> {
+    getsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY).map(|value| value != 0)
+}
+
 /// Sets the receive buffer for a UDP socket.
 ///
 /// The kernel may clamp the request to `net.core.rmem_max` and doubles the
@@ -186,8 +191,8 @@ fn setsockopt_int(
 #[cfg(test)]
 mod tests {
     use super::{
-        AcceptError, get_tcp_maxseg, getsockopt_int, set_reuse_addr, set_tcp_keepalive,
-        set_tcp_maxseg, set_tcp_nodelay, set_udp_recv_buffer,
+        AcceptError, get_ipv6_v6only, get_tcp_maxseg, getsockopt_int, set_reuse_addr,
+        set_tcp_keepalive, set_tcp_maxseg, set_tcp_nodelay, set_udp_recv_buffer,
     };
     use std::io;
     use std::net::{TcpListener, TcpStream, UdpSocket};
@@ -380,5 +385,35 @@ mod tests {
             getsockopt_int(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn ipv6_v6only_reports_effective_socket_mode() {
+        let required = std::env::var_os("BEAM_REQUIRE_IPV6_TESTS").is_some();
+        let loopback = match TcpListener::bind("[::1]:0") {
+            Ok(listener) => listener,
+            Err(error)
+                if !required
+                    && matches!(
+                        error.raw_os_error(),
+                        Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)
+                    ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("IPv6 loopback bind failed: {error}"),
+        };
+        // Linux forces IPV6_V6ONLY=1 on non-wildcard IPv6 binds such as ::1.
+        assert!(get_ipv6_v6only(loopback.as_raw_fd()).unwrap());
+
+        // A wildcard [::] bind inherits the host net.ipv6.bindv6only default.
+        if let Ok(wildcard) = TcpListener::bind("[::]:0") {
+            let effective = get_ipv6_v6only(wildcard.as_raw_fd()).unwrap();
+            if let Ok(raw) = std::fs::read_to_string("/proc/sys/net/ipv6/bindv6only")
+                && let Ok(sysctl) = raw.trim().parse::<u8>()
+            {
+                assert_eq!(effective, sysctl != 0);
+            }
+        }
     }
 }

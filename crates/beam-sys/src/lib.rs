@@ -32,8 +32,8 @@ pub use fd::{set_cloexec, set_nonblocking};
 pub use poll::{PollEvents, PollFd, poll};
 #[cfg(target_os = "linux")]
 pub use socket::{
-    AcceptError, get_tcp_maxseg, set_reuse_addr, set_tcp_keepalive, set_tcp_maxseg,
-    set_tcp_nodelay, set_udp_recv_buffer,
+    AcceptError, get_ipv6_v6only, get_tcp_maxseg, set_reuse_addr, set_tcp_keepalive,
+    set_tcp_maxseg, set_tcp_nodelay, set_udp_recv_buffer,
 };
 #[cfg(target_os = "linux")]
 pub use splice::{SpliceFlags, pipe, splice};
@@ -61,6 +61,19 @@ pub fn set_pipe_size(fd: RawFd, size: usize) -> io::Result<usize> {
     // not dereference a user pointer. The kernel validates the descriptor and
     // the requested size, reporting invalid values as an error.
     let result = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, size) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+/// Returns the current kernel buffer capacity of a pipe in bytes.
+#[cfg(target_os = "linux")]
+pub fn get_pipe_size(fd: RawFd) -> io::Result<usize> {
+    // SAFETY: `F_GETPIPE_SZ` takes no pointer arguments and queries the
+    // kernel's current capacity for `fd`, returning -1 on error.
+    let result = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
     if result == -1 {
         Err(io::Error::last_os_error())
     } else {
@@ -96,6 +109,19 @@ pub fn pipe_user_pages_soft() -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// Reads the host TCP listen backlog ceiling (`net.core.somaxconn`).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn tcp_somaxconn() -> Option<u32> {
+    let raw = std::fs::read_to_string("/proc/sys/net/core/somaxconn").ok()?;
+    parse_positive_u32(&raw)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_positive_u32(raw: &str) -> Option<u32> {
+    raw.trim().parse::<u32>().ok().filter(|&value| value > 0)
 }
 
 /// Returns the soft `RLIMIT_NOFILE` limit. `None` means unlimited.
@@ -267,5 +293,54 @@ mod tests {
     fn shutdown_write_propagates_invalid_descriptor_error() {
         let error = shutdown_write(-1).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn set_pipe_size_resizes_and_reports_effective_capacity() {
+        let (_read_end, write_end) = pipe().unwrap();
+        let fd = write_end.as_raw_fd();
+        let page = usize::try_from(page_size()).unwrap_or(4096);
+        let pipe_max = std::fs::read_to_string("/proc/sys/fs/pipe-max-size")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok());
+        // Request two pages (or one page if the host cap is smaller) so the
+        // resize stays well within ordinary unprivileged limits.
+        let requested = match pipe_max {
+            Some(max) if max < page.saturating_mul(2) => page.min(max).max(1),
+            _ => page.saturating_mul(2),
+        };
+        let required = std::env::var_os("BEAM_REQUIRE_PIPE_RESIZE_TEST").is_some();
+
+        match set_pipe_size(fd, requested) {
+            Ok(actual) => {
+                assert!(
+                    actual >= requested,
+                    "granted pipe size {actual} must be at least requested {requested}"
+                );
+                assert_eq!(
+                    get_pipe_size(fd).unwrap(),
+                    actual,
+                    "F_GETPIPE_SZ must match the capacity returned by set_pipe_size"
+                );
+            }
+            Err(error)
+                if !required
+                    && matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOMEM)) =>
+            {
+                // Host pipe limits prevented resizing on an unprivileged host;
+                // eligible runners set BEAM_REQUIRE_PIPE_RESIZE_TEST=1.
+            }
+            Err(error) => {
+                panic!("set_pipe_size({requested}) failed unexpectedly: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_positive_u32_validates_sysctl_values() {
+        assert_eq!(parse_positive_u32("4096\n"), Some(4096));
+        assert_eq!(parse_positive_u32("0\n"), None);
+        assert_eq!(parse_positive_u32("-1\n"), None);
+        assert_eq!(parse_positive_u32("not-a-number"), None);
     }
 }

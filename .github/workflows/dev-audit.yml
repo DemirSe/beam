@@ -16,6 +16,7 @@ jobs:
     timeout-minutes: 20
     env:
       BEAM_REQUIRE_IPV6_TESTS: "1"
+      BEAM_REQUIRE_PIPE_RESIZE_TEST: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1

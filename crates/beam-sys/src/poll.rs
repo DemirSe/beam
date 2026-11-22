@@ -163,14 +163,20 @@ pub fn poll(fds: &mut [PollFd], timeout: Option<Duration>) -> io::Result<usize> 
     let result = unsafe { libc::poll(fds_ptr, nfds, timeout) };
 
     if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EINTR) {
-            return Err(io::Error::from(io::ErrorKind::Interrupted));
-        }
-        return Err(error);
+        return Err(map_poll_error(io::Error::last_os_error()));
     }
 
     Ok(result as usize)
+}
+
+/// Classifies a `poll(2)` OS error, mapping `EINTR` to `ErrorKind::Interrupted`
+/// so relay loops can retry while re-checking their deadlines.
+fn map_poll_error(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::EINTR) {
+        io::Error::from(io::ErrorKind::Interrupted)
+    } else {
+        error
+    }
 }
 
 fn timeout_millis(timeout: Option<Duration>) -> libc::c_int {
@@ -184,7 +190,7 @@ fn timeout_millis(timeout: Option<Duration>) -> libc::c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_POLL_TIMEOUT, PollEvents, PollFd, poll, timeout_millis};
+    use super::{MAX_POLL_TIMEOUT, PollEvents, PollFd, map_poll_error, poll, timeout_millis};
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
@@ -352,5 +358,92 @@ mod tests {
 
         let oversized = crate::set_pipe_size(write_end.as_raw_fd(), usize::MAX).unwrap_err();
         assert_eq!(oversized.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn map_poll_error_classifies_eintr_as_interrupted() {
+        let interrupted = map_poll_error(std::io::Error::from_raw_os_error(libc::EINTR));
+        assert_eq!(interrupted.kind(), std::io::ErrorKind::Interrupted);
+
+        let nomem = map_poll_error(std::io::Error::from_raw_os_error(libc::ENOMEM));
+        assert_eq!(nomem.raw_os_error(), Some(libc::ENOMEM));
+        assert_ne!(nomem.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn poll_reports_eintr_as_interrupted() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        static SIGNAL_LOCK: Mutex<()> = Mutex::new(());
+        extern "C" fn noop_handler(_sig: libc::c_int) {}
+
+        struct SigactionGuard {
+            previous: libc::sigaction,
+        }
+
+        impl Drop for SigactionGuard {
+            fn drop(&mut self) {
+                // SAFETY: `self.previous` was populated by `sigaction(2)` and
+                // restoring the previous `SIGUSR1` handler uses valid pointers.
+                unsafe {
+                    libc::sigaction(
+                        libc::SIGUSR1,
+                        &raw const self.previous,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+        }
+
+        let _lock = SIGNAL_LOCK.lock().unwrap();
+        let mut previous = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+        // SAFETY: `sigaction` structs are plain-old-data C structs initialized
+        // with `sigemptyset` and a valid async-signal-safe no-op handler with
+        // no `SA_RESTART`, so `poll(2)` returns `EINTR` when `SIGUSR1` arrives.
+        let _guard = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigemptyset(&raw mut action.sa_mask);
+            action.sa_flags = 0;
+            action.sa_sigaction = noop_handler as *const () as usize;
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &raw const action, previous.as_mut_ptr()),
+                0,
+                "sigaction(SIGUSR1) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            SigactionGuard {
+                previous: previous.assume_init(),
+            }
+        };
+
+        let (read_end, _write_end) = crate::pipe().unwrap();
+        // SAFETY: `pthread_self` takes no arguments and returns the calling
+        // thread's handle, which remains valid until this test joins `sender`.
+        let target = unsafe { libc::pthread_self() };
+        let done = Arc::new(AtomicBool::new(false));
+        let done_sender = Arc::clone(&done);
+        let sender = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while !done_sender.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+                if done_sender.load(Ordering::Acquire) {
+                    break;
+                }
+                // SAFETY: `target` is the live parent test thread waiting to
+                // join this thread; `SIGUSR1` has our no-op handler installed.
+                unsafe {
+                    libc::pthread_kill(target, libc::SIGUSR1);
+                }
+            }
+        });
+
+        let mut fds = [PollFd::new(read_end.as_raw_fd(), PollEvents::READ)];
+        let outcome = poll(&mut fds, Some(Duration::from_secs(2)));
+        done.store(true, Ordering::Release);
+        sender.join().unwrap();
+
+        let error = outcome.expect_err("SIGUSR1 without SA_RESTART must interrupt poll");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
     }
 }
