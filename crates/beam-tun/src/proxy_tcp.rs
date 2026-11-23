@@ -1,32 +1,23 @@
-//! Lightweight, proxy-oriented TCP/IP stack with RFC 7323 Window Scaling.
-//!
-//! Designed specifically for a local TUN interface (0 ms local hop) feeding a
-//! high-BDP remote proxy tunnel:
-//! - Zero external TCP/IP stack dependency (pure safe Rust).
-//! - RFC 7323 Window Scaling (`wscale = 6`, advertising up to 2 MiB receive
-//!   window) so single-flow high-RTT uploads never stall on a 64 KiB cap.
-//! - Cumulative ACK coalescing per `poll()` batch (1 ACK per burst of up to
-//!   64 segments instead of 1 ACK per segment).
-//! - Accurate atomic backpressure between the async relay and TCP `rcv_wnd`.
-//! - Bounded out-of-order reassembly, bounded TX buffer, fast retransmit on
-//!   3 dup-ACKs, and exponential-backoff RTO retransmit.
+//! Lightweight, proxy-oriented IPv4 + IPv6 TCP/IP stack with RFC 7323 Window
+//! Scaling, zero-copy `VecDeque::as_slices()` TX segmentation, lossless
+//! receive backpressure, and cumulative ACK coalescing.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::{Notify, mpsc};
 
 use crate::packet::{
-    IP_PROTO_TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, build_ipv4_tcp_packet, parse_ipv4,
-    parse_tcp, parse_tcp_syn_options,
+    IP_PROTO_TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, build_ip_tcp_packet_slices,
+    parse_ip, parse_tcp, parse_tcp_syn_options,
 };
 use crate::stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
 
-const OUR_WSCALE: u8 = 6; // 64x multiplier -> up to ~4 MiB window; we cap at max_rcv_buf (2 MiB)
-const DEFAULT_MAX_RCV_BUF: usize = 2 * 1024 * 1024;
-const DEFAULT_MAX_SND_BUF: usize = 2 * 1024 * 1024;
+const OUR_WSCALE: u8 = 7; // 128x multiplier -> up to ~8 MiB window; capped at max_rcv_buf (4 MiB)
+const DEFAULT_MAX_RCV_BUF: usize = 4 * 1024 * 1024;
+const DEFAULT_MAX_SND_BUF: usize = 4 * 1024 * 1024;
 const MAX_OOO_SEGMENTS: usize = 64;
 const STREAM_CHANNEL_CAP: usize = 64;
 const RELAY_COALESCE_BYTES: usize = 64 * 1024;
@@ -36,7 +27,7 @@ const MAX_RETRIES: u8 = 8;
 const HANDSHAKE_TIMEOUT_MS: i64 = 10_000;
 const CLOSING_TIMEOUT_MS: i64 = 5_000;
 
-type FlowKey = (Ipv4Addr, u16, Ipv4Addr, u16);
+type FlowKey = (IpAddr, u16, IpAddr, u16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpState {
@@ -59,12 +50,15 @@ struct TcpConn {
     // Receive state (peer -> proxy)
     rcv_nxt: u32,
     rcv_coalesce: Vec<u8>,
+    pending_to_relay: VecDeque<Vec<u8>>,
+    pending_to_relay_bytes: usize,
     ooo: BTreeMap<u32, Vec<u8>>,
     ooo_bytes: usize,
     in_flight_relay: Arc<AtomicUsize>,
     max_rcv_buf: usize,
     last_advertised_wnd: u32,
     need_ack: bool,
+    peer_fin_received: bool,
     // Send state (proxy -> peer)
     snd_una: u32,
     snd_nxt: u32,
@@ -90,6 +84,7 @@ impl TcpConn {
         let used = self
             .in_flight_relay
             .load(Ordering::Acquire)
+            .saturating_add(self.pending_to_relay_bytes)
             .saturating_add(self.ooo_bytes)
             .saturating_add(self.rcv_coalesce.len());
         let avail = self.max_rcv_buf.saturating_sub(used);
@@ -102,17 +97,17 @@ impl TcpConn {
         u16::try_from(wnd).unwrap_or(u16::MAX)
     }
 
-    fn build_packet(
+    fn build_packet_slices(
         &mut self,
         flags: u8,
         options: &[u8],
-        payload: &[u8],
+        payload_a: &[u8],
+        payload_b: &[u8],
         seq: u32,
     ) -> Option<Vec<u8>> {
         let wnd_scaled = self.advertised_window();
         self.last_advertised_wnd = u32::from(wnd_scaled) << self.our_wscale;
-        // Source is the remote destination (dst_ip:dst_port), dest is the local OS (src_ip:src_port).
-        build_ipv4_tcp_packet(
+        build_ip_tcp_packet_slices(
             self.flow.2,
             self.flow.3,
             self.flow.0,
@@ -122,20 +117,67 @@ impl TcpConn {
             flags,
             wnd_scaled,
             options,
-            payload,
+            payload_a,
+            payload_b,
         )
+    }
+
+    /// Emits a TCP segment slicing `tx_buf[offset..offset+len]` directly via
+    /// `VecDeque::as_slices()` with zero intermediate payload allocation.
+    fn emit_tx_segment(
+        &mut self,
+        offset: usize,
+        len: usize,
+        flags: u8,
+        seq: u32,
+        tx_out: &mut Vec<Vec<u8>>,
+    ) {
+        let (s1, s2) = self.tx_buf.as_slices();
+        let (part_a, part_b) = if offset < s1.len() {
+            let a_len = (s1.len() - offset).min(len);
+            let a = &s1[offset..offset + a_len];
+            let rem = len - a_len;
+            let b = if rem > 0 {
+                &s2[..rem.min(s2.len())]
+            } else {
+                &[]
+            };
+            (a, b)
+        } else {
+            let s2_off = offset - s1.len();
+            let b = &s2[s2_off..(s2_off + len).min(s2.len())];
+            (&[][..], b)
+        };
+        let wnd_scaled = self.advertised_window();
+        self.last_advertised_wnd = u32::from(wnd_scaled) << self.our_wscale;
+        if let Some(pkt) = build_ip_tcp_packet_slices(
+            self.flow.2,
+            self.flow.3,
+            self.flow.0,
+            self.flow.1,
+            seq,
+            self.rcv_nxt,
+            flags,
+            wnd_scaled,
+            &[],
+            part_a,
+            part_b,
+        ) {
+            tx_out.push(pkt);
+        }
     }
 
     fn send_syn_ack(&mut self, now_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
         let mss_u16 = self.mss as u16;
         let mss_bytes = mss_u16.to_be_bytes();
         let options: Vec<u8> = if self.our_wscale > 0 {
-            // MSS(4) + NOP(1) + WScale(3) = 8 bytes (multiple of 4)
             vec![2, 4, mss_bytes[0], mss_bytes[1], 1, 3, 3, self.our_wscale]
         } else {
             vec![2, 4, mss_bytes[0], mss_bytes[1]]
         };
-        if let Some(pkt) = self.build_packet(TCP_SYN | TCP_ACK, &options, &[], self.snd_una) {
+        if let Some(pkt) =
+            self.build_packet_slices(TCP_SYN | TCP_ACK, &options, &[], &[], self.snd_una)
+        {
             tx_out.push(pkt);
         }
         self.snd_nxt = self.snd_una.wrapping_add(1);
@@ -143,7 +185,7 @@ impl TcpConn {
     }
 
     fn send_rst(&mut self, seq: u32, tx_out: &mut Vec<Vec<u8>>) {
-        if let Some(pkt) = build_ipv4_tcp_packet(
+        if let Some(pkt) = build_ip_tcp_packet_slices(
             self.flow.2,
             self.flow.3,
             self.flow.0,
@@ -152,6 +194,7 @@ impl TcpConn {
             self.rcv_nxt,
             TCP_RST | TCP_ACK,
             0,
+            &[],
             &[],
             &[],
         ) {
@@ -175,7 +218,6 @@ impl TcpConn {
             return;
         }
 
-        // Duplicate SYN in SynReceived: re-send SYN+ACK.
         if (seg.flags & TCP_SYN) != 0 && (seg.flags & TCP_ACK) == 0 {
             if self.state == TcpState::SynReceived {
                 self.send_syn_ack(now_ms, tx_out);
@@ -191,7 +233,6 @@ impl TcpConn {
             return;
         }
 
-        // Process incoming payload (in-order or out-of-order).
         if !seg.payload.is_empty()
             && matches!(
                 self.state,
@@ -202,13 +243,12 @@ impl TcpConn {
             self.need_ack = true;
         }
 
-        // Process incoming FIN if it sits right at `rcv_nxt`.
         let fin_seq = seg.seq.wrapping_add(seg.payload.len() as u32);
         if (seg.flags & TCP_FIN) != 0 && fin_seq == self.rcv_nxt {
             self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
             self.need_ack = true;
-            self.flush_rcv_coalesce();
-            self.to_relay.take(); // signal EOF to upstream relay
+            self.peer_fin_received = true;
+            self.flush_rcv_to_relay();
             match self.state {
                 TcpState::Established => {
                     self.state = TcpState::CloseWait;
@@ -218,8 +258,9 @@ impl TcpConn {
                     self.state_deadline_ms = Some(now_ms + CLOSING_TIMEOUT_MS);
                 }
                 TcpState::FinWait2 => {
-                    // Both sides finished cleanly.
-                    if let Some(pkt) = self.build_packet(TCP_ACK, &[], &[], self.snd_nxt) {
+                    if let Some(pkt) =
+                        self.build_packet_slices(TCP_ACK, &[], &[], &[], self.snd_nxt)
+                    {
                         tx_out.push(pkt);
                     }
                     self.need_ack = false;
@@ -250,7 +291,6 @@ impl TcpConn {
 
         if advance > 0 && advance <= in_flight {
             let mut acked = advance as usize;
-            // Account for data bytes in tx_buf (excluding FIN sequence number if acked).
             let data_acked = acked.min(self.tx_buf.len());
             self.tx_buf.drain(..data_acked);
             acked -= data_acked;
@@ -281,13 +321,8 @@ impl TcpConn {
         } else if advance == 0 && in_flight > 0 && !self.tx_buf.is_empty() {
             self.dup_acks = self.dup_acks.saturating_add(1);
             if self.dup_acks == 3 {
-                // Fast retransmit oldest unacked segment.
                 let len = self.tx_buf.len().min(self.mss);
-                let payload: Vec<u8> = self.tx_buf.iter().take(len).copied().collect();
-                if let Some(pkt) = self.build_packet(TCP_ACK | TCP_PSH, &[], &payload, self.snd_una)
-                {
-                    tx_out.push(pkt);
-                }
+                self.emit_tx_segment(0, len, TCP_ACK | TCP_PSH, self.snd_una, tx_out);
                 self.rto_deadline_ms = Some(now_ms + self.rto_ms);
             }
         }
@@ -304,19 +339,16 @@ impl TcpConn {
             self.rcv_coalesce.extend_from_slice(fresh);
             self.rcv_nxt = self.rcv_nxt.wrapping_add(fresh.len() as u32);
             if self.rcv_coalesce.len() >= RELAY_COALESCE_BYTES {
-                self.flush_rcv_coalesce();
+                self.queue_coalesce_chunk();
             }
             self.drain_ooo();
-        } else {
-            // Out-of-order segment: store bounded.
-            if self.ooo.len() < MAX_OOO_SEGMENTS
-                && self.ooo_bytes.saturating_add(payload.len()) <= self.max_rcv_buf
-            {
-                let entry = self.ooo.entry(seq).or_default();
-                if payload.len() > entry.len() {
-                    self.ooo_bytes = self.ooo_bytes.saturating_add(payload.len() - entry.len());
-                    *entry = payload.to_vec();
-                }
+        } else if self.ooo.len() < MAX_OOO_SEGMENTS
+            && self.ooo_bytes.saturating_add(payload.len()) <= self.max_rcv_buf
+        {
+            let entry = self.ooo.entry(seq).or_default();
+            if payload.len() > entry.len() {
+                self.ooo_bytes = self.ooo_bytes.saturating_add(payload.len() - entry.len());
+                *entry = payload.to_vec();
             }
         }
     }
@@ -340,25 +372,55 @@ impl TcpConn {
                     self.rcv_coalesce.extend_from_slice(fresh);
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(fresh.len() as u32);
                     if self.rcv_coalesce.len() >= RELAY_COALESCE_BYTES {
-                        self.flush_rcv_coalesce();
+                        self.queue_coalesce_chunk();
                     }
                 }
             }
         }
     }
 
-    fn flush_rcv_coalesce(&mut self) {
+    fn queue_coalesce_chunk(&mut self) {
         if self.rcv_coalesce.is_empty() {
             return;
         }
-        let Some(tx) = self.to_relay.as_ref() else {
-            self.rcv_coalesce.clear();
-            return;
-        };
         let chunk = std::mem::take(&mut self.rcv_coalesce);
-        let len = chunk.len();
-        if tx.try_send(chunk).is_ok() {
-            self.in_flight_relay.fetch_add(len, Ordering::AcqRel);
+        self.pending_to_relay_bytes = self.pending_to_relay_bytes.saturating_add(chunk.len());
+        self.pending_to_relay.push_back(chunk);
+    }
+
+    /// Losslessly delivers queued in-order receive chunks to the upstream relay
+    /// channel. If the channel is momentarily full, chunks stay in
+    /// `pending_to_relay` and reduce `rcv_wnd_bytes()` until drained.
+    fn flush_rcv_to_relay(&mut self) {
+        self.queue_coalesce_chunk();
+        let mut closed = false;
+        if let Some(tx) = self.to_relay.as_ref() {
+            while let Some(front) = self.pending_to_relay.front() {
+                let len = front.len();
+                match tx.try_reserve() {
+                    Ok(permit) => {
+                        if let Some(chunk) = self.pending_to_relay.pop_front() {
+                            self.pending_to_relay_bytes =
+                                self.pending_to_relay_bytes.saturating_sub(len);
+                            self.in_flight_relay.fetch_add(len, Ordering::AcqRel);
+                            permit.send(chunk);
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Full(())) => break,
+                    Err(mpsc::error::TrySendError::Closed(())) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if closed {
+            self.pending_to_relay.clear();
+            self.pending_to_relay_bytes = 0;
+            self.to_relay.take();
+        }
+        if self.peer_fin_received && self.pending_to_relay.is_empty() {
+            self.to_relay.take();
         }
     }
 
@@ -384,7 +446,6 @@ impl TcpConn {
             return;
         }
 
-        // Send as many MSS segments as peer window and tx_buf allow.
         loop {
             let in_flight = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
             if in_flight >= self.tx_buf.len() {
@@ -399,22 +460,13 @@ impl TcpConn {
             if seg_len == 0 {
                 break;
             }
-            let payload: Vec<u8> = self
-                .tx_buf
-                .iter()
-                .skip(in_flight)
-                .take(seg_len)
-                .copied()
-                .collect();
             let flags = if in_flight + seg_len >= self.tx_buf.len() {
                 TCP_ACK | TCP_PSH
             } else {
                 TCP_ACK
             };
             let seq = self.snd_nxt;
-            if let Some(pkt) = self.build_packet(flags, &[], &payload, seq) {
-                tx_out.push(pkt);
-            }
+            self.emit_tx_segment(in_flight, seg_len, flags, seq, tx_out);
             self.snd_nxt = self.snd_nxt.wrapping_add(seg_len as u32);
             self.need_ack = false;
             if self.rto_deadline_ms.is_none() {
@@ -422,13 +474,12 @@ impl TcpConn {
             }
         }
 
-        // Send FIN once relay has closed and all queued bytes are sent.
         if self.relay_eof
             && !self.fin_sent
             && (self.snd_nxt.wrapping_sub(self.snd_una) as usize) >= self.tx_buf.len()
         {
             let seq = self.snd_nxt;
-            if let Some(pkt) = self.build_packet(TCP_FIN | TCP_ACK, &[], &[], seq) {
+            if let Some(pkt) = self.build_packet_slices(TCP_FIN | TCP_ACK, &[], &[], &[], seq) {
                 tx_out.push(pkt);
             }
             self.fin_sent = true;
@@ -476,16 +527,11 @@ impl TcpConn {
                 | TcpState::LastAck => {
                     if !self.tx_buf.is_empty() {
                         let len = self.tx_buf.len().min(self.mss);
-                        let payload: Vec<u8> = self.tx_buf.iter().take(len).copied().collect();
-                        if let Some(pkt) =
-                            self.build_packet(TCP_ACK | TCP_PSH, &[], &payload, self.snd_una)
-                        {
-                            tx_out.push(pkt);
-                        }
+                        self.emit_tx_segment(0, len, TCP_ACK | TCP_PSH, self.snd_una, tx_out);
                     } else if self.fin_sent
                         && self.snd_una == self.fin_seq
                         && let Some(pkt) =
-                            self.build_packet(TCP_FIN | TCP_ACK, &[], &[], self.fin_seq)
+                            self.build_packet_slices(TCP_FIN | TCP_ACK, &[], &[], &[], self.fin_seq)
                     {
                         tx_out.push(pkt);
                     }
@@ -496,8 +542,8 @@ impl TcpConn {
     }
 }
 
-/// Custom proxy-oriented [`NetStack`] implementation with RFC 7323 Window
-/// Scaling and cumulative ACK coalescing.
+/// Custom proxy-oriented [`NetStack`] implementation supporting IPv4 + IPv6,
+/// RFC 7323 Window Scaling, zero-copy TX segmentation, and ACK coalescing.
 pub struct ProxyTcpStack {
     config: TcpStackConfig,
     conns: HashMap<FlowKey, TcpConn>,
@@ -518,7 +564,7 @@ impl ProxyTcpStack {
 }
 
 impl NetStack for ProxyTcpStack {
-    fn push_ipv4_tcp(&mut self, packet: &[u8]) {
+    fn push_ip_tcp(&mut self, packet: &[u8]) {
         if self.incoming.len() < 2048 {
             self.incoming.push_back(packet.to_vec());
         }
@@ -530,9 +576,8 @@ impl NetStack for ProxyTcpStack {
         tx_out: &mut Vec<Vec<u8>>,
         accepted: &mut Vec<AcceptedTcpStream>,
     ) {
-        // 1. Process all batched incoming TCP segments.
         while let Some(pkt) = self.incoming.pop_front() {
-            let Some(ip) = parse_ipv4(&pkt) else {
+            let Some(ip) = parse_ip(&pkt) else {
                 continue;
             };
             if ip.protocol != IP_PROTO_TCP {
@@ -550,7 +595,15 @@ impl NetStack for ProxyTcpStack {
                     continue;
                 }
                 let (peer_mss, peer_wscale) = parse_tcp_syn_options(seg.options);
-                let max_mss = self.config.mtu.saturating_sub(40).clamp(536, 1460);
+                let header_overhead = match ip.src_ip {
+                    IpAddr::V4(_) => 40,
+                    IpAddr::V6(_) => 60,
+                };
+                let max_mss = self
+                    .config
+                    .mtu
+                    .saturating_sub(header_overhead)
+                    .clamp(536, 1460);
                 let mss = peer_mss
                     .map(|m| usize::from(m).clamp(536, max_mss))
                     .unwrap_or(max_mss);
@@ -568,12 +621,15 @@ impl NetStack for ProxyTcpStack {
                     our_wscale,
                     rcv_nxt: seg.seq.wrapping_add(1),
                     rcv_coalesce: Vec::with_capacity(RELAY_COALESCE_BYTES),
+                    pending_to_relay: VecDeque::new(),
+                    pending_to_relay_bytes: 0,
                     ooo: BTreeMap::new(),
                     ooo_bytes: 0,
                     in_flight_relay: Arc::new(AtomicUsize::new(0)),
                     max_rcv_buf: max_buf,
                     last_advertised_wnd: max_buf as u32,
                     need_ack: false,
+                    peer_fin_received: false,
                     snd_una: iss,
                     snd_nxt: iss,
                     snd_wnd: u32::from(seg.window),
@@ -594,13 +650,12 @@ impl NetStack for ProxyTcpStack {
                 conn.send_syn_ack(now_ms, tx_out);
                 self.conns.insert(flow, conn);
             } else if (seg.flags & TCP_RST) == 0 {
-                // Reply with RST for unknown non-SYN segments so stale sockets recover immediately.
                 let rst_seq = if (seg.flags & TCP_ACK) != 0 {
                     seg.ack
                 } else {
                     0
                 };
-                if let Some(rst) = build_ipv4_tcp_packet(
+                if let Some(rst) = build_ip_tcp_packet_slices(
                     ip.dst_ip,
                     seg.dst_port,
                     ip.src_ip,
@@ -611,13 +666,13 @@ impl NetStack for ProxyTcpStack {
                     0,
                     &[],
                     &[],
+                    &[],
                 ) {
                     tx_out.push(rst);
                 }
             }
         }
 
-        // 2. Advance every active connection: accept, flush coalesced RX, drain TX, send cumulative ACK, check timers.
         self.conns.retain(|_, conn| {
             if !conn.accepted && matches!(conn.state, TcpState::Established | TcpState::CloseWait) {
                 let (to_relay_tx, to_relay_rx) = mpsc::channel(STREAM_CHANNEL_CAP);
@@ -626,8 +681,8 @@ impl NetStack for ProxyTcpStack {
                 conn.to_relay = Some(to_relay_tx);
                 conn.from_relay = Some(from_relay_rx);
                 accepted.push(AcceptedTcpStream {
-                    src: SocketAddrV4::new(conn.flow.0, conn.flow.1),
-                    dst: SocketAddrV4::new(conn.flow.2, conn.flow.3),
+                    src: SocketAddr::new(conn.flow.0, conn.flow.1),
+                    dst: SocketAddr::new(conn.flow.2, conn.flow.3),
                     stream: TunTcpStream::new_with_accounting(
                         to_relay_rx,
                         from_relay_tx,
@@ -637,11 +692,11 @@ impl NetStack for ProxyTcpStack {
                 });
             }
 
-            conn.flush_rcv_coalesce();
+            conn.flush_rcv_to_relay();
             conn.drain_from_relay();
             conn.flush_tx(now_ms, tx_out);
 
-            // Emit window update ACK if relay freed significant receive buffer space.
+            // Emit a Window Update ACK once the relay drains receive space.
             let current_wnd = conn.rcv_wnd_bytes();
             if !conn.need_ack
                 && matches!(conn.state, TcpState::Established)
@@ -652,7 +707,7 @@ impl NetStack for ProxyTcpStack {
             }
 
             if conn.need_ack && conn.state != TcpState::Closed {
-                if let Some(pkt) = conn.build_packet(TCP_ACK, &[], &[], conn.snd_nxt) {
+                if let Some(pkt) = conn.build_packet_slices(TCP_ACK, &[], &[], &[], conn.snd_nxt) {
                     tx_out.push(pkt);
                 }
                 conn.need_ack = false;

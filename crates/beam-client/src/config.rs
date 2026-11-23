@@ -227,10 +227,7 @@ impl ClientFileConfig {
             IpAddr::V4(ip) => Some(ip),
             IpAddr::V6(_) => None,
         };
-        let mut exclude_ips = Vec::new();
-        if let Some(ip) = server_ip {
-            exclude_ips.push(ip);
-        }
+        let exclude_ips = vec![self.server.address.ip()];
 
         let route = RoutePolicy {
             reject_quic: self.tun.reject_quic,

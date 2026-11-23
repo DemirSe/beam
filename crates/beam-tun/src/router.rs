@@ -1,22 +1,21 @@
-//! Minimal packet routing policy for `beam-tun`.
+//! Minimal IPv4 + IPv6 packet routing policy for `beam-tun`.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::packet::{IP_PROTO_TCP, IP_PROTO_UDP, Ipv4PacketView, parse_udp};
+use crate::packet::{IP_PROTO_TCP, IP_PROTO_UDP, IpPacketView, parse_udp};
 
 /// Routing policy applied to packets arriving from the TUN interface.
 #[derive(Clone, Debug)]
 pub struct RoutePolicy {
-    /// Emit immediate ICMP Port Unreachable for UDP/443 so browsers fall back
-    /// to HTTP/2 instead of stalling on QUIC-over-TCP.
+    /// Emit immediate ICMP/ICMPv6 Port Unreachable for UDP/443 so browsers
+    /// fall back to HTTP/2 instead of stalling on QUIC-over-TCP.
     pub reject_quic: bool,
-    /// Drop packets destined for RFC 1918 / link-local / multicast / loopback
-    /// addresses so they never enter the tunnel (the OS route table keeps LAN
-    /// direct).
+    /// Drop packets destined for RFC 1918 / ULA / link-local / multicast /
+    /// loopback addresses so they never enter the tunnel.
     pub drop_private_destinations: bool,
-    /// Explicit IPv4 addresses excluded from tunneling (always includes the
+    /// Explicit IP addresses excluded from tunneling (always includes the
     /// `beam` server IP to prevent routing loops).
-    pub exclude_ips: Vec<Ipv4Addr>,
+    pub exclude_ips: Vec<IpAddr>,
 }
 
 impl Default for RoutePolicy {
@@ -29,26 +28,26 @@ impl Default for RoutePolicy {
     }
 }
 
-/// Decision for one IPv4 packet read from the TUN device.
+/// Decision for one IP packet read from the TUN interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteDecision {
     /// Forward through the TCP stack to `beam`.
     ProxyTcp,
     /// Forward through the XUDP NAT bridge to `beam`.
     ProxyUdp,
-    /// Reply immediately with ICMP Port Unreachable (Type 3, Code 3).
+    /// Reply immediately with ICMP/ICMPv6 Port Unreachable.
     RejectIcmpUnreachable,
     /// Silently drop (unsupported protocol, excluded IP, or private address).
     Drop,
 }
 
 impl RoutePolicy {
-    /// Classifies an IPv4 packet read from the TUN interface.
-    pub fn classify(&self, pkt: &Ipv4PacketView<'_>) -> RouteDecision {
+    /// Classifies an IPv4 or IPv6 packet read from the TUN interface.
+    pub fn classify(&self, pkt: &IpPacketView<'_>) -> RouteDecision {
         if self.exclude_ips.contains(&pkt.dst_ip) {
             return RouteDecision::Drop;
         }
-        if self.drop_private_destinations && is_non_global_ipv4(pkt.dst_ip) {
+        if self.drop_private_destinations && is_non_global_ip(pkt.dst_ip) {
             return RouteDecision::Drop;
         }
 
@@ -72,8 +71,16 @@ impl RoutePolicy {
     }
 }
 
-/// Returns `true` for loopback, RFC 1918 private, link-local, multicast,
-/// broadcast, or unspecified IPv4 addresses.
+/// Returns `true` for loopback, private/ULA, link-local, multicast, broadcast,
+/// or unspecified IP addresses.
+pub fn is_non_global_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_non_global_ipv4(v4),
+        IpAddr::V6(v6) => is_non_global_ipv6(v6),
+    }
+}
+
+/// Returns `true` for non-global IPv4 addresses.
 pub fn is_non_global_ipv4(ip: Ipv4Addr) -> bool {
     ip.is_private()
         || ip.is_loopback()
@@ -83,10 +90,19 @@ pub fn is_non_global_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_unspecified()
 }
 
+/// Returns `true` for non-global IPv6 addresses.
+pub fn is_non_global_ipv6(ip: Ipv6Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::{build_ipv4_udp_packet, parse_ipv4};
+    use crate::packet::{build_ipv4_udp_packet, parse_ip};
 
     #[test]
     fn rejects_quic_udp_443_when_enabled() {
@@ -99,7 +115,7 @@ mod tests {
             b"quic",
         )
         .expect("udp");
-        let ip = parse_ipv4(&pkt).expect("ip");
+        let ip = parse_ip(&pkt).expect("ip");
         assert_eq!(policy.classify(&ip), RouteDecision::RejectIcmpUnreachable);
     }
 
@@ -115,7 +131,7 @@ mod tests {
         )
         .expect("udp");
         assert_eq!(
-            policy.classify(&parse_ipv4(&dns).expect("ip")),
+            policy.classify(&parse_ip(&dns).expect("ip")),
             RouteDecision::ProxyUdp
         );
 
@@ -128,7 +144,7 @@ mod tests {
         )
         .expect("udp");
         assert_eq!(
-            policy.classify(&parse_ipv4(&lan).expect("ip")),
+            policy.classify(&parse_ip(&lan).expect("ip")),
             RouteDecision::Drop
         );
     }

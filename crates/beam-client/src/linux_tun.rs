@@ -39,6 +39,11 @@ impl TunDevice for AsyncLinuxTun {
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.inner.get_ref().read_packet(buf) {
+            Ok(n) => return Ok(n),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err),
+        }
         loop {
             let mut guard = self.inner.readable().await?;
             match guard.try_io(|inner| inner.get_ref().read_packet(buf)) {
@@ -57,6 +62,13 @@ impl TunDevice for AsyncLinuxTun {
     }
 
     async fn send(&mut self, packet: &[u8]) -> io::Result<()> {
+        // Fast path: `/dev/net/tun` is almost always immediately writable;
+        // avoid an AsyncFd epoll readiness check on every outbound packet.
+        match self.inner.get_ref().write_packet(packet) {
+            Ok(_) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err),
+        }
         loop {
             let mut guard = self.inner.writable().await?;
             match guard.try_io(|inner| inner.get_ref().write_packet(packet)) {

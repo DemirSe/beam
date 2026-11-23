@@ -2,7 +2,7 @@
 //! async stream bridge (`TunTcpStream`, `TunTcpReader`, `TunTcpWriter`).
 
 use std::io;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc};
 
 const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
-const DEFAULT_TCP_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Tuning parameters for a [`NetStack`] implementation.
 #[derive(Clone, Copy, Debug)]
@@ -38,17 +38,17 @@ impl Default for TcpStackConfig {
 /// An accepted TCP connection emitted by a [`NetStack`].
 pub struct AcceptedTcpStream {
     /// Client source address inside the TUN.
-    pub src: SocketAddrV4,
+    pub src: SocketAddr,
     /// Intended remote destination address.
-    pub dst: SocketAddrV4,
+    pub dst: SocketAddr,
     /// Bidirectional async stream bridged to the stack's TCP state machine.
     pub stream: TunTcpStream,
 }
 
 /// Pluggable Layer 3 -> Layer 4 TCP stack interface.
 pub trait NetStack: Send + 'static {
-    /// Feeds one incoming IPv4 TCP packet from the TUN device into the stack.
-    fn push_ipv4_tcp(&mut self, packet: &[u8]);
+    /// Feeds one incoming IPv4 or IPv6 TCP packet from the TUN device into the stack.
+    fn push_ip_tcp(&mut self, packet: &[u8]);
 
     /// Advances timers, drains relay <-> TCP buffers, emits newly accepted
     /// connections into `accepted`, and appends outbound IPv4 packets to `tx_out`.

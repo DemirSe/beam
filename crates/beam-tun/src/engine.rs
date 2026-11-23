@@ -2,7 +2,7 @@
 //! [`NetStack`], `beam_core::client::dial_tcp`, and [`UdpNatBridge`].
 
 use std::io;
-use std::net::SocketAddrV4;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info};
 
 use crate::device::TunDevice;
-use crate::packet::{build_icmp_port_unreachable, parse_ipv4, parse_udp};
+use crate::packet::{build_icmp_port_unreachable, parse_ip, parse_udp};
 use crate::router::{RouteDecision, RoutePolicy};
 use crate::stack::{AcceptedTcpStream, NetStack};
 use crate::udp::{UdpBridgeConfig, UdpNatBridge};
@@ -120,15 +120,15 @@ where
                 for batch_idx in 0..RX_BATCH_MAX {
                     if n > 0 {
                         let raw = &recv_buf[..n];
-                        if let Some(ip) = parse_ipv4(raw) {
+                        if let Some(ip) = parse_ip(raw) {
                             match config.route.classify(&ip) {
                                 RouteDecision::ProxyTcp => {
-                                    stack.push_ipv4_tcp(ip.raw);
+                                    stack.push_ip_tcp(ip.raw);
                                 }
                                 RouteDecision::ProxyUdp => {
                                     if let Some(udp) = parse_udp(ip.payload) {
-                                        let src = SocketAddrV4::new(ip.src_ip, udp.src_port);
-                                        let dst = SocketAddrV4::new(ip.dst_ip, udp.dst_port);
+                                        let src = SocketAddr::new(ip.src_ip, udp.src_port);
+                                        let dst = SocketAddr::new(ip.dst_ip, udp.dst_port);
                                         udp_bridge.handle_datagram(src, dst, udp.payload).await;
                                     }
                                 }
@@ -174,8 +174,12 @@ fn spawn_tcp_relay(
 
     tokio::spawn(async move {
         let _permit = permit;
+        let address = match conn.dst.ip() {
+            IpAddr::V4(v4) => Address::Ipv4(v4),
+            IpAddr::V6(v6) => Address::Ipv6(v6),
+        };
         let dest = NetLocation {
-            address: Address::Ipv4(*conn.dst.ip()),
+            address,
             port: conn.dst.port(),
         };
         let upstream = match dial_tcp(&client_config, dest).await {

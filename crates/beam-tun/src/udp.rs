@@ -1,9 +1,9 @@
-//! UDP NAT bridge translating TUN IPv4/UDP packets into `beam-core` XUDP
-//! sessions and synthesizing IPv4/UDP reply packets (preserving full-cone
+//! UDP NAT bridge translating TUN IPv4/IPv6 UDP packets into `beam-core` XUDP
+//! sessions and synthesizing IPv4/IPv6 UDP reply packets (preserving full-cone
 //! source addresses).
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::packet::build_ipv4_udp_packet;
+use crate::packet::build_ip_udp_packet;
 
 const DEFAULT_MAX_UDP_SESSIONS: usize = 256;
 const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -38,23 +38,23 @@ impl Default for UdpBridgeConfig {
 }
 
 struct NatEntry {
-    tx: mpsc::Sender<(SocketAddrV4, Vec<u8>)>,
+    tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     last_active: Instant,
     task: JoinHandle<()>,
 }
 
-/// Bridges TUN UDP packets over a shared [`XudpClient`] mux, reconnecting the
-/// mux automatically if it closes.
+/// Bridges TUN UDP packets (IPv4 and IPv6) over a shared [`XudpClient`] mux,
+/// reconnecting the mux automatically if it closes.
 pub struct UdpNatBridge {
     client_config: BeamClientConfig,
     bridge_config: UdpBridgeConfig,
     tun_tx: mpsc::Sender<Vec<u8>>,
     mux: Option<Arc<XudpClient>>,
-    sessions: HashMap<SocketAddrV4, NatEntry>,
+    sessions: HashMap<SocketAddr, NatEntry>,
 }
 
 impl UdpNatBridge {
-    /// Creates a new UDP NAT bridge that writes synthesized IPv4/UDP reply
+    /// Creates a new UDP NAT bridge that writes synthesized IPv4/IPv6 UDP reply
     /// packets into `tun_tx`.
     pub fn new(
         client_config: BeamClientConfig,
@@ -71,7 +71,7 @@ impl UdpNatBridge {
     }
 
     /// Handles one outbound UDP datagram from `src` to `dst`.
-    pub async fn handle_datagram(&mut self, src: SocketAddrV4, dst: SocketAddrV4, payload: &[u8]) {
+    pub async fn handle_datagram(&mut self, src: SocketAddr, dst: SocketAddr, payload: &[u8]) {
         if payload.is_empty() {
             return;
         }
@@ -98,10 +98,7 @@ impl UdpNatBridge {
             None => return,
         };
 
-        let first_dest = NetLocation {
-            address: Address::Ipv4(*dst.ip()),
-            port: dst.port(),
-        };
+        let first_dest = socket_to_netloc(dst);
         let mut session = match mux.open_session(first_dest) {
             Ok(session) => session,
             Err(err) => {
@@ -110,7 +107,7 @@ impl UdpNatBridge {
             }
         };
 
-        let (tx, mut rx) = mpsc::channel::<(SocketAddrV4, Vec<u8>)>(PER_SESSION_SEND_QUEUE);
+        let (tx, mut rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(PER_SESSION_SEND_QUEUE);
         let _ = tx.try_send((dst, payload.to_vec()));
 
         let tun_tx = self.tun_tx.clone();
@@ -123,12 +120,8 @@ impl UdpNatBridge {
                         let Some((target, data)) = maybe_out else {
                             break;
                         };
-                        let loc = NetLocation {
-                            address: Address::Ipv4(*target.ip()),
-                            port: target.port(),
-                        };
                         last_dst = target;
-                        if session.send_to(loc, &data).await.is_err() {
+                        if session.send_to(socket_to_netloc(target), &data).await.is_err() {
                             break;
                         }
                     }
@@ -137,13 +130,14 @@ impl UdpNatBridge {
                             break;
                         };
                         let (src_ip, src_port) = match reply.source {
-                            Some(NetLocation { address: Address::Ipv4(ip), port }) => (ip, port),
-                            _ => (*last_dst.ip(), last_dst.port()),
+                            Some(NetLocation { address: Address::Ipv4(ip), port }) => (IpAddr::V4(ip), port),
+                            Some(NetLocation { address: Address::Ipv6(ip), port }) => (IpAddr::V6(ip), port),
+                            _ => (last_dst.ip(), last_dst.port()),
                         };
-                        if let Some(pkt) = build_ipv4_udp_packet(
+                        if let Some(pkt) = build_ip_udp_packet(
                             src_ip,
                             src_port,
-                            *src.ip(),
+                            src.ip(),
                             src.port(),
                             &reply.payload,
                         ) {
@@ -215,7 +209,13 @@ impl Drop for UdpNatBridge {
     }
 }
 
-/// Convenience helper for converting an IPv4 address + port pair.
-pub const fn socket_v4(ip: Ipv4Addr, port: u16) -> SocketAddrV4 {
-    SocketAddrV4::new(ip, port)
+fn socket_to_netloc(addr: SocketAddr) -> NetLocation {
+    let address = match addr.ip() {
+        IpAddr::V4(v4) => Address::Ipv4(v4),
+        IpAddr::V6(v6) => Address::Ipv6(v6),
+    };
+    NetLocation {
+        address,
+        port: addr.port(),
+    }
 }
