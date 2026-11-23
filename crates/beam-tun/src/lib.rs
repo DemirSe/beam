@@ -14,12 +14,14 @@
 pub mod device;
 pub mod engine;
 pub mod packet;
+pub mod proxy_tcp;
 pub mod router;
 pub mod stack;
 pub mod udp;
 
 pub use device::{MemoryTun, TunDevice};
 pub use engine::{EngineError, TunEngineConfig, run_tun_engine};
+pub use proxy_tcp::ProxyTcpStack;
 pub use router::{RouteDecision, RoutePolicy};
-pub use stack::{AcceptedTcpStream, NetStack, SmoltcpStack, TcpStackConfig};
+pub use stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
 pub use udp::{UdpBridgeConfig, UdpNatBridge};

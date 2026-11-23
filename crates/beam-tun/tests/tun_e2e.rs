@@ -17,7 +17,7 @@ use beam_core::tls::{MAX_RECORD_LEN, TLS_RECORD_HEADER_LEN};
 use beam_tun::device::{MemoryTun, TunDevice};
 use beam_tun::packet::{IP_PROTO_ICMP, IP_PROTO_UDP, build_ipv4_udp_packet, parse_ipv4, parse_udp};
 use beam_tun::{
-    RoutePolicy, SmoltcpStack, TcpStackConfig, TunEngineConfig, UdpBridgeConfig, run_tun_engine,
+    ProxyTcpStack, RoutePolicy, TcpStackConfig, TunEngineConfig, UdpBridgeConfig, run_tun_engine,
 };
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -162,7 +162,7 @@ async fn tun_tcp_through_beam_server() {
             max_tcp_connections: 16,
             udp: UdpBridgeConfig::default(),
         };
-        let stack = SmoltcpStack::new(TcpStackConfig::default());
+        let stack = ProxyTcpStack::new(TcpStackConfig::default());
         let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));
 
         // 4. Virtual host TCP client speaking raw IPv4 packets into `host_tun`
@@ -300,7 +300,7 @@ async fn tun_udp_and_reject_quic_work_end_to_end() {
             max_tcp_connections: 16,
             udp: UdpBridgeConfig::default(),
         };
-        let stack = SmoltcpStack::new(TcpStackConfig::default());
+        let stack = ProxyTcpStack::new(TcpStackConfig::default());
         let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));
 
         // 4a. Test `reject_quic`: UDP/443 must immediately return ICMP Port Unreachable.

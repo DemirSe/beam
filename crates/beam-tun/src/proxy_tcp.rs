@@ -1,0 +1,692 @@
+//! Lightweight, proxy-oriented TCP/IP stack with RFC 7323 Window Scaling.
+//!
+//! Designed specifically for a local TUN interface (0 ms local hop) feeding a
+//! high-BDP remote proxy tunnel:
+//! - Zero external TCP/IP stack dependency (pure safe Rust).
+//! - RFC 7323 Window Scaling (`wscale = 6`, advertising up to 2 MiB receive
+//!   window) so single-flow high-RTT uploads never stall on a 64 KiB cap.
+//! - Cumulative ACK coalescing per `poll()` batch (1 ACK per burst of up to
+//!   64 segments instead of 1 ACK per segment).
+//! - Accurate atomic backpressure between the async relay and TCP `rcv_wnd`.
+//! - Bounded out-of-order reassembly, bounded TX buffer, fast retransmit on
+//!   3 dup-ACKs, and exponential-backoff RTO retransmit.
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use tokio::sync::{Notify, mpsc};
+
+use crate::packet::{
+    IP_PROTO_TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, build_ipv4_tcp_packet, parse_ipv4,
+    parse_tcp, parse_tcp_syn_options,
+};
+use crate::stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
+
+const OUR_WSCALE: u8 = 6; // 64x multiplier -> up to ~4 MiB window; we cap at max_rcv_buf (2 MiB)
+const DEFAULT_MAX_RCV_BUF: usize = 2 * 1024 * 1024;
+const DEFAULT_MAX_SND_BUF: usize = 2 * 1024 * 1024;
+const MAX_OOO_SEGMENTS: usize = 64;
+const STREAM_CHANNEL_CAP: usize = 64;
+const RELAY_COALESCE_BYTES: usize = 64 * 1024;
+const INITIAL_RTO_MS: i64 = 200;
+const MAX_RTO_MS: i64 = 4_000;
+const MAX_RETRIES: u8 = 8;
+const HANDSHAKE_TIMEOUT_MS: i64 = 10_000;
+const CLOSING_TIMEOUT_MS: i64 = 5_000;
+
+type FlowKey = (Ipv4Addr, u16, Ipv4Addr, u16);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpState {
+    SynReceived,
+    Established,
+    CloseWait,
+    FinWait1,
+    FinWait2,
+    Closing,
+    LastAck,
+    Closed,
+}
+
+struct TcpConn {
+    flow: FlowKey,
+    state: TcpState,
+    mss: usize,
+    peer_wscale: u8,
+    our_wscale: u8,
+    // Receive state (peer -> proxy)
+    rcv_nxt: u32,
+    rcv_coalesce: Vec<u8>,
+    ooo: BTreeMap<u32, Vec<u8>>,
+    ooo_bytes: usize,
+    in_flight_relay: Arc<AtomicUsize>,
+    max_rcv_buf: usize,
+    last_advertised_wnd: u32,
+    need_ack: bool,
+    // Send state (proxy -> peer)
+    snd_una: u32,
+    snd_nxt: u32,
+    snd_wnd: u32,
+    tx_buf: VecDeque<u8>,
+    max_snd_buf: usize,
+    fin_sent: bool,
+    fin_seq: u32,
+    dup_acks: u8,
+    rto_ms: i64,
+    rto_deadline_ms: Option<i64>,
+    retries: u8,
+    state_deadline_ms: Option<i64>,
+    // Async relay channels
+    accepted: bool,
+    to_relay: Option<mpsc::Sender<Vec<u8>>>,
+    from_relay: Option<mpsc::Receiver<Vec<u8>>>,
+    relay_eof: bool,
+}
+
+impl TcpConn {
+    fn rcv_wnd_bytes(&self) -> u32 {
+        let used = self
+            .in_flight_relay
+            .load(Ordering::Acquire)
+            .saturating_add(self.ooo_bytes)
+            .saturating_add(self.rcv_coalesce.len());
+        let avail = self.max_rcv_buf.saturating_sub(used);
+        let max_scaled = (u32::from(u16::MAX)) << self.our_wscale;
+        u32::try_from(avail).unwrap_or(max_scaled).min(max_scaled)
+    }
+
+    fn advertised_window(&self) -> u16 {
+        let wnd = self.rcv_wnd_bytes() >> self.our_wscale;
+        u16::try_from(wnd).unwrap_or(u16::MAX)
+    }
+
+    fn build_packet(
+        &mut self,
+        flags: u8,
+        options: &[u8],
+        payload: &[u8],
+        seq: u32,
+    ) -> Option<Vec<u8>> {
+        let wnd_scaled = self.advertised_window();
+        self.last_advertised_wnd = u32::from(wnd_scaled) << self.our_wscale;
+        // Source is the remote destination (dst_ip:dst_port), dest is the local OS (src_ip:src_port).
+        build_ipv4_tcp_packet(
+            self.flow.2,
+            self.flow.3,
+            self.flow.0,
+            self.flow.1,
+            seq,
+            self.rcv_nxt,
+            flags,
+            wnd_scaled,
+            options,
+            payload,
+        )
+    }
+
+    fn send_syn_ack(&mut self, now_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
+        let mss_u16 = self.mss as u16;
+        let mss_bytes = mss_u16.to_be_bytes();
+        let options: Vec<u8> = if self.our_wscale > 0 {
+            // MSS(4) + NOP(1) + WScale(3) = 8 bytes (multiple of 4)
+            vec![2, 4, mss_bytes[0], mss_bytes[1], 1, 3, 3, self.our_wscale]
+        } else {
+            vec![2, 4, mss_bytes[0], mss_bytes[1]]
+        };
+        if let Some(pkt) = self.build_packet(TCP_SYN | TCP_ACK, &options, &[], self.snd_una) {
+            tx_out.push(pkt);
+        }
+        self.snd_nxt = self.snd_una.wrapping_add(1);
+        self.rto_deadline_ms = Some(now_ms + self.rto_ms);
+    }
+
+    fn send_rst(&mut self, seq: u32, tx_out: &mut Vec<Vec<u8>>) {
+        if let Some(pkt) = build_ipv4_tcp_packet(
+            self.flow.2,
+            self.flow.3,
+            self.flow.0,
+            self.flow.1,
+            seq,
+            self.rcv_nxt,
+            TCP_RST | TCP_ACK,
+            0,
+            &[],
+            &[],
+        ) {
+            tx_out.push(pkt);
+        }
+        self.state = TcpState::Closed;
+        self.to_relay.take();
+        self.from_relay.take();
+    }
+
+    fn on_segment(
+        &mut self,
+        seg: &crate::packet::TcpSegmentView<'_>,
+        now_ms: i64,
+        tx_out: &mut Vec<Vec<u8>>,
+    ) {
+        if (seg.flags & TCP_RST) != 0 {
+            self.state = TcpState::Closed;
+            self.to_relay.take();
+            self.from_relay.take();
+            return;
+        }
+
+        // Duplicate SYN in SynReceived: re-send SYN+ACK.
+        if (seg.flags & TCP_SYN) != 0 && (seg.flags & TCP_ACK) == 0 {
+            if self.state == TcpState::SynReceived {
+                self.send_syn_ack(now_ms, tx_out);
+            }
+            return;
+        }
+
+        if (seg.flags & TCP_ACK) != 0 {
+            self.process_ack(seg.ack, seg.window, now_ms, tx_out);
+        }
+
+        if self.state == TcpState::Closed {
+            return;
+        }
+
+        // Process incoming payload (in-order or out-of-order).
+        if !seg.payload.is_empty()
+            && matches!(
+                self.state,
+                TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
+            )
+        {
+            self.process_data(seg.seq, seg.payload);
+            self.need_ack = true;
+        }
+
+        // Process incoming FIN if it sits right at `rcv_nxt`.
+        let fin_seq = seg.seq.wrapping_add(seg.payload.len() as u32);
+        if (seg.flags & TCP_FIN) != 0 && fin_seq == self.rcv_nxt {
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+            self.need_ack = true;
+            self.flush_rcv_coalesce();
+            self.to_relay.take(); // signal EOF to upstream relay
+            match self.state {
+                TcpState::Established => {
+                    self.state = TcpState::CloseWait;
+                }
+                TcpState::FinWait1 => {
+                    self.state = TcpState::Closing;
+                    self.state_deadline_ms = Some(now_ms + CLOSING_TIMEOUT_MS);
+                }
+                TcpState::FinWait2 => {
+                    // Both sides finished cleanly.
+                    if let Some(pkt) = self.build_packet(TCP_ACK, &[], &[], self.snd_nxt) {
+                        tx_out.push(pkt);
+                    }
+                    self.need_ack = false;
+                    self.state = TcpState::Closed;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn process_ack(&mut self, ack: u32, raw_window: u16, now_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
+        self.snd_wnd = u32::from(raw_window) << self.peer_wscale;
+
+        if self.state == TcpState::SynReceived {
+            if ack == self.snd_nxt {
+                self.snd_una = ack;
+                self.state = TcpState::Established;
+                self.state_deadline_ms = None;
+                self.rto_deadline_ms = None;
+                self.rto_ms = INITIAL_RTO_MS;
+                self.retries = 0;
+            }
+            return;
+        }
+
+        let advance = ack.wrapping_sub(self.snd_una) as i32;
+        let in_flight = self.snd_nxt.wrapping_sub(self.snd_una) as i32;
+
+        if advance > 0 && advance <= in_flight {
+            let mut acked = advance as usize;
+            // Account for data bytes in tx_buf (excluding FIN sequence number if acked).
+            let data_acked = acked.min(self.tx_buf.len());
+            self.tx_buf.drain(..data_acked);
+            acked -= data_acked;
+
+            self.snd_una = ack;
+            self.dup_acks = 0;
+            self.rto_ms = INITIAL_RTO_MS;
+            self.retries = 0;
+
+            if self.snd_una == self.snd_nxt {
+                self.rto_deadline_ms = None;
+            } else {
+                self.rto_deadline_ms = Some(now_ms + self.rto_ms);
+            }
+
+            if self.fin_sent && acked > 0 && ack == self.fin_seq.wrapping_add(1) {
+                match self.state {
+                    TcpState::FinWait1 => {
+                        self.state = TcpState::FinWait2;
+                        self.state_deadline_ms = Some(now_ms + CLOSING_TIMEOUT_MS);
+                    }
+                    TcpState::Closing | TcpState::LastAck => {
+                        self.state = TcpState::Closed;
+                    }
+                    _ => {}
+                }
+            }
+        } else if advance == 0 && in_flight > 0 && !self.tx_buf.is_empty() {
+            self.dup_acks = self.dup_acks.saturating_add(1);
+            if self.dup_acks == 3 {
+                // Fast retransmit oldest unacked segment.
+                let len = self.tx_buf.len().min(self.mss);
+                let payload: Vec<u8> = self.tx_buf.iter().take(len).copied().collect();
+                if let Some(pkt) = self.build_packet(TCP_ACK | TCP_PSH, &[], &payload, self.snd_una)
+                {
+                    tx_out.push(pkt);
+                }
+                self.rto_deadline_ms = Some(now_ms + self.rto_ms);
+            }
+        }
+    }
+
+    fn process_data(&mut self, seq: u32, payload: &[u8]) {
+        let rel = seq.wrapping_sub(self.rcv_nxt) as i32;
+        if rel <= 0 {
+            let skip = (-rel) as usize;
+            if skip >= payload.len() {
+                return;
+            }
+            let fresh = &payload[skip..];
+            self.rcv_coalesce.extend_from_slice(fresh);
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(fresh.len() as u32);
+            if self.rcv_coalesce.len() >= RELAY_COALESCE_BYTES {
+                self.flush_rcv_coalesce();
+            }
+            self.drain_ooo();
+        } else {
+            // Out-of-order segment: store bounded.
+            if self.ooo.len() < MAX_OOO_SEGMENTS
+                && self.ooo_bytes.saturating_add(payload.len()) <= self.max_rcv_buf
+            {
+                let entry = self.ooo.entry(seq).or_default();
+                if payload.len() > entry.len() {
+                    self.ooo_bytes = self.ooo_bytes.saturating_add(payload.len() - entry.len());
+                    *entry = payload.to_vec();
+                }
+            }
+        }
+    }
+
+    fn drain_ooo(&mut self) {
+        loop {
+            let next_key = self
+                .ooo
+                .keys()
+                .copied()
+                .find(|&k| (k.wrapping_sub(self.rcv_nxt) as i32) <= 0);
+            let Some(seq) = next_key else {
+                break;
+            };
+            if let Some(seg) = self.ooo.remove(&seq) {
+                self.ooo_bytes = self.ooo_bytes.saturating_sub(seg.len());
+                let rel = seq.wrapping_sub(self.rcv_nxt) as i32;
+                let skip = (-rel) as usize;
+                if skip < seg.len() {
+                    let fresh = &seg[skip..];
+                    self.rcv_coalesce.extend_from_slice(fresh);
+                    self.rcv_nxt = self.rcv_nxt.wrapping_add(fresh.len() as u32);
+                    if self.rcv_coalesce.len() >= RELAY_COALESCE_BYTES {
+                        self.flush_rcv_coalesce();
+                    }
+                }
+            }
+        }
+    }
+
+    fn flush_rcv_coalesce(&mut self) {
+        if self.rcv_coalesce.is_empty() {
+            return;
+        }
+        let Some(tx) = self.to_relay.as_ref() else {
+            self.rcv_coalesce.clear();
+            return;
+        };
+        let chunk = std::mem::take(&mut self.rcv_coalesce);
+        let len = chunk.len();
+        if tx.try_send(chunk).is_ok() {
+            self.in_flight_relay.fetch_add(len, Ordering::AcqRel);
+        }
+    }
+
+    fn drain_from_relay(&mut self) {
+        let Some(rx) = self.from_relay.as_mut() else {
+            return;
+        };
+        while self.tx_buf.len() < self.max_snd_buf {
+            match rx.try_recv() {
+                Ok(chunk) => self.tx_buf.extend(chunk),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.from_relay.take();
+                    self.relay_eof = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn flush_tx(&mut self, now_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
+        if !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
+            return;
+        }
+
+        // Send as many MSS segments as peer window and tx_buf allow.
+        loop {
+            let in_flight = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
+            if in_flight >= self.tx_buf.len() {
+                break;
+            }
+            let wnd_avail = (self.snd_wnd as usize).saturating_sub(in_flight);
+            if wnd_avail == 0 {
+                break;
+            }
+            let unsent = self.tx_buf.len() - in_flight;
+            let seg_len = unsent.min(wnd_avail).min(self.mss);
+            if seg_len == 0 {
+                break;
+            }
+            let payload: Vec<u8> = self
+                .tx_buf
+                .iter()
+                .skip(in_flight)
+                .take(seg_len)
+                .copied()
+                .collect();
+            let flags = if in_flight + seg_len >= self.tx_buf.len() {
+                TCP_ACK | TCP_PSH
+            } else {
+                TCP_ACK
+            };
+            let seq = self.snd_nxt;
+            if let Some(pkt) = self.build_packet(flags, &[], &payload, seq) {
+                tx_out.push(pkt);
+            }
+            self.snd_nxt = self.snd_nxt.wrapping_add(seg_len as u32);
+            self.need_ack = false;
+            if self.rto_deadline_ms.is_none() {
+                self.rto_deadline_ms = Some(now_ms + self.rto_ms);
+            }
+        }
+
+        // Send FIN once relay has closed and all queued bytes are sent.
+        if self.relay_eof
+            && !self.fin_sent
+            && (self.snd_nxt.wrapping_sub(self.snd_una) as usize) >= self.tx_buf.len()
+        {
+            let seq = self.snd_nxt;
+            if let Some(pkt) = self.build_packet(TCP_FIN | TCP_ACK, &[], &[], seq) {
+                tx_out.push(pkt);
+            }
+            self.fin_sent = true;
+            self.fin_seq = seq;
+            self.snd_nxt = self.snd_nxt.wrapping_add(1);
+            self.need_ack = false;
+            self.rto_deadline_ms = Some(now_ms + self.rto_ms);
+            self.state_deadline_ms = Some(now_ms + CLOSING_TIMEOUT_MS);
+            self.state = match self.state {
+                TcpState::Established => TcpState::FinWait1,
+                TcpState::CloseWait => TcpState::LastAck,
+                other => other,
+            };
+        }
+    }
+
+    fn check_timers(&mut self, now_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
+        if let Some(deadline) = self.state_deadline_ms
+            && now_ms >= deadline
+        {
+            self.state = TcpState::Closed;
+            self.to_relay.take();
+            self.from_relay.take();
+            return;
+        }
+
+        if let Some(rto_at) = self.rto_deadline_ms
+            && now_ms >= rto_at
+        {
+            if self.retries >= MAX_RETRIES {
+                self.send_rst(self.snd_nxt, tx_out);
+                return;
+            }
+            self.retries += 1;
+            self.rto_ms = (self.rto_ms * 2).min(MAX_RTO_MS);
+            self.rto_deadline_ms = Some(now_ms + self.rto_ms);
+
+            match self.state {
+                TcpState::SynReceived => {
+                    self.send_syn_ack(now_ms, tx_out);
+                }
+                TcpState::Established
+                | TcpState::CloseWait
+                | TcpState::FinWait1
+                | TcpState::LastAck => {
+                    if !self.tx_buf.is_empty() {
+                        let len = self.tx_buf.len().min(self.mss);
+                        let payload: Vec<u8> = self.tx_buf.iter().take(len).copied().collect();
+                        if let Some(pkt) =
+                            self.build_packet(TCP_ACK | TCP_PSH, &[], &payload, self.snd_una)
+                        {
+                            tx_out.push(pkt);
+                        }
+                    } else if self.fin_sent
+                        && self.snd_una == self.fin_seq
+                        && let Some(pkt) =
+                            self.build_packet(TCP_FIN | TCP_ACK, &[], &[], self.fin_seq)
+                    {
+                        tx_out.push(pkt);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Custom proxy-oriented [`NetStack`] implementation with RFC 7323 Window
+/// Scaling and cumulative ACK coalescing.
+pub struct ProxyTcpStack {
+    config: TcpStackConfig,
+    conns: HashMap<FlowKey, TcpConn>,
+    incoming: VecDeque<Vec<u8>>,
+    waker: Arc<Notify>,
+}
+
+impl ProxyTcpStack {
+    /// Creates a new custom proxy TCP stack.
+    pub fn new(config: TcpStackConfig) -> Self {
+        Self {
+            config,
+            conns: HashMap::new(),
+            incoming: VecDeque::with_capacity(128),
+            waker: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl NetStack for ProxyTcpStack {
+    fn push_ipv4_tcp(&mut self, packet: &[u8]) {
+        if self.incoming.len() < 2048 {
+            self.incoming.push_back(packet.to_vec());
+        }
+    }
+
+    fn poll(
+        &mut self,
+        now_ms: i64,
+        tx_out: &mut Vec<Vec<u8>>,
+        accepted: &mut Vec<AcceptedTcpStream>,
+    ) {
+        // 1. Process all batched incoming TCP segments.
+        while let Some(pkt) = self.incoming.pop_front() {
+            let Some(ip) = parse_ipv4(&pkt) else {
+                continue;
+            };
+            if ip.protocol != IP_PROTO_TCP {
+                continue;
+            }
+            let Some(seg) = parse_tcp(ip.payload) else {
+                continue;
+            };
+            let flow: FlowKey = (ip.src_ip, seg.src_port, ip.dst_ip, seg.dst_port);
+
+            if let Some(conn) = self.conns.get_mut(&flow) {
+                conn.on_segment(&seg, now_ms, tx_out);
+            } else if (seg.flags & TCP_SYN) != 0 && (seg.flags & TCP_ACK) == 0 {
+                if self.conns.len() >= self.config.max_connections {
+                    continue;
+                }
+                let (peer_mss, peer_wscale) = parse_tcp_syn_options(seg.options);
+                let max_mss = self.config.mtu.saturating_sub(40).clamp(536, 1460);
+                let mss = peer_mss
+                    .map(|m| usize::from(m).clamp(536, max_mss))
+                    .unwrap_or(max_mss);
+                let (our_wscale, negotiated_peer_wscale) = match peer_wscale {
+                    Some(ws) => (OUR_WSCALE, ws),
+                    None => (0, 0),
+                };
+                let iss = next_iss();
+                let max_buf = self.config.socket_buffer_bytes.max(DEFAULT_MAX_RCV_BUF);
+                let mut conn = TcpConn {
+                    flow,
+                    state: TcpState::SynReceived,
+                    mss,
+                    peer_wscale: negotiated_peer_wscale,
+                    our_wscale,
+                    rcv_nxt: seg.seq.wrapping_add(1),
+                    rcv_coalesce: Vec::with_capacity(RELAY_COALESCE_BYTES),
+                    ooo: BTreeMap::new(),
+                    ooo_bytes: 0,
+                    in_flight_relay: Arc::new(AtomicUsize::new(0)),
+                    max_rcv_buf: max_buf,
+                    last_advertised_wnd: max_buf as u32,
+                    need_ack: false,
+                    snd_una: iss,
+                    snd_nxt: iss,
+                    snd_wnd: u32::from(seg.window),
+                    tx_buf: VecDeque::new(),
+                    max_snd_buf: self.config.socket_buffer_bytes.max(DEFAULT_MAX_SND_BUF),
+                    fin_sent: false,
+                    fin_seq: 0,
+                    dup_acks: 0,
+                    rto_ms: INITIAL_RTO_MS,
+                    rto_deadline_ms: None,
+                    retries: 0,
+                    state_deadline_ms: Some(now_ms + HANDSHAKE_TIMEOUT_MS),
+                    accepted: false,
+                    to_relay: None,
+                    from_relay: None,
+                    relay_eof: false,
+                };
+                conn.send_syn_ack(now_ms, tx_out);
+                self.conns.insert(flow, conn);
+            } else if (seg.flags & TCP_RST) == 0 {
+                // Reply with RST for unknown non-SYN segments so stale sockets recover immediately.
+                let rst_seq = if (seg.flags & TCP_ACK) != 0 {
+                    seg.ack
+                } else {
+                    0
+                };
+                if let Some(rst) = build_ipv4_tcp_packet(
+                    ip.dst_ip,
+                    seg.dst_port,
+                    ip.src_ip,
+                    seg.src_port,
+                    rst_seq,
+                    seg.seq.wrapping_add(seg.payload.len() as u32),
+                    TCP_RST | TCP_ACK,
+                    0,
+                    &[],
+                    &[],
+                ) {
+                    tx_out.push(rst);
+                }
+            }
+        }
+
+        // 2. Advance every active connection: accept, flush coalesced RX, drain TX, send cumulative ACK, check timers.
+        self.conns.retain(|_, conn| {
+            if !conn.accepted && matches!(conn.state, TcpState::Established | TcpState::CloseWait) {
+                let (to_relay_tx, to_relay_rx) = mpsc::channel(STREAM_CHANNEL_CAP);
+                let (from_relay_tx, from_relay_rx) = mpsc::channel(STREAM_CHANNEL_CAP);
+                conn.accepted = true;
+                conn.to_relay = Some(to_relay_tx);
+                conn.from_relay = Some(from_relay_rx);
+                accepted.push(AcceptedTcpStream {
+                    src: SocketAddrV4::new(conn.flow.0, conn.flow.1),
+                    dst: SocketAddrV4::new(conn.flow.2, conn.flow.3),
+                    stream: TunTcpStream::new_with_accounting(
+                        to_relay_rx,
+                        from_relay_tx,
+                        Arc::clone(&self.waker),
+                        Some(Arc::clone(&conn.in_flight_relay)),
+                    ),
+                });
+            }
+
+            conn.flush_rcv_coalesce();
+            conn.drain_from_relay();
+            conn.flush_tx(now_ms, tx_out);
+
+            // Emit window update ACK if relay freed significant receive buffer space.
+            let current_wnd = conn.rcv_wnd_bytes();
+            if !conn.need_ack
+                && matches!(conn.state, TcpState::Established)
+                && conn.last_advertised_wnd < (conn.max_rcv_buf as u32 / 2)
+                && current_wnd >= (conn.max_rcv_buf as u32 * 3 / 4)
+            {
+                conn.need_ack = true;
+            }
+
+            if conn.need_ack && conn.state != TcpState::Closed {
+                if let Some(pkt) = conn.build_packet(TCP_ACK, &[], &[], conn.snd_nxt) {
+                    tx_out.push(pkt);
+                }
+                conn.need_ack = false;
+            }
+
+            conn.check_timers(now_ms, tx_out);
+            conn.state != TcpState::Closed
+        });
+    }
+
+    fn poll_delay_ms(&mut self, now_ms: i64) -> Option<u64> {
+        let mut earliest: Option<i64> = None;
+        for conn in self.conns.values() {
+            for d in [conn.rto_deadline_ms, conn.state_deadline_ms]
+                .into_iter()
+                .flatten()
+            {
+                earliest = Some(earliest.map_or(d, |cur| cur.min(d)));
+            }
+        }
+        earliest.map(|d| d.saturating_sub(now_ms).max(1) as u64)
+    }
+
+    fn waker(&self) -> Arc<Notify> {
+        Arc::clone(&self.waker)
+    }
+}
+
+fn next_iss() -> u32 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    (now ^ n.wrapping_mul(0x9e37_79b9_7f4a_7c15)) as u32
+}

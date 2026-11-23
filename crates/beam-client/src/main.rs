@@ -9,7 +9,7 @@ mod linux_tun;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use beam_tun::{SmoltcpStack, run_tun_engine};
+use beam_tun::{ProxyTcpStack, run_tun_engine};
 use tokio::sync::watch;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -153,7 +153,7 @@ async fn run_client(cfg: config::ValidatedConfig) -> Result<(), Box<dyn std::err
         let _ = shutdown_tx.send(true);
     });
 
-    let stack = SmoltcpStack::new(cfg.tcp_stack);
+    let stack = ProxyTcpStack::new(cfg.tcp_stack);
     run_tun_engine(tun, stack, cfg.engine, shutdown_rx).await?;
     Ok(())
 }

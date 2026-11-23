@@ -17,6 +17,158 @@ pub const TCP_MIN_HEADER_LEN: usize = 20;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
 
+/// TCP header flag constants.
+pub const TCP_FIN: u8 = 0x01;
+pub const TCP_SYN: u8 = 0x02;
+pub const TCP_RST: u8 = 0x04;
+pub const TCP_PSH: u8 = 0x08;
+pub const TCP_ACK: u8 = 0x10;
+
+/// Parsed view of a TCP segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpSegmentView<'a> {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq: u32,
+    pub ack: u32,
+    pub flags: u8,
+    pub window: u16,
+    pub options: &'a [u8],
+    pub payload: &'a [u8],
+}
+
+/// Parses a TCP segment from an IPv4 payload slice.
+pub fn parse_tcp(payload: &[u8]) -> Option<TcpSegmentView<'_>> {
+    if payload.len() < TCP_MIN_HEADER_LEN {
+        return None;
+    }
+    let data_offset = usize::from(payload[12] >> 4) * 4;
+    if data_offset < TCP_MIN_HEADER_LEN || data_offset > payload.len() {
+        return None;
+    }
+    Some(TcpSegmentView {
+        src_port: u16::from_be_bytes([payload[0], payload[1]]),
+        dst_port: u16::from_be_bytes([payload[2], payload[3]]),
+        seq: u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
+        ack: u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]),
+        flags: payload[13],
+        window: u16::from_be_bytes([payload[14], payload[15]]),
+        options: &payload[TCP_MIN_HEADER_LEN..data_offset],
+        payload: &payload[data_offset..],
+    })
+}
+
+/// Parses MSS and RFC 7323 Window Scale from TCP SYN options.
+pub fn parse_tcp_syn_options(options: &[u8]) -> (Option<u16>, Option<u8>) {
+    let mut mss = None;
+    let mut wscale = None;
+    let mut i = 0;
+    while i < options.len() {
+        match options[i] {
+            0 => break, // End of Option List
+            1 => {
+                i += 1; // NOP
+            }
+            kind => {
+                if i + 1 >= options.len() {
+                    break;
+                }
+                let len = usize::from(options[i + 1]);
+                if len < 2 || i + len > options.len() {
+                    break;
+                }
+                if kind == 2 && len == 4 {
+                    mss = Some(u16::from_be_bytes([options[i + 2], options[i + 3]]));
+                } else if kind == 3 && len == 3 {
+                    wscale = Some(options[i + 2].min(14));
+                }
+                i += len;
+            }
+        }
+    }
+    (mss, wscale)
+}
+
+/// Builds a complete IPv4/TCP packet with valid IPv4 header and TCP checksums.
+/// `options` length must be a multiple of 4 (up to 40 bytes).
+#[allow(clippy::too_many_arguments)]
+pub fn build_ipv4_tcp_packet(
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    options: &[u8],
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    if options.len() > 40 || !options.len().is_multiple_of(4) {
+        return None;
+    }
+    let tcp_header_len = TCP_MIN_HEADER_LEN + options.len();
+    let tcp_len = tcp_header_len.checked_add(payload.len())?;
+    let total_len = IPV4_MIN_HEADER_LEN.checked_add(tcp_len)?;
+    let total_len_u16 = u16::try_from(total_len).ok()?;
+
+    let mut pkt = vec![0u8; total_len];
+    // IPv4 header
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&total_len_u16.to_be_bytes());
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+    pkt[8] = 64; // TTL
+    pkt[9] = IP_PROTO_TCP;
+    pkt[12..16].copy_from_slice(&src_ip.octets());
+    pkt[16..20].copy_from_slice(&dst_ip.octets());
+    let ip_cksum = internet_checksum(&pkt[..IPV4_MIN_HEADER_LEN]);
+    pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // TCP header + options + payload
+    let tcp = &mut pkt[IPV4_MIN_HEADER_LEN..];
+    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp[12] = ((tcp_header_len / 4) as u8) << 4;
+    tcp[13] = flags;
+    tcp[14..16].copy_from_slice(&window.to_be_bytes());
+    if !options.is_empty() {
+        tcp[TCP_MIN_HEADER_LEN..tcp_header_len].copy_from_slice(options);
+    }
+    if !payload.is_empty() {
+        tcp[tcp_header_len..].copy_from_slice(payload);
+    }
+
+    let tcp_cksum = tcp_ipv4_checksum(src_ip, dst_ip, tcp);
+    tcp[16..18].copy_from_slice(&tcp_cksum.to_be_bytes());
+    Some(pkt)
+}
+
+fn tcp_ipv4_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_segment: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let src = src_ip.octets();
+    let dst = dst_ip.octets();
+    sum += u32::from(u16::from_be_bytes([src[0], src[1]]));
+    sum += u32::from(u16::from_be_bytes([src[2], src[3]]));
+    sum += u32::from(u16::from_be_bytes([dst[0], dst[1]]));
+    sum += u32::from(u16::from_be_bytes([dst[2], dst[3]]));
+    sum += u32::from(IP_PROTO_TCP);
+    sum += tcp_segment.len() as u32;
+
+    let (chunks, remainder) = tcp_segment.as_chunks::<2>();
+    for chunk in chunks {
+        sum += u32::from(u16::from_be_bytes(*chunk));
+    }
+    if let Some(&last) = remainder.first() {
+        sum += u32::from(u16::from_be_bytes([last, 0]));
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 /// Parsed view of an IPv4 packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv4PacketView<'a> {
