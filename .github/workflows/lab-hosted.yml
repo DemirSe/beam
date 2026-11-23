@@ -37,7 +37,7 @@ on:
         required: true
         default: both
         type: choice
-        options: [both, bench, tun, stress, protocols, preprod]
+        options: [both, bench, tun, stress, protocols, preprod, client-bench]
       udp_mode:
         description: "sing-box packet encoding for the TUN suite"
         required: true
@@ -295,6 +295,11 @@ jobs:
           fi
           arms=stock,beam
           [ -z "$baseline_ref" ] || arms=baseline,beam
+          client_ab=0
+          if [ "$INPUT_SUITE" = "client-bench" ]; then
+            arms=baseline,beam
+            client_ab=1
+          fi
           if [ "$perf_flag" = "true" ]; then perf_value=1; else perf_value=0; fi
           {
             echo "RTT_MS=$rtt"
@@ -311,6 +316,7 @@ jobs:
             echo "BENCH_REQUIRE_COMPLETE=$require_complete"
             echo "BASELINE_REF=$baseline_ref"
             echo "BENCH_ARMS=$arms"
+            echo "BENCH_CLIENT_AB=$client_ab"
             echo "BENCH_PERF=$perf_value"
             echo "BENCH_PERF_EVENTS=$perf_events"
             [ -z "$udp_count_override" ] || echo "BENCH_UDP_COUNT=$udp_count_override"
@@ -436,6 +442,10 @@ jobs:
           source scripts/dev-env.sh
           rustc --version
           cargo build --locked --release -p beam
+          if [ "${{ inputs.suite }}" = "client-bench" ]; then
+            cargo build --locked --release -p beam-client
+            ls -l target/release/beam-client
+          fi
           cargo build --locked --manifest-path tests/tun/h3-origin/Cargo.toml
           ls -l target/release/beam tests/tun/h3-origin/target/debug/h3-origin \
                 tests/tun/h3-origin/target/debug/h2-client
@@ -548,7 +558,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/protocol-run.log"
 
       - name: Benchmark (root, private namespaces)
-        if: (inputs.suite == 'both' || inputs.suite == 'bench') && matrix.phase == 'all' || (inputs.suite == 'preprod' && matrix.phase == 'bench')
+        if: (inputs.suite == 'both' || inputs.suite == 'bench' || inputs.suite == 'client-bench') && matrix.phase == 'all' || (inputs.suite == 'preprod' && matrix.phase == 'bench')
         timeout-minutes: 110
         run: |
           set -euo pipefail
@@ -587,6 +597,8 @@ jobs:
             BENCH_PERF_EVENTS="$BENCH_PERF_EVENTS" \
             BENCH_LOG_LEVEL="${BENCH_LOG_LEVEL:-}" \
             BEAM_BASELINE_BIN="$RUNNER_TEMP/beam-baseline" \
+            BENCH_CLIENT_AB="${BENCH_CLIENT_AB:-0}" \
+            BEAM_CLIENT_BIN="$GITHUB_WORKSPACE/target/release/beam-client" \
             BENCH_REPORT=1 \
             BENCH_RATIO_ONLY=1 \
             BENCH_REQUIRE_COMPLETE="$BENCH_REQUIRE_COMPLETE" \
@@ -639,8 +651,8 @@ jobs:
             echo "Bench: no summary.md produced." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          if [ "${{ inputs.suite }}" = "bench" ] || [ "${{ inputs.suite }}" = "stress" ] \
-            || [ "${{ inputs.suite }}" = "protocols" ]; then
+          if [ "${{ inputs.suite }}" = "bench" ] || [ "${{ inputs.suite }}" = "client-bench" ] \
+            || [ "${{ inputs.suite }}" = "stress" ] || [ "${{ inputs.suite }}" = "protocols" ]; then
             echo "TUN: skipped (suite=${{ inputs.suite }})." >> "$GITHUB_STEP_SUMMARY"
           elif [ "${{ inputs.suite }}" = preprod ]; then
             echo "TUN: see separate XUDP, legacy and packetaddr matrices in the evidence artifact." >> "$GITHUB_STEP_SUMMARY"
@@ -658,8 +670,8 @@ jobs:
             echo "TUN: no results-beam.tsv produced." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          if [ "${{ inputs.suite }}" = "bench" ] || [ "${{ inputs.suite }}" = "tun" ] \
-            || [ "${{ inputs.suite }}" = "protocols" ]; then
+          if [ "${{ inputs.suite }}" = "bench" ] || [ "${{ inputs.suite }}" = "client-bench" ] \
+            || [ "${{ inputs.suite }}" = "tun" ] || [ "${{ inputs.suite }}" = "protocols" ]; then
             echo "Stress: skipped (suite=${{ inputs.suite }})." >> "$GITHUB_STEP_SUMMARY"
           elif [ -f "$RUNNER_TEMP/stress-out/summary.md" ]; then
             echo "## Stress" >> "$GITHUB_STEP_SUMMARY"
@@ -774,7 +786,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Bench acceptance
-        if: always() && (inputs.suite == 'bench' || inputs.suite == 'both')
+        if: always() && (inputs.suite == 'bench' || inputs.suite == 'both' || inputs.suite == 'client-bench')
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP/bench-out/summary.json" <<'PY'

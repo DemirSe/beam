@@ -23,6 +23,8 @@ pub mod poll;
 pub mod socket;
 #[cfg(target_os = "linux")]
 pub mod splice;
+#[cfg(target_os = "linux")]
+pub mod tun;
 
 #[cfg(target_os = "linux")]
 pub use eventfd::EventFd;
@@ -37,6 +39,8 @@ pub use socket::{
 };
 #[cfg(target_os = "linux")]
 pub use splice::{SpliceFlags, pipe, splice};
+#[cfg(target_os = "linux")]
+pub use tun::{LinuxTun, MAX_IFNAME_LEN, validate_ifname};
 
 /// Resizes the kernel buffer of a pipe.
 ///

@@ -64,6 +64,8 @@ REPS="${BENCH_REPS:-3}"
 DURATION="${BENCH_DURATION:-10}"
 ARMS="${BENCH_ARMS:-stock,beam}"
 BASELINE_BIN="${BEAM_BASELINE_BIN:-}"
+CLIENT_AB="${BENCH_CLIENT_AB:-0}"
+BEAM_CLIENT_BIN="${BEAM_CLIENT_BIN:-$ROOT/target/release/beam-client}"
 UDP_WINDOW="${BENCH_UDP_WINDOW:-32}"
 OUT=""
 QUICK=0
@@ -303,7 +305,11 @@ if [ "$INNER" != "1" ]; then
 
   if [ "$SKIP_BUILD" != "1" ]; then
     echo "bench: building beam release" >&2
-    if ! (cd "$ROOT" && cargo build --locked --release -p beam) > "$BUILD_LOG" 2>&1; then
+    local_pkgs=(-p beam)
+    if [ "$CLIENT_AB" = "1" ]; then
+      local_pkgs+=(-p beam-client)
+    fi
+    if ! (cd "$ROOT" && cargo build --locked --release "${local_pkgs[@]}") > "$BUILD_LOG" 2>&1; then
       echo "bench: cargo build failed; see $BUILD_LOG" >&2
       tail -n 20 "$BUILD_LOG" >&2 || true
       exit 1
@@ -345,6 +351,7 @@ if [ "$INNER" != "1" ]; then
     BENCH_SCENARIOS="$SCENARIOS" BENCH_REPORT="$REPORT" \
     BEAM_BASELINE_BIN="$BASELINE_BIN" BENCH_UDP_WINDOW="$UDP_WINDOW" \
     SING_BOX="$SING_BOX" XRAY_BIN="$XRAY_BIN" TEST_CONFIG="$TEST_CONFIG" \
+    BENCH_CLIENT_AB="$CLIENT_AB" BEAM_CLIENT_BIN="$BEAM_CLIENT_BIN" \
     IPERF3="$IPERF3" IPERF3_LIB="$IPERF3_LIB" TC="$TC" H3_ORIGIN_BIN="$H3_ORIGIN_BIN" \
     bash "$SELF" "${ORIGINAL_ARGS[@]}"
 fi
@@ -453,7 +460,10 @@ export LD_LIBRARY_PATH="$IPERF3_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 if [[ " ${ARM_LIST[*]} " == *" stock "* ]]; then
   XRAY_BIN="$(resolve_bin "$XRAY_BIN")" || die "stock Xray not found: $XRAY_BIN (set XRAY_BIN)"
 fi
-if [[ " ${ARM_LIST[*]} " == *" baseline "* ]]; then
+if [ "$CLIENT_AB" = "1" ]; then
+  BEAM_CLIENT_BIN="$(resolve_bin "$BEAM_CLIENT_BIN")" \
+    || die "beam-client not found: $BEAM_CLIENT_BIN (set BEAM_CLIENT_BIN)"
+elif [[ " ${ARM_LIST[*]} " == *" baseline "* ]]; then
   [ -n "$BASELINE_BIN" ] || die "baseline arm needs BEAM_BASELINE_BIN"
   BASELINE_BIN="$(resolve_bin "$BASELINE_BIN")" \
     || die "baseline beam not found: $BASELINE_BIN (set BEAM_BASELINE_BIN)"
@@ -713,12 +723,17 @@ XRAY_FLAG=()
 if [[ " ${ARM_LIST[*]} " == *" stock "* ]]; then
   XRAY_FLAG=(--xray)
 fi
+CLIENT_FLAG=()
+if [ "$CLIENT_AB" = "1" ]; then
+  CLIENT_FLAG=(--beam-client)
+fi
 "$PYTHON" "$HERE/../tests/tun/config.py" \
   --test-config "$TEST_CONFIG" \
   --out-dir "$CONFIG_DIR" \
   --listen "$BEAM_ADDR" \
   --cover "$COVER" \
   --singbox \
+  "${CLIENT_FLAG[@]}" \
   "${XRAY_FLAG[@]}" \
   --log-level "$LOG_LEVEL" \
   || die "could not render the beam/sing-box/Xray configs"
@@ -826,7 +841,12 @@ start_arm() {
   : > "$client_log"
 
   local -a server_cmd
-  if [ "$arm" = "baseline" ]; then
+  if [ "$CLIENT_AB" = "1" ]; then
+    # Client A/B mode: both arms use the exact same `beam` server;
+    # `baseline` uses sing-box as the TUN client, `beam` uses `beam-client`.
+    server_cmd=(ip netns exec tun-server taskset -c "$SERVER_CPU" \
+      "$ROOT/target/release/beam" --config "$CONFIG_DIR/beam.toml")
+  elif [ "$arm" = "baseline" ]; then
     server_cmd=(ip netns exec tun-server taskset -c "$SERVER_CPU" \
       "$BASELINE_BIN" --config "$CONFIG_DIR/beam.toml")
   elif [ "$arm" = "beam" ]; then
@@ -911,9 +931,15 @@ WRAPPER
     die "$arm did not start listening on $BEAM_ADDR"
   fi
   SERVER_MASK="$(mask_of "$SERVER_PID")"
-  taskset -c "$CLIENT_MASK_SPEC" ip netns exec tun-client \
-    env GOMAXPROCS="$GOMAXPROCS_CLIENT" "$SING_BOX" run -c "$CONFIG_DIR/singbox.json" \
-    > "$client_log" 2>&1 &
+  if [ "$CLIENT_AB" = "1" ] && [ "$arm" = "beam" ]; then
+    taskset -c "$CLIENT_MASK_SPEC" ip netns exec tun-client \
+      "$BEAM_CLIENT_BIN" -c "$CONFIG_DIR/beam-client.toml" \
+      > "$client_log" 2>&1 &
+  else
+    taskset -c "$CLIENT_MASK_SPEC" ip netns exec tun-client \
+      env GOMAXPROCS="$GOMAXPROCS_CLIENT" "$SING_BOX" run -c "$CONFIG_DIR/singbox.json" \
+      > "$client_log" 2>&1 &
+  fi
   SINGBOX_PID=$!
   local ready=0
   for _ in $(seq 1 200); do

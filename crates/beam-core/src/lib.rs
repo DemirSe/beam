@@ -4,6 +4,7 @@
 
 pub mod address;
 pub mod admission;
+pub mod client;
 pub mod config;
 pub mod dns;
 pub mod identity;
