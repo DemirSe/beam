@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -154,10 +154,28 @@ impl XudpClient {
         let table = Arc::new(Mutex::new(SessionTable::new(xudp_config.max_sessions)));
         let (outbound_tx, mut outbound_rx) =
             mpsc::channel::<Vec<u8>>(xudp_config.outbound_queue.max(1));
+        let (closed_tx, mut writer_closed_rx) = watch::channel(false);
+        let mut reader_closed_rx = closed_tx.subscribe();
 
         let writer_table = Arc::clone(&table);
+        let writer_closed_tx = closed_tx.clone();
         let writer_task = tokio::spawn(async move {
-            while let Some(frame) = outbound_rx.recv().await {
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    _ = writer_closed_rx.changed() => {
+                        if *writer_closed_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    maybe = outbound_rx.recv() => {
+                        let Some(frame) = maybe else {
+                            break;
+                        };
+                        frame
+                    }
+                };
                 let res = timeout(WRITE_TIMEOUT, write_half.write_all(&frame)).await;
                 match res {
                     Ok(Ok(())) => {}
@@ -170,6 +188,7 @@ impl XudpClient {
                 }
             }
             let _ = timeout(Duration::from_secs(1), write_half.shutdown()).await;
+            let _ = writer_closed_tx.send(true);
             if let Ok(mut guard) = writer_table.lock() {
                 guard.close_all();
             }
@@ -183,7 +202,17 @@ impl XudpClient {
             let mut chunk = vec![0u8; 8192];
 
             loop {
-                match timeout(idle_timeout, read_half.read(&mut chunk)).await {
+                let read_res = tokio::select! {
+                    biased;
+                    _ = reader_closed_rx.changed() => {
+                        if *reader_closed_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    res = timeout(idle_timeout, read_half.read(&mut chunk)) => res,
+                };
+                match read_res {
                     Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                     Ok(Ok(n)) => {
                         if buf.len().saturating_sub(offset).saturating_add(n) > MAX_READ_BUF {
@@ -230,6 +259,7 @@ impl XudpClient {
                         }
                         Ok(None) => break,
                         Err(_) => {
+                            let _ = closed_tx.send(true);
                             if let Ok(mut t) = reader_table.lock() {
                                 t.close_all();
                             }
@@ -244,6 +274,7 @@ impl XudpClient {
                 }
             }
 
+            let _ = closed_tx.send(true);
             if let Ok(mut t) = reader_table.lock() {
                 t.close_all();
             }
@@ -346,6 +377,14 @@ impl XudpSession {
         destination: Option<NetLocation>,
         payload: &[u8],
     ) -> Result<(), XudpClientError> {
+        let is_live = self
+            .table
+            .lock()
+            .map(|t| !t.closed && t.sessions.contains_key(&self.session_id))
+            .unwrap_or(false);
+        if !is_live {
+            return Err(XudpClientError::Closed);
+        }
         if payload.is_empty() || payload.len() > MAX_PAYLOAD_LEN {
             return Err(XudpClientError::InvalidPayloadLength {
                 length: payload.len(),

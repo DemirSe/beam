@@ -61,7 +61,12 @@ where
     let stack_waker = stack.waker();
     let tcp_permits = Arc::new(Semaphore::new(config.max_tcp_connections.max(1)));
     let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(TUN_TX_CHANNEL_CAP);
-    let mut udp_bridge = UdpNatBridge::new(config.client.clone(), config.udp, tun_tx.clone());
+    let mut udp_bridge = UdpNatBridge::new(
+        config.client.clone(),
+        config.udp,
+        tun_tx.clone(),
+        Arc::clone(&stack_waker),
+    );
 
     let mut recv_buf = vec![0u8; device.mtu().clamp(2048, MAX_PACKET_BUF)];
     let mut tx_batch: Vec<Vec<u8>> = Vec::with_capacity(64);
@@ -81,6 +86,7 @@ where
         }
 
         let now_ms = start.elapsed().as_millis() as i64;
+        udp_bridge.poll_connect();
         stack.poll(now_ms, &mut tx_batch, &mut accepted);
 
         for pkt in tx_batch.drain(..) {
@@ -129,7 +135,7 @@ where
                                     if let Some(udp) = parse_udp(ip.payload) {
                                         let src = SocketAddr::new(ip.src_ip, udp.src_port);
                                         let dst = SocketAddr::new(ip.dst_ip, udp.dst_port);
-                                        udp_bridge.handle_datagram(src, dst, udp.payload).await;
+                                        udp_bridge.handle_datagram(src, dst, udp.payload);
                                     }
                                 }
                                 RouteDecision::RejectIcmpUnreachable => {

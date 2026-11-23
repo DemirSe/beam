@@ -177,6 +177,8 @@ impl ClientFileConfig {
         beam_sys::validate_ifname(&self.tun.name)
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
 
+        validate_ipv4_cidr(&self.tun.address)?;
+
         if !(576..=9000).contains(&self.tun.mtu) {
             return Err(ConfigError::Invalid(format!(
                 "tun.mtu {} must be between 576 and 9000",
@@ -211,6 +213,11 @@ impl ClientFileConfig {
         let public_key: [u8; 32] = pk_bytes.try_into().map_err(|_| {
             ConfigError::Invalid("server.public_key must decode to 32 bytes".into())
         })?;
+        if public_key == [0u8; 32] {
+            return Err(ConfigError::Invalid(
+                "server.public_key must not be all zeroes".into(),
+            ));
+        }
 
         let reality = RealityClientConfig::new(public_key, &self.server.short_id, &self.server.sni)
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
@@ -264,6 +271,24 @@ impl ClientFileConfig {
     }
 }
 
+fn validate_ipv4_cidr(cidr: &str) -> Result<(), ConfigError> {
+    let (addr_str, prefix_str) = cidr.split_once('/').ok_or_else(|| {
+        ConfigError::Invalid("tun.address must be IPv4 CIDR (e.g. 172.19.0.1/30)".into())
+    })?;
+    let _ip: Ipv4Addr = addr_str
+        .parse()
+        .map_err(|_| ConfigError::Invalid("tun.address has invalid IPv4 address".into()))?;
+    let prefix: u8 = prefix_str
+        .parse()
+        .map_err(|_| ConfigError::Invalid("tun.address has invalid prefix length".into()))?;
+    if !(1..=32).contains(&prefix) {
+        return Err(ConfigError::Invalid(
+            "tun.address prefix length must be 1..=32".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +307,17 @@ mod tests {
     fn rejects_unknown_field() {
         let bad = format!("{EXAMPLE}\nunknown_key = 1\n");
         assert!(ClientFileConfig::parse_and_validate(&bad).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_tun_cidr_and_zero_public_key() {
+        let bad_cidr = EXAMPLE.replace("172.19.0.1/30", "--flag");
+        assert!(ClientFileConfig::parse_and_validate(&bad_cidr).is_err());
+
+        let zero_pk = EXAMPLE.replace(
+            "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        );
+        assert!(ClientFileConfig::parse_and_validate(&zero_pk).is_err());
     }
 }

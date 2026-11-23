@@ -2,14 +2,14 @@
 
 //! Platform-independent TUN packet engine for `beam-client`.
 //!
-//! Translates raw Layer 3 IPv4 packets from a [`device::TunDevice`] into:
-//! - TCP streams through a pluggable [`stack::NetStack`] (Phase 1: `smoltcp`,
-//!   Phase 2: optional custom lightweight proxy TCP/IP stack), relayed over
-//!   `beam_core::client::dial_tcp` (REALITY + VLESS + Vision).
+//! Translates raw Layer 3 IPv4/IPv6 packets from a [`device::TunDevice`] into:
+//! - TCP streams through a pluggable [`stack::NetStack`] (default:
+//!   [`proxy_tcp::ProxyTcpStack`], RFC 7323 Window Scaling, zero external TCP
+//!   stack dependencies), relayed over `beam_core::client::dial_tcp`.
 //! - UDP datagrams through [`udp::UdpNatBridge`], relayed directly over
-//!   `beam_core::client::XudpClient` (full-cone).
-//! - Immediate ICMP Port Unreachable replies for UDP/443 when `reject_quic`
-//!   is enabled.
+//!   `beam_core::client::XudpClient` (full-cone, non-blocking reconnect).
+//! - Immediate ICMP/ICMPv6 Port Unreachable replies for UDP/443 when
+//!   `reject_quic` is enabled.
 
 pub mod device;
 pub mod engine;

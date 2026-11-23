@@ -18,7 +18,7 @@ use rustls::crypto::{
     ActiveKeyExchange, CryptoProvider, GetRandomFailed, SecureRandom, SharedSecret,
     SupportedKxGroup, WebPkiSupportedAlgorithms, verify_tls13_signature,
 };
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, DnsName, ServerName, UnixTime};
 use rustls::{
     CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, NamedGroup,
     SignatureScheme,
@@ -62,7 +62,7 @@ impl RealityClientConfig {
         let short_id =
             decode_short_id(short_id_hex).map_err(|_| RealityClientError::InvalidShortId)?;
         let server_name = server_name.into();
-        ServerName::try_from(server_name.clone())
+        DnsName::try_from(server_name.clone())
             .map_err(|_| RealityClientError::InvalidServerName)?;
         Ok(Self {
             server_public_key,
@@ -163,13 +163,19 @@ impl SecureRandom for ThreadLocalRandom {
             };
             match buf.len() {
                 32 => {
-                    if mat.fills_32 == 0 {
-                        buf.copy_from_slice(&mat.session_id);
-                    } else {
-                        buf.copy_from_slice(&mat.hello_random);
+                    let idx = mat.fills_32;
+                    mat.fills_32 = mat.fills_32.saturating_add(1);
+                    match idx {
+                        0 => {
+                            buf.copy_from_slice(&mat.session_id);
+                            true
+                        }
+                        1 => {
+                            buf.copy_from_slice(&mat.hello_random);
+                            true
+                        }
+                        _ => false,
                     }
-                    mat.fills_32 += 1;
-                    true
                 }
                 2 => {
                     buf.copy_from_slice(&mat.ext_seed);
@@ -326,11 +332,16 @@ impl ServerCertVerifier for RealityCertVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
+        intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        if !intermediates.is_empty() {
+            return Err(rustls::Error::InvalidCertificate(
+                CertificateError::BadEncoding,
+            ));
+        }
         let (pubkey, sig) = extract_ed25519_cert_fields(end_entity.as_ref()).ok_or(
             rustls::Error::InvalidCertificate(CertificateError::BadEncoding),
         )?;
@@ -569,9 +580,17 @@ fn read_der_tlv(input: &[u8], expected_tag: u8) -> Option<(&[u8], &[u8])> {
             return None;
         }
         let (len_bytes, rest) = rest.split_at_checked(num_bytes)?;
+        // Enforce minimal DER length encoding (no leading zero byte, and
+        // multi-byte form only for lengths >= 128).
+        if len_bytes[0] == 0 {
+            return None;
+        }
         let mut value = 0usize;
         for &b in len_bytes {
             value = (value << 8) | usize::from(b);
+        }
+        if value < 0x80 {
+            return None;
         }
         (value, rest)
     };

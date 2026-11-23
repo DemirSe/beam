@@ -15,13 +15,18 @@ const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
 
+const MAX_EINTR_RETRIES: usize = 32;
+
 /// Minimal `struct ifreq` layout needed for `TUNSETIFF`.
-#[repr(C)]
+#[repr(C, align(8))]
 struct IfReq {
     ifr_name: [libc::c_char; libc::IFNAMSIZ],
     ifr_flags: libc::c_short,
     _pad: [u8; 22],
 }
+
+const _: () = assert!(std::mem::size_of::<IfReq>() == std::mem::size_of::<libc::ifreq>());
+const _: () = assert!(std::mem::align_of::<IfReq>() == std::mem::align_of::<libc::ifreq>());
 
 /// An owned Linux TUN file descriptor (`IFF_TUN | IFF_NO_PI`).
 pub struct LinuxTun {
@@ -98,40 +103,58 @@ impl LinuxTun {
         &self.name
     }
 
-    /// Performs a non-blocking read of one IP packet from the TUN device.
+    /// Performs a non-blocking read of one IP packet from the TUN device,
+    /// retrying bounded `EINTR` interruptions.
     pub fn read_packet(&self, buf: &mut [u8]) -> io::Result<usize> {
-        // SAFETY: `buf` is a valid writable slice of length `buf.len()`, and
-        // `self.fd` is a valid owned file descriptor.
-        let n = unsafe {
-            libc::read(
-                self.fd.as_raw_fd(),
-                buf.as_mut_ptr().cast::<libc::c_void>(),
-                buf.len(),
-            )
-        };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
+        for _ in 0..MAX_EINTR_RETRIES {
+            // SAFETY: `buf` is a valid writable slice of length `buf.len()`, and
+            // `self.fd` is a valid owned file descriptor.
+            let n = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "TUN read interrupted repeatedly",
+        ))
     }
 
-    /// Performs a non-blocking write of one IP packet to the TUN device.
+    /// Performs a non-blocking write of one IP packet to the TUN device,
+    /// retrying bounded `EINTR` interruptions.
     pub fn write_packet(&self, buf: &[u8]) -> io::Result<usize> {
-        // SAFETY: `buf` is a valid readable slice of length `buf.len()`, and
-        // `self.fd` is a valid owned file descriptor.
-        let n = unsafe {
-            libc::write(
-                self.fd.as_raw_fd(),
-                buf.as_ptr().cast::<libc::c_void>(),
-                buf.len(),
-            )
-        };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
+        for _ in 0..MAX_EINTR_RETRIES {
+            // SAFETY: `buf` is a valid readable slice of length `buf.len()`, and
+            // `self.fd` is a valid owned file descriptor.
+            let n = unsafe {
+                libc::write(
+                    self.fd.as_raw_fd(),
+                    buf.as_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "TUN write interrupted repeatedly",
+        ))
     }
 }
 

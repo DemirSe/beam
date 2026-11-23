@@ -1,4 +1,4 @@
-//! Rootless release-mode micro-benchmark for `beam-tun` (`SmoltcpStack` +
+//! Rootless release-mode micro-benchmark for `beam-tun` (`ProxyTcpStack` +
 //! `UdpNatBridge`) through `beam_core::client` and `beam` server on loopback.
 //!
 //! Measures:

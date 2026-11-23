@@ -1,5 +1,5 @@
 //! Rootless end-to-end tests for `beam-tun`:
-//! raw IPv4 packets -> `MemoryTun` -> `TunEngine` (`SmoltcpStack` / `UdpNatBridge`)
+//! raw IPv4 packets -> `MemoryTun` -> `TunEngine` (`ProxyTcpStack` / `UdpNatBridge`)
 //! -> `beam_core::client` (REALITY + VLESS + Vision / XUDP)
 //! -> `beam_core::tls::server::handle_connection`
 //! -> loopback TCP / UDP target.
