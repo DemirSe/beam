@@ -15,9 +15,9 @@ use crate::packet::{
 };
 use crate::stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
 
-const OUR_WSCALE: u8 = 7; // 128x multiplier -> up to ~8 MiB window; capped at max_rcv_buf (4 MiB)
-const DEFAULT_MAX_RCV_BUF: usize = 4 * 1024 * 1024;
-const DEFAULT_MAX_SND_BUF: usize = 4 * 1024 * 1024;
+const OUR_WSCALE: u8 = 6; // 64x multiplier -> up to ~4 MiB window; capped at max_rcv_buf (2 MiB)
+const DEFAULT_MAX_RCV_BUF: usize = 2 * 1024 * 1024;
+const DEFAULT_MAX_SND_BUF: usize = 2 * 1024 * 1024;
 const MAX_OOO_SEGMENTS: usize = 64;
 const STREAM_CHANNEL_CAP: usize = 64;
 const RELAY_COALESCE_BYTES: usize = 64 * 1024;
@@ -696,12 +696,15 @@ impl NetStack for ProxyTcpStack {
             conn.drain_from_relay();
             conn.flush_tx(now_ms, tx_out);
 
-            // Emit a Window Update ACK once the relay drains receive space.
+            // Emit a Window Update ACK promptly once the relay reopens >= 256 KiB
+            // after a low/zero window so the local OS sender never stalls in
+            // zero-window persist waiting for megabytes to drain.
             let current_wnd = conn.rcv_wnd_bytes();
+            let reopen_threshold = (conn.max_rcv_buf as u32 / 4).min(256 * 1024);
             if !conn.need_ack
                 && matches!(conn.state, TcpState::Established)
-                && conn.last_advertised_wnd < (conn.max_rcv_buf as u32 / 2)
-                && current_wnd >= (conn.max_rcv_buf as u32 * 3 / 4)
+                && conn.last_advertised_wnd < reopen_threshold
+                && current_wnd >= reopen_threshold
             {
                 conn.need_ack = true;
             }

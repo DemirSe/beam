@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc};
 
 const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
-const DEFAULT_TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_TCP_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 /// Tuning parameters for a [`NetStack`] implementation.
 #[derive(Clone, Copy, Debug)]
