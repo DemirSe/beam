@@ -22,6 +22,7 @@ use crate::udp::{UdpBridgeConfig, UdpNatBridge};
 const MAX_PACKET_BUF: usize = 65_536;
 const TUN_TX_CHANNEL_CAP: usize = 512;
 const DEFAULT_IDLE_POLL_MS: u64 = 100;
+const RX_BATCH_MAX: usize = 64;
 
 /// Configuration for [`run_tun_engine`].
 #[derive(Clone, Debug)]
@@ -115,31 +116,39 @@ where
                 device.send(&reply_pkt).await?;
             }
             read_res = device.recv(&mut recv_buf) => {
-                let n = read_res?;
-                if n == 0 {
-                    continue;
-                }
-                let raw = &recv_buf[..n];
-                let Some(ip) = parse_ipv4(raw) else {
-                    continue;
-                };
-                match config.route.classify(&ip) {
-                    RouteDecision::ProxyTcp => {
-                        stack.push_ipv4_tcp(ip.raw);
-                    }
-                    RouteDecision::ProxyUdp => {
-                        if let Some(udp) = parse_udp(ip.payload) {
-                            let src = SocketAddrV4::new(ip.src_ip, udp.src_port);
-                            let dst = SocketAddrV4::new(ip.dst_ip, udp.dst_port);
-                            udp_bridge.handle_datagram(src, dst, udp.payload).await;
+                let mut n = read_res?;
+                for batch_idx in 0..RX_BATCH_MAX {
+                    if n > 0 {
+                        let raw = &recv_buf[..n];
+                        if let Some(ip) = parse_ipv4(raw) {
+                            match config.route.classify(&ip) {
+                                RouteDecision::ProxyTcp => {
+                                    stack.push_ipv4_tcp(ip.raw);
+                                }
+                                RouteDecision::ProxyUdp => {
+                                    if let Some(udp) = parse_udp(ip.payload) {
+                                        let src = SocketAddrV4::new(ip.src_ip, udp.src_port);
+                                        let dst = SocketAddrV4::new(ip.dst_ip, udp.dst_port);
+                                        udp_bridge.handle_datagram(src, dst, udp.payload).await;
+                                    }
+                                }
+                                RouteDecision::RejectIcmpUnreachable => {
+                                    if let Some(icmp) = build_icmp_port_unreachable(&ip) {
+                                        let _ = tun_tx.try_send(icmp);
+                                    }
+                                }
+                                RouteDecision::Drop => {}
+                            }
                         }
                     }
-                    RouteDecision::RejectIcmpUnreachable => {
-                        if let Some(icmp) = build_icmp_port_unreachable(&ip) {
-                            let _ = tun_tx.try_send(icmp);
-                        }
+                    if batch_idx + 1 == RX_BATCH_MAX {
+                        break;
                     }
-                    RouteDecision::Drop => {}
+                    match device.try_recv_into(&mut recv_buf) {
+                        Ok(Some(next_n)) => n = next_n,
+                        Ok(None) => break,
+                        Err(err) => return Err(EngineError::Device(err)),
+                    }
                 }
             }
             () = stack_waker.notified() => {}
@@ -178,44 +187,46 @@ fn spawn_tcp_relay(
         };
 
         let idle = client_config.idle_timeout;
-        let (mut tun_r, mut tun_w) = tokio::io::split(conn.stream);
+        let (mut tun_r, mut tun_w) = conn.stream.into_split();
         let (mut up_r, mut up_w) = tokio::io::split(upstream);
 
         let c2s = async {
-            let mut buf = vec![0u8; 16 * 1024];
             loop {
-                let n = match timeout(idle, tun_r.read(&mut buf)).await {
-                    Ok(Ok(0)) => {
+                let chunk = match timeout(idle, tun_r.recv_chunk()).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => {
                         let _ = up_w.shutdown().await;
                         break;
                     }
-                    Ok(Ok(n)) => n,
-                    _ => break,
+                    Err(_) => break,
                 };
-                if !matches!(timeout(idle, up_w.write_all(&buf[..n])).await, Ok(Ok(()))) {
+                if !matches!(timeout(idle, up_w.write_all(&chunk)).await, Ok(Ok(()))) {
                     break;
                 }
-                if !matches!(timeout(idle, up_w.flush()).await, Ok(Ok(()))) {
+                // Flush only when no further chunk is already queued, preserving
+                // 0 ms interactive latency while avoiding per-chunk flush stalls
+                // during bulk uploads.
+                if !tun_r.has_queued() && !matches!(timeout(idle, up_w.flush()).await, Ok(Ok(()))) {
                     break;
                 }
             }
         };
 
         let s2c = async {
-            let mut buf = vec![0u8; 16 * 1024];
+            let mut buf = vec![0u8; 64 * 1024];
             loop {
                 let n = match timeout(idle, up_r.read(&mut buf)).await {
                     Ok(Ok(0)) => {
-                        let _ = tun_w.shutdown().await;
+                        tun_w.shutdown();
                         break;
                     }
                     Ok(Ok(n)) => n,
                     _ => break,
                 };
-                if !matches!(timeout(idle, tun_w.write_all(&buf[..n])).await, Ok(Ok(()))) {
-                    break;
-                }
-                if !matches!(timeout(idle, tun_w.flush()).await, Ok(Ok(()))) {
+                if !matches!(
+                    timeout(idle, tun_w.send_chunk(buf[..n].to_vec())).await,
+                    Ok(Ok(()))
+                ) {
                     break;
                 }
             }

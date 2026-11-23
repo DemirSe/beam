@@ -14,6 +14,12 @@ pub trait TunDevice: Send + 'static {
     /// Receives one IP packet into `buf` and returns its byte length.
     fn recv(&mut self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
 
+    /// Non-blocking receive of one additional queued packet for batching.
+    /// Returns `Ok(None)` when no packet is immediately ready.
+    fn try_recv_into(&mut self, _buf: &mut [u8]) -> io::Result<Option<usize>> {
+        Ok(None)
+    }
+
     /// Sends one complete IP packet to the OS / peer.
     fn send(&mut self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
 }
@@ -72,6 +78,20 @@ impl TunDevice for MemoryTun {
         }
         buf[..pkt.len()].copy_from_slice(&pkt);
         Ok(pkt.len())
+    }
+
+    fn try_recv_into(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        let Ok(pkt) = self.rx.try_recv() else {
+            return Ok(None);
+        };
+        if pkt.len() > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packet exceeds receive buffer",
+            ));
+        }
+        buf[..pkt.len()].copy_from_slice(&pkt);
+        Ok(Some(pkt.len()))
     }
 
     async fn send(&mut self, packet: &[u8]) -> io::Result<()> {

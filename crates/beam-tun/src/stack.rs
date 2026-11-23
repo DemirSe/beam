@@ -23,9 +23,10 @@ use tokio::sync::{Notify, mpsc};
 use crate::packet::{IP_PROTO_TCP, parse_ipv4, parse_tcp_syn};
 
 const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
-const DEFAULT_TCP_BUFFER_BYTES: usize = 64 * 1024;
+const DEFAULT_TCP_BUFFER_BYTES: usize = 256 * 1024;
 const STREAM_CHANNEL_CAPACITY: usize = 32;
-const MAX_POLL_ITERATIONS: usize = 16;
+const RELAY_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_POLL_ITERATIONS: usize = 32;
 
 /// Tuning parameters for a [`NetStack`] implementation.
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +89,79 @@ pub struct TunTcpStream {
     read_offset: usize,
     to_stack: Option<mpsc::Sender<Vec<u8>>>,
     waker: Arc<Notify>,
+}
+
+/// Owned read half of a [`TunTcpStream`].
+pub struct TunTcpReader {
+    from_stack: mpsc::Receiver<Vec<u8>>,
+    waker: Arc<Notify>,
+}
+
+impl TunTcpReader {
+    /// Receives the next chunk from the TUN TCP socket, or `None` on EOF.
+    pub async fn recv_chunk(&mut self) -> Option<Vec<u8>> {
+        let chunk = self.from_stack.recv().await?;
+        self.waker.notify_one();
+        Some(chunk)
+    }
+
+    /// Returns `true` if another chunk is already buffered in the channel.
+    pub fn has_queued(&self) -> bool {
+        !self.from_stack.is_empty()
+    }
+}
+
+/// Owned write half of a [`TunTcpStream`] with spin-free async backpressure.
+pub struct TunTcpWriter {
+    to_stack: Option<mpsc::Sender<Vec<u8>>>,
+    waker: Arc<Notify>,
+}
+
+impl TunTcpWriter {
+    /// Sends a chunk to the TUN TCP socket, awaiting backpressure without spinning.
+    pub async fn send_chunk(&mut self, data: Vec<u8>) -> io::Result<()> {
+        let Some(tx) = self.to_stack.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TUN TCP stream already shut down",
+            ));
+        };
+        tx.send(data)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUN TCP socket closed"))?;
+        self.waker.notify_one();
+        Ok(())
+    }
+
+    /// Closes the write half (triggers TCP FIN on the TUN socket).
+    pub fn shutdown(&mut self) {
+        self.to_stack.take();
+        self.waker.notify_one();
+    }
+}
+
+impl Drop for TunTcpWriter {
+    fn drop(&mut self) {
+        self.to_stack.take();
+        self.waker.notify_one();
+    }
+}
+
+impl TunTcpStream {
+    /// Splits this stream into spin-free chunked read and write halves.
+    pub fn into_split(mut self) -> (TunTcpReader, TunTcpWriter) {
+        let (_, dummy_rx) = mpsc::channel(1);
+        let from_stack = std::mem::replace(&mut self.from_stack, dummy_rx);
+        let to_stack = self.to_stack.take();
+        let waker = Arc::clone(&self.waker);
+        (
+            TunTcpReader {
+                from_stack,
+                waker: Arc::clone(&waker),
+            },
+            TunTcpWriter { to_stack, waker },
+        )
+    }
 }
 
 impl AsyncRead for TunTcpStream {
@@ -325,6 +399,9 @@ impl NetStack for SmoltcpStack {
                 let tx_buf = SocketBuffer::new(vec![0u8; self.config.socket_buffer_bytes]);
                 let mut sock = TcpSocket::new(rx_buf, tx_buf);
                 sock.set_nagle_enabled(false);
+                // Immediate ACKs on the local TUN avoid 10 ms delayed-ACK
+                // stalls during high-BDP uploads.
+                sock.set_ack_delay(None);
                 let listen_ep = IpListenEndpoint {
                     addr: Some(IpAddress::Ipv4(ip.dst_ip)),
                     port: dst_port,
@@ -409,7 +486,7 @@ impl NetStack for SmoltcpStack {
                         };
                         let mut data = Vec::new();
                         let res = sock.recv(|buf| {
-                            let take = buf.len().min(16 * 1024);
+                            let take = buf.len().min(RELAY_CHUNK_BYTES);
                             data.extend_from_slice(&buf[..take]);
                             (take, ())
                         });

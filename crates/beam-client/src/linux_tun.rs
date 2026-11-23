@@ -48,6 +48,14 @@ impl TunDevice for AsyncLinuxTun {
         }
     }
 
+    fn try_recv_into(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        match self.inner.get_ref().read_packet(buf) {
+            Ok(n) => Ok(Some(n)),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     async fn send(&mut self, packet: &[u8]) -> io::Result<()> {
         loop {
             let mut guard = self.inner.writable().await?;
