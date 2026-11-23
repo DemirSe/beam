@@ -18,7 +18,7 @@ use crate::stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
 const OUR_WSCALE: u8 = 6; // 64x multiplier -> up to ~4 MiB window; capped at max_rcv_buf (2 MiB)
 const DEFAULT_MAX_RCV_BUF: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_SND_BUF: usize = 2 * 1024 * 1024;
-const MAX_OOO_SEGMENTS: usize = 64;
+const MAX_OOO_SEGMENTS: usize = 256;
 const STREAM_CHANNEL_CAP: usize = 64;
 const RELAY_COALESCE_BYTES: usize = 64 * 1024;
 const INITIAL_RTO_MS: i64 = 200;
@@ -239,8 +239,18 @@ impl TcpConn {
                 TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
             )
         {
-            self.process_data(seg.seq, seg.payload);
-            self.need_ack = true;
+            let out_of_order = self.process_data(seg.seq, seg.payload);
+            if out_of_order {
+                // RFC 5681: emit an immediate duplicate ACK for every
+                // out-of-order segment so the local OS triggers Fast
+                // Retransmit (3 dup-ACKs) in 0 ms instead of a 200 ms RTO.
+                if let Some(pkt) = self.build_packet_slices(TCP_ACK, &[], &[], &[], self.snd_nxt) {
+                    tx_out.push(pkt);
+                }
+                self.need_ack = false;
+            } else {
+                self.need_ack = true;
+            }
         }
 
         let fin_seq = seg.seq.wrapping_add(seg.payload.len() as u32);
@@ -328,12 +338,13 @@ impl TcpConn {
         }
     }
 
-    fn process_data(&mut self, seq: u32, payload: &[u8]) {
+    /// Returns `true` if the segment arrived ahead of `rcv_nxt` (out-of-order).
+    fn process_data(&mut self, seq: u32, payload: &[u8]) -> bool {
         let rel = seq.wrapping_sub(self.rcv_nxt) as i32;
         if rel <= 0 {
             let skip = (-rel) as usize;
             if skip >= payload.len() {
-                return;
+                return false;
             }
             let fresh = &payload[skip..];
             self.rcv_coalesce.extend_from_slice(fresh);
@@ -342,14 +353,18 @@ impl TcpConn {
                 self.queue_coalesce_chunk();
             }
             self.drain_ooo();
-        } else if self.ooo.len() < MAX_OOO_SEGMENTS
-            && self.ooo_bytes.saturating_add(payload.len()) <= self.max_rcv_buf
-        {
-            let entry = self.ooo.entry(seq).or_default();
-            if payload.len() > entry.len() {
-                self.ooo_bytes = self.ooo_bytes.saturating_add(payload.len() - entry.len());
-                *entry = payload.to_vec();
+            false
+        } else {
+            if self.ooo.len() < MAX_OOO_SEGMENTS
+                && self.ooo_bytes.saturating_add(payload.len()) <= self.max_rcv_buf
+            {
+                let entry = self.ooo.entry(seq).or_default();
+                if payload.len() > entry.len() {
+                    self.ooo_bytes = self.ooo_bytes.saturating_add(payload.len() - entry.len());
+                    *entry = payload.to_vec();
+                }
             }
+            true
         }
     }
 
