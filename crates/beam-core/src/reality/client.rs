@@ -506,6 +506,12 @@ pub fn build_client_connection_at(
     Ok(conn)
 }
 
+/// Fuzzing entry point for the DER X.509 Ed25519 certificate parser.
+#[cfg(feature = "fuzz")]
+pub fn fuzz_extract_ed25519_cert_fields(der: &[u8]) -> Option<([u8; 32], [u8; 64])> {
+    extract_ed25519_cert_fields(der)
+}
+
 /// Extracts the 32-byte Ed25519 public key and 64-byte signature from a
 /// DER-encoded X.509 Certificate.
 ///

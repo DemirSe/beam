@@ -10,6 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 beam-core = { path = "../crates/beam-core", features = ["fuzz"] }
+beam-tun = { path = "../crates/beam-tun" }
 libfuzzer-sys = "0.4"
 
 [[bin]]
@@ -57,6 +58,20 @@ bench = false
 [[bin]]
 name = "config"
 path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reality_cert"
+path = "fuzz_targets/reality_cert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tun_packet"
+path = "fuzz_targets/tun_packet.rs"
 test = false
 doc = false
 bench = false

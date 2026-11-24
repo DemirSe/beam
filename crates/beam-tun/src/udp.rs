@@ -224,7 +224,8 @@ impl UdpNatBridge {
                         }
                         last_dst = target;
                         task_active.store(start.elapsed().as_millis() as u64, Ordering::Release);
-                        if session.send_to(socket_to_netloc(target), &data).await.is_err() {
+                        if let Err(err) = session.send_to(socket_to_netloc(target), &data).await {
+                            warn!(%target, error = %err, "xudp session send_to failed");
                             break;
                         }
                     }

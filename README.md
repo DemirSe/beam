@@ -583,6 +583,35 @@ VLESS with `xtls-rprx-vision` is expected to work.
   change. Client TUN profiles use MTU 1500; lowering that MTU loses some
   HTTP/3 paths and stalls large H3 bodies in gVisor.
 
+## Client (`beam-client`)
+
+`beam-client` is a lightweight, single-purpose Rust TUN client for `beam`
+(`crates/beam-client` + `crates/beam-tun`), designed as a low-CPU, always-on
+replacement for `sing-box` on Linux (with a platform-independent core for
+future Windows `WinTun` and Android `VpnService` backends).
+
+- **Protocol & cover:** pure-Rust REALITY TLS 1.3 (`rustls` + `aws-lc-rs`,
+  default cover SNI `whatsapp.net`), VLESS + Vision Direct handoff, and
+  non-blocking full-cone XUDP.
+- **Custom proxy TCP/IP stack (`ProxyTcpStack`):** zero external TCP stack
+  dependencies, IPv4 + IPv6, RFC 7323 Window Scaling (4 MiB default buffer),
+  zero-copy `VecDeque::as_slices()` TX segmentation, immediate dup-ACKs on
+  out-of-order segments, and prompt window updates.
+- **Built-in DNS & bypass:** optional `[dns]` interceptor supporting DoH
+  (`https://...`) and plain DNS (`tcp://` / `udp://`) through the tunnel with a
+  bounded LRU TTL cache, automatic `.lan`/`.local`/`.internal` + `[bypass]`
+  (`cidrs` and `domains`) split to the pre-VPN local DNS, and `reject_quic = true`
+  by default (immediate ICMP/ICMPv6 Port Unreachable on UDP/443 so browsers
+  fall back cleanly to TCP/HTTPS + Vision Direct).
+- **Always-on resilience:** fail-closed kill-switch split routes (`0.0.0.0/1`,
+  `128.0.0.0/1`, `::/1`, `8000::/1`), automatic physical gateway & wake-from-sleep
+  detection that migrates bypass routes, sends immediate `TCP RST` to dead
+  flows, resets XUDP/local DNS, and publishes live state + RTT to
+  `/run/beam-client/status` for `clients/linux-tray/tray.c`.
+- **Service & config:** start from [`config.client.example.toml`](config.client.example.toml)
+  and [`deploy/beam-client.service`](deploy/beam-client.service); validate with
+  `beam-client --check -c /etc/beam/client.toml`.
+
 ## Security notes
 
 - **Single-user only.** One user ID, one inbound, and no account system. beam

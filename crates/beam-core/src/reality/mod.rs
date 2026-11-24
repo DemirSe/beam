@@ -9,6 +9,8 @@ pub mod auth;
 pub mod client;
 
 pub use auth::{Auth, AuthError, RealityAuthConfig, authenticate};
+#[cfg(feature = "fuzz")]
+pub use client::fuzz_extract_ed25519_cert_fields;
 pub use client::{
     RealityClientConfig, RealityClientError, build_client_connection, build_client_connection_at,
 };

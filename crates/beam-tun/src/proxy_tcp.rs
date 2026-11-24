@@ -1157,4 +1157,71 @@ mod tests {
             "relay stream must close"
         );
     }
+
+    #[tokio::test]
+    async fn ipv6_tcp_handshake_data_and_fin() {
+        let src6: IpAddr = "fd00:be:a::1".parse().expect("src6");
+        let dst6: IpAddr = "2001:db8::1".parse().expect("dst6");
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+
+        let syn = build_ip_tcp_packet_slices(
+            src6,
+            44_000,
+            dst6,
+            443,
+            9000,
+            0,
+            TCP_SYN,
+            65535,
+            &[2, 4, 0x05, 0xa0, 1, 3, 3, 6],
+            &[],
+            &[],
+        )
+        .expect("v6 syn");
+        stack.push_ip_tcp(&syn);
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+        stack.poll(10, &mut tx, &mut accepted);
+        assert_eq!(tx.len(), 1);
+        let syn_ack_ip = parse_ip(&tx[0]).expect("v6 ip");
+        assert_eq!(syn_ack_ip.src_ip, dst6);
+        assert_eq!(syn_ack_ip.dst_ip, src6);
+        let syn_ack = parse_tcp(syn_ack_ip.payload).expect("v6 syn-ack");
+        assert_eq!(syn_ack.flags, TCP_SYN | TCP_ACK);
+
+        let ack_data = build_ip_tcp_packet_slices(
+            src6,
+            44_000,
+            dst6,
+            443,
+            9001,
+            syn_ack.seq.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            1024,
+            &[],
+            b"hello-ipv6",
+            &[],
+        )
+        .expect("v6 data");
+        tx.clear();
+        stack.push_ip_tcp(&ack_data);
+        stack.poll(20, &mut tx, &mut accepted);
+        assert_eq!(accepted.len(), 1);
+
+        let (mut reader, mut writer) = accepted.pop().expect("acc").stream.into_split();
+        assert_eq!(reader.recv_chunk().await.expect("data"), b"hello-ipv6");
+
+        writer
+            .send_chunk(b"reply-ipv6".to_vec())
+            .await
+            .expect("send");
+        writer.shutdown();
+        tx.clear();
+        stack.poll(30, &mut tx, &mut accepted);
+        assert!(tx.iter().any(|p| {
+            parse_ip(p)
+                .and_then(|ip| parse_tcp(ip.payload))
+                .is_some_and(|seg| seg.payload == b"reply-ipv6")
+        }));
+    }
 }
