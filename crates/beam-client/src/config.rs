@@ -7,7 +7,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use beam_core::client::BeamClientConfig;
 use beam_core::reality::RealityClientConfig;
-use beam_tun::{RoutePolicy, TcpStackConfig, TunEngineConfig, UdpBridgeConfig};
+use beam_tun::{
+    DnsConfig, DnsUpstream, IpNet, RoutePolicy, TcpStackConfig, TunEngineConfig, UdpBridgeConfig,
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -18,6 +20,10 @@ pub struct ClientFileConfig {
     pub server: ServerSection,
     #[serde(default)]
     pub tun: TunSection,
+    #[serde(default)]
+    pub dns: DnsSection,
+    #[serde(default)]
+    pub bypass: BypassSection,
     #[serde(default)]
     pub limits: LimitsSection,
     #[serde(default)]
@@ -67,6 +73,45 @@ impl Default for TunSection {
             drop_private_destinations: true,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_dns_upstream")]
+    pub upstream: String,
+    #[serde(default)]
+    pub local_upstream: Option<String>,
+    #[serde(default = "default_local_suffixes")]
+    pub local_suffixes: Vec<String>,
+    #[serde(default = "default_dns_cache_size")]
+    pub cache_size: usize,
+    #[serde(default = "default_dns_timeout_ms")]
+    pub query_timeout_ms: u64,
+}
+
+impl Default for DnsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            upstream: default_dns_upstream(),
+            local_upstream: None,
+            local_suffixes: default_local_suffixes(),
+            cache_size: default_dns_cache_size(),
+            query_timeout_ms: default_dns_timeout_ms(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BypassSection {
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -135,6 +180,18 @@ fn default_idle_timeout_ms() -> u64 {
 fn default_log_level() -> String {
     "info".to_owned()
 }
+fn default_dns_upstream() -> String {
+    "https://1.1.1.1/dns-query".to_owned()
+}
+fn default_local_suffixes() -> Vec<String> {
+    DnsConfig::default_local_suffixes()
+}
+fn default_dns_cache_size() -> usize {
+    1024
+}
+fn default_dns_timeout_ms() -> u64 {
+    4_000
+}
 
 /// Errors returned while loading or validating `beam-client` configuration.
 #[derive(Debug, thiserror::Error)]
@@ -156,6 +213,7 @@ pub struct ValidatedConfig {
     pub auto_route: bool,
     pub log_level: String,
     pub server_ip: Option<Ipv4Addr>,
+    pub bypass_cidrs: Vec<String>,
     pub engine: TunEngineConfig,
     pub tcp_stack: TcpStackConfig,
 }
@@ -230,6 +288,54 @@ impl ClientFileConfig {
         client.handshake_timeout = Duration::from_millis(self.limits.handshake_timeout_ms);
         client.idle_timeout = Duration::from_millis(self.limits.idle_timeout_ms);
 
+        if self.bypass.cidrs.len() > 256 {
+            return Err(ConfigError::Invalid(
+                "bypass.cidrs must contain at most 256 entries".into(),
+            ));
+        }
+        if self.bypass.domains.len() > 256 {
+            return Err(ConfigError::Invalid(
+                "bypass.domains must contain at most 256 entries".into(),
+            ));
+        }
+        let mut parsed_bypass_cidrs = Vec::with_capacity(self.bypass.cidrs.len());
+        let mut bypass_cidrs_raw = Vec::with_capacity(self.bypass.cidrs.len());
+        for cidr in &self.bypass.cidrs {
+            let trimmed = cidr.trim();
+            let net = IpNet::parse_cidr(trimmed).ok_or_else(|| {
+                ConfigError::Invalid(format!("bypass.cidrs has invalid CIDR: {trimmed}"))
+            })?;
+            parsed_bypass_cidrs.push(net);
+            bypass_cidrs_raw.push(trimmed.to_owned());
+        }
+
+        let dns_cfg = if self.dns.enabled {
+            if self.dns.cache_size > 16_384 {
+                return Err(ConfigError::Invalid(
+                    "dns.cache_size must be <= 16384".into(),
+                ));
+            }
+            if !(200..=30_000).contains(&self.dns.query_timeout_ms) {
+                return Err(ConfigError::Invalid(
+                    "dns.query_timeout_ms must be in 200..=30000".into(),
+                ));
+            }
+            let upstream = DnsUpstream::parse(&self.dns.upstream)
+                .map_err(|e| ConfigError::Invalid(format!("dns.upstream: {e}")))?;
+            let local_upstream = match self.dns.local_upstream.as_deref() {
+                Some(raw) if !raw.trim().is_empty() => Some(parse_dns_socket_addr(raw)?),
+                _ => detect_system_local_dns(),
+            };
+            let mut cfg = DnsConfig::new(upstream, local_upstream);
+            cfg.local_suffixes = self.dns.local_suffixes;
+            cfg.bypass_domains = self.bypass.domains;
+            cfg.cache_size = self.dns.cache_size;
+            cfg.query_timeout = Duration::from_millis(self.dns.query_timeout_ms);
+            Some(cfg)
+        } else {
+            None
+        };
+
         let server_ip = match self.server.address.ip() {
             IpAddr::V4(ip) => Some(ip),
             IpAddr::V6(_) => None,
@@ -240,6 +346,8 @@ impl ClientFileConfig {
             reject_quic: self.tun.reject_quic,
             drop_private_destinations: self.tun.drop_private_destinations,
             exclude_ips,
+            bypass_cidrs: parsed_bypass_cidrs,
+            intercept_dns: dns_cfg.is_some(),
         };
 
         let engine = TunEngineConfig {
@@ -250,6 +358,7 @@ impl ClientFileConfig {
                 max_sessions: self.limits.max_udp_sessions,
                 idle_timeout: Duration::from_millis(self.limits.idle_timeout_ms.min(60_000)),
             },
+            dns: dns_cfg,
         };
 
         let tcp_stack = TcpStackConfig {
@@ -265,10 +374,57 @@ impl ClientFileConfig {
             auto_route: self.tun.auto_route,
             log_level: self.log.level,
             server_ip,
+            bypass_cidrs: bypass_cidrs_raw,
             engine,
             tcp_stack,
         })
     }
+}
+
+fn parse_dns_socket_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
+    let trimmed = raw.trim();
+    if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+        return Ok(sock);
+    }
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, 53));
+    }
+    Err(ConfigError::Invalid(format!(
+        "dns.local_upstream must be IP or IP:port, got: {trimmed}"
+    )))
+}
+
+/// Auto-detects the host's pre-VPN local DNS server from systemd-resolved's
+/// upstream resolv.conf or `/etc/resolv.conf`, skipping loopback stubs.
+pub fn detect_system_local_dns() -> Option<SocketAddr> {
+    for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
+        if let Ok(content) = std::fs::read_to_string(path)
+            && let Some(addr) = parse_resolv_conf_nameserver(&content)
+        {
+            return Some(addr);
+        }
+    }
+    None
+}
+
+fn parse_resolv_conf_nameserver(content: &str) -> Option<SocketAddr> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("nameserver") else {
+            continue;
+        };
+        let Some(ip_str) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(ip) = ip_str.parse::<IpAddr>() else {
+            continue;
+        };
+        if ip.is_loopback() || ip.is_unspecified() {
+            continue;
+        }
+        return Some(SocketAddr::new(ip, 53));
+    }
+    None
 }
 
 fn validate_ipv4_cidr(cidr: &str) -> Result<(), ConfigError> {
@@ -319,5 +475,46 @@ mod tests {
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         );
         assert!(ClientFileConfig::parse_and_validate(&zero_pk).is_err());
+    }
+
+    #[test]
+    fn parses_dns_and_bypass_sections() {
+        let with_bypass = EXAMPLE
+            .replace(
+                "cidrs = []",
+                "cidrs = [\"198.51.100.0/24\", \"2001:db8::/32\"]",
+            )
+            .replace("domains = []", "domains = [\"corp.example\"]");
+        let cfg = ClientFileConfig::parse_and_validate(&with_bypass).expect("valid config");
+        assert!(cfg.engine.dns.is_some());
+        assert!(cfg.engine.route.intercept_dns);
+        assert_eq!(cfg.bypass_cidrs.len(), 2);
+        assert_eq!(cfg.engine.route.bypass_cidrs.len(), 2);
+        assert_eq!(
+            cfg.engine.dns.as_ref().expect("dns").bypass_domains,
+            vec!["corp.example".to_owned()]
+        );
+
+        let bad_cidr = EXAMPLE.replace("cidrs = []", "cidrs = [\"not-a-cidr\"]");
+        assert!(ClientFileConfig::parse_and_validate(&bad_cidr).is_err());
+
+        let bad_dns = EXAMPLE.replace(
+            "https://1.1.1.1/dns-query",
+            "http://insecure.example/dns-query",
+        );
+        assert!(ClientFileConfig::parse_and_validate(&bad_dns).is_err());
+    }
+
+    #[test]
+    fn resolv_conf_parser_skips_loopback_stub() {
+        let text = "# comment\nnameserver 127.0.0.53\nnameserver 192.168.1.1\n";
+        assert_eq!(
+            parse_resolv_conf_nameserver(text),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                53
+            ))
+        );
+        assert_eq!(parse_resolv_conf_nameserver("nameserver 127.0.0.1\n"), None);
     }
 }

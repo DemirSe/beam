@@ -15,6 +15,22 @@ mtu = 1500
 auto_route = true
 reject_quic = true
 
+[dns]
+enabled = true
+# Supports DoH ("https://1.1.1.1/dns-query" or "https://dns.nextdns.io/<id>"),
+# plain TCP ("tcp://1.1.1.1:53"), or plain UDP ("1.1.1.1:53").
+upstream = "https://1.1.1.1/dns-query"
+# Omit local_upstream to auto-detect the host's pre-VPN local DNS.
+# local_upstream = "192.168.1.1:53"
+local_suffixes = ["lan", "local", "internal"]
+cache_size = 1024
+query_timeout_ms = 4000
+
+[bypass]
+# Extra IPv4/IPv6 CIDRs or domain suffixes kept outside the tunnel.
+cidrs = []
+domains = []
+
 [limits]
 max_tcp_connections = 256
 max_udp_sessions = 256

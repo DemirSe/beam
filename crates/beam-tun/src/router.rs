@@ -4,6 +4,56 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::packet::{IP_PROTO_TCP, IP_PROTO_UDP, IpPacketView, parse_udp};
 
+/// Minimal zero-dependency IPv4/IPv6 CIDR network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpNet {
+    V4 { net: u32, mask: u32 },
+    V6 { net: u128, mask: u128 },
+}
+
+impl IpNet {
+    /// Parses an IPv4 or IPv6 CIDR string (e.g. `10.20.0.0/16`, `2001:db8::/32`).
+    pub fn parse_cidr(raw: &str) -> Option<Self> {
+        let (ip_str, prefix_str) = raw.trim().split_once('/')?;
+        let ip: IpAddr = ip_str.parse().ok()?;
+        let prefix: u8 = prefix_str.parse().ok()?;
+        match ip {
+            IpAddr::V4(v4) if prefix <= 32 => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                Some(Self::V4 {
+                    net: u32::from(v4) & mask,
+                    mask,
+                })
+            }
+            IpAddr::V6(v6) if prefix <= 128 => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                Some(Self::V6 {
+                    net: u128::from(v6) & mask,
+                    mask,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns `true` when `ip` falls inside this CIDR prefix.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (*self, ip) {
+            (Self::V4 { net, mask }, IpAddr::V4(v4)) => (u32::from(v4) & mask) == net,
+            (Self::V6 { net, mask }, IpAddr::V6(v6)) => (u128::from(v6) & mask) == net,
+            _ => false,
+        }
+    }
+}
+
 /// Routing policy applied to packets arriving from the TUN interface.
 #[derive(Clone, Debug)]
 pub struct RoutePolicy {
@@ -16,6 +66,11 @@ pub struct RoutePolicy {
     /// Explicit IP addresses excluded from tunneling (always includes the
     /// `beam` server IP to prevent routing loops).
     pub exclude_ips: Vec<IpAddr>,
+    /// Explicit user-configured CIDR prefixes excluded from tunneling.
+    pub bypass_cidrs: Vec<IpNet>,
+    /// Intercept UDP/53 packets in the built-in DNS resolver (including
+    /// queries addressed to private/TUN DNS IPs).
+    pub intercept_dns: bool,
 }
 
 impl Default for RoutePolicy {
@@ -24,6 +79,8 @@ impl Default for RoutePolicy {
             reject_quic: true,
             drop_private_destinations: true,
             exclude_ips: Vec::new(),
+            bypass_cidrs: Vec::new(),
+            intercept_dns: false,
         }
     }
 }
@@ -35,6 +92,8 @@ pub enum RouteDecision {
     ProxyTcp,
     /// Forward through the XUDP NAT bridge to `beam`.
     ProxyUdp,
+    /// Intercept UDP/53 in the built-in DNS resolver (DoH / plain / local split).
+    InterceptDns,
     /// Reply immediately with ICMP/ICMPv6 Port Unreachable.
     RejectIcmpUnreachable,
     /// Silently drop (unsupported protocol, excluded IP, or private address).
@@ -45,6 +104,16 @@ impl RoutePolicy {
     /// Classifies an IPv4 or IPv6 packet read from the TUN interface.
     pub fn classify(&self, pkt: &IpPacketView<'_>) -> RouteDecision {
         if self.exclude_ips.contains(&pkt.dst_ip) {
+            return RouteDecision::Drop;
+        }
+        if self.intercept_dns
+            && pkt.protocol == IP_PROTO_UDP
+            && let Some(udp) = parse_udp(pkt.payload)
+            && udp.dst_port == 53
+        {
+            return RouteDecision::InterceptDns;
+        }
+        if self.bypass_cidrs.iter().any(|net| net.contains(pkt.dst_ip)) {
             return RouteDecision::Drop;
         }
         if self.drop_private_destinations && is_non_global_ip(pkt.dst_ip) {
@@ -146,6 +215,49 @@ mod tests {
         assert_eq!(
             policy.classify(&parse_ip(&lan).expect("ip")),
             RouteDecision::Drop
+        );
+    }
+
+    #[test]
+    fn bypass_cidrs_and_dns_interception_work() {
+        let net4 = IpNet::parse_cidr("198.51.100.0/24").expect("v4 cidr");
+        assert!(net4.contains(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 42))));
+        assert!(!net4.contains(IpAddr::V4(Ipv4Addr::new(198, 51, 101, 1))));
+        let net6 = IpNet::parse_cidr("2001:db8::/32").expect("v6 cidr");
+        assert!(net6.contains(IpAddr::V6("2001:db8::1".parse().expect("v6"))));
+        assert!(IpNet::parse_cidr("1.2.3.4/33").is_none());
+
+        let policy = RoutePolicy {
+            reject_quic: true,
+            drop_private_destinations: true,
+            exclude_ips: Vec::new(),
+            bypass_cidrs: vec![net4],
+            intercept_dns: true,
+        };
+        let bypassed = build_ipv4_udp_packet(
+            Ipv4Addr::new(172, 19, 0, 1),
+            55555,
+            Ipv4Addr::new(198, 51, 100, 10),
+            9999,
+            b"x",
+        )
+        .expect("udp");
+        assert_eq!(
+            policy.classify(&parse_ip(&bypassed).expect("ip")),
+            RouteDecision::Drop
+        );
+
+        let dns_priv = build_ipv4_udp_packet(
+            Ipv4Addr::new(172, 19, 0, 1),
+            55555,
+            Ipv4Addr::new(172, 19, 0, 2),
+            53,
+            b"q",
+        )
+        .expect("udp");
+        assert_eq!(
+            policy.classify(&parse_ip(&dns_priv).expect("ip")),
+            RouteDecision::InterceptDns
         );
     }
 }

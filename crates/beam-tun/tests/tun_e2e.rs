@@ -158,9 +158,12 @@ async fn tun_tcp_through_beam_server() {
                 reject_quic: true,
                 drop_private_destinations: false,
                 exclude_ips: Vec::new(),
+                bypass_cidrs: Vec::new(),
+                intercept_dns: false,
             },
             max_tcp_connections: 16,
             udp: UdpBridgeConfig::default(),
+            dns: None,
         };
         let stack = ProxyTcpStack::new(TcpStackConfig::default());
         let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));
@@ -296,9 +299,12 @@ async fn tun_udp_and_reject_quic_work_end_to_end() {
                 reject_quic: true,
                 drop_private_destinations: false,
                 exclude_ips: Vec::new(),
+                bypass_cidrs: Vec::new(),
+                intercept_dns: false,
             },
             max_tcp_connections: 16,
             udp: UdpBridgeConfig::default(),
+            dns: None,
         };
         let stack = ProxyTcpStack::new(TcpStackConfig::default());
         let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));
@@ -351,4 +357,154 @@ async fn tun_udp_and_reject_quic_work_end_to_end() {
     })
     .await
     .expect("tun_udp_and_reject_quic_work_end_to_end timed out");
+}
+
+fn build_dns_query(tx_id: u16, name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&tx_id.to_be_bytes());
+    out.extend_from_slice(&0x0100u16.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&[0; 6]);
+    for label in name.split('.') {
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+    out.extend_from_slice(&1u16.to_be_bytes()); // A
+    out.extend_from_slice(&1u16.to_be_bytes()); // IN
+    out
+}
+
+fn build_dns_a_reply(query: &[u8], ip: Ipv4Addr) -> Vec<u8> {
+    let mut out = query.to_vec();
+    out[2] = 0x81;
+    out[3] = 0x80;
+    out[6] = 0;
+    out[7] = 1;
+    out.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+    out.extend_from_slice(&ip.octets());
+    out
+}
+
+#[tokio::test]
+async fn tun_dns_split_and_tunneled_tcp_dns_end_to_end() {
+    timeout(Duration::from_secs(10), async {
+        // 1. Local mock UDP DNS server (must receive `.lan` queries directly).
+        let local_dns = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local dns");
+        let local_dns_addr = local_dns.local_addr().expect("local dns addr");
+        let local_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = local_dns.recv_from(&mut buf).await.expect("local recv");
+            let reply = build_dns_a_reply(&buf[..n], Ipv4Addr::new(192, 168, 1, 77));
+            local_dns.send_to(&reply, peer).await.expect("local send");
+        });
+
+        // 2. Remote mock TCP DNS server (must receive public queries via `beam`).
+        let remote_dns = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind remote dns");
+        let remote_dns_addr = remote_dns.local_addr().expect("remote dns addr");
+        let remote_task = tokio::spawn(async move {
+            let (mut sock, _) = remote_dns.accept().await.expect("accept remote dns");
+            let mut len_buf = [0u8; 2];
+            sock.read_exact(&mut len_buf).await.expect("read len");
+            let qlen = usize::from(u16::from_be_bytes(len_buf));
+            let mut q = vec![0u8; qlen];
+            sock.read_exact(&mut q).await.expect("read query");
+            let reply = build_dns_a_reply(&q, Ipv4Addr::new(93, 184, 216, 34));
+            let rlen = (reply.len() as u16).to_be_bytes();
+            sock.write_all(&rlen).await.expect("write rlen");
+            sock.write_all(&reply).await.expect("write reply");
+        });
+
+        // 3. Real `beam` server
+        let cover_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind cover");
+        let cover_port = cover_listener.local_addr().expect("cover addr").port();
+        let beam_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind beam");
+        let beam_addr = beam_listener.local_addr().expect("beam addr");
+        let srv_cfg = make_server_config(cover_port);
+        let server_task = tokio::spawn(async move {
+            let (sock, _) = beam_listener.accept().await.expect("accept beam");
+            handle_connection(sock, srv_cfg).await
+        });
+
+        // 4. `beam-tun` engine with built-in DNS split enabled
+        let (engine_tun, mut host_tun) = MemoryTun::pair(1500, 128);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let dns_cfg = beam_tun::DnsConfig::new(
+            beam_tun::DnsUpstream::PlainTcp(remote_dns_addr),
+            Some(local_dns_addr),
+        );
+        let engine_cfg = TunEngineConfig {
+            client: make_client_config(beam_addr),
+            route: RoutePolicy {
+                reject_quic: true,
+                drop_private_destinations: true,
+                exclude_ips: Vec::new(),
+                bypass_cidrs: Vec::new(),
+                intercept_dns: true,
+            },
+            max_tcp_connections: 16,
+            udp: UdpBridgeConfig::default(),
+            dns: Some(dns_cfg),
+        };
+        let stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));
+
+        let mut buf = vec![0u8; 2048];
+
+        // 4a. `.lan` query -> bypassed to local mock DNS
+        let lan_q = build_dns_query(0x1001, "printer.lan");
+        let lan_pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(172, 19, 0, 1),
+            54_001,
+            Ipv4Addr::new(172, 19, 0, 2),
+            53,
+            &lan_q,
+        )
+        .expect("lan pkt");
+        host_tun.send(&lan_pkt).await.expect("send lan dns");
+        let n = host_tun.recv(&mut buf).await.expect("recv lan dns");
+        let lan_udp = parse_udp(parse_ipv4(&buf[..n]).expect("ip").payload).expect("udp");
+        let (_, lan_ips) = beam_tun::dns::parse_dns_response_meta(lan_udp.payload);
+        assert_eq!(
+            lan_ips,
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 77))]
+        );
+
+        // 4b. Public domain -> tunneled via `beam` to remote mock TCP DNS
+        let pub_q = build_dns_query(0x1002, "example.com");
+        let pub_pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(172, 19, 0, 1),
+            54_002,
+            Ipv4Addr::new(172, 19, 0, 2),
+            53,
+            &pub_q,
+        )
+        .expect("pub pkt");
+        host_tun.send(&pub_pkt).await.expect("send pub dns");
+        let n = host_tun.recv(&mut buf).await.expect("recv pub dns");
+        let pub_udp = parse_udp(parse_ipv4(&buf[..n]).expect("ip").payload).expect("udp");
+        let (_, pub_ips) = beam_tun::dns::parse_dns_response_meta(pub_udp.payload);
+        assert_eq!(
+            pub_ips,
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = engine_task.await;
+        drop(host_tun);
+        let _ = timeout(Duration::from_secs(3), local_task).await;
+        let _ = timeout(Duration::from_secs(3), remote_task).await;
+        let _ = timeout(Duration::from_secs(3), server_task).await;
+        drop(cover_listener);
+    })
+    .await
+    .expect("tun_dns_split_and_tunneled_tcp_dns_end_to_end timed out");
 }

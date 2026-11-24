@@ -14,6 +14,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info};
 
 use crate::device::TunDevice;
+use crate::dns::{DnsConfig, DnsInterceptor};
 use crate::packet::{build_icmp_port_unreachable, parse_ip, parse_udp};
 use crate::router::{RouteDecision, RoutePolicy};
 use crate::stack::{AcceptedTcpStream, NetStack};
@@ -37,6 +38,8 @@ pub struct TunEngineConfig {
     pub max_tcp_connections: usize,
     /// UDP NAT bridge configuration.
     pub udp: UdpBridgeConfig,
+    /// Optional built-in DNS interceptor (DoH / plain DNS + local suffix split).
+    pub dns: Option<DnsConfig>,
 }
 
 /// Errors returned by [`run_tun_engine`].
@@ -69,6 +72,10 @@ where
         tun_tx.clone(),
         Arc::clone(&stack_waker),
     );
+    let dns_interceptor = config
+        .dns
+        .as_ref()
+        .map(|dns_cfg| DnsInterceptor::new(config.client.clone(), dns_cfg.clone(), tun_tx.clone()));
 
     let mut recv_buf = vec![0u8; device.mtu().clamp(2048, MAX_PACKET_BUF)];
     let mut tx_batch: Vec<Vec<u8>> = Vec::with_capacity(64);
@@ -138,6 +145,17 @@ where
                                         let src = SocketAddr::new(ip.src_ip, udp.src_port);
                                         let dst = SocketAddr::new(ip.dst_ip, udp.dst_port);
                                         udp_bridge.handle_datagram(src, dst, udp.payload);
+                                    }
+                                }
+                                RouteDecision::InterceptDns => {
+                                    if let Some(udp) = parse_udp(ip.payload) {
+                                        let src = SocketAddr::new(ip.src_ip, udp.src_port);
+                                        let dst = SocketAddr::new(ip.dst_ip, udp.dst_port);
+                                        if let Some(dns) = dns_interceptor.as_ref() {
+                                            dns.handle_query(src, dst, udp.payload);
+                                        } else {
+                                            udp_bridge.handle_datagram(src, dst, udp.payload);
+                                        }
                                     }
                                 }
                                 RouteDecision::RejectIcmpUnreachable => {

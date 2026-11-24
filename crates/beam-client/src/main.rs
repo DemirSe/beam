@@ -132,6 +132,7 @@ async fn run_client(cfg: config::ValidatedConfig) -> Result<(), Box<dyn std::err
         cfg.mtu,
         cfg.auto_route,
         cfg.server_ip,
+        &cfg.bypass_cidrs,
     )?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

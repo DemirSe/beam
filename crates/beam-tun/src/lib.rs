@@ -12,6 +12,7 @@
 //!   `reject_quic` is enabled.
 
 pub mod device;
+pub mod dns;
 pub mod engine;
 pub mod packet;
 pub mod proxy_tcp;
@@ -20,8 +21,9 @@ pub mod stack;
 pub mod udp;
 
 pub use device::{MemoryTun, TunDevice};
+pub use dns::{DnsConfig, DnsInterceptor, DnsUpstream};
 pub use engine::{EngineError, TunEngineConfig, run_tun_engine};
 pub use proxy_tcp::ProxyTcpStack;
-pub use router::{RouteDecision, RoutePolicy};
+pub use router::{IpNet, RouteDecision, RoutePolicy};
 pub use stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
 pub use udp::{UdpBridgeConfig, UdpNatBridge};

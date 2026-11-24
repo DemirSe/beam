@@ -190,9 +190,12 @@ async fn main() {
             reject_quic: true,
             drop_private_destinations: false,
             exclude_ips: Vec::new(),
+            bypass_cidrs: Vec::new(),
+            intercept_dns: false,
         },
         max_tcp_connections: 32,
         udp: UdpBridgeConfig::default(),
+        dns: None,
     };
     let stack = ProxyTcpStack::new(TcpStackConfig::default());
     let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));

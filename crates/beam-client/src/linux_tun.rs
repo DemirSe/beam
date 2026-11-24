@@ -104,19 +104,22 @@ pub struct LinuxRouteGuard {
     installed_v6_low: bool,
     installed_v6_high: bool,
     bypass_route: Option<(Ipv4Addr, Option<String>, String)>,
+    extra_bypass_v4: Vec<(String, Option<String>, String)>,
 }
 
 impl LinuxRouteGuard {
     /// Brings up `ifname` with `cidr` and `mtu`. When `auto_route` is `true`,
-    /// installs a host bypass route for `server_ip` first, then routes IPv4
-    /// (`0.0.0.0/1`, `128.0.0.0/1`) and IPv6 (`::/1`, `8000::/1`) through
-    /// `ifname` so dual-stack hosts do not leak IPv6 traffic in the clear.
+    /// installs a host bypass route for `server_ip` (and any user-configured
+    /// IPv4 `bypass_cidrs`) first, then routes IPv4 (`0.0.0.0/1`,
+    /// `128.0.0.0/1`) and IPv6 (`::/1`, `8000::/1`) through `ifname` so
+    /// dual-stack hosts do not leak IPv6 traffic in the clear.
     pub fn setup(
         ifname: &str,
         cidr: &str,
         mtu: usize,
         auto_route: bool,
         server_ip: Option<Ipv4Addr>,
+        bypass_cidrs: &[String],
     ) -> io::Result<Self> {
         run_ip(&["addr", "replace", cidr, "dev", ifname])?;
         run_ip(&["link", "set", "dev", ifname, "mtu", &mtu.to_string(), "up"])?;
@@ -130,26 +133,39 @@ impl LinuxRouteGuard {
             installed_v6_low: false,
             installed_v6_high: false,
             bypass_route: None,
+            extra_bypass_v4: Vec::new(),
         };
 
         if auto_route {
+            let detected_gw = detect_default_ipv4_gateway();
             if let Some(ip) = server_ip
                 && !ip.is_loopback()
             {
-                if let Some((maybe_gw, dev)) = detect_default_ipv4_gateway() {
+                if let Some((maybe_gw, dev)) = detected_gw.clone() {
                     let host = format!("{ip}/32");
-                    if let Some(gw) = maybe_gw.as_deref() {
-                        run_ip(&["route", "replace", &host, "via", gw, "dev", &dev])?;
-                        info!(%ip, via = %gw, dev = %dev, "installed server bypass route");
-                    } else {
-                        run_ip(&["route", "replace", &host, "dev", &dev])?;
-                        info!(%ip, dev = %dev, "installed server direct bypass route");
-                    }
+                    install_v4_bypass(&host, maybe_gw.as_deref(), &dev)?;
+                    info!(%ip, via = ?maybe_gw, dev = %dev, "installed server bypass route");
                     guard.bypass_route = Some((ip, maybe_gw, dev));
                 } else {
                     return Err(io::Error::other(
                         "could not detect default IPv4 gateway for server bypass route",
                     ));
+                }
+            }
+
+            if let Some((maybe_gw, dev)) = detected_gw {
+                for cidr_entry in bypass_cidrs {
+                    if is_ipv4_cidr(cidr_entry) {
+                        if let Err(err) = install_v4_bypass(cidr_entry, maybe_gw.as_deref(), &dev) {
+                            warn!(cidr = %cidr_entry, error = %err, "failed to install IPv4 bypass CIDR route");
+                        } else {
+                            guard.extra_bypass_v4.push((
+                                cidr_entry.clone(),
+                                maybe_gw.clone(),
+                                dev.clone(),
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -192,17 +208,36 @@ impl Drop for LinuxRouteGuard {
         if self.installed_v6_high {
             let _ = run_ip(&["-6", "route", "del", "8000::/1", "dev", &self.ifname]);
         }
+        for (cidr_entry, maybe_gw, dev) in &self.extra_bypass_v4 {
+            let _ = remove_v4_bypass(cidr_entry, maybe_gw.as_deref(), dev);
+        }
         if let Some((ip, maybe_gw, dev)) = self.bypass_route.as_ref() {
             let host = format!("{ip}/32");
-            let res = if let Some(gw) = maybe_gw.as_deref() {
-                run_ip(&["route", "del", &host, "via", gw, "dev", dev])
-            } else {
-                run_ip(&["route", "del", &host, "dev", dev])
-            };
-            if let Err(err) = res {
+            if let Err(err) = remove_v4_bypass(&host, maybe_gw.as_deref(), dev) {
                 warn!(%ip, error = %err, "failed to remove server bypass route on shutdown");
             }
         }
+    }
+}
+
+fn is_ipv4_cidr(cidr: &str) -> bool {
+    cidr.split_once('/')
+        .is_some_and(|(ip, _)| ip.parse::<Ipv4Addr>().is_ok())
+}
+
+fn install_v4_bypass(prefix: &str, gw: Option<&str>, dev: &str) -> io::Result<()> {
+    if let Some(gw) = gw {
+        run_ip(&["route", "replace", prefix, "via", gw, "dev", dev])
+    } else {
+        run_ip(&["route", "replace", prefix, "dev", dev])
+    }
+}
+
+fn remove_v4_bypass(prefix: &str, gw: Option<&str>, dev: &str) -> io::Result<()> {
+    if let Some(gw) = gw {
+        run_ip(&["route", "del", prefix, "via", gw, "dev", dev])
+    } else {
+        run_ip(&["route", "del", prefix, "dev", dev])
     }
 }
 
