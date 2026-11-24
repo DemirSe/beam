@@ -40,6 +40,9 @@ pub struct TunEngineConfig {
     pub udp: UdpBridgeConfig,
     /// Optional built-in DNS interceptor (DoH / plain DNS + local suffix split).
     pub dns: Option<DnsConfig>,
+    /// Optional generation counter incremented on network/gateway switches or
+    /// wake-from-sleep to reset active TCP flows (`RST`), XUDP mux, and local DNS.
+    pub network_reset: Option<watch::Receiver<u64>>,
 }
 
 /// Errors returned by [`run_tun_engine`].
@@ -76,6 +79,7 @@ where
         .dns
         .as_ref()
         .map(|dns_cfg| DnsInterceptor::new(config.client.clone(), dns_cfg.clone(), tun_tx.clone()));
+    let mut network_reset = config.network_reset.clone();
 
     let mut recv_buf = vec![0u8; device.mtu().clamp(2048, MAX_PACKET_BUF)];
     let mut tx_batch: Vec<Vec<u8>> = Vec::with_capacity(64);
@@ -125,6 +129,25 @@ where
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     break;
+                }
+            }
+            Ok(()) = async {
+                match network_reset.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let generation = network_reset.as_ref().map(|rx| *rx.borrow()).unwrap_or(0);
+                info!(generation, "network transition detected; resetting TCP flows, XUDP mux, and local DNS cache");
+                stack.reset_all(&mut tx_batch);
+                for pkt in tx_batch.drain(..) {
+                    if let Err(err) = device.send(&pkt).await {
+                        return Err(EngineError::Device(err));
+                    }
+                }
+                udp_bridge.reset();
+                if let Some(dns) = dns_interceptor.as_ref() {
+                    dns.on_network_change();
                 }
             }
             Some(reply_pkt) = tun_rx.recv() => {

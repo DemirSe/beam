@@ -21,7 +21,9 @@
 #include <unistd.h>
 
 #define HELPER "/usr/local/libexec/beam-helper"
-#define TUN_IFACE "sbtun0"
+#define TUN_IFACE_NATIVE "beamtun0"
+#define TUN_IFACE_LEGACY "sbtun0"
+#define STATUS_FILE "/run/beam-client/status"
 #define CATEGORY_SYSTEM_SERVICES 2
 #define INDICATOR_STATUS_ACTIVE 1
 
@@ -79,13 +81,50 @@ static time_t g_cooldown_until;
 
 static int tunnel_present(void)
 {
-    return if_nametoindex(TUN_IFACE) != 0;
+    return if_nametoindex(TUN_IFACE_NATIVE) != 0 ||
+           if_nametoindex(TUN_IFACE_LEGACY) != 0;
+}
+
+static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
+{
+    FILE *fp;
+    char line[128];
+    int found_state = 0;
+
+    state_out[0] = '\0';
+    *rtt_out = -1;
+
+    fp = fopen(STATUS_FILE, "r");
+    if (!fp)
+        return 0;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (strncmp(line, "state=", 6) == 0) {
+            snprintf(state_out, state_cap, "%s", line + 6);
+            found_state = 1;
+        } else if (strncmp(line, "rtt_ms=", 7) == 0) {
+            char *end = NULL;
+            long val = strtol(line + 7, &end, 10);
+            if (end != line + 7 && *end == '\0' && val >= 0 && val <= 60000)
+                *rtt_out = val;
+        }
+    }
+    fclose(fp);
+    return found_state;
 }
 
 static void update_ui(void)
 {
     int connected = tunnel_present();
     int cooling = time(NULL) < g_cooldown_until;
+    char state[32];
+    char label[96];
+    long rtt_ms = -1;
+    const char *icon = "network-vpn-disconnected-symbolic";
+    const char *desc = "Disconnected";
 
     if (g_busy) {
         gtk_menu_item_set_label(g_status_item, "Beam: working...");
@@ -93,17 +132,38 @@ static void update_ui(void)
         return;
     }
 
-    if (g_helper_failed)
+    if (g_helper_failed) {
         gtk_menu_item_set_label(g_status_item, "Beam: error");
-    else
+    } else if (connected && read_client_status(state, sizeof(state), &rtt_ms)) {
+        if (strcmp(state, "connected") == 0) {
+            if (rtt_ms >= 0)
+                snprintf(label, sizeof(label), "Beam: connected (%ld ms)", rtt_ms);
+            else
+                snprintf(label, sizeof(label), "Beam: connected");
+            icon = "network-vpn-symbolic";
+            desc = "Connected";
+        } else if (strcmp(state, "waiting_network") == 0) {
+            snprintf(label, sizeof(label), "Beam: waiting for network...");
+            icon = "network-vpn-acquiring-symbolic";
+            desc = "Waiting for network";
+        } else {
+            snprintf(label, sizeof(label), "Beam: reconnecting...");
+            icon = "network-vpn-acquiring-symbolic";
+            desc = "Reconnecting";
+        }
+        gtk_menu_item_set_label(g_status_item, label);
+    } else {
         gtk_menu_item_set_label(g_status_item,
                                 connected ? "Beam: interface up" : "Beam: interface down");
+        if (connected) {
+            icon = "network-vpn-symbolic";
+            desc = "Interface up";
+        }
+    }
     gtk_menu_item_set_label(g_action_item,
                             connected ? "Disconnect" : "Connect");
     gtk_widget_set_sensitive(g_action_item, !cooling);
-    app_indicator_set_icon_full(g_indicator,
-        connected ? "network-vpn-symbolic" : "network-vpn-disconnected-symbolic",
-        connected ? "Interface up" : "Interface down");
+    app_indicator_set_icon_full(g_indicator, icon, desc);
 }
 
 static gboolean poll_state(gpointer data)

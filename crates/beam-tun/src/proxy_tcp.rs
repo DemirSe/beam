@@ -894,6 +894,14 @@ impl NetStack for ProxyTcpStack {
     fn waker(&self) -> Arc<Notify> {
         Arc::clone(&self.waker)
     }
+
+    fn reset_all(&mut self, tx_out: &mut Vec<Vec<u8>>) {
+        for (_, mut conn) in self.conns.drain() {
+            conn.send_rst(conn.snd_nxt, tx_out);
+        }
+        self.incoming_buf.clear();
+        self.incoming_lens.clear();
+    }
 }
 
 fn next_iss() -> u32 {
@@ -1130,5 +1138,23 @@ mod tests {
         let ack_seg = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
         assert_eq!(ack_seg.flags, TCP_ACK);
         assert_eq!(ack_seg.ack, seq);
+    }
+
+    #[tokio::test]
+    async fn reset_all_emits_rst_and_closes_relay_streams() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let (_srv_nxt, acc) = handshake(&mut stack, 4000);
+        let (mut reader, _writer) = acc.stream.into_split();
+
+        let mut tx = Vec::new();
+        stack.reset_all(&mut tx);
+        assert!(stack.conns.is_empty());
+        assert_eq!(tx.len(), 1);
+        let rst = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_ne!(rst.flags & TCP_RST, 0, "expected TCP RST on reset_all");
+        assert!(
+            reader.recv_chunk().await.is_none(),
+            "relay stream must close"
+        );
     }
 }

@@ -24,6 +24,8 @@ const DEFAULT_MAX_UDP_SESSIONS: usize = 256;
 const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const PER_SESSION_SEND_QUEUE: usize = 32;
 const MAX_PENDING_CONNECT_DATAGRAMS: usize = 64;
+const INITIAL_CONNECT_BACKOFF_MS: u64 = 250;
+const MAX_CONNECT_BACKOFF_MS: u64 = 10_000;
 
 /// Tuning parameters for [`UdpNatBridge`].
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +62,8 @@ pub struct UdpNatBridge {
     mux: Option<Arc<XudpClient>>,
     connecting: Option<oneshot::Receiver<Option<Arc<XudpClient>>>>,
     connect_task: Option<JoinHandle<()>>,
+    connect_backoff_ms: u64,
+    next_connect_allowed_ms: u64,
     pending_initial: VecDeque<(SocketAddr, SocketAddr, Vec<u8>)>,
     sessions: HashMap<SocketAddr, NatEntry>,
 }
@@ -83,8 +87,26 @@ impl UdpNatBridge {
             mux: None,
             connecting: None,
             connect_task: None,
+            connect_backoff_ms: 0,
+            next_connect_allowed_ms: 0,
             pending_initial: VecDeque::with_capacity(MAX_PENDING_CONNECT_DATAGRAMS),
             sessions: HashMap::new(),
+        }
+    }
+
+    /// Aborts active XUDP mux & NAT sessions and clears reconnect backoff
+    /// (called on network/gateway transitions or wake-from-sleep).
+    pub fn reset(&mut self) {
+        if let Some(handle) = self.connect_task.take() {
+            handle.abort();
+        }
+        self.connecting = None;
+        self.mux = None;
+        self.connect_backoff_ms = 0;
+        self.next_connect_allowed_ms = 0;
+        self.pending_initial.clear();
+        for (_, entry) in self.sessions.drain() {
+            entry.task.abort();
         }
     }
 
@@ -103,6 +125,8 @@ impl UdpNatBridge {
                 self.mux = Some(client);
                 self.connecting = None;
                 self.connect_task = None;
+                self.connect_backoff_ms = 0;
+                self.next_connect_allowed_ms = 0;
                 let queued = std::mem::take(&mut self.pending_initial);
                 for (src, dst, payload) in queued {
                     self.handle_datagram(src, dst, &payload);
@@ -112,6 +136,13 @@ impl UdpNatBridge {
                 self.connecting = None;
                 self.connect_task = None;
                 self.pending_initial.clear();
+                let next_backoff = if self.connect_backoff_ms == 0 {
+                    INITIAL_CONNECT_BACKOFF_MS
+                } else {
+                    (self.connect_backoff_ms * 2).min(MAX_CONNECT_BACKOFF_MS)
+                };
+                self.connect_backoff_ms = next_backoff;
+                self.next_connect_allowed_ms = self.now_ms().saturating_add(next_backoff);
             }
             Err(oneshot::error::TryRecvError::Empty) => {}
         }
@@ -252,6 +283,9 @@ impl UdpNatBridge {
 
     fn start_background_connect(&mut self) {
         if self.connecting.is_some() {
+            return;
+        }
+        if self.now_ms() < self.next_connect_allowed_ms {
             return;
         }
         let (tx, rx) = oneshot::channel();

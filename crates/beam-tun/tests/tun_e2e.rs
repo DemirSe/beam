@@ -164,6 +164,7 @@ async fn tun_tcp_through_beam_server() {
             max_tcp_connections: 16,
             udp: UdpBridgeConfig::default(),
             dns: None,
+            network_reset: None,
         };
         let stack = ProxyTcpStack::new(TcpStackConfig::default());
         let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));
@@ -305,6 +306,7 @@ async fn tun_udp_and_reject_quic_work_end_to_end() {
             max_tcp_connections: 16,
             udp: UdpBridgeConfig::default(),
             dns: None,
+            network_reset: None,
         };
         let stack = ProxyTcpStack::new(TcpStackConfig::default());
         let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));
@@ -453,6 +455,7 @@ async fn tun_dns_split_and_tunneled_tcp_dns_end_to_end() {
             max_tcp_connections: 16,
             udp: UdpBridgeConfig::default(),
             dns: Some(dns_cfg),
+            network_reset: None,
         };
         let stack = ProxyTcpStack::new(TcpStackConfig::default());
         let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));

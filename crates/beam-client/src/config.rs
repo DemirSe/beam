@@ -359,6 +359,7 @@ impl ClientFileConfig {
                 idle_timeout: Duration::from_millis(self.limits.idle_timeout_ms.min(60_000)),
             },
             dns: dns_cfg,
+            network_reset: None,
         };
 
         let tcp_stack = TcpStackConfig {

@@ -1,0 +1,42 @@
+[Unit]
+Description=beam-client VLESS REALITY Vision TUN client
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/beam-client --check -c /etc/beam/client.toml
+ExecStart=/usr/local/bin/beam-client -c /etc/beam/client.toml
+Restart=always
+RestartSec=3s
+RestartSteps=4
+RestartMaxDelaySec=60s
+TimeoutStartSec=15s
+TimeoutStopSec=15s
+RuntimeDirectory=beam-client
+RuntimeDirectoryMode=0755
+TasksMax=1024
+LimitNOFILE=65536
+MemoryHigh=128M
+MemoryMax=256M
+LimitCORE=0
+UMask=0022
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

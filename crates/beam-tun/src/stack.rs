@@ -66,6 +66,11 @@ pub trait NetStack: Send + 'static {
     /// Returns a handle notified whenever a relay writes to or closes a
     /// [`TunTcpStream`], allowing the engine loop to wake immediately.
     fn waker(&self) -> Arc<Notify>;
+
+    /// Resets all active TCP flows (emitting `TCP RST` packets into `tx_out`
+    /// and closing relay channels) on network/gateway transitions so local
+    /// applications reconnect immediately instead of hanging on dead sockets.
+    fn reset_all(&mut self, _tx_out: &mut Vec<Vec<u8>>) {}
 }
 
 /// Async TCP stream bridged to a [`NetStack`] socket.

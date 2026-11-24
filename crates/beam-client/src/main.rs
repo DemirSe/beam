@@ -4,10 +4,13 @@
 //! TUN client for `beam`.
 
 mod config;
+mod health;
 mod linux_tun;
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use beam_tun::{ProxyTcpStack, run_tun_engine};
 use tokio::sync::watch;
@@ -15,6 +18,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::ClientFileConfig;
+use crate::health::{DEFAULT_STATUS_PATH, spawn_network_monitor};
 use crate::linux_tun::{AsyncLinuxTun, LinuxRouteGuard};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/beam/client.toml";
@@ -121,21 +125,48 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run_client(cfg: config::ValidatedConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std::error::Error>> {
     let tun = AsyncLinuxTun::open(&cfg.tun_name, cfg.mtu)?;
     let actual_name = tun.name().to_owned();
     info!(ifname = %actual_name, mtu = cfg.mtu, "opened Linux TUN device");
 
-    let _routes = LinuxRouteGuard::setup(
+    let routes = Arc::new(Mutex::new(LinuxRouteGuard::setup(
         &actual_name,
         &cfg.tun_cidr,
         cfg.mtu,
         cfg.auto_route,
         cfg.server_ip,
         &cfg.bypass_cidrs,
-    )?;
+    )?));
+
+    // Wire dynamic bypass route installation for resolved `bypass.domains` IPs.
+    if let Some(dns_cfg) = cfg.engine.dns.as_mut() {
+        let routes_cb = Arc::clone(&routes);
+        dns_cfg.on_bypass_ips = Some(Arc::new(move |ips: &[IpAddr]| {
+            if let Ok(mut guard) = routes_cb.lock() {
+                for &ip in ips {
+                    if let IpAddr::V4(v4) = ip {
+                        guard.install_dynamic_bypass_ip(v4);
+                    }
+                }
+            }
+        }));
+    }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (network_reset_tx, network_reset_rx) = watch::channel(0u64);
+    cfg.engine.network_reset = Some(network_reset_rx);
+
+    let monitor_handle = spawn_network_monitor(
+        actual_name.clone(),
+        cfg.engine.client.server_addr,
+        cfg.auto_route,
+        Arc::clone(&routes),
+        network_reset_tx,
+        shutdown_rx.clone(),
+        PathBuf::from(DEFAULT_STATUS_PATH),
+    );
+
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
         let mut sigterm =
@@ -155,6 +186,8 @@ async fn run_client(cfg: config::ValidatedConfig) -> Result<(), Box<dyn std::err
     });
 
     let stack = ProxyTcpStack::new(cfg.tcp_stack);
-    run_tun_engine(tun, stack, cfg.engine, shutdown_rx).await?;
+    let res = run_tun_engine(tun, stack, cfg.engine, shutdown_rx).await;
+    let _ = monitor_handle.await;
+    res?;
     Ok(())
 }

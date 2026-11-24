@@ -91,6 +91,11 @@ impl TunDevice for AsyncLinuxTun {
     }
 }
 
+/// Detected physical IPv4 default gateway `(optional_gateway_ip, interface_name)`.
+pub type GatewayState = Option<(Option<String>, String)>;
+
+const MAX_DYNAMIC_BYPASS_IPS: usize = 256;
+
 /// Configures IP address, MTU, link UP, and optional default split-routes
 /// (`0.0.0.0/1`, `128.0.0.0/1`, IPv6 `::/1`, `8000::/1` + host bypass route
 /// for the `beam` server) on Linux.
@@ -99,6 +104,11 @@ impl TunDevice for AsyncLinuxTun {
 /// shutdowns roll back **only** the routes installed by this guard.
 pub struct LinuxRouteGuard {
     ifname: String,
+    auto_route: bool,
+    server_ip: Option<Ipv4Addr>,
+    configured_bypass_v4: Vec<String>,
+    dynamic_bypass_v4: Vec<Ipv4Addr>,
+    current_gw: GatewayState,
     installed_v4_low: bool,
     installed_v4_high: bool,
     installed_v6_low: bool,
@@ -113,6 +123,10 @@ impl LinuxRouteGuard {
     /// IPv4 `bypass_cidrs`) first, then routes IPv4 (`0.0.0.0/1`,
     /// `128.0.0.0/1`) and IPv6 (`::/1`, `8000::/1`) through `ifname` so
     /// dual-stack hosts do not leak IPv6 traffic in the clear.
+    ///
+    /// Fail-closed: if no physical default gateway exists yet at startup, the
+    /// TUN split routes are still installed so traffic never leaks in the clear,
+    /// and bypass routes are installed automatically once a gateway appears.
     pub fn setup(
         ifname: &str,
         cidr: &str,
@@ -124,10 +138,21 @@ impl LinuxRouteGuard {
         run_ip(&["addr", "replace", cidr, "dev", ifname])?;
         run_ip(&["link", "set", "dev", ifname, "mtu", &mtu.to_string(), "up"])?;
 
+        let configured_bypass_v4: Vec<String> = bypass_cidrs
+            .iter()
+            .filter(|c| is_ipv4_cidr(c))
+            .cloned()
+            .collect();
+
         // Construct the guard before adding any routes so a failure mid-setup
         // automatically rolls back everything installed so far via `Drop`.
         let mut guard = Self {
             ifname: ifname.to_owned(),
+            auto_route,
+            server_ip,
+            configured_bypass_v4,
+            dynamic_bypass_v4: Vec::new(),
+            current_gw: None,
             installed_v4_low: false,
             installed_v4_high: false,
             installed_v6_low: false,
@@ -137,37 +162,13 @@ impl LinuxRouteGuard {
         };
 
         if auto_route {
-            let detected_gw = detect_default_ipv4_gateway();
-            if let Some(ip) = server_ip
-                && !ip.is_loopback()
-            {
-                if let Some((maybe_gw, dev)) = detected_gw.clone() {
-                    let host = format!("{ip}/32");
-                    install_v4_bypass(&host, maybe_gw.as_deref(), &dev)?;
-                    info!(%ip, via = ?maybe_gw, dev = %dev, "installed server bypass route");
-                    guard.bypass_route = Some((ip, maybe_gw, dev));
-                } else {
-                    return Err(io::Error::other(
-                        "could not detect default IPv4 gateway for server bypass route",
-                    ));
-                }
+            let detected_gw = detect_default_ipv4_gateway_excluding(ifname);
+            if detected_gw.is_none() {
+                warn!(
+                    "no physical default IPv4 gateway detected at startup; running fail-closed until network comes up"
+                );
             }
-
-            if let Some((maybe_gw, dev)) = detected_gw {
-                for cidr_entry in bypass_cidrs {
-                    if is_ipv4_cidr(cidr_entry) {
-                        if let Err(err) = install_v4_bypass(cidr_entry, maybe_gw.as_deref(), &dev) {
-                            warn!(cidr = %cidr_entry, error = %err, "failed to install IPv4 bypass CIDR route");
-                        } else {
-                            guard.extra_bypass_v4.push((
-                                cidr_entry.clone(),
-                                maybe_gw.clone(),
-                                dev.clone(),
-                            ));
-                        }
-                    }
-                }
-            }
+            guard.update_bypass_gateway(&detected_gw);
 
             run_ip(&["route", "replace", "0.0.0.0/1", "dev", ifname])?;
             guard.installed_v4_low = true;
@@ -191,6 +192,81 @@ impl LinuxRouteGuard {
         }
 
         Ok(guard)
+    }
+
+    /// Migrates server & bypass CIDR routes to `new_gw` on network transitions
+    /// (Wi-Fi <-> Ethernet, hotspot switch, or recovery after outage) while
+    /// keeping TUN split routes active (fail-closed kill-switch).
+    pub fn update_bypass_gateway(&mut self, new_gw: &GatewayState) {
+        if !self.auto_route {
+            return;
+        }
+        // Best-effort removal of previous bypass routes (old interface may already be down).
+        for (prefix, maybe_gw, dev) in self.extra_bypass_v4.drain(..) {
+            let _ = remove_v4_bypass(&prefix, maybe_gw.as_deref(), &dev);
+        }
+        if let Some((ip, maybe_gw, dev)) = self.bypass_route.take() {
+            let host = format!("{ip}/32");
+            let _ = remove_v4_bypass(&host, maybe_gw.as_deref(), &dev);
+        }
+
+        self.current_gw = new_gw.clone();
+        let Some((maybe_gw, dev)) = new_gw.as_ref() else {
+            return;
+        };
+
+        if let Some(ip) = self.server_ip
+            && !ip.is_loopback()
+        {
+            let host = format!("{ip}/32");
+            match install_v4_bypass(&host, maybe_gw.as_deref(), dev) {
+                Ok(()) => {
+                    info!(%ip, via = ?maybe_gw, dev = %dev, "installed server bypass route");
+                    self.bypass_route = Some((ip, maybe_gw.clone(), dev.clone()));
+                }
+                Err(err) => {
+                    warn!(%ip, dev = %dev, error = %err, "failed to install server bypass route");
+                }
+            }
+        }
+
+        for cidr_entry in &self.configured_bypass_v4 {
+            if let Err(err) = install_v4_bypass(cidr_entry, maybe_gw.as_deref(), dev) {
+                warn!(cidr = %cidr_entry, error = %err, "failed to install IPv4 bypass CIDR route");
+            } else {
+                self.extra_bypass_v4
+                    .push((cidr_entry.clone(), maybe_gw.clone(), dev.clone()));
+            }
+        }
+
+        for &ip in &self.dynamic_bypass_v4 {
+            let host = format!("{ip}/32");
+            if install_v4_bypass(&host, maybe_gw.as_deref(), dev).is_ok() {
+                self.extra_bypass_v4
+                    .push((host, maybe_gw.clone(), dev.clone()));
+            }
+        }
+    }
+
+    /// Dynamically installs a `/32` bypass route for an IP resolved from a
+    /// configured `bypass.domains` entry (bounded to [`MAX_DYNAMIC_BYPASS_IPS`]).
+    pub fn install_dynamic_bypass_ip(&mut self, ip: Ipv4Addr) {
+        if !self.auto_route || ip.is_loopback() || ip.is_private() {
+            return;
+        }
+        if self.dynamic_bypass_v4.contains(&ip)
+            || self.dynamic_bypass_v4.len() >= MAX_DYNAMIC_BYPASS_IPS
+        {
+            return;
+        }
+        self.dynamic_bypass_v4.push(ip);
+        if let Some((maybe_gw, dev)) = self.current_gw.as_ref() {
+            let host = format!("{ip}/32");
+            if install_v4_bypass(&host, maybe_gw.as_deref(), dev).is_ok() {
+                self.extra_bypass_v4
+                    .push((host, maybe_gw.clone(), dev.clone()));
+            }
+        }
     }
 }
 
@@ -253,7 +329,8 @@ fn run_ip(args: &[&str]) -> io::Result<()> {
     }
 }
 
-fn detect_default_ipv4_gateway() -> Option<(Option<String>, String)> {
+/// Detects the current physical default IPv4 gateway, skipping `exclude_ifname`.
+pub fn detect_default_ipv4_gateway_excluding(exclude_ifname: &str) -> GatewayState {
     let output = Command::new("ip")
         .args(["-4", "route", "show", "default"])
         .output()
@@ -262,16 +339,22 @@ fn detect_default_ipv4_gateway() -> Option<(Option<String>, String)> {
         return None;
     }
     let text = String::from_utf8(output.stdout).ok()?;
-    let line = text.lines().next()?;
-    let mut tokens = line.split_whitespace();
-    let mut gw = None;
-    let mut dev = None;
-    while let Some(tok) = tokens.next() {
-        match tok {
-            "via" => gw = tokens.next().map(str::to_owned),
-            "dev" => dev = tokens.next().map(str::to_owned),
-            _ => {}
+    for line in text.lines() {
+        let mut tokens = line.split_whitespace();
+        let mut gw = None;
+        let mut dev = None;
+        while let Some(tok) = tokens.next() {
+            match tok {
+                "via" => gw = tokens.next().map(str::to_owned),
+                "dev" => dev = tokens.next().map(str::to_owned),
+                _ => {}
+            }
+        }
+        if let Some(dev_name) = dev
+            && dev_name != exclude_ifname
+        {
+            return Some((gw, dev_name));
         }
     }
-    Some((gw, dev?))
+    None
 }

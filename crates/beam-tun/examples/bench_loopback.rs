@@ -196,6 +196,7 @@ async fn main() {
         max_tcp_connections: 32,
         udp: UdpBridgeConfig::default(),
         dns: None,
+        network_reset: None,
     };
     let stack = ProxyTcpStack::new(TcpStackConfig::default());
     let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));
