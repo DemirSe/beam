@@ -498,6 +498,8 @@ impl TcpConn {
             self.ooo_bytes = self.ooo_bytes.saturating_sub(seg.len());
             let skip = self.rcv_nxt.wrapping_sub(seq) as usize;
             if skip < seg.len() {
+                // If `avail == 0` (zero receive window), the segment is dropped
+                // here rather than re-queued; recovery relies on peer retransmit.
                 let avail = self.rcv_wnd_bytes() as usize;
                 let fresh = &seg[skip..];
                 let accept = fresh.len().min(avail);
@@ -1388,6 +1390,25 @@ mod tests {
         assert_eq!(conn.rcv_nxt, 104);
         assert!(conn.ooo.is_empty());
         assert_eq!(conn.ooo_bytes, 0);
+
+        // Non-wrapping boundary (`rcv_nxt = 0x8000_0000`, `lo = 0`): ready set
+        // is `0..=0x8000_0000` (oldest ready key `0` is stale and dropped, then
+        // `0x8000_0000` is delivered; `0x8000_0004` stays queued).
+        conn.rcv_nxt = 0x8000_0000;
+        conn.rcv_coalesce.clear();
+        conn.ooo.clear();
+        conn.ooo.insert(0, b"stale".to_vec());
+        conn.ooo.insert(0x8000_0000, b"ok".to_vec());
+        conn.ooo.insert(0x8000_0004, b"later".to_vec());
+        conn.ooo_bytes = 12;
+        conn.drain_ooo();
+        assert_eq!(conn.rcv_coalesce, b"ok");
+        assert_eq!(conn.rcv_nxt, 0x8000_0002);
+        assert_eq!(
+            conn.ooo.keys().copied().collect::<Vec<_>>(),
+            vec![0x8000_0004]
+        );
+        assert_eq!(conn.ooo_bytes, 5);
     }
 
     #[test]

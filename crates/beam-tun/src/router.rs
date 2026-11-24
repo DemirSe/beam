@@ -175,7 +175,12 @@ pub fn is_non_global_ip(ip: IpAddr) -> bool {
 /// Returns `true` for non-global IPv4 addresses (RFC 6890 special-purpose
 /// ranges included).
 pub fn is_non_global_ipv4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
+    let [a, b, c, d] = ip.octets();
+    // 192.0.0.9/32 (PCP anycast) and 192.0.0.10/32 (TURN anycast) are globally
+    // reachable exceptions inside 192.0.0.0/24 (RFC 6890 / RFC 7723 / RFC 8155).
+    if a == 192 && b == 0 && c == 0 && (d == 9 || d == 10) {
+        return false;
+    }
     ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
@@ -185,7 +190,7 @@ pub fn is_non_global_ipv4(ip: Ipv4Addr) -> bool {
         || a == 0
         // 100.64.0.0/10 carrier-grade NAT (RFC 6598)
         || (a == 100 && (64..=127).contains(&b))
-        // 192.0.0.0/24 IETF protocol assignments (RFC 6890)
+        // 192.0.0.0/24 IETF protocol assignments (RFC 6890, except .9/.10 above)
         || (a == 192 && b == 0 && c == 0)
         // 192.88.99.0/24 deprecated 6to4 relay anycast (RFC 7526)
         || (a == 192 && b == 88 && c == 99)
@@ -336,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn non_global_ipv4_covers_every_special_purpose_range() {
+    fn non_global_ipv4_covers_documented_special_purpose_ranges() {
         for raw in [
             "0.0.0.0",         // unspecified
             "0.1.2.3",         // 0.0.0.0/8 "this network"
@@ -367,6 +372,8 @@ mod tests {
             "100.63.255.255",
             "100.128.0.0",
             "9.9.9.9",
+            "192.0.0.9",
+            "192.0.0.10",
             "198.17.255.255",
             "198.20.0.0",
             "223.255.255.255",

@@ -1194,7 +1194,9 @@ impl DnsInterceptor {
                         );
                         build_servfail_response(&wire_owned)
                     } else {
-                        // Ensure tx_id matches the client query.
+                        // Rewrite tx_id to match the client query. DoH uses tx_id 0
+                        // per RFC 8484 and TCP/XUDP are 1-to-1 exchanges, so question
+                        // matching above is what prevents cross-query injection.
                         let id = query.tx_id.to_be_bytes();
                         resp[0] = id[0];
                         resp[1] = id[1];
@@ -1497,11 +1499,7 @@ async fn resolve_doh_over_beam(
         }
     }
 
-    let dial_gen = doh_pool
-        .lock()
-        .ok()
-        .map(|pool| pool.generation())
-        .unwrap_or(0);
+    let dial_gen = doh_pool.lock().ok().map(|pool| pool.generation());
     let address = if let Ok(ip) = host.parse::<IpAddr>() {
         match ip {
             IpAddr::V4(v4) => Address::Ipv4(v4),
@@ -1521,8 +1519,8 @@ async fn resolve_doh_over_beam(
     let mut tls = connector.connect(server_name, beam_stream).await?;
 
     let (body, reusable) = send_doh_http_request(&mut tls, &host_header, path, query).await?;
-    if reusable && let Ok(mut pool) = doh_pool.lock() {
-        pool.put(tls, dial_gen, Instant::now());
+    if reusable && let (Some(gen_id), Ok(mut pool)) = (dial_gen, doh_pool.lock()) {
+        pool.put(tls, gen_id, Instant::now());
     }
     Ok(body)
 }

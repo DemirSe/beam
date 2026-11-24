@@ -603,12 +603,13 @@ future Windows `WinTun` and Android `VpnService` backends).
   fragmented IPv4 and IPv6 packets.
 - **Destination policy:** unless `drop_private_destinations = false`, the stack
   drops destinations outside global unicast: `0.0.0.0/8`, RFC 1918, CGNAT
-  (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`), deprecated
-  6to4 relay anycast (`192.88.99.0/24`), benchmarking (`198.18.0.0/15`),
-  documentation (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), reserved
-  (`240.0.0.0/4`), ULA, link-local, multicast, and loopback. Hosts that
-  intentionally reach Tailscale/CGNAT or private endpoints over the tunnel
-  should add them to `bypass.cidrs` (for direct LAN reach) or set
+  (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`, excluding
+  globally reachable `192.0.0.9/32` and `192.0.0.10/32`), deprecated 6to4 relay
+  anycast (`192.88.99.0/24`), benchmarking (`198.18.0.0/15`), documentation
+  (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), reserved
+  (`240.0.0.0/4`), ULA, link-local, multicast, and loopback. To reach
+  Tailscale/CGNAT or private endpoints directly over the LAN, add them to
+  `bypass.cidrs`; to send them through the tunnel, set
   `drop_private_destinations = false`.
 - **Built-in DNS & bypass:** optional `[dns]` interceptor supporting DoH
   (`https://1.1.1.1/dns-query`) and plain DNS (`tcp://` / `udp://`) through the
@@ -636,9 +637,11 @@ future Windows `WinTun` and Android `VpnService` backends).
   without touching pre-existing host routes.
 - **Service & config:** start from [`config.client.example.toml`](config.client.example.toml)
   and [`deploy/beam-client.service`](deploy/beam-client.service); validate with
-  `beam-client --check -c /etc/beam/client.toml`. The native unit (`beamtun0`,
-  per-link DNS) and the sing-box tray install (`sbtun0`, global `99-beam.conf`)
-  write the same unit name, so install only one of them. See
+  `beam-client --check -c /etc/beam/client.toml`. With `auto_route = true`,
+  `iproute2` (`ip`) must be installed in a fixed system path (`/usr/sbin`,
+  `/sbin`, `/usr/bin`, or `/bin`; `PATH` is never searched). The native unit
+  (`beamtun0`, per-link DNS) and the sing-box tray install (`sbtun0`, global
+  `99-beam.conf`) write the same unit name, so install only one of them. See
   [`clients/linux-tray/README.md`](clients/linux-tray/README.md).
 
 ## Security notes

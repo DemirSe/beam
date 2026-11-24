@@ -40,7 +40,12 @@ def unit_settings_all(path):
 
 
 def parse_seconds(value):
-    return int(value[:-1]) if value[-1] == "s" else int(value)
+    if value.endswith("min"):
+        return int(value[:-3]) * 60
+    factors = {"s": 1, "m": 60}
+    if value[-1] in factors:
+        return int(value[:-1]) * factors[value[-1]]
+    return int(value)
 
 
 def config_values(text):
@@ -66,29 +71,23 @@ class RestartPolicyTest(unittest.TestCase):
     def settings(self, path):
         return unit_settings(path)
 
-    def seconds(self, value):
-        factors = {"s": 1, "m": 60}
-        if value[-1] in factors:
-            return int(value[:-1]) * factors[value[-1]]
-        return int(value)
-
     def unit(self):
         return self.settings(DEPLOY / "beam.service")
 
     def test_beam_restarts_are_bounded(self):
         unit = self.unit()
         self.assertEqual(unit[("Service", "Restart")], "always")
-        interval = self.seconds(unit[("Unit", "StartLimitIntervalSec")])
+        interval = parse_seconds(unit[("Unit", "StartLimitIntervalSec")])
         burst = int(unit[("Unit", "StartLimitBurst")])
         self.assertGreater(interval, 0, "a zero interval disables the limit")
         self.assertGreater(burst, 1)
 
     def test_the_window_covers_the_slowest_start(self):
         unit = self.unit()
-        interval = self.seconds(unit[("Unit", "StartLimitIntervalSec")])
+        interval = parse_seconds(unit[("Unit", "StartLimitIntervalSec")])
         burst = int(unit[("Unit", "StartLimitBurst")])
-        period = self.seconds(unit[("Service", "TimeoutStartSec")])
-        period += self.seconds(unit[("Service", "RestartSec")])
+        period = parse_seconds(unit[("Service", "TimeoutStartSec")])
+        period += parse_seconds(unit[("Service", "RestartSec")])
         # A shorter window lets old attempts age out before the burst is
         # reached, so the slowest allowed start would loop forever.
         self.assertGreaterEqual(interval, (burst - 1) * period)
@@ -101,14 +100,14 @@ class RestartPolicyTest(unittest.TestCase):
             with self.subTest(unit=path.name):
                 self.assertIn(("Unit", "StartLimitIntervalSec"), unit)
                 self.assertIn(("Unit", "StartLimitBurst"), unit)
-                interval = self.seconds(
+                interval = parse_seconds(
                     unit[("Unit", "StartLimitIntervalSec")]
                 )
                 self.assertGreater(interval, 0)
                 self.assertGreater(int(unit[("Unit", "StartLimitBurst")]), 0)
 
     def test_liveness_retry_clears_the_limit_window(self):
-        interval = self.seconds(self.unit()[("Unit", "StartLimitIntervalSec")])
+        interval = parse_seconds(self.unit()[("Unit", "StartLimitIntervalSec")])
         timer = (DEPLOY / "beam-liveness.timer").read_text()
         self.assertIn("OnUnitActiveSec=5min", timer)
         limit = re.search(
@@ -233,8 +232,10 @@ class ClientInstallPathTest(unittest.TestCase):
     """The native and the sing-box tray installs must never be mixed."""
 
     def test_both_installs_claim_the_same_unit_name(self):
-        native = unit_settings(DEPLOY / "beam-client.service")
-        self.assertTrue(native[("Service", "ExecStart")].startswith("/usr/local/bin/beam-client"))
+        native = unit_settings_all(DEPLOY / "beam-client.service")
+        exec_start = native[("Service", "ExecStart")]
+        self.assertEqual(len(exec_start), 1)
+        self.assertTrue(exec_start[0].startswith("/usr/local/bin/beam-client"))
         installer = (ROOT / "clients/linux-tray/install.sh").read_text()
         self.assertIn("/etc/systemd/system/beam-client.service", installer)
         self.assertIn("sing-box run -c /etc/beam/config.json", installer)

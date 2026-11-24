@@ -35,12 +35,26 @@ fn cap_warn_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.saturating_duration_since(t) >= DYNAMIC_BYPASS_CAP_WARN_INTERVAL)
 }
 
-fn warn_dynamic_bypass_cap(family: &'static str) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IpFamily {
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V4 => "ipv4",
+            Self::V6 => "ipv6",
+        }
+    }
+}
+
+fn warn_dynamic_bypass_cap(family: IpFamily) {
     let now = Instant::now();
-    let slot = if family == "ipv6" {
-        &DYNAMIC_BYPASS_CAP_WARNED_V6_AT
-    } else {
-        &DYNAMIC_BYPASS_CAP_WARNED_V4_AT
+    let slot = match family {
+        IpFamily::V4 => &DYNAMIC_BYPASS_CAP_WARNED_V4_AT,
+        IpFamily::V6 => &DYNAMIC_BYPASS_CAP_WARNED_V6_AT,
     };
     let Ok(mut last) = slot.lock() else {
         return;
@@ -50,7 +64,7 @@ fn warn_dynamic_bypass_cap(family: &'static str) {
     }
     *last = Some(now);
     warn!(
-        family,
+        family = family.as_str(),
         cap = MAX_DYNAMIC_BYPASS_IPS,
         "dynamic bypass.domains route table is full; evicting the oldest route"
     );
@@ -583,7 +597,7 @@ impl LinuxRouteGuard {
         while let Some(&(ip, ts)) = self.dynamic_bypass_v4.front() {
             let at_cap = self.dynamic_bypass_v4.len() >= MAX_DYNAMIC_BYPASS_IPS;
             if at_cap {
-                warn_dynamic_bypass_cap("ipv4");
+                warn_dynamic_bypass_cap(IpFamily::V4);
             }
             if now.saturating_duration_since(ts) >= DYNAMIC_BYPASS_TTL || at_cap {
                 self.dynamic_bypass_v4.pop_front();
@@ -611,7 +625,7 @@ impl LinuxRouteGuard {
         while let Some(&(ip, ts)) = self.dynamic_bypass_v6.front() {
             let at_cap = self.dynamic_bypass_v6.len() >= MAX_DYNAMIC_BYPASS_IPS;
             if at_cap {
-                warn_dynamic_bypass_cap("ipv6");
+                warn_dynamic_bypass_cap(IpFamily::V6);
             }
             if now.saturating_duration_since(ts) >= DYNAMIC_BYPASS_TTL || at_cap {
                 self.dynamic_bypass_v6.pop_front();
