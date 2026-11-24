@@ -80,6 +80,9 @@ impl DnsUpstream {
             if host.is_empty() || host.len() > 255 {
                 return Err("invalid DoH host".into());
             }
+            if ServerName::try_from(host.to_owned()).is_err() {
+                return Err(format!("invalid DoH TLS server name: {host}"));
+            }
             if !path.starts_with('/') || path.len() > 512 {
                 return Err("invalid DoH path".into());
             }
@@ -123,6 +126,9 @@ fn split_host_port(authority: &str, default_port: u16) -> Result<(&str, u16), St
             .find(']')
             .ok_or_else(|| "unclosed IPv6 bracket in DoH authority".to_owned())?;
         let host = &bracketed[..end];
+        if host.parse::<Ipv6Addr>().is_err() {
+            return Err(format!("invalid IPv6 literal in DoH authority: [{host}]"));
+        }
         let rest = &bracketed[end + 1..];
         if rest.is_empty() {
             return Ok((host, default_port));
@@ -618,10 +624,22 @@ impl DnsInterceptor {
         };
 
         let current_local = self.local_upstream.lock().ok().and_then(|g| *g);
-        // Loop guard: if a query destined for `local_upstream` itself somehow
-        // re-entered the TUN (e.g. bypass route vanished mid-transition), refuse
-        // to recurse into `resolve_local_udp` so we can never self-DoS.
-        if current_local.is_some_and(|local| local.ip() == dst.ip()) {
+        let is_local = self
+            .dns_config
+            .local_suffixes
+            .iter()
+            .any(|s| matches_domain_suffix(&query.qname, s));
+        let is_bypass_domain = self
+            .dns_config
+            .bypass_domains
+            .iter()
+            .any(|s| matches_domain_suffix(&query.qname, s));
+        let use_local = (is_local || is_bypass_domain) && current_local.is_some();
+
+        // Loop guard: if a local/bypass query destined for `local_upstream`
+        // itself re-entered the TUN (e.g. bypass route vanished mid-transition),
+        // refuse to recurse into `resolve_local_udp` so we can never self-DoS.
+        if use_local && current_local.is_some_and(|local| local.ip() == dst.ip()) {
             if let Some(sf) = build_servfail_response(wire)
                 && let Some(pkt) =
                     build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &sf)
@@ -647,18 +665,6 @@ impl DnsInterceptor {
             debug!(qname = %query.qname, "DNS concurrency limit reached; dropping query");
             return;
         };
-
-        let is_local = self
-            .dns_config
-            .local_suffixes
-            .iter()
-            .any(|s| matches_domain_suffix(&query.qname, s));
-        let is_bypass_domain = self
-            .dns_config
-            .bypass_domains
-            .iter()
-            .any(|s| matches_domain_suffix(&query.qname, s));
-        let use_local = (is_local || is_bypass_domain) && current_local.is_some();
 
         let wire_owned = wire.to_vec();
         let client_cfg = self.client_config.clone();
@@ -1248,6 +1254,7 @@ mod tests {
             DnsUpstream::PlainUdp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53))
         );
         assert!(DnsUpstream::parse("https://evil.com/\r\nX: y").is_err());
+        assert!(DnsUpstream::parse("https://[bad]/dns-query").is_err());
         assert!(DnsUpstream::parse("http://1.1.1.1/dns-query").is_err());
         assert!(DnsUpstream::parse("tcp://1.1.1.1:0").is_err());
         assert!(DnsUpstream::parse("udp://1.1.1.1:0").is_err());

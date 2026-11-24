@@ -566,6 +566,197 @@ async fn tun_ipv6_quic_reject_end_to_end() {
 }
 
 #[tokio::test]
+async fn tun_tcp_recovers_after_network_reset() {
+    use beam_tun::packet::{
+        IP_PROTO_TCP, TCP_ACK, TCP_PSH, TCP_RST, TCP_SYN, build_ip_tcp_packet_slices, parse_ip,
+        parse_tcp,
+    };
+    use std::net::IpAddr;
+
+    timeout(Duration::from_secs(10), async {
+        let target_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind target");
+        let target_port = target_listener.local_addr().expect("target addr").port();
+        let target_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = target_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    if let Ok(n) = sock.read(&mut buf).await
+                        && n > 0
+                    {
+                        let _ = sock.write_all(&buf[..n]).await;
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let cover_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind cover");
+        let cover_port = cover_listener.local_addr().expect("cover addr").port();
+        let beam_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind beam");
+        let beam_addr = beam_listener.local_addr().expect("beam addr");
+        let srv_cfg = make_server_config(cover_port);
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((sock, _)) = beam_listener.accept().await else {
+                    break;
+                };
+                let cfg = Arc::clone(&srv_cfg);
+                tokio::spawn(async move {
+                    let _ = handle_connection(sock, cfg).await;
+                });
+            }
+        });
+
+        let (engine_tun, mut host_tun) = MemoryTun::pair(1500, 128);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (reset_tx, reset_rx) = watch::channel(0u64);
+        let engine_cfg = TunEngineConfig {
+            client: make_client_config(beam_addr),
+            route: RoutePolicy {
+                reject_quic: true,
+                drop_private_destinations: false,
+                exclude_ips: Vec::new(),
+                bypass_cidrs: Vec::new(),
+                intercept_dns: false,
+            },
+            max_tcp_connections: 16,
+            udp: UdpBridgeConfig::default(),
+            dns: None,
+            network_reset: Some(reset_rx),
+        };
+        let stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));
+
+        let src = IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1));
+        let dst = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut buf = vec![0u8; 2048];
+
+        // 1. Open flow #1 (stays established while we trigger a network transition).
+        let syn1 = build_ip_tcp_packet_slices(
+            src,
+            41_001,
+            dst,
+            target_port,
+            1000,
+            0,
+            TCP_SYN,
+            65535,
+            &[2, 4, 0x05, 0xb4],
+            &[],
+            &[],
+        )
+        .expect("syn1");
+        host_tun.send(&syn1).await.expect("send syn1");
+        let n = host_tun.recv(&mut buf).await.expect("recv syn-ack1");
+        let sa1 = parse_tcp(parse_ip(&buf[..n]).expect("ip").payload).expect("tcp");
+        assert_eq!(sa1.flags, TCP_SYN | TCP_ACK);
+        let ack1 = build_ip_tcp_packet_slices(
+            src,
+            41_001,
+            dst,
+            target_port,
+            1001,
+            sa1.seq.wrapping_add(1),
+            TCP_ACK,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("ack1");
+        host_tun.send(&ack1).await.expect("send ack1");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 2. Trigger network_reset -> flow #1 must receive TCP RST.
+        reset_tx.send(1).expect("send reset");
+        let n = timeout(Duration::from_secs(2), host_tun.recv(&mut buf))
+            .await
+            .expect("rst timeout")
+            .expect("recv rst");
+        let rst = parse_tcp(parse_ip(&buf[..n]).expect("ip").payload).expect("tcp");
+        assert_ne!(
+            rst.flags & TCP_RST,
+            0,
+            "expected TCP RST after network_reset"
+        );
+
+        // 3. New flow #2 after network_reset MUST connect and echo data cleanly.
+        let syn2 = build_ip_tcp_packet_slices(
+            src,
+            41_002,
+            dst,
+            target_port,
+            2000,
+            0,
+            TCP_SYN,
+            65535,
+            &[2, 4, 0x05, 0xb4],
+            &[],
+            &[],
+        )
+        .expect("syn2");
+        host_tun.send(&syn2).await.expect("send syn2");
+        let n = timeout(Duration::from_secs(2), host_tun.recv(&mut buf))
+            .await
+            .expect("syn-ack2 timeout")
+            .expect("recv syn-ack2");
+        let sa2 = parse_tcp(parse_ip(&buf[..n]).expect("ip").payload).expect("tcp");
+        assert_eq!(sa2.flags, TCP_SYN | TCP_ACK);
+
+        let payload = b"post-reset-ok";
+        let data2 = build_ip_tcp_packet_slices(
+            src,
+            41_002,
+            dst,
+            target_port,
+            2001,
+            sa2.seq.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            65535,
+            &[],
+            payload,
+            &[],
+        )
+        .expect("data2");
+        host_tun.send(&data2).await.expect("send data2");
+
+        let mut echoed = Vec::new();
+        while echoed.len() < payload.len() {
+            let n = timeout(Duration::from_secs(2), host_tun.recv(&mut buf))
+                .await
+                .expect("post-reset echo timeout")
+                .expect("recv data2");
+            let ip = parse_ip(&buf[..n]).expect("ip");
+            if ip.protocol == IP_PROTO_TCP
+                && let Some(seg) = parse_tcp(ip.payload)
+                && !seg.payload.is_empty()
+            {
+                echoed.extend_from_slice(seg.payload);
+            }
+        }
+        assert_eq!(echoed, payload);
+
+        let _ = shutdown_tx.send(true);
+        let _ = engine_task.await;
+        drop(host_tun);
+        server_task.abort();
+        target_task.abort();
+        drop(cover_listener);
+    })
+    .await
+    .expect("tun_tcp_recovers_after_network_reset timed out");
+}
+
+#[tokio::test]
 #[ignore = "requires unfirewalled host IPv6 ::1 loopback; run explicitly in CI"]
 async fn tun_ipv6_tcp_and_udp_loopback_end_to_end() {
     use beam_tun::packet::{

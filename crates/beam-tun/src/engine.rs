@@ -114,7 +114,7 @@ where
                 conn,
                 config.client.clone(),
                 Arc::clone(&tcp_permits),
-                config.network_reset.clone(),
+                network_reset.clone(),
             );
         }
 
@@ -300,10 +300,7 @@ fn spawn_tcp_relay(
                     res = timeout(idle, up_r.read(&mut buf)) => res,
                 };
                 let n = match read_res {
-                    Ok(Ok(0)) => {
-                        tun_w.shutdown();
-                        break;
-                    }
+                    Ok(Ok(0)) => break,
                     Ok(Ok(n)) => n,
                     _ => break,
                 };
@@ -314,6 +311,7 @@ fn spawn_tcp_relay(
                     break;
                 }
             }
+            tun_w.shutdown();
         };
 
         tokio::select! {

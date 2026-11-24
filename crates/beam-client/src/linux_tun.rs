@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 
 use beam_sys::LinuxTun;
-use beam_tun::TunDevice;
+use beam_tun::{IpNet, TunDevice};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info, warn};
 
@@ -110,6 +110,7 @@ impl TunDevice for AsyncLinuxTun {
 pub struct LinuxRouteGuard {
     ifname: String,
     auto_route: bool,
+    tun_v4_net: Option<IpNet>,
     server_ip: IpAddr,
     local_dns_ip: Option<IpAddr>,
     configured_bypass_v4: Vec<String>,
@@ -162,6 +163,7 @@ impl LinuxRouteGuard {
         let mut guard = Self {
             ifname: ifname.to_owned(),
             auto_route,
+            tun_v4_net: IpNet::parse_cidr(cidr),
             server_ip,
             local_dns_ip,
             configured_bypass_v4,
@@ -220,6 +222,12 @@ impl LinuxRouteGuard {
         Ok(guard)
     }
 
+    /// Returns `true` if `ip` lies inside the TUN IPv4 or IPv6 subnet.
+    fn is_in_tun_subnet(&self, ip: IpAddr) -> bool {
+        self.tun_v4_net.is_some_and(|net| net.contains(ip))
+            || IpNet::parse_cidr("fd00:be:a::/126").is_some_and(|net| net.contains(ip))
+    }
+
     /// Returns `true` if the server bypass route is not needed (loopback) or is
     /// currently installed and present in the kernel routing table.
     pub fn server_bypass_installed(&self) -> bool {
@@ -276,6 +284,7 @@ impl LinuxRouteGuard {
         if let Some(dns_ip) = self.local_dns_ip
             && !dns_ip.is_loopback()
             && dns_ip != self.server_ip
+            && !self.is_in_tun_subnet(dns_ip)
             && let Some((maybe_gw, dev)) = gateway_for_ip(new_gw, dns_ip)
         {
             match install_host_bypass(dns_ip, maybe_gw.as_deref(), dev) {

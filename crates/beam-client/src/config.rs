@@ -209,6 +209,7 @@ pub enum ConfigError {
 pub struct ValidatedConfig {
     pub tun_name: String,
     pub tun_cidr: String,
+    pub tun_net: IpNet,
     pub tun_dns_peer: Option<Ipv4Addr>,
     pub mtu: usize,
     pub auto_route: bool,
@@ -312,6 +313,8 @@ impl ClientFileConfig {
             bypass_cidrs_raw.push(trimmed.to_owned());
         }
 
+        let tun_net = IpNet::parse_cidr(&self.tun.address)
+            .ok_or_else(|| ConfigError::Invalid("tun.address must be valid IPv4 CIDR".into()))?;
         let mut fixed_local_dns = None;
         let mut initial_local_dns = None;
         let dns_cfg = if self.dns.enabled {
@@ -333,12 +336,14 @@ impl ClientFileConfig {
                     fixed_local_dns = Some(parsed.ip());
                     (Some(parsed), false)
                 }
-                _ => (detect_system_local_dns(), true),
+                _ => (detect_system_local_dns_excluding(Some(tun_net)), true),
             };
             initial_local_dns = local_upstream.map(|s| s.ip());
             let mut cfg = DnsConfig::new(upstream, local_upstream);
             if auto_detect {
-                cfg.refresh_local_upstream = Some(std::sync::Arc::new(detect_system_local_dns));
+                cfg.refresh_local_upstream = Some(std::sync::Arc::new(move || {
+                    detect_system_local_dns_excluding(Some(tun_net))
+                }));
             }
             cfg.local_suffixes = self.dns.local_suffixes;
             cfg.bypass_domains = self.bypass.domains;
@@ -386,6 +391,7 @@ impl ClientFileConfig {
         Ok(ValidatedConfig {
             tun_name: self.tun.name,
             tun_cidr: self.tun.address,
+            tun_net,
             tun_dns_peer,
             mtu: self.tun.mtu,
             auto_route: self.tun.auto_route,
@@ -414,11 +420,13 @@ fn parse_dns_socket_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
 }
 
 /// Auto-detects the host's pre-VPN local DNS server from systemd-resolved's
-/// upstream resolv.conf or `/etc/resolv.conf`, skipping loopback stubs.
-pub fn detect_system_local_dns() -> Option<SocketAddr> {
+/// upstream resolv.conf or `/etc/resolv.conf`, skipping loopback stubs and any
+/// address inside `exclude_tun_net` (or the IPv6 TUN subnet `fd00:be:a::/126`)
+/// so `systemd-resolved`'s per-link TUN DNS never self-poisons `local_upstream`.
+pub fn detect_system_local_dns_excluding(exclude_tun_net: Option<IpNet>) -> Option<SocketAddr> {
     for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
         if let Ok(content) = std::fs::read_to_string(path)
-            && let Some(addr) = parse_resolv_conf_nameserver(&content)
+            && let Some(addr) = parse_resolv_conf_nameserver(&content, exclude_tun_net)
         {
             return Some(addr);
         }
@@ -426,7 +434,14 @@ pub fn detect_system_local_dns() -> Option<SocketAddr> {
     None
 }
 
-fn parse_resolv_conf_nameserver(content: &str) -> Option<SocketAddr> {
+fn is_tun_ipv6(ip: IpAddr) -> bool {
+    IpNet::parse_cidr("fd00:be:a::/126").is_some_and(|net| net.contains(ip))
+}
+
+fn parse_resolv_conf_nameserver(
+    content: &str,
+    exclude_tun_net: Option<IpNet>,
+) -> Option<SocketAddr> {
     for line in content.lines() {
         let trimmed = line.trim();
         let Some(rest) = trimmed.strip_prefix("nameserver") else {
@@ -438,7 +453,11 @@ fn parse_resolv_conf_nameserver(content: &str) -> Option<SocketAddr> {
         let Ok(ip) = ip_str.parse::<IpAddr>() else {
             continue;
         };
-        if ip.is_loopback() || ip.is_unspecified() {
+        if ip.is_loopback()
+            || ip.is_unspecified()
+            || is_tun_ipv6(ip)
+            || exclude_tun_net.is_some_and(|net| net.contains(ip))
+        {
             continue;
         }
         return Some(SocketAddr::new(ip, 53));
@@ -453,8 +472,22 @@ fn derive_tun_peer_ipv4(cidr: &str) -> Option<Ipv4Addr> {
     if prefix >= 31 {
         return None;
     }
+    let mask = if prefix == 0 {
+        0u32
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     let raw = u32::from(ip);
-    Some(Ipv4Addr::from(raw.wrapping_add(1)))
+    let network = raw & mask;
+    let broadcast = network | !mask;
+    let candidate = if raw.wrapping_add(1) < broadcast {
+        raw.wrapping_add(1)
+    } else if raw.saturating_sub(1) > network {
+        raw.saturating_sub(1)
+    } else {
+        return None;
+    };
+    Some(Ipv4Addr::from(candidate))
 }
 
 fn validate_ipv4_cidr(cidr: &str) -> Result<(), ConfigError> {
@@ -536,15 +569,33 @@ mod tests {
     }
 
     #[test]
-    fn resolv_conf_parser_skips_loopback_stub() {
-        let text = "# comment\nnameserver 127.0.0.53\nnameserver 192.168.1.1\n";
+    fn resolv_conf_parser_skips_loopback_and_tun_subnet() {
+        let tun_net = IpNet::parse_cidr("172.19.0.1/30").expect("tun cidr");
+        let text =
+            "# comment\nnameserver 127.0.0.53\nnameserver 172.19.0.2\nnameserver 192.168.1.1\n";
         assert_eq!(
-            parse_resolv_conf_nameserver(text),
+            parse_resolv_conf_nameserver(text, Some(tun_net)),
             Some(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
                 53
             ))
         );
-        assert_eq!(parse_resolv_conf_nameserver("nameserver 127.0.0.1\n"), None);
+        assert_eq!(
+            parse_resolv_conf_nameserver(
+                "nameserver 127.0.0.1\nnameserver 172.19.0.2\n",
+                Some(tun_net)
+            ),
+            None
+        );
+
+        // derive_tun_peer_ipv4 must never return the subnet broadcast address.
+        assert_eq!(
+            derive_tun_peer_ipv4("172.19.0.1/30"),
+            Some(Ipv4Addr::new(172, 19, 0, 2))
+        );
+        assert_eq!(
+            derive_tun_peer_ipv4("172.19.0.2/30"),
+            Some(Ipv4Addr::new(172, 19, 0, 1))
+        );
     }
 }

@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use beam_tun::IpNet;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info};
 
-use crate::config::detect_system_local_dns;
+use crate::config::detect_system_local_dns_excluding;
 use crate::linux_tun::{LinuxRouteGuard, PhysicalGateways, detect_physical_gateways_excluding};
 
 /// Default runtime status file path (owned by `RuntimeDirectory=beam-client`).
@@ -71,6 +72,7 @@ impl Drop for StatusFileGuard {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_network_monitor(
     ifname: String,
+    tun_net: IpNet,
     server_addr: SocketAddr,
     auto_route: bool,
     fixed_local_dns: Option<IpAddr>,
@@ -130,9 +132,12 @@ pub fn spawn_network_monitor(
             };
 
             let gw_changed = auto_route && current_gw != last_gw;
-            let has_any_gw = current_gw.v4.is_some() || current_gw.v6.is_some();
+            let server_has_gw = match server_addr.ip() {
+                IpAddr::V4(_) => current_gw.v4.is_some(),
+                IpAddr::V6(_) => current_gw.v6.is_some(),
+            };
 
-            if gw_changed || slept_from_suspend || (bypass_missing && has_any_gw) {
+            if gw_changed || slept_from_suspend || (bypass_missing && server_has_gw) {
                 info!(
                     gw_changed,
                     slept_from_suspend,
@@ -145,8 +150,9 @@ pub fn spawn_network_monitor(
                     let routes_upd = Arc::clone(&routes);
                     let gw_clone = current_gw.clone();
                     let installed = tokio::task::spawn_blocking(move || {
-                        let local_dns =
-                            fixed_local_dns.or_else(|| detect_system_local_dns().map(|s| s.ip()));
+                        let local_dns = fixed_local_dns.or_else(|| {
+                            detect_system_local_dns_excluding(Some(tun_net)).map(|s| s.ip())
+                        });
                         if let Ok(mut guard) = routes_upd.lock() {
                             guard.update_bypass_gateway(&gw_clone, local_dns);
                             guard.server_bypass_installed()
@@ -156,7 +162,7 @@ pub fn spawn_network_monitor(
                     })
                     .await
                     .unwrap_or(false);
-                    if installed || !has_any_gw {
+                    if installed || !server_has_gw {
                         last_gw = current_gw.clone();
                     }
                 }
@@ -169,10 +175,6 @@ pub fn spawn_network_monitor(
             }
 
             if Instant::now() >= next_probe_at {
-                let server_has_gw = match server_addr.ip() {
-                    IpAddr::V4(_) => current_gw.v4.is_some(),
-                    IpAddr::V6(_) => current_gw.v6.is_some(),
-                };
                 if auto_route && !server_has_gw && !server_addr.ip().is_loopback() {
                     write_status_atomic(&status_path, LinkState::WaitingNetwork, None, &ifname);
                     next_probe_at = Instant::now() + Duration::from_secs(offline_backoff_secs);

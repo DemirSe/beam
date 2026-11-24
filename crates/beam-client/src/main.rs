@@ -164,6 +164,7 @@ async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std:
 
     let monitor_handle = spawn_network_monitor(
         actual_name.clone(),
+        cfg.tun_net,
         cfg.engine.client.server_addr,
         cfg.auto_route,
         cfg.fixed_local_dns,
