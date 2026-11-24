@@ -16,11 +16,13 @@ use crate::packet::{
 };
 use crate::stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
 
-const OUR_WSCALE: u8 = 6; // 64x multiplier -> up to ~4 MiB window; capped at max_rcv_buf
+const OUR_WSCALE: u8 = 7; // 128x multiplier -> up to ~8 MiB window; capped at max_rcv_buf
 const MIN_TCP_BUF: usize = 64 * 1024;
-const MAX_TCP_BUF: usize = 4 * 1024 * 1024;
+const MAX_TCP_BUF: usize = 8 * 1024 * 1024;
+const MAX_INCOMING_PACKETS: usize = 2048;
+const MAX_INCOMING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OOO_SEGMENTS: usize = 256;
-const STREAM_CHANNEL_CAP: usize = 64;
+const STREAM_CHANNEL_CAP: usize = 96;
 const RELAY_COALESCE_BYTES: usize = 64 * 1024;
 const INITIAL_RTO_MS: i64 = 200;
 const MAX_RTO_MS: i64 = 4_000;
@@ -674,7 +676,8 @@ impl TcpConn {
 pub struct ProxyTcpStack {
     config: TcpStackConfig,
     conns: HashMap<FlowKey, TcpConn>,
-    incoming: VecDeque<Vec<u8>>,
+    incoming_buf: Vec<u8>,
+    incoming_lens: Vec<usize>,
     waker: Arc<Notify>,
 }
 
@@ -684,7 +687,8 @@ impl ProxyTcpStack {
         Self {
             config,
             conns: HashMap::new(),
-            incoming: VecDeque::with_capacity(128),
+            incoming_buf: Vec::with_capacity(64 * 1024),
+            incoming_lens: Vec::with_capacity(128),
             waker: Arc::new(Notify::new()),
         }
     }
@@ -692,8 +696,11 @@ impl ProxyTcpStack {
 
 impl NetStack for ProxyTcpStack {
     fn push_ip_tcp(&mut self, packet: &[u8]) {
-        if self.incoming.len() < 2048 {
-            self.incoming.push_back(packet.to_vec());
+        if self.incoming_lens.len() < MAX_INCOMING_PACKETS
+            && self.incoming_buf.len().saturating_add(packet.len()) <= MAX_INCOMING_BYTES
+        {
+            self.incoming_buf.extend_from_slice(packet);
+            self.incoming_lens.push(packet.len());
         }
     }
 
@@ -703,8 +710,12 @@ impl NetStack for ProxyTcpStack {
         tx_out: &mut Vec<Vec<u8>>,
         accepted: &mut Vec<AcceptedTcpStream>,
     ) {
-        while let Some(pkt) = self.incoming.pop_front() {
-            let Some(ip) = parse_ip(&pkt) else {
+        let mut offset = 0usize;
+        for idx in 0..self.incoming_lens.len() {
+            let len = self.incoming_lens[idx];
+            let pkt = &self.incoming_buf[offset..offset + len];
+            offset += len;
+            let Some(ip) = parse_ip(pkt) else {
                 continue;
             };
             if ip.protocol != IP_PROTO_TCP {
@@ -806,6 +817,8 @@ impl NetStack for ProxyTcpStack {
                 }
             }
         }
+        self.incoming_buf.clear();
+        self.incoming_lens.clear();
 
         self.conns.retain(|_, conn| {
             if !conn.accepted && matches!(conn.state, TcpState::Established | TcpState::CloseWait) {
@@ -830,17 +843,21 @@ impl NetStack for ProxyTcpStack {
             conn.drain_from_relay(now_ms);
             conn.flush_tx(now_ms, tx_out);
 
-            // Emit a Window Update ACK promptly once the relay reopens >= 256 KiB
-            // after a low/zero window (including during half-closed FinWait1/FinWait2).
+            // Emit a Window Update ACK promptly when:
+            // 1. Reopening from a low/zero advertised window to >= reopen_threshold, OR
+            // 2. Available receive window has grown by >= max(256 KiB, max_rcv_buf / 4)
+            //    above `last_advertised_wnd` (RFC 1122 / Linux tcp_select_window).
             let current_wnd = conn.rcv_wnd_bytes();
             let reopen_threshold = (conn.max_rcv_buf as u32 / 4).min(256 * 1024);
+            let growth_step = (conn.max_rcv_buf as u32 / 4).max(256 * 1024);
             if !conn.need_ack
                 && matches!(
                     conn.state,
                     TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
                 )
-                && conn.last_advertised_wnd < reopen_threshold
-                && current_wnd >= reopen_threshold
+                && ((conn.last_advertised_wnd < reopen_threshold
+                    && current_wnd >= reopen_threshold)
+                    || current_wnd.saturating_sub(conn.last_advertised_wnd) >= growth_step)
             {
                 conn.need_ack = true;
             }
@@ -1074,5 +1091,44 @@ mod tests {
 
         let chunk = reader.recv_chunk().await.expect("wrapped data");
         assert_eq!(chunk, b"123456");
+    }
+
+    #[tokio::test]
+    async fn window_growth_emits_prompt_window_update_ack() {
+        let cfg = TcpStackConfig {
+            socket_buffer_bytes: 1024 * 1024, // 1 MiB -> growth_step = 256 KiB
+            ..TcpStackConfig::default()
+        };
+        let mut stack = ProxyTcpStack::new(cfg);
+        let (srv_nxt, acc) = handshake(&mut stack, 1000);
+        let (mut reader, _writer) = acc.stream.into_split();
+
+        // Fill 512 KiB so advertised window drops to 512 KiB (still above reopen_threshold).
+        let payload = vec![0x5a_u8; 1024];
+        let mut seq = 1001u32;
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+        for _ in 0..512 {
+            stack.push_ip_tcp(&make_seg(seq, srv_nxt, TCP_ACK, 1024, &[], &payload));
+            seq = seq.wrapping_add(payload.len() as u32);
+        }
+        stack.poll(30, &mut tx, &mut accepted);
+        tx.clear();
+
+        // Drain >= 256 KiB from the relay reader; next poll must emit a Window Update ACK.
+        let mut drained = 0usize;
+        while drained < 300 * 1024 {
+            let chunk = reader.recv_chunk().await.expect("chunk");
+            drained += chunk.len();
+        }
+        stack.poll(40, &mut tx, &mut accepted);
+        assert_eq!(
+            tx.len(),
+            1,
+            "expected prompt window-update ACK after >=256 KiB drain"
+        );
+        let ack_seg = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_eq!(ack_seg.flags, TCP_ACK);
+        assert_eq!(ack_seg.ack, seq);
     }
 }

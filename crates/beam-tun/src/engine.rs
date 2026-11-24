@@ -22,7 +22,9 @@ use crate::udp::{UdpBridgeConfig, UdpNatBridge};
 const MAX_PACKET_BUF: usize = 65_536;
 const TUN_TX_CHANNEL_CAP: usize = 512;
 const DEFAULT_IDLE_POLL_MS: u64 = 100;
-const RX_BATCH_MAX: usize = 64;
+const RX_BATCH_MAX: usize = 128;
+const C2S_COALESCE_TARGET: usize = 64 * 1024;
+const S2C_READ_BUF_BYTES: usize = 128 * 1024;
 
 /// Configuration for [`run_tun_engine`].
 #[derive(Clone, Debug)]
@@ -202,7 +204,7 @@ fn spawn_tcp_relay(
 
         let c2s = async {
             loop {
-                let chunk = match timeout(idle, tun_r.recv_chunk()).await {
+                let mut chunk = match timeout(idle, tun_r.recv_chunk()).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => {
                         let _ = up_w.shutdown().await;
@@ -210,6 +212,14 @@ fn spawn_tcp_relay(
                     }
                     Err(_) => break,
                 };
+                // Coalesce immediately-queued small chunks up to C2S_COALESCE_TARGET
+                // so multi-flow uploads write full TLS records with fewer syscalls.
+                while chunk.len() < C2S_COALESCE_TARGET {
+                    let Some(next) = tun_r.try_recv_chunk() else {
+                        break;
+                    };
+                    chunk.extend_from_slice(&next);
+                }
                 if !matches!(timeout(idle, up_w.write_all(&chunk)).await, Ok(Ok(()))) {
                     break;
                 }
@@ -223,7 +233,7 @@ fn spawn_tcp_relay(
         };
 
         let s2c = async {
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut buf = vec![0u8; S2C_READ_BUF_BYTES];
             loop {
                 let n = match timeout(idle, up_r.read(&mut buf)).await {
                     Ok(Ok(0)) => {

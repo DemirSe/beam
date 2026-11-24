@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc};
 
 const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
-const DEFAULT_TCP_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Tuning parameters for a [`NetStack`] implementation.
 #[derive(Clone, Copy, Debug)]
@@ -89,6 +89,16 @@ impl TunTcpReader {
     /// Receives the next chunk from the TUN TCP socket, or `None` on EOF.
     pub async fn recv_chunk(&mut self) -> Option<Vec<u8>> {
         let chunk = self.from_stack.recv().await?;
+        if let Some(counter) = self.in_flight_relay.as_ref() {
+            counter.fetch_sub(chunk.len(), Ordering::AcqRel);
+        }
+        self.waker.notify_one();
+        Some(chunk)
+    }
+
+    /// Non-blocking receive of an already-queued chunk from the TUN TCP socket.
+    pub fn try_recv_chunk(&mut self) -> Option<Vec<u8>> {
+        let chunk = self.from_stack.try_recv().ok()?;
         if let Some(counter) = self.in_flight_relay.as_ref() {
             counter.fetch_sub(chunk.len(), Ordering::AcqRel);
         }

@@ -295,7 +295,7 @@ async fn main() {
     let p99 = rtts_us[(rtts_us.len() * 99) / 100];
 
     let hwm_kib = read_vm_hwm_kib().unwrap_or(0);
-    println!("=== beam-tun (SmoltcpStack) rootless loopback micro-bench ===");
+    println!("=== beam-tun (ProxyTcpStack) rootless loopback micro-bench ===");
     println!(
         "TCP bulk ({} MiB): {:.2} s -> {:.1} MiB/s ({:.0} Mbps)",
         BULK_BYTES / (1024 * 1024),
