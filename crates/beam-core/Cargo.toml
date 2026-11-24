@@ -33,6 +33,10 @@ uuid = { version = "1", features = ["serde"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = { version = "1", features = ["derive"] }
 
+[[bench]]
+name = "xudp_writer"
+harness = false
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

@@ -304,3 +304,16 @@ profile. The TCP/REALITY path is unchanged.
 
 The Windows profile is `$HOME/.config/beam/windows.json`. The installer is
 `$HOME/.config/beam/beam-install-windows.ps1`.
+
+## beam-client diagnostics
+
+`beam-client --check` prints the validated TUN and server policy, then one DNS
+summary line: upstream kind and target, the detected or configured
+`local_upstream`, `cache_size`, `ipv4_only`, and the configured suffix counts.
+
+The client publishes `/run/beam-client/status` as `key=value` lines for
+`beam-tray`: `state`, `ifname`, `ts`, `pid`, `rtt_ms`, `reason`, `generation`,
+`bypass_ok`, `dial_failures`, and, when non-zero, `drops`. The tray ignores keys
+it does not know, so this list can grow without breaking an older tray. A
+`reason` of `dial_failures` means authenticated upstream dials keep failing, so
+a bare TCP connect to the server no longer reports the link as connected.
