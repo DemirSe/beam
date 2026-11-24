@@ -2802,7 +2802,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let (n, peer) = local_dns.recv_from(&mut buf).await.expect("recv");
-            // A late duplicate from an earlier query on the same socket.
+            // A short/corrupt datagram and a late duplicate from an earlier query.
+            local_dns
+                .send_to(b"\x00\x01", peer)
+                .await
+                .expect("send short");
             let stale = build_a_response(
                 &build_query(0x7001, "nas.lan", 1),
                 Ipv4Addr::new(1, 1, 1, 1),

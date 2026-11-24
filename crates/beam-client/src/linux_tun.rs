@@ -294,7 +294,11 @@ impl LinuxRouteGuard {
                     "no physical default gateway detected at startup; running fail-closed until network comes up"
                 );
             }
-            guard.update_bypass_gateway(&detected_gw, local_dns_ip);
+            if !guard.update_bypass_gateway(&detected_gw, local_dns_ip) {
+                warn!(
+                    "initial bypass route reconcile skipped due to ip lookup error; monitor will retry"
+                );
+            }
 
             run_ip(&["route", "replace", "0.0.0.0/1", "dev", ifname])?;
             guard.installed_v4_low = true;
@@ -382,7 +386,7 @@ impl LinuxRouteGuard {
     ///
     /// A failed exact-route lookup (`ip` missing, transient non-zero exit) is
     /// not treated as "route absent": the whole reconcile is skipped for this
-    /// Reconciles bypass routes for `new_gw` and `new_local_dns`.
+    /// cycle, so every route keeps its last-known state.
     ///
     /// Returns `false` if pre-checking existing routes failed with an `ip`
     /// execution error and the reconcile was skipped for this cycle, so callers

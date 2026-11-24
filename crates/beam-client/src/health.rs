@@ -195,7 +195,7 @@ pub fn spawn_network_monitor(
                 next_route_check_at = now_mono + ROUTE_HEALTH_CHECK_INTERVAL;
             }
 
-            let (current_gw, bypass_missing) = if should_check_routes {
+            let (current_gw, mut bypass_missing) = if should_check_routes {
                 let name = ifname.clone();
                 let gw =
                     tokio::task::spawn_blocking(move || detect_physical_gateways_excluding(&name))
@@ -222,11 +222,12 @@ pub fn spawn_network_monitor(
             };
             let any_gw = current_gw.v4.is_some() || current_gw.v6.is_some();
 
-            if gw_changed || slept_from_suspend || (bypass_missing && any_gw) {
+            if gw_changed || slept_from_suspend || (any_gw && (bypass_missing || route_retry_due)) {
                 info!(
                     gw_changed,
                     slept_from_suspend,
                     bypass_missing,
+                    route_retry_due,
                     old_gw = ?last_gw,
                     new_gw = ?current_gw,
                     "network transition, resume, or missing bypass route detected"
@@ -252,6 +253,7 @@ pub fn spawn_network_monitor(
                     // transition; incomplete bypass routes are still retried via
                     // `next_route_retry_at`.
                     last_gw = current_gw.clone();
+                    bypass_missing = !installed && any_gw;
                     if installed || !any_gw {
                         next_route_retry_at = None;
                         route_retry_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
