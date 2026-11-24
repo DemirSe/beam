@@ -32,6 +32,7 @@ ipv4_only = false
 
 [bypass]
 # Extra IPv4/IPv6 CIDRs or domain suffixes kept outside the tunnel.
+# domains needs dns.enabled = true: only the built-in resolver applies the split.
 cidrs = []
 domains = []
 

@@ -320,21 +320,15 @@ pub fn spawn_network_monitor(
 
             let wait_dur = {
                 let now = Instant::now();
-                let until_probe = next_probe_at.saturating_duration_since(now);
-                let until_route_check = next_route_check_at.saturating_duration_since(now);
-                let until_route_retry = next_route_retry_at
-                    .map(|t| t.saturating_duration_since(now))
-                    .unwrap_or(Duration::MAX);
-                let max_sleep = if netlink.is_some() {
-                    SLEEP_CHECK_INTERVAL
-                } else {
-                    FALLBACK_POLL_TICK
-                };
-                until_probe
-                    .min(until_route_check)
-                    .min(until_route_retry)
-                    .min(max_sleep)
-                    .max(Duration::from_millis(50))
+                next_wait_duration(
+                    next_probe_at.saturating_duration_since(now),
+                    next_route_check_at.saturating_duration_since(now),
+                    next_route_retry_at
+                        .map(|t| t.saturating_duration_since(now))
+                        .unwrap_or(Duration::MAX),
+                    auto_route,
+                    netlink.is_some(),
+                )
             };
 
             tokio::select! {
@@ -383,6 +377,29 @@ pub fn spawn_network_monitor(
             }
         }
     })
+}
+
+/// Computes one monitor sleep. With `auto_route` and no netlink watcher the
+/// loop must poll routes, so it stays on [`FALLBACK_POLL_TICK`]; otherwise
+/// (including `auto_route = false`) it may sleep up to
+/// [`SLEEP_CHECK_INTERVAL`] and still wakes for the next probe.
+fn next_wait_duration(
+    until_probe: Duration,
+    until_route_check: Duration,
+    until_route_retry: Duration,
+    auto_route: bool,
+    has_netlink: bool,
+) -> Duration {
+    let max_sleep = if auto_route && !has_netlink {
+        FALLBACK_POLL_TICK
+    } else {
+        SLEEP_CHECK_INTERVAL
+    };
+    until_probe
+        .min(until_route_check)
+        .min(until_route_retry)
+        .min(max_sleep)
+        .max(Duration::from_millis(50))
 }
 
 /// Drains queued netlink notifications and clears Tokio edge-triggered
@@ -512,6 +529,38 @@ mod tests {
         let t0 = boottime_offset().expect("read CLOCK_BOOTTIME - CLOCK_MONOTONIC");
         let t1 = boottime_offset().expect("read CLOCK_BOOTTIME - CLOCK_MONOTONIC");
         assert!(!detect_boottime_sleep_jump(t0, t1));
+    }
+
+    #[test]
+    fn monitor_sleep_keeps_the_fast_poll_only_for_netlink_fallback() {
+        let probe = Duration::from_secs(10);
+        let far = Duration::from_secs(600);
+
+        // No auto-route: no route work to poll, so sleep until the probe.
+        assert_eq!(next_wait_duration(probe, far, far, false, false), probe);
+        assert_eq!(
+            next_wait_duration(far, far, far, false, false),
+            SLEEP_CHECK_INTERVAL
+        );
+
+        // Auto-route without netlink needs the 2 s fallback poll.
+        assert_eq!(
+            next_wait_duration(probe, far, far, true, false),
+            FALLBACK_POLL_TICK
+        );
+
+        // Auto-route with netlink follows the probe schedule.
+        assert_eq!(next_wait_duration(probe, far, far, true, true), probe);
+        assert_eq!(
+            next_wait_duration(far, far, far, true, true),
+            SLEEP_CHECK_INTERVAL
+        );
+
+        // A due deadline never yields a spin loop.
+        assert_eq!(
+            next_wait_duration(Duration::ZERO, far, far, true, true),
+            Duration::from_millis(50)
+        );
     }
 
     #[test]

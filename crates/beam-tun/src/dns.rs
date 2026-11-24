@@ -255,6 +255,9 @@ pub struct DnsQuery {
     pub qname: String,
     pub qtype: u16,
     pub qclass: u16,
+    /// EDNS0 `DO` (DNSSEC OK) bit, part of the cache key because an upstream
+    /// answer differs with and without DNSSEC records.
+    pub dnssec_ok: bool,
 }
 
 /// Zero-panic RFC 1035 DNS query parser.
@@ -269,7 +272,7 @@ pub fn parse_dns_query(wire: &[u8]) -> Option<DnsQuery> {
         return None;
     }
     let qdcount = u16::from_be_bytes([wire[4], wire[5]]);
-    if qdcount == 0 {
+    if qdcount != 1 {
         return None;
     }
     let (qname, next_offset) = parse_dns_name(wire, 12)?;
@@ -283,7 +286,38 @@ pub fn parse_dns_query(wire: &[u8]) -> Option<DnsQuery> {
         qname,
         qtype,
         qclass,
+        dnssec_ok: query_edns0(wire).is_some_and(|(_, dnssec_ok)| dnssec_ok),
     })
+}
+
+/// Returns `true` when the response has `QR=1`, `QDCOUNT=1`, and its question
+/// matches the query.
+///
+/// An upstream resolver is untrusted: a reply with extra questions or for a
+/// different name, type, or class is rejected before it is delivered or cached.
+fn response_question_matches(query: &DnsQuery, resp: &[u8]) -> bool {
+    if resp.len() < 12 || resp.len() > MAX_DOH_RESPONSE_BYTES {
+        return false;
+    }
+    let flags = u16::from_be_bytes([resp[2], resp[3]]);
+    if (flags & 0x8000) == 0 {
+        return false;
+    }
+    if u16::from_be_bytes([resp[4], resp[5]]) != 1 {
+        return false;
+    }
+    let Some((qname, next)) = parse_dns_name(resp, 12) else {
+        return false;
+    };
+    let Some(after) = next.checked_add(4) else {
+        return false;
+    };
+    if after > resp.len() {
+        return false;
+    }
+    let qtype = u16::from_be_bytes([resp[next], resp[next + 1]]);
+    let qclass = u16::from_be_bytes([resp[next + 2], resp[next + 3]]);
+    qname.eq_ignore_ascii_case(&query.qname) && qtype == query.qtype && qclass == query.qclass
 }
 
 /// Parses a domain name at `start` (supporting RFC 1035 compression pointers
@@ -423,11 +457,12 @@ pub fn parse_dns_response_meta(wire: &[u8]) -> (Option<u32>, Vec<IpAddr>) {
     }
 
     let ttl = match rcode {
-        0 => Some(
-            min_ttl
-                .map(|t| t.clamp(MIN_CACHE_TTL_SECS, MAX_CACHE_TTL_SECS))
-                .unwrap_or(NEGATIVE_CACHE_TTL_SECS), // Cache NOERROR NODATA briefly
-        ),
+        0 => match min_ttl {
+            // RFC 1035 §3.2.1: a TTL of 0 tells the receiver not to cache.
+            Some(0) => None,
+            Some(t) => Some(t.clamp(MIN_CACHE_TTL_SECS, MAX_CACHE_TTL_SECS)),
+            None => Some(NEGATIVE_CACHE_TTL_SECS), // Cache NOERROR NODATA briefly
+        },
         3 => Some(NEGATIVE_CACHE_TTL_SECS), // NXDOMAIN
         _ => None,                          // Do not cache SERVFAIL/REFUSED
     };
@@ -486,6 +521,12 @@ fn build_truncated_response_with_rcode(query_wire: &[u8], rcode: u8) -> Option<V
 /// (type 41) pseudo-RR in its Additional section. Strictly bounded and never
 /// panics.
 fn query_edns0_udp_payload_size(query_wire: &[u8]) -> Option<usize> {
+    query_edns0(query_wire).map(|(payload_size, _)| payload_size)
+}
+
+/// Returns `(advertised_udp_payload_size, dnssec_ok)` for the query's first
+/// EDNS0 `OPT` (type 41) pseudo-RR. Strictly bounded and never panics.
+fn query_edns0(query_wire: &[u8]) -> Option<(usize, bool)> {
     if query_wire.len() < 12 || query_wire.len() > MAX_DNS_QUERY_BYTES {
         return None;
     }
@@ -537,7 +578,9 @@ fn query_edns0_udp_payload_size(query_wire: &[u8]) -> Option<usize> {
                 query_wire[next + 2],
                 query_wire[next + 3],
             ]));
-            return Some(advertised.max(CLASSIC_UDP_DNS_RESPONSE_BYTES));
+            // RFC 3225: DO is the top bit of the OPT TTL flags word.
+            let dnssec_ok = query_wire[next + 6] & 0x80 != 0;
+            return Some((advertised.max(CLASSIC_UDP_DNS_RESPONSE_BYTES), dnssec_ok));
         }
         let rdlength = usize::from(u16::from_be_bytes([
             query_wire[next + 8],
@@ -627,6 +670,7 @@ struct CacheKey {
     qname: String,
     qtype: u16,
     qclass: u16,
+    dnssec_ok: bool,
 }
 
 struct CacheEntry {
@@ -663,6 +707,7 @@ impl DnsCache {
             qname: query.qname.clone(),
             qtype: query.qtype,
             qclass: query.qclass,
+            dnssec_ok: query.dnssec_ok,
         };
         let expired = self
             .entries
@@ -701,6 +746,7 @@ impl DnsCache {
             qname: query.qname.clone(),
             qtype: query.qtype,
             qclass: query.qclass,
+            dnssec_ok: query.dnssec_ok,
         };
         if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
             self.entries.retain(|_, v| now < v.expires_at);
@@ -824,6 +870,10 @@ impl<S> Default for TcpDnsPool<S> {
 }
 
 impl<S> TcpDnsPool<S> {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
     fn take(&mut self, now: Instant) -> (Option<S>, u64) {
         let generation = self.generation;
         while let Some(entry) = self.idle.pop() {
@@ -1136,23 +1186,34 @@ impl DnsInterceptor {
 
             let reply_wire = match result {
                 Ok(mut resp) if resp.len() >= 12 && resp.len() <= MAX_DOH_RESPONSE_BYTES => {
-                    // Ensure tx_id matches the client query.
-                    let id = query.tx_id.to_be_bytes();
-                    resp[0] = id[0];
-                    resp[1] = id[1];
-                    let (maybe_ttl, ips) = parse_dns_response_meta(&resp);
-                    if is_bypass_domain
-                        && !ips.is_empty()
-                        && let Some(cb) = dns_cfg.on_bypass_ips.as_ref()
-                    {
-                        cb(&ips);
+                    if !response_question_matches(&query, &resp) {
+                        debug!(
+                            qname = %query.qname,
+                            local = use_local,
+                            "DNS response question does not match the query; replying with SERVFAIL"
+                        );
+                        build_servfail_response(&wire_owned)
+                    } else {
+                        // Rewrite tx_id to match the client query. DoH uses tx_id 0
+                        // per RFC 8484 and TCP/XUDP are 1-to-1 exchanges, so question
+                        // matching above is what prevents cross-query injection.
+                        let id = query.tx_id.to_be_bytes();
+                        resp[0] = id[0];
+                        resp[1] = id[1];
+                        let (maybe_ttl, ips) = parse_dns_response_meta(&resp);
+                        if is_bypass_domain
+                            && !ips.is_empty()
+                            && let Some(cb) = dns_cfg.on_bypass_ips.as_ref()
+                        {
+                            cb(&ips);
+                        }
+                        if let Some(ttl) = maybe_ttl
+                            && let Ok(mut guard) = cache.lock()
+                        {
+                            guard.insert(&query, resp.clone(), ttl, use_local, Instant::now());
+                        }
+                        fit_response_for_udp(&wire_owned, resp)
                     }
-                    if let Some(ttl) = maybe_ttl
-                        && let Ok(mut guard) = cache.lock()
-                    {
-                        guard.insert(&query, resp.clone(), ttl, use_local, Instant::now());
-                    }
-                    fit_response_for_udp(&wire_owned, resp)
                 }
                 Ok(_) => build_servfail_response(&wire_owned),
                 Err(err) => {
@@ -1292,12 +1353,17 @@ async fn resolve_tcp_over_beam(
         },
         port: addr.port(),
     };
+    // Sample the current pool generation right before dialing a fresh
+    // connection (after any stale-pooled attempt above), so a post-reset dial
+    // is pooled under the current generation while a transition during dial
+    // still drops it.
+    let pool_gen = tcp_pool.lock().ok().map(|pool| pool.generation());
     let mut stream = dial_tcp(client_cfg, dest)
         .await
         .map_err(|e| io::Error::other(e.to_string()))?;
     let resp = send_tcp_dns_request(&mut stream, query).await?;
-    if let Ok(mut pool) = tcp_pool.lock() {
-        pool.put(stream, pool_gen, Instant::now());
+    if let (Some(gen_id), Ok(mut pool)) = (pool_gen, tcp_pool.lock()) {
+        pool.put(stream, gen_id, Instant::now());
     }
     Ok(resp)
 }
@@ -1433,11 +1499,7 @@ async fn resolve_doh_over_beam(
         }
     }
 
-    let dial_gen = doh_pool
-        .lock()
-        .ok()
-        .map(|pool| pool.generation())
-        .unwrap_or(0);
+    let dial_gen = doh_pool.lock().ok().map(|pool| pool.generation());
     let address = if let Ok(ip) = host.parse::<IpAddr>() {
         match ip {
             IpAddr::V4(v4) => Address::Ipv4(v4),
@@ -1457,8 +1519,8 @@ async fn resolve_doh_over_beam(
     let mut tls = connector.connect(server_name, beam_stream).await?;
 
     let (body, reusable) = send_doh_http_request(&mut tls, &host_header, path, query).await?;
-    if reusable && let Ok(mut pool) = doh_pool.lock() {
-        pool.put(tls, dial_gen, Instant::now());
+    if reusable && let (Some(gen_id), Ok(mut pool)) = (dial_gen, doh_pool.lock()) {
+        pool.put(tls, gen_id, Instant::now());
     }
     Ok(body)
 }
@@ -1834,6 +1896,125 @@ mod tests {
 
         // Expired after TTL.
         assert!(cache.get(&q1, t0 + Duration::from_secs(31)).is_none());
+    }
+
+    #[test]
+    fn ttl_zero_answer_is_not_cached() {
+        let q = build_query(0x4242, "nocache.example", 1);
+        // RFC 1035 §3.2.1: TTL 0 means "do not cache".
+        assert_eq!(
+            parse_dns_response_meta(&build_a_response(&q, Ipv4Addr::new(1, 2, 3, 4), 0)).0,
+            None
+        );
+        // Non-zero TTLs keep the `MIN_CACHE_TTL_SECS` floor.
+        assert_eq!(
+            parse_dns_response_meta(&build_a_response(&q, Ipv4Addr::new(1, 2, 3, 4), 1)).0,
+            Some(MIN_CACHE_TTL_SECS)
+        );
+        assert_eq!(
+            parse_dns_response_meta(&build_a_response(&q, Ipv4Addr::new(1, 2, 3, 4), 120)).0,
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn cache_separates_dnssec_ok_from_plain_queries() {
+        let mut cache = DnsCache::new(4);
+        let now = Instant::now();
+        let plain_wire = build_query_with_edns0_do(0x1234, "dnssec.example", 1, false);
+        let signed_wire = build_query_with_edns0_do(0x1234, "dnssec.example", 1, true);
+        let q_plain = parse_dns_query(&plain_wire).expect("plain query");
+        let q_signed = parse_dns_query(&signed_wire).expect("signed query");
+        assert!(!q_plain.dnssec_ok);
+        assert!(q_signed.dnssec_ok);
+
+        cache.insert(
+            &q_plain,
+            build_a_response(
+                &build_query(0x1234, "dnssec.example", 1),
+                Ipv4Addr::new(1, 2, 3, 4),
+                60,
+            ),
+            60,
+            false,
+            now,
+        );
+        cache.insert(
+            &q_signed,
+            build_a_response(
+                &build_query(0x1234, "dnssec.example", 1),
+                Ipv4Addr::new(5, 6, 7, 8),
+                60,
+            ),
+            60,
+            false,
+            now,
+        );
+
+        let plain_hit = cache.get(&q_plain, now).expect("plain hit");
+        let signed_hit = cache.get(&q_signed, now).expect("signed hit");
+        assert_eq!(
+            parse_dns_response_meta(&plain_hit).1,
+            vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]
+        );
+        assert_eq!(
+            parse_dns_response_meta(&signed_hit).1,
+            vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))]
+        );
+    }
+
+    #[test]
+    fn rejects_response_question_mismatch() {
+        let query = parse_dns_query(&build_query(0x1111, "good.example", 1)).expect("query");
+
+        // Case-insensitive match on the same name/type/class is accepted.
+        let matching = build_a_response(
+            &build_query(0x1111, "Good.Example", 1),
+            Ipv4Addr::new(1, 2, 3, 4),
+            60,
+        );
+        assert!(response_question_matches(&query, &matching));
+
+        let wrong_name = build_a_response(
+            &build_query(0x1111, "evil.example", 1),
+            Ipv4Addr::new(1, 2, 3, 4),
+            60,
+        );
+        assert!(!response_question_matches(&query, &wrong_name));
+
+        let wrong_type = build_a_response(
+            &build_query(0x1111, "good.example", 28),
+            Ipv4Addr::new(1, 2, 3, 4),
+            60,
+        );
+        assert!(!response_question_matches(&query, &wrong_type));
+
+        let mut class_query = build_query(0x1111, "good.example", 1);
+        let class_at = class_query.len() - 2;
+        class_query[class_at..].copy_from_slice(&3u16.to_be_bytes());
+        let wrong_class = build_a_response(&class_query, Ipv4Addr::new(1, 2, 3, 4), 60);
+        assert!(!response_question_matches(&query, &wrong_class));
+
+        // Truncated, question-less, multi-question, and QR=0 responses never match.
+        assert!(!response_question_matches(&query, &matching[..11]));
+        let mut no_question = matching.clone();
+        no_question[4] = 0;
+        no_question[5] = 0;
+        assert!(!response_question_matches(&query, &no_question));
+
+        let mut two_questions = matching.clone();
+        two_questions[4] = 0;
+        two_questions[5] = 2;
+        assert!(!response_question_matches(&query, &two_questions));
+
+        let mut qr_zero = matching.clone();
+        qr_zero[2] &= !0x80;
+        assert!(!response_question_matches(&query, &qr_zero));
+
+        let mut multi_q_query = build_query(0x1111, "good.example", 1);
+        multi_q_query[4] = 0;
+        multi_q_query[5] = 2;
+        assert!(parse_dns_query(&multi_q_query).is_none());
     }
 
     #[test]
@@ -2296,6 +2477,18 @@ mod tests {
         q.extend_from_slice(&udp_payload_size.to_be_bytes()); // CLASS = UDP payload size
         q.extend_from_slice(&0u32.to_be_bytes()); // extended RCODE / version / flags
         q.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH = 0
+        q
+    }
+
+    /// Builds a query with an EDNS0 `OPT` record and the given DNSSEC OK bit.
+    fn build_query_with_edns0_do(tx_id: u16, name: &str, qtype: u16, dnssec_ok: bool) -> Vec<u8> {
+        let mut q = build_query_with_edns0(tx_id, name, qtype, 1232);
+        if dnssec_ok {
+            // DO is the top bit of the OPT TTL flags word, 4 bytes from the end
+            // of the record when RDLENGTH is 0.
+            let do_byte = q.len() - 4;
+            q[do_byte] |= 0x80;
+        }
         q
     }
 

@@ -1,5 +1,6 @@
 //! Strict TOML configuration for `beam-client`.
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -10,7 +11,8 @@ use base64::Engine as _;
 use beam_core::client::BeamClientConfig;
 use beam_core::reality::RealityClientConfig;
 use beam_tun::{
-    DnsConfig, DnsUpstream, IpNet, RoutePolicy, TcpStackConfig, TunEngineConfig, UdpBridgeConfig,
+    DnsConfig, DnsUpstream, IpNet, RoutePolicy, TUN_V6_NET, TcpStackConfig, TunEngineConfig,
+    UdpBridgeConfig,
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -45,7 +47,7 @@ pub struct ClientFileConfig {
     pub log: LogSection,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
     /// Server socket address (`ip:port`).
@@ -58,6 +60,18 @@ pub struct ServerSection {
     pub short_id: String,
     /// VLESS user UUID.
     pub user_id: Uuid,
+}
+
+impl fmt::Debug for ServerSection {
+    /// Redacts every credential so a debug-printed config cannot leak
+    /// `public_key`, `short_id`, or `user_id` into logs.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerSection")
+            .field("address", &self.address)
+            .field("sni", &self.sni)
+            .field("credentials", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -326,6 +340,13 @@ impl ClientFileConfig {
                 "bypass.domains must contain at most 256 entries".into(),
             ));
         }
+        if !self.bypass.domains.is_empty() && !self.dns.enabled {
+            return Err(ConfigError::Invalid(
+                "bypass.domains requires dns.enabled = true; the split is only applied by the \
+                 built-in DNS interceptor"
+                    .into(),
+            ));
+        }
         let mut parsed_bypass_cidrs = Vec::with_capacity(self.bypass.cidrs.len());
         let mut bypass_cidrs_raw = Vec::with_capacity(self.bypass.cidrs.len());
         for cidr in &self.bypass.cidrs {
@@ -436,15 +457,26 @@ impl ClientFileConfig {
 
 fn parse_dns_socket_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
     let trimmed = raw.trim();
-    if let Ok(sock) = trimmed.parse::<SocketAddr>() {
-        return Ok(sock);
+    let sock = if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+        sock
+    } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        SocketAddr::new(ip, 53)
+    } else {
+        return Err(ConfigError::Invalid(format!(
+            "dns.local_upstream must be IP or IP:port, got: {trimmed}"
+        )));
+    };
+    if sock.ip().is_unspecified() {
+        return Err(ConfigError::Invalid(
+            "dns.local_upstream must not use an unspecified IP address".into(),
+        ));
     }
-    if let Ok(ip) = trimmed.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, 53));
+    if sock.port() == 0 {
+        return Err(ConfigError::Invalid(
+            "dns.local_upstream must not use port 0".into(),
+        ));
     }
-    Err(ConfigError::Invalid(format!(
-        "dns.local_upstream must be IP or IP:port, got: {trimmed}"
-    )))
+    Ok(sock)
 }
 
 /// Auto-detects the host's pre-VPN local DNS server from systemd-resolved's
@@ -463,7 +495,7 @@ pub fn detect_system_local_dns_excluding(exclude_tun_net: Option<IpNet>) -> Opti
 }
 
 fn is_tun_ipv6(ip: IpAddr) -> bool {
-    IpNet::parse_cidr("fd00:be:a::/126").is_some_and(|net| net.contains(ip))
+    TUN_V6_NET.contains(ip)
 }
 
 fn parse_resolv_conf_nameserver(
@@ -730,5 +762,84 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debug_output_redacts_server_credentials() {
+        let cfg: ClientFileConfig = toml::from_str(EXAMPLE).expect("example parses");
+        let user_id = cfg.server.user_id.to_string();
+        let secrets = [
+            "user_id",
+            "public_key",
+            "short_id",
+            user_id.as_str(),
+            cfg.server.public_key.as_str(),
+            cfg.server.short_id.as_str(),
+        ];
+
+        let rendered = format!("{cfg:?}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(rendered.contains("whatsapp.net"), "{rendered}");
+        for secret in secrets {
+            assert!(!rendered.contains(secret), "leaked {secret} in {rendered}");
+        }
+
+        let server_only = format!("{:?}", cfg.server);
+        for secret in secrets {
+            assert!(
+                !server_only.contains(secret),
+                "leaked {secret} in {server_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_tun_cidr_prefix_and_address() {
+        assert!(validate_ipv4_cidr("172.19.0.1/30").is_ok());
+        assert!(validate_ipv4_cidr("10.0.0.0/8").is_ok());
+        assert!(validate_ipv4_cidr("192.168.1.1/32").is_ok());
+        assert!(validate_ipv4_cidr("172.19.0.1/0").is_err());
+        assert!(validate_ipv4_cidr("172.19.0.1/33").is_err());
+        assert!(validate_ipv4_cidr("not-an-ip/30").is_err());
+        assert!(validate_ipv4_cidr("172.19.0.1").is_err());
+    }
+
+    #[test]
+    fn rejects_zero_port_local_upstream() {
+        assert!(parse_dns_socket_addr("192.168.1.1:53").is_ok());
+        assert_eq!(
+            parse_dns_socket_addr("192.168.1.1")
+                .expect("default port")
+                .port(),
+            53
+        );
+        assert!(parse_dns_socket_addr("192.168.1.1:0").is_err());
+        assert!(parse_dns_socket_addr("[fd00::1]:0").is_err());
+        assert!(parse_dns_socket_addr("0.0.0.0:53").is_err());
+        assert!(parse_dns_socket_addr("[::]:53").is_err());
+
+        let zero_port = EXAMPLE.replace(
+            "# local_upstream = \"192.168.1.1:53\"",
+            "local_upstream = \"192.168.1.1:0\"",
+        );
+        assert!(ClientFileConfig::parse_and_validate(&zero_port).is_err());
+    }
+
+    #[test]
+    fn rejects_bypass_domains_without_dns() {
+        let with_domains = EXAMPLE.replace("domains = []", "domains = [\"corp.example\"]");
+        assert!(ClientFileConfig::parse_and_validate(&with_domains).is_ok());
+
+        let dns_disabled = with_domains.replace("enabled = true", "enabled = false");
+        let err = ClientFileConfig::parse_and_validate(&dns_disabled)
+            .expect_err("bypass.domains without dns must fail");
+        assert!(
+            err.to_string()
+                .contains("bypass.domains requires dns.enabled"),
+            "{err}"
+        );
+
+        let no_domains = EXAMPLE.replace("enabled = true", "enabled = false");
+        assert!(ClientFileConfig::parse_and_validate(&no_domains).is_ok());
     }
 }

@@ -9,7 +9,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use beam_sys::LinuxTun;
-use beam_tun::{IpNet, TunDevice};
+use beam_tun::{IpNet, TUN_V6_NET, TunDevice};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info, warn};
 
@@ -21,6 +21,54 @@ pub const DEFAULT_ROUTES_STATE_PATH: &str = "/run/beam-client/routes.state";
 const MAX_DYNAMIC_BYPASS_IPS: usize = 256;
 const DYNAMIC_BYPASS_TTL: Duration = Duration::from_secs(3600);
 const MAX_PERSISTED_ROUTES: usize = 1024;
+/// At most one `warn!` for a full dynamic-bypass table per interval and address
+/// family, so a busy host with `bypass.domains` cannot flood the journal and an
+/// IPv4 warning does not silence IPv6.
+const DYNAMIC_BYPASS_CAP_WARN_INTERVAL: Duration = Duration::from_secs(600);
+static DYNAMIC_BYPASS_CAP_WARNED_V4_AT: std::sync::Mutex<Option<Instant>> =
+    std::sync::Mutex::new(None);
+static DYNAMIC_BYPASS_CAP_WARNED_V6_AT: std::sync::Mutex<Option<Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Returns `true` when the cap warning is due, so it fires once per interval.
+fn cap_warn_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= DYNAMIC_BYPASS_CAP_WARN_INTERVAL)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IpFamily {
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V4 => "ipv4",
+            Self::V6 => "ipv6",
+        }
+    }
+}
+
+fn warn_dynamic_bypass_cap(family: IpFamily) {
+    let now = Instant::now();
+    let slot = match family {
+        IpFamily::V4 => &DYNAMIC_BYPASS_CAP_WARNED_V4_AT,
+        IpFamily::V6 => &DYNAMIC_BYPASS_CAP_WARNED_V6_AT,
+    };
+    let Ok(mut last) = slot.lock() else {
+        return;
+    };
+    if !cap_warn_due(*last, now) {
+        return;
+    }
+    *last = Some(now);
+    warn!(
+        family = family.as_str(),
+        cap = MAX_DYNAMIC_BYPASS_IPS,
+        "dynamic bypass.domains route table is full; evicting the oldest route"
+    );
+}
 
 /// Detected physical IPv4 and IPv6 default gateways `(optional_gw_ip, dev)`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -279,8 +327,7 @@ impl LinuxRouteGuard {
 
     /// Returns `true` if `ip` lies inside the TUN IPv4 or IPv6 subnet.
     fn is_in_tun_subnet(&self, ip: IpAddr) -> bool {
-        self.tun_v4_net.is_some_and(|net| net.contains(ip))
-            || IpNet::parse_cidr("fd00:be:a::/126").is_some_and(|net| net.contains(ip))
+        self.tun_v4_net.is_some_and(|net| net.contains(ip)) || TUN_V6_NET.contains(ip)
     }
 
     /// Returns `true` if all required bypass routes (server and active
@@ -548,9 +595,11 @@ impl LinuxRouteGuard {
     fn evict_v4_if_needed(&mut self, now: Instant) {
         let mut evicted_prefixes = Vec::new();
         while let Some(&(ip, ts)) = self.dynamic_bypass_v4.front() {
-            if now.saturating_duration_since(ts) >= DYNAMIC_BYPASS_TTL
-                || self.dynamic_bypass_v4.len() >= MAX_DYNAMIC_BYPASS_IPS
-            {
+            let at_cap = self.dynamic_bypass_v4.len() >= MAX_DYNAMIC_BYPASS_IPS;
+            if at_cap {
+                warn_dynamic_bypass_cap(IpFamily::V4);
+            }
+            if now.saturating_duration_since(ts) >= DYNAMIC_BYPASS_TTL || at_cap {
                 self.dynamic_bypass_v4.pop_front();
                 evicted_prefixes.push(format!("{ip}/32"));
             } else {
@@ -574,9 +623,11 @@ impl LinuxRouteGuard {
     fn evict_v6_if_needed(&mut self, now: Instant) {
         let mut evicted_prefixes = Vec::new();
         while let Some(&(ip, ts)) = self.dynamic_bypass_v6.front() {
-            if now.saturating_duration_since(ts) >= DYNAMIC_BYPASS_TTL
-                || self.dynamic_bypass_v6.len() >= MAX_DYNAMIC_BYPASS_IPS
-            {
+            let at_cap = self.dynamic_bypass_v6.len() >= MAX_DYNAMIC_BYPASS_IPS;
+            if at_cap {
+                warn_dynamic_bypass_cap(IpFamily::V6);
+            }
+            if now.saturating_duration_since(ts) >= DYNAMIC_BYPASS_TTL || at_cap {
                 self.dynamic_bypass_v6.pop_front();
                 evicted_prefixes.push(format!("{ip}/128"));
             } else {
@@ -865,17 +916,33 @@ fn remove_v6_bypass(prefix: &str, gw: Option<&str>, dev: &str) -> io::Result<()>
     }
 }
 
-fn ip_binary() -> &'static str {
-    for candidate in ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"] {
+const IP_BINARY_CANDIDATES: [&str; 4] = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"];
+
+/// Resolves `ip` (iproute2) from the fixed system paths.
+///
+/// Deliberately never falls back to a bare `"ip"` `PATH` lookup: a privileged
+/// daemon must not run an operator-writable binary from `PATH`.
+fn find_ip_binary(candidates: &[&'static str]) -> io::Result<&'static str> {
+    for candidate in candidates {
         if Path::new(candidate).is_file() {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    "ip"
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "iproute2 `ip` not found in {}; install iproute2",
+            candidates.join(", ")
+        ),
+    ))
+}
+
+fn ip_binary() -> io::Result<&'static str> {
+    find_ip_binary(&IP_BINARY_CANDIDATES)
 }
 
 fn run_ip(args: &[&str]) -> io::Result<()> {
-    let output = Command::new(ip_binary()).args(args).output()?;
+    let output = Command::new(ip_binary()?).args(args).output()?;
     if output.status.success() {
         Ok(())
     } else {
@@ -906,7 +973,10 @@ fn has_host_route(ip: IpAddr) -> bool {
 }
 
 fn has_exact_route(family_flag: &str, prefix: &str) -> bool {
-    let Ok(output) = Command::new(ip_binary())
+    let Ok(ip) = ip_binary() else {
+        return false;
+    };
+    let Ok(output) = Command::new(ip)
         .args([family_flag, "route", "show", "exact", prefix])
         .output()
     else {
@@ -962,7 +1032,7 @@ fn detect_default_gateway(
     family_flag: &str,
     exclude_ifname: &str,
 ) -> Option<(Option<String>, String)> {
-    let output = Command::new(ip_binary())
+    let output = Command::new(ip_binary().ok()?)
         .args([family_flag, "route", "show", "default"])
         .output()
         .ok()?;
@@ -1179,5 +1249,29 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
         ));
         let _ = std::fs::remove_file(&path);
         assert_eq!(cleanup_persisted_routes(&path).expect("noop"), 0);
+    }
+
+    #[test]
+    fn ip_lookup_never_falls_back_to_path() {
+        let err = find_ip_binary(&["/nonexistent/beam/ip", "/nonexistent/beam/ip2"])
+            .expect_err("missing candidates must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("iproute2"), "{err}");
+
+        // A present candidate is returned as-is, without a `PATH` search.
+        let missing = find_ip_binary(&["/nonexistent/beam/ip"]).expect_err("missing");
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert_eq!(find_ip_binary(&["/bin/sh"]).expect("found"), "/bin/sh");
+    }
+
+    #[test]
+    fn dynamic_bypass_cap_warning_is_rate_limited() {
+        let now = Instant::now();
+        assert!(cap_warn_due(None, now));
+        assert!(!cap_warn_due(Some(now), now + Duration::from_secs(1)));
+        assert!(cap_warn_due(
+            Some(now),
+            now + DYNAMIC_BYPASS_CAP_WARN_INTERVAL
+        ));
     }
 }
