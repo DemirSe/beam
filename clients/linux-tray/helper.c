@@ -48,6 +48,7 @@
 #ifndef TUN_IFACE
 #define TUN_IFACE "sbtun0"
 #endif
+#define TUN_IFACE_NATIVE "beamtun0"
 #ifndef DNS_DIR
 #define DNS_DIR "/etc/systemd/resolved.conf.d"
 #endif
@@ -485,7 +486,8 @@ static int wait_tun(int seconds)
 {
     int i;
     for (i = 0; i < seconds * 10; i++) {
-        if (if_nametoindex(TUN_IFACE) != 0)
+        if (if_nametoindex(TUN_IFACE) != 0 ||
+            if_nametoindex(TUN_IFACE_NATIVE) != 0)
             return 0;
         usleep(100000);
     }

@@ -108,7 +108,11 @@ static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             line[--len] = '\0';
         if (strncmp(line, "state=", 6) == 0) {
-            snprintf(state_out, state_cap, "%s", line + 6);
+            size_t copy_len = strlen(line + 6);
+            if (copy_len >= state_cap)
+                copy_len = state_cap - 1;
+            memcpy(state_out, line + 6, copy_len);
+            state_out[copy_len] = '\0';
             found_state = 1;
         } else if (strncmp(line, "rtt_ms=", 7) == 0) {
             char *end = NULL;
