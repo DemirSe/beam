@@ -4,11 +4,11 @@
 use std::io::{self, Write as _};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use beam_sys::{NetlinkRouteWatcher, boottime_offset};
-use beam_tun::{IpNet, TunnelActivity};
+use beam_tun::{DropSnapshot, IpNet, RateLimiter, TunnelActivity};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -21,7 +21,12 @@ use crate::linux_tun::{LinuxRouteGuard, PhysicalGateways, detect_physical_gatewa
 /// Default runtime status file path (owned by `RuntimeDirectory=beam-client`).
 pub const DEFAULT_STATUS_PATH: &str = "/run/beam-client/status";
 
+/// First no-netlink fallback poll interval (unchanged default behavior).
 const FALLBACK_POLL_TICK: Duration = Duration::from_secs(2);
+/// Upper bound of the backed-off no-netlink fallback poll interval.
+const FALLBACK_POLL_MAX_SECS: u64 = 30;
+/// Consecutive authenticated dial failures that mark the link degraded.
+const DEGRADED_DIAL_FAILURE_STREAK: u64 = 3;
 const SLEEP_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const ROUTE_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const NETLINK_COALESCE_DELAY: Duration = Duration::from_millis(150);
@@ -32,6 +37,16 @@ const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(75);
 const IDLE_PROBE_JITTER_MAX_SECS: u64 = 15;
 const INITIAL_OFFLINE_BACKOFF_SECS: u64 = 2;
 const MAX_OFFLINE_BACKOFF_SECS: u64 = 10;
+
+/// At most 1 status-write warning per 30 s window.
+static STATUS_WRITE_LOG: LazyLock<RateLimiter> =
+    LazyLock::new(|| RateLimiter::new(1, Duration::from_secs(30)));
+/// At most 3 degraded-link warnings per 30 s window.
+static DEGRADED_LOG: LazyLock<RateLimiter> =
+    LazyLock::new(|| RateLimiter::new(3, Duration::from_secs(30)));
+/// At most 3 probe-failure warnings per 30 s window.
+static PROBE_LOG: LazyLock<RateLimiter> =
+    LazyLock::new(|| RateLimiter::new(3, Duration::from_secs(30)));
 
 /// Connection health state written to the status file for `beam-tray`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +149,8 @@ pub fn spawn_network_monitor(
         let mut is_connected = false;
         let mut last_reset_at: Option<Instant> = None;
         let mut probe_seq: u64 = u64::from(std::process::id());
+        let mut fallback_poll_secs = FALLBACK_POLL_TICK.as_secs();
+        let mut bypass_ok;
 
         loop {
             if *shutdown.borrow() {
@@ -258,18 +275,69 @@ pub fn spawn_network_monitor(
                 route_retry_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
             }
 
+            bypass_ok = !bypass_missing;
+            let mut probe_failed = false;
             if Instant::now() >= next_probe_at {
+                let recent_window = match last_reset_at {
+                    Some(reset_at) => RECENT_ACTIVITY_WINDOW
+                        .min(Instant::now().saturating_duration_since(reset_at)),
+                    None => RECENT_ACTIVITY_WINDOW,
+                };
+                // Authenticated dials are the only trustworthy liveness signal: a
+                // bare TCP connect can succeed while REALITY/VLESS dials fail (wrong
+                // key, expired short id, broken server), so a consecutive failure
+                // streak overrides a successful probe instead of reporting green.
+                let failure_streak = if recent_window.is_zero() {
+                    0
+                } else {
+                    activity.recent_failure_streak(recent_window)
+                };
                 if auto_route && !server_has_gw && !server_addr.ip().is_loopback() {
                     is_connected = false;
-                    write_status_atomic(&status_path, LinkState::WaitingNetwork, None, &ifname);
+                    probe_failed = true;
+                    write_status_atomic(
+                        &status_path,
+                        &StatusInfo::new(
+                            &ifname,
+                            LinkState::WaitingNetwork,
+                            None,
+                            "no_gateway",
+                            generation,
+                            bypass_ok,
+                            &activity,
+                        ),
+                    );
+                    next_probe_at = Instant::now() + Duration::from_secs(offline_backoff_secs);
+                    offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
+                } else if failure_streak >= DEGRADED_DIAL_FAILURE_STREAK {
+                    is_connected = false;
+                    probe_failed = true;
+                    if let Some(suppressed) = DEGRADED_LOG.allow() {
+                        let last = activity.recent_failure(recent_window);
+                        warn!(
+                            streak = failure_streak,
+                            stage = last.map(|f| f.stage.as_str()).unwrap_or("unknown"),
+                            kind = last.map(|f| f.kind.as_str()).unwrap_or("unknown"),
+                            server = %server_addr,
+                            suppressed,
+                            "authenticated tunnel dials keep failing; reporting a degraded link"
+                        );
+                    }
+                    write_status_atomic(
+                        &status_path,
+                        &StatusInfo::new(
+                            &ifname,
+                            LinkState::Reconnecting,
+                            None,
+                            "dial_failures",
+                            generation,
+                            bypass_ok,
+                            &activity,
+                        ),
+                    );
                     next_probe_at = Instant::now() + Duration::from_secs(offline_backoff_secs);
                     offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
                 } else {
-                    let recent_window = match last_reset_at {
-                        Some(reset_at) => RECENT_ACTIVITY_WINDOW
-                            .min(Instant::now().saturating_duration_since(reset_at)),
-                        None => RECENT_ACTIVITY_WINDOW,
-                    };
                     let recent_rtt = if is_connected && !recent_window.is_zero() {
                         activity.recent_rtt(recent_window)
                     } else {
@@ -278,36 +346,56 @@ pub fn spawn_network_monitor(
                     if let Some(rtt_ms) = recent_rtt {
                         write_status_atomic(
                             &status_path,
-                            LinkState::Connected,
-                            Some(rtt_ms),
-                            &ifname,
+                            &StatusInfo::new(
+                                &ifname,
+                                LinkState::Connected,
+                                Some(rtt_ms),
+                                "dial_activity",
+                                generation,
+                                bypass_ok,
+                                &activity,
+                            ),
                         );
                         offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
                         probe_seq = probe_seq.wrapping_add(1);
                         next_probe_at = Instant::now() + next_healthy_probe_interval(probe_seq);
                     } else {
                         match probe_server_rtt(server_addr).await {
-                            Some(rtt_ms) => {
+                            Ok(rtt_ms) => {
                                 is_connected = true;
                                 write_status_atomic(
                                     &status_path,
-                                    LinkState::Connected,
-                                    Some(rtt_ms),
-                                    &ifname,
+                                    &StatusInfo::new(
+                                        &ifname,
+                                        LinkState::Connected,
+                                        Some(rtt_ms),
+                                        "probe_ok",
+                                        generation,
+                                        bypass_ok,
+                                        &activity,
+                                    ),
                                 );
                                 offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
                                 probe_seq = probe_seq.wrapping_add(1);
                                 next_probe_at =
                                     Instant::now() + next_healthy_probe_interval(probe_seq);
                             }
-                            None => {
+                            Err(err) => {
                                 is_connected = false;
-                                debug!(%server_addr, backoff_secs = offline_backoff_secs, "server reachability probe failed");
+                                probe_failed = true;
+                                log_probe_failure(server_addr, &err);
+                                debug!(%server_addr, backoff_secs = offline_backoff_secs, "retrying after probe failure");
                                 write_status_atomic(
                                     &status_path,
-                                    LinkState::Reconnecting,
-                                    None,
-                                    &ifname,
+                                    &StatusInfo::new(
+                                        &ifname,
+                                        LinkState::Reconnecting,
+                                        None,
+                                        "probe_failed",
+                                        generation,
+                                        bypass_ok,
+                                        &activity,
+                                    ),
                                 );
                                 next_probe_at =
                                     Instant::now() + Duration::from_secs(offline_backoff_secs);
@@ -317,6 +405,11 @@ pub fn spawn_network_monitor(
                     }
                 }
             }
+
+            // Grow the no-netlink fallback poll while gateways, bypass routes, and
+            // probes stay stable; snap back to 2 s on any instability.
+            let stable = !gw_changed && !slept_from_suspend && !bypass_missing && !probe_failed;
+            fallback_poll_secs = next_fallback_poll(fallback_poll_secs, stable);
 
             let wait_dur = {
                 let now = Instant::now();
@@ -328,6 +421,7 @@ pub fn spawn_network_monitor(
                         .unwrap_or(Duration::MAX),
                     auto_route,
                     netlink.is_some(),
+                    Duration::from_secs(fallback_poll_secs),
                 )
             };
 
@@ -380,18 +474,19 @@ pub fn spawn_network_monitor(
 }
 
 /// Computes one monitor sleep. With `auto_route` and no netlink watcher the
-/// loop must poll routes, so it stays on [`FALLBACK_POLL_TICK`]; otherwise
-/// (including `auto_route = false`) it may sleep up to
-/// [`SLEEP_CHECK_INTERVAL`] and still wakes for the next probe.
+/// loop must poll routes, so it is capped at `fallback_poll` (see
+/// [`next_fallback_poll`]); otherwise (including `auto_route = false`) it may
+/// sleep up to [`SLEEP_CHECK_INTERVAL`] and still wakes for the next probe.
 fn next_wait_duration(
     until_probe: Duration,
     until_route_check: Duration,
     until_route_retry: Duration,
     auto_route: bool,
     has_netlink: bool,
+    fallback_poll: Duration,
 ) -> Duration {
     let max_sleep = if auto_route && !has_netlink {
-        FALLBACK_POLL_TICK
+        fallback_poll
     } else {
         SLEEP_CHECK_INTERVAL
     };
@@ -413,14 +508,37 @@ fn drain_netlink_guard(guard: &mut AsyncFdReadyGuard<'_, NetlinkRouteWatcher>) -
     Ok(status.saw_event)
 }
 
-async fn probe_server_rtt(server_addr: SocketAddr) -> Option<u64> {
+/// Measures a bare TCP connect RTT to the server.
+///
+/// The error (and its `kind()`) is returned to the caller and logged at
+/// rate-limited `warn` level so a failing probe is diagnosable without
+/// flooding the journal.
+async fn probe_server_rtt(server_addr: SocketAddr) -> io::Result<u64> {
     let start = Instant::now();
     match timeout(PROBE_TIMEOUT, TcpStream::connect(server_addr)).await {
         Ok(Ok(stream)) => {
             drop(stream);
-            Some(start.elapsed().as_millis() as u64)
+            Ok(start.elapsed().as_millis() as u64)
         }
-        _ => None,
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "server reachability probe timed out",
+        )),
+    }
+}
+
+/// Logs one probe failure, rate-limited, including `error.kind()`.
+fn log_probe_failure(server_addr: SocketAddr, err: &io::Error) {
+    debug!(%server_addr, error = %err, kind = ?err.kind(), "server reachability probe failed");
+    if let Some(suppressed) = PROBE_LOG.allow() {
+        warn!(
+            %server_addr,
+            error = %err,
+            kind = ?err.kind(),
+            suppressed,
+            "server reachability probe failed"
+        );
     }
 }
 
@@ -452,41 +570,141 @@ pub fn next_offline_backoff(current_secs: u64) -> u64 {
         .clamp(INITIAL_OFFLINE_BACKOFF_SECS, MAX_OFFLINE_BACKOFF_SECS)
 }
 
+/// Backs off the no-netlink fallback poll interval while routes stay stable and
+/// snaps back to [`FALLBACK_POLL_TICK`] on any instability (gateway change,
+/// missing bypass route, probe failure).
+pub fn next_fallback_poll(current_secs: u64, stable: bool) -> u64 {
+    if !stable {
+        return FALLBACK_POLL_TICK.as_secs();
+    }
+    current_secs
+        .saturating_mul(2)
+        .clamp(FALLBACK_POLL_TICK.as_secs(), FALLBACK_POLL_MAX_SECS)
+}
+
+/// One status-file snapshot consumed by `beam-tray`.
+///
+/// Unknown keys are ignored by the tray, so new fields are backward compatible.
+#[derive(Clone, Debug)]
+pub struct StatusInfo<'a> {
+    /// Link state.
+    pub state: LinkState,
+    /// Last measured RTT in milliseconds, if any.
+    pub rtt_ms: Option<u64>,
+    /// TUN interface name.
+    pub ifname: &'a str,
+    /// Short machine-readable reason for `state` (`ok`, `probe_failed`, ...).
+    pub reason: &'static str,
+    /// Network generation counter (incremented on gateway changes and resume).
+    pub generation: u64,
+    /// Whether every required bypass route is installed.
+    pub bypass_ok: bool,
+    /// Total failed authenticated upstream dials since start.
+    pub dial_failures: u64,
+    /// Packet drop counters, when the engine has published them.
+    pub drops: Option<DropSnapshot>,
+}
+
+impl<'a> StatusInfo<'a> {
+    /// Builds a status snapshot from live diagnostics.
+    pub fn new(
+        ifname: &'a str,
+        state: LinkState,
+        rtt_ms: Option<u64>,
+        reason: &'static str,
+        generation: u64,
+        bypass_ok: bool,
+        activity: &TunnelActivity,
+    ) -> Self {
+        Self {
+            state,
+            rtt_ms,
+            ifname,
+            reason,
+            generation,
+            bypass_ok,
+            dial_failures: activity.dial_failure_count(),
+            drops: Some(activity.drop_snapshot()),
+        }
+    }
+}
+
 /// Formats status text consumed by `beam-tray` (includes Unix timestamp & PID
 /// so the tray ignores stale files after a crash).
-pub fn format_status(state: LinkState, rtt_ms: Option<u64>, ifname: &str) -> String {
+///
+/// `beam-tray` matches single keys and ignores unknown ones, so the trailing
+/// diagnostic keys (`reason`, `generation`, `bypass_ok`, `dial_failures`,
+/// `drops`) are backward compatible with older trays.
+pub fn format_status(info: &StatusInfo<'_>) -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let pid = std::process::id();
     let mut out = format!(
-        "state={}\nifname={ifname}\nts={ts}\npid={pid}\n",
-        state.as_str()
+        "state={}\nifname={}\nts={ts}\npid={pid}\nreason={}\ngeneration={}\nbypass_ok={}\ndial_failures={}\n",
+        info.state.as_str(),
+        info.ifname,
+        info.reason,
+        info.generation,
+        u8::from(info.bypass_ok),
+        info.dial_failures
     );
-    if let Some(rtt) = rtt_ms {
+    if let Some(rtt) = info.rtt_ms {
         out.push_str(&format!("rtt_ms={rtt}\n"));
+    }
+    if let Some(drops) = info.drops
+        && !drops.is_empty()
+    {
+        out.push_str(&format!("drops={}\n", drops.as_status_value()));
     }
     out
 }
 
 /// Atomically writes and fsyncs the status file if its parent directory exists.
-pub fn write_status_atomic(path: &Path, state: LinkState, rtt_ms: Option<u64>, ifname: &str) {
+///
+/// Every failure step (missing parent, create, write, fsync, rename) is
+/// reported at rate-limited `warn` level instead of being dropped silently.
+pub fn write_status_atomic(path: &Path, info: &StatusInfo<'_>) {
+    if let Err((stage, err)) = write_status_file(path, info)
+        && let Some(suppressed) = STATUS_WRITE_LOG.allow()
+    {
+        warn!(
+            path = %path.display(),
+            stage,
+            error = %err,
+            kind = ?err.kind(),
+            suppressed,
+            "failed to publish client status file"
+        );
+    }
+}
+
+/// Writes the status file, returning the failing stage and error.
+fn write_status_file(path: &Path, info: &StatusInfo<'_>) -> Result<(), (&'static str, io::Error)> {
     let Some(parent) = path.parent() else {
-        return;
+        return Err((
+            "parent",
+            io::Error::new(io::ErrorKind::InvalidInput, "status path has no parent"),
+        ));
     };
     if !parent.is_dir() {
-        return;
+        return Err((
+            "parent_dir",
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("status directory {} does not exist", parent.display()),
+            ),
+        ));
     }
     let tmp = path.with_extension("tmp");
-    let body = format_status(state, rtt_ms, ifname);
-    let written = std::fs::File::create(&tmp).and_then(|mut file| {
-        file.write_all(body.as_bytes())?;
-        file.sync_all()
-    });
-    if written.is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    let body = format_status(info);
+    let mut file = std::fs::File::create(&tmp).map_err(|err| ("create", err))?;
+    file.write_all(body.as_bytes())
+        .map_err(|err| ("write_all", err))?;
+    file.sync_all().map_err(|err| ("sync_all", err))?;
+    std::fs::rename(&tmp, path).map_err(|err| ("rename", err))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -537,30 +755,113 @@ mod tests {
         let far = Duration::from_secs(600);
 
         // No auto-route: no route work to poll, so sleep until the probe.
-        assert_eq!(next_wait_duration(probe, far, far, false, false), probe);
         assert_eq!(
-            next_wait_duration(far, far, far, false, false),
+            next_wait_duration(probe, far, far, false, false, FALLBACK_POLL_TICK),
+            probe
+        );
+        assert_eq!(
+            next_wait_duration(far, far, far, false, false, FALLBACK_POLL_TICK),
             SLEEP_CHECK_INTERVAL
         );
 
-        // Auto-route without netlink needs the 2 s fallback poll.
+        // Auto-route without netlink needs the fallback poll.
         assert_eq!(
-            next_wait_duration(probe, far, far, true, false),
+            next_wait_duration(probe, far, far, true, false, FALLBACK_POLL_TICK),
             FALLBACK_POLL_TICK
         );
 
-        // Auto-route with netlink follows the probe schedule.
-        assert_eq!(next_wait_duration(probe, far, far, true, true), probe);
+        // A backed-off fallback poll is honored while routes stay stable.
         assert_eq!(
-            next_wait_duration(far, far, far, true, true),
+            next_wait_duration(
+                far,
+                far,
+                far,
+                true,
+                false,
+                Duration::from_secs(FALLBACK_POLL_MAX_SECS)
+            ),
+            Duration::from_secs(FALLBACK_POLL_MAX_SECS)
+        );
+
+        // Auto-route with netlink follows the probe schedule.
+        assert_eq!(
+            next_wait_duration(probe, far, far, true, true, FALLBACK_POLL_TICK),
+            probe
+        );
+        assert_eq!(
+            next_wait_duration(far, far, far, true, true, FALLBACK_POLL_TICK),
             SLEEP_CHECK_INTERVAL
         );
 
         // A due deadline never yields a spin loop.
         assert_eq!(
-            next_wait_duration(Duration::ZERO, far, far, true, true),
+            next_wait_duration(Duration::ZERO, far, far, true, true, FALLBACK_POLL_TICK),
             Duration::from_millis(50)
         );
+    }
+
+    #[test]
+    fn fallback_poll_backs_off_while_stable_and_snaps_back() {
+        // Stable: 2 s -> 4 s -> ... -> 30 s ceiling.
+        let mut secs = FALLBACK_POLL_TICK.as_secs();
+        let mut seen = vec![secs];
+        for _ in 0..6 {
+            secs = next_fallback_poll(secs, true);
+            seen.push(secs);
+        }
+        assert_eq!(seen, vec![2, 4, 8, 16, 30, 30, 30]);
+
+        // Any instability (gateway change, missing bypass route, probe
+        // failure) snaps straight back to the 2 s fallback.
+        for current in [4, 16, FALLBACK_POLL_MAX_SECS] {
+            assert_eq!(next_fallback_poll(current, false), 2);
+        }
+    }
+
+    #[test]
+    fn degraded_state_reports_dial_failures_until_a_dial_succeeds() {
+        let activity = TunnelActivity::new();
+        assert_eq!(activity.recent_failure_streak(RECENT_ACTIVITY_WINDOW), 0);
+
+        for _ in 0..DEGRADED_DIAL_FAILURE_STREAK {
+            activity.record_dial_failure(beam_tun::DialFailure {
+                stage: beam_tun::DialFailureStage::RealityHandshake,
+                kind: beam_tun::DialFailureKind::Other,
+            });
+        }
+        assert_eq!(activity.dial_failure_count(), 3);
+        assert_eq!(
+            activity.recent_failure_streak(RECENT_ACTIVITY_WINDOW),
+            DEGRADED_DIAL_FAILURE_STREAK,
+            "consecutive authenticated dial failures must mark the link degraded"
+        );
+
+        // A successful authenticated dial resets the streak and the health state.
+        activity.record_dial_success(21);
+        assert_eq!(activity.recent_failure_streak(RECENT_ACTIVITY_WINDOW), 0);
+        assert_eq!(activity.dial_failure_count(), 3);
+        assert_eq!(activity.recent_rtt(RECENT_ACTIVITY_WINDOW), Some(21));
+
+        // A stale failure streak must not keep the link degraded forever.
+        activity.record_dial_failure(beam_tun::DialFailure {
+            stage: beam_tun::DialFailureStage::TcpConnect,
+            kind: beam_tun::DialFailureKind::Refused,
+        });
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(activity.recent_failure_streak(Duration::from_millis(1)), 0);
+        assert_eq!(activity.recent_failure_streak(RECENT_ACTIVITY_WINDOW), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_reports_the_underlying_error_kind() {
+        // Bind and immediately drop a listener so the port is closed.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind probe target");
+        let addr = listener.local_addr().expect("probe addr");
+        drop(listener);
+
+        let err = probe_server_rtt(addr).await.expect_err("closed port");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     }
 
     #[test]
@@ -586,14 +887,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("beam-status-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("status");
-        write_status_atomic(&path, LinkState::Connected, Some(37), "beamtun0");
+        let activity = TunnelActivity::new();
+        activity.record_dial_failure(beam_tun::DialFailure {
+            stage: beam_tun::DialFailureStage::TcpConnect,
+            kind: beam_tun::DialFailureKind::Timeout,
+        });
+        let info = StatusInfo::new(
+            "beamtun0",
+            LinkState::Connected,
+            Some(37),
+            "probe_ok",
+            4,
+            true,
+            &activity,
+        );
+        write_status_atomic(&path, &info);
         let text = std::fs::read_to_string(&path).expect("read status");
+        // Pre-existing keys stay first so an older tray keeps working.
         assert!(text.contains("state=connected\n"));
         assert!(text.contains("rtt_ms=37\n"));
         assert!(text.contains("ifname=beamtun0\n"));
         assert!(text.contains("ts="));
         assert!(text.contains("pid="));
+        // New diagnostic keys (ignored by older trays).
+        assert!(text.contains("reason=probe_ok\n"));
+        assert!(text.contains("generation=4\n"));
+        assert!(text.contains("bypass_ok=1\n"));
+        assert!(text.contains("dial_failures=1\n"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_write_reports_the_failing_stage() {
+        let dir = std::env::temp_dir().join(format!("beam-status-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("status");
+        let info = StatusInfo::new(
+            "beamtun0",
+            LinkState::Reconnecting,
+            None,
+            "probe_failed",
+            0,
+            false,
+            &TunnelActivity::new(),
+        );
+        let (stage, err) = write_status_file(&path, &info).expect_err("missing dir");
+        assert_eq!(stage, "parent_dir");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        // `write_status_atomic` must stay silent-but-safe on the same input.
+        write_status_atomic(&path, &info);
+        assert!(!path.exists());
     }
 
     #[tokio::test]

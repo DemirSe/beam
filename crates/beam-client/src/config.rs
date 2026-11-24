@@ -412,8 +412,8 @@ impl ClientFileConfig {
             reject_quic: self.tun.reject_quic,
             reject_ipv6: self.tun.reject_ipv6,
             drop_private_destinations: self.tun.drop_private_destinations,
-            exclude_ips,
-            bypass_cidrs: parsed_bypass_cidrs,
+            exclude_ips: exclude_ips.into(),
+            bypass_cidrs: parsed_bypass_cidrs.into(),
             intercept_dns: dns_cfg.is_some(),
         };
 

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use beam_core::address::{Address, NetLocation};
@@ -21,9 +21,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
-use crate::packet::build_ip_udp_packet;
+use crate::packet::build_ip_udp_packet_patched;
+use crate::ratelimit::RateLimiter;
+use crate::stats::{DnsCounters, DnsSnapshot};
 
 const MAX_DNS_QUERY_BYTES: usize = 1232;
 /// Maximum DNS response size accepted from DoH or DNS-over-TCP upstreams
@@ -48,6 +50,8 @@ const MAX_DOH_POOL_SIZE: usize = 4;
 const DOH_POOL_IDLE_TTL: Duration = Duration::from_secs(30);
 const MAX_TCP_DNS_POOL_SIZE: usize = 4;
 const TCP_DNS_POOL_IDLE_TTL: Duration = Duration::from_secs(30);
+const MAX_LOCAL_UDP_POOL_SIZE: usize = 4;
+const LOCAL_UDP_POOL_IDLE_TTL: Duration = Duration::from_secs(30);
 const DNS_XUDP_REPLY_QUEUE: usize = 8;
 const MAX_DNS_NAME_LEN: usize = 255;
 const MAX_DNS_LABELS: usize = 128;
@@ -55,6 +59,13 @@ const MAX_POINTER_HOPS: usize = 16;
 const MAX_RR_COUNT: usize = 128;
 /// Minimal RFC 6891 EDNS0 OPT pseudo-RR (root `.`, TYPE=41, UDP payload=1232,
 /// extended RCODE/version/flags=0, RDLENGTH=0).
+/// At most 3 upstream DNS failure warnings per 30 s window.
+static DNS_UPSTREAM_LOG: LazyLock<RateLimiter> =
+    LazyLock::new(|| RateLimiter::new(3, Duration::from_secs(30)));
+/// At most 2 concurrency-limit SERVFAIL warnings per 30 s window.
+static DNS_BUSY_LOG: LazyLock<RateLimiter> =
+    LazyLock::new(|| RateLimiter::new(2, Duration::from_secs(30)));
+
 const EDNS0_OPT_RR: [u8; 11] = [
     0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
@@ -75,6 +86,15 @@ pub enum DnsUpstream {
 }
 
 impl DnsUpstream {
+    /// Short transport name used in structured logs (`doh`, `tcp`, `udp`).
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Doh { .. } => "doh",
+            Self::PlainTcp(_) => "tcp",
+            Self::PlainUdp(_) => "udp",
+        }
+    }
+
     /// Parses a DNS upstream URI or address:
     /// - `https://host[:port]/path` -> [`DnsUpstream::Doh`]
     /// - `tcp://ip:port` -> [`DnsUpstream::PlainTcp`]
@@ -136,6 +156,16 @@ impl DnsUpstream {
             return Err("DNS upstream port must be non-zero".into());
         }
         Ok(Self::PlainUdp(addr))
+    }
+}
+
+impl std::fmt::Display for DnsUpstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Doh { host, port, path } => write!(f, "https://{host}:{port}{path}"),
+            Self::PlainTcp(addr) => write!(f, "tcp://{addr}"),
+            Self::PlainUdp(addr) => write!(f, "udp://{addr}"),
+        }
     }
 }
 
@@ -674,7 +704,9 @@ struct CacheKey {
 }
 
 struct CacheEntry {
-    wire: Vec<u8>,
+    /// Shared wire response; the `tx_id` is patched at reply time so a cache
+    /// hit never clones the whole DNS message (#168).
+    wire: Arc<[u8]>,
     expires_at: Instant,
     last_used: u64,
     is_local: bool,
@@ -698,8 +730,11 @@ impl DnsCache {
         }
     }
 
-    /// Looks up a cached response and rewrites its 2-byte `tx_id`.
-    pub fn get(&mut self, query: &DnsQuery, now: Instant) -> Option<Vec<u8>> {
+    /// Looks up a cached response.
+    ///
+    /// The returned buffer still carries the original responder's `tx_id`; the
+    /// caller patches bytes `0..2` when it builds the reply packet.
+    pub fn get(&mut self, query: &DnsQuery, now: Instant) -> Option<Arc<[u8]>> {
         if self.max_entries == 0 {
             return None;
         }
@@ -720,13 +755,7 @@ impl DnsCache {
         let entry = self.entries.get_mut(&key)?;
         self.seq = self.seq.wrapping_add(1);
         entry.last_used = self.seq;
-        let mut wire = entry.wire.clone();
-        if wire.len() >= 2 {
-            let id = query.tx_id.to_be_bytes();
-            wire[0] = id[0];
-            wire[1] = id[1];
-        }
-        Some(wire)
+        Some(Arc::clone(&entry.wire))
     }
 
     /// Inserts a DNS response with `ttl_secs`, evicting expired or LRU entries
@@ -734,7 +763,7 @@ impl DnsCache {
     pub fn insert(
         &mut self,
         query: &DnsQuery,
-        wire: Vec<u8>,
+        wire: Arc<[u8]>,
         ttl_secs: u32,
         is_local: bool,
         now: Instant,
@@ -919,6 +948,81 @@ impl MuxHealth for XudpClient {
     }
 }
 
+struct PooledLocalUdp {
+    sock: UdpSocket,
+    key: SocketAddr,
+    last_used: Instant,
+}
+
+#[derive(Default)]
+struct LocalUdpPoolState {
+    idle: Vec<PooledLocalUdp>,
+    generation: u64,
+}
+
+/// Passive, bounded pool of connected local DNS `UdpSocket`s keyed by
+/// `local_upstream`.
+///
+/// Reusing the connected socket removes a `bind`/`connect` pair (and its port
+/// churn) from every `.lan` query. There are zero background timers: stale
+/// entries are dropped passively on borrow, and a generation counter bumped by
+/// [`Self::clear`] on network transitions rejects sockets dialed before the
+/// change. A socket is only returned to the pool after a fully successful
+/// exchange, so a late reply can never poison a pooled socket.
+#[derive(Default)]
+struct LocalUdpPool {
+    state: Mutex<LocalUdpPoolState>,
+}
+
+impl LocalUdpPool {
+    fn take(&self, key: SocketAddr, now: Instant) -> (Option<UdpSocket>, u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return (None, 0);
+        };
+        let generation = state.generation;
+        state.idle.retain(|entry| {
+            now.saturating_duration_since(entry.last_used) < LOCAL_UDP_POOL_IDLE_TTL
+        });
+        let found = state
+            .idle
+            .iter()
+            .position(|entry| entry.key == key)
+            .map(|idx| state.idle.swap_remove(idx));
+        (found.map(|entry| entry.sock), generation)
+    }
+
+    fn put(&self, sock: UdpSocket, key: SocketAddr, expected_generation: u64, now: Instant) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.generation != expected_generation {
+            return;
+        }
+        state.idle.retain(|entry| {
+            now.saturating_duration_since(entry.last_used) < LOCAL_UDP_POOL_IDLE_TTL
+        });
+        if state.idle.len() < MAX_LOCAL_UDP_POOL_SIZE {
+            state.idle.push(PooledLocalUdp {
+                sock,
+                key,
+                last_used: now,
+            });
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.generation = state.generation.wrapping_add(1);
+            state.idle.clear();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state.lock().map(|s| s.idle.len()).unwrap_or(0)
+    }
+}
+
 struct UdpDnsMuxSlot<C> {
     mux: Option<Arc<C>>,
     generation: u64,
@@ -1020,11 +1124,32 @@ pub struct DnsInterceptor {
     cache: Arc<Mutex<DnsCache>>,
     inflight: Arc<Semaphore>,
     tun_tx: mpsc::Sender<Vec<u8>>,
+    local_udp_pool: Arc<LocalUdpPool>,
+    counters: Arc<DnsCounters>,
 }
 
 impl DnsInterceptor {
     /// Creates a new [`DnsInterceptor`] writing synthesized UDP/53 replies into `tun_tx`.
     pub fn new(
+        client_config: BeamClientConfig,
+        dns_config: DnsConfig,
+        tun_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Self {
+        let interceptor = Self::with_pool(client_config, dns_config, tun_tx);
+        info!(
+            upstream = %interceptor.dns_config.upstream,
+            upstream_kind = interceptor.dns_config.upstream.kind(),
+            local_upstream = ?interceptor.dns_config.local_upstream,
+            cache_size = interceptor.dns_config.cache_size,
+            ipv4_only = interceptor.dns_config.ipv4_only,
+            local_suffixes = interceptor.dns_config.local_suffixes.len(),
+            bypass_domains = interceptor.dns_config.bypass_domains.len(),
+            "DNS interceptor configured"
+        );
+        interceptor
+    }
+
+    fn with_pool(
         client_config: BeamClientConfig,
         dns_config: DnsConfig,
         tun_tx: mpsc::Sender<Vec<u8>>,
@@ -1052,7 +1177,14 @@ impl DnsInterceptor {
             cache,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_DNS_QUERIES)),
             tun_tx,
+            local_udp_pool: Arc::new(LocalUdpPool::default()),
+            counters: Arc::new(DnsCounters::default()),
         }
+    }
+
+    /// Returns a snapshot of the DNS outcome counters for diagnostics.
+    pub fn stats(&self) -> DnsSnapshot {
+        self.counters.snapshot()
     }
 
     /// Clears local-only cache entries, drops pooled DoH/TCP/UDP connections,
@@ -1067,6 +1199,7 @@ impl DnsInterceptor {
         if let Ok(mut pool) = self.tcp_pool.lock() {
             pool.clear();
         }
+        self.local_udp_pool.clear();
         self.udp_mux_pool.clear();
         if let Some(refresher) = self.dns_config.refresh_local_upstream.as_ref() {
             let refreshed = refresher();
@@ -1099,11 +1232,18 @@ impl DnsInterceptor {
         // itself re-entered the TUN (e.g. bypass route vanished mid-transition),
         // refuse to recurse into `resolve_local_udp` so we can never self-DoS.
         if use_local && current_local.is_some_and(|local| local.ip() == dst.ip()) {
-            if let Some(sf) = build_servfail_response(wire)
-                && let Some(pkt) =
-                    build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &sf)
-            {
-                let _ = self.tun_tx.try_send(pkt);
+            self.counters.loop_guard.incr();
+            if let Some(suppressed) = DNS_UPSTREAM_LOG.allow() {
+                warn!(
+                    qtype = query.qtype,
+                    local = true,
+                    stage = "loop_guard",
+                    suppressed,
+                    "local DNS query re-entered the tunnel; replying with SERVFAIL"
+                );
+            }
+            if let Some(sf) = build_servfail_response(wire) {
+                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &sf, None);
             }
             return;
         }
@@ -1112,38 +1252,57 @@ impl DnsInterceptor {
         // queries with an empty `NOERROR` response so IPv4-only upstream
         // servers never cause dual-stack apps to stall or fail on IPv6.
         if self.dns_config.ipv4_only && !use_local && query.qtype == 28 {
-            if let Some(empty) = build_empty_noerror_response(wire)
-                && let Some(pkt) =
-                    build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &empty)
-            {
-                let _ = self.tun_tx.try_send(pkt);
+            if let Some(empty) = build_empty_noerror_response(wire) {
+                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &empty, None);
             }
             return;
         }
 
-        // Fast path: synchronous cache hit (0 ms latency).
-        if let Ok(mut cache) = self.cache.lock()
-            && let Some(cached) = cache.get(&query, Instant::now())
-        {
-            if let Some(reply) = fit_response_for_udp(wire, cached)
-                && let Some(pkt) =
-                    build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &reply)
+        // Fast path: synchronous cache hit (0 ms latency). The hit shares the
+        // cached wire buffer and patches only the 2-byte `tx_id` (#168).
+        let cached = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(&query, Instant::now()));
+        if let Some(cached) = cached {
+            self.counters.hits.incr();
+            if cached.len() <= udp_dns_response_limit(wire) {
+                send_udp_reply(
+                    &self.tun_tx,
+                    &self.counters,
+                    src,
+                    dst,
+                    &cached,
+                    Some(query.tx_id),
+                );
+            } else if let Some(reply) =
+                fit_response_for_udp(wire, patch_tx_id(&cached, query.tx_id))
             {
-                let _ = self.tun_tx.try_send(pkt);
+                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &reply, None);
             }
             return;
         }
 
         let Ok(permit) = Arc::clone(&self.inflight).try_acquire_owned() else {
+            self.counters.servfail_concurrency.incr();
             debug!(qname = %query.qname, "DNS concurrency limit reached; replying with SERVFAIL");
-            if let Some(sf) = build_servfail_response(wire)
-                && let Some(pkt) =
-                    build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &sf)
-            {
-                let _ = self.tun_tx.try_send(pkt);
+            if let Some(suppressed) = DNS_BUSY_LOG.allow() {
+                warn!(
+                    qtype = query.qtype,
+                    local = use_local,
+                    inflight_limit = MAX_INFLIGHT_DNS_QUERIES,
+                    stage = "concurrency_limit",
+                    suppressed,
+                    "DNS concurrency limit reached; replying with SERVFAIL"
+                );
+            }
+            if let Some(sf) = build_servfail_response(wire) {
+                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &sf, None);
             }
             return;
         };
+        self.counters.misses.incr();
 
         let wire_owned = wire.to_vec();
         let client_cfg = self.client_config.clone();
@@ -1152,8 +1311,15 @@ impl DnsInterceptor {
         let doh_pool = Arc::clone(&self.doh_pool);
         let tcp_pool = Arc::clone(&self.tcp_pool);
         let udp_mux_pool = Arc::clone(&self.udp_mux_pool);
+        let local_udp_pool = Arc::clone(&self.local_udp_pool);
         let cache = Arc::clone(&self.cache);
+        let counters = Arc::clone(&self.counters);
         let tun_tx = self.tun_tx.clone();
+        let upstream_kind = if use_local {
+            "local_udp"
+        } else {
+            dns_cfg.upstream.kind()
+        };
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -1161,6 +1327,7 @@ impl DnsInterceptor {
                 match current_local {
                     Some(local_addr) => {
                         resolve_local_udp(
+                            &local_udp_pool,
                             local_addr,
                             &wire_owned,
                             query.tx_id,
@@ -1187,11 +1354,22 @@ impl DnsInterceptor {
             let reply_wire = match result {
                 Ok(mut resp) if resp.len() >= 12 && resp.len() <= MAX_DOH_RESPONSE_BYTES => {
                     if !response_question_matches(&query, &resp) {
+                        counters.servfail_mismatch.incr();
                         debug!(
                             qname = %query.qname,
                             local = use_local,
                             "DNS response question does not match the query; replying with SERVFAIL"
                         );
+                        if let Some(suppressed) = DNS_UPSTREAM_LOG.allow() {
+                            warn!(
+                                qtype = query.qtype,
+                                upstream_kind,
+                                local = use_local,
+                                stage = "question_mismatch",
+                                suppressed,
+                                "DNS response rejected; replying with SERVFAIL"
+                            );
+                        }
                         build_servfail_response(&wire_owned)
                     } else {
                         // Rewrite tx_id to match the client query. DoH uses tx_id 0
@@ -1210,40 +1388,129 @@ impl DnsInterceptor {
                         if let Some(ttl) = maybe_ttl
                             && let Ok(mut guard) = cache.lock()
                         {
-                            guard.insert(&query, resp.clone(), ttl, use_local, Instant::now());
+                            guard.insert(
+                                &query,
+                                Arc::from(resp.as_slice()),
+                                ttl,
+                                use_local,
+                                Instant::now(),
+                            );
                         }
                         fit_response_for_udp(&wire_owned, resp)
                     }
                 }
-                Ok(_) => build_servfail_response(&wire_owned),
+                Ok(_) => {
+                    counters.servfail_upstream.incr();
+                    build_servfail_response(&wire_owned)
+                }
                 Err(err) => {
-                    debug!(qname = %query.qname, local = use_local, error = %err, "DNS resolution failed");
+                    counters.servfail_upstream.incr();
+                    let stage = if err.kind() == io::ErrorKind::TimedOut {
+                        counters.timeout.incr();
+                        "timeout"
+                    } else if use_local {
+                        "local_upstream"
+                    } else {
+                        upstream_kind
+                    };
+                    debug!(
+                        qname = %query.qname,
+                        local = use_local,
+                        stage,
+                        error = %err,
+                        kind = ?err.kind(),
+                        "DNS resolution failed"
+                    );
+                    if let Some(suppressed) = DNS_UPSTREAM_LOG.allow() {
+                        warn!(
+                            qtype = query.qtype,
+                            upstream_kind,
+                            local = use_local,
+                            stage,
+                            error = %err,
+                            kind = ?err.kind(),
+                            suppressed,
+                            "DNS resolution failed; replying with SERVFAIL"
+                        );
+                    }
                     build_servfail_response(&wire_owned)
                 }
             };
 
-            if let Some(resp) = reply_wire
-                && let Some(pkt) =
-                    build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &resp)
-            {
-                let _ = tun_tx.try_send(pkt);
+            if let Some(resp) = reply_wire {
+                send_udp_reply(&tun_tx, &counters, src, dst, &resp, None);
             }
         });
     }
 }
 
+/// Copies `wire` and overwrites its 2-byte `tx_id`.
+fn patch_tx_id(wire: &[u8], tx_id: u16) -> Vec<u8> {
+    let mut out = wire.to_vec();
+    if out.len() >= 2 {
+        out[0..2].copy_from_slice(&tx_id.to_be_bytes());
+    }
+    out
+}
+
+/// Builds and queues one synthesized UDP/53 reply, counting `tun_tx` drops.
+///
+/// `tx_id` rewrites the first two payload bytes while the packet is assembled,
+/// so a cache hit never clones its shared wire buffer.
+fn send_udp_reply(
+    tun_tx: &mpsc::Sender<Vec<u8>>,
+    counters: &DnsCounters,
+    src: SocketAddr,
+    dst: SocketAddr,
+    payload: &[u8],
+    tx_id: Option<u16>,
+) {
+    let patch = tx_id.map(|id| (0usize, id.to_be_bytes()));
+    let pkt =
+        build_ip_udp_packet_patched(dst.ip(), dst.port(), src.ip(), src.port(), payload, patch);
+    if let Some(pkt) = pkt
+        && tun_tx.try_send(pkt).is_err()
+    {
+        counters.tun_tx_dropped.incr();
+    }
+}
+
 async fn resolve_local_udp(
+    pool: &LocalUdpPool,
     local_upstream: SocketAddr,
     query: &[u8],
     expected_tx_id: u16,
     query_timeout: Duration,
 ) -> io::Result<Vec<u8>> {
-    let bind_addr: SocketAddr = match local_upstream {
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    let (pooled, generation) = pool.take(local_upstream, Instant::now());
+    let sock = match pooled {
+        Some(sock) => sock,
+        None => {
+            let bind_addr: SocketAddr = match local_upstream {
+                SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+            };
+            let sock = UdpSocket::bind(bind_addr).await?;
+            sock.connect(local_upstream).await?;
+            sock
+        }
     };
-    let sock = UdpSocket::bind(bind_addr).await?;
-    sock.connect(local_upstream).await?;
+
+    // Any timeout, I/O error, or `tx_id` mismatch drops the socket instead of
+    // returning it, so a late reply can never be delivered to a later query.
+    let result = exchange_local_udp(&sock, query, expected_tx_id, query_timeout).await;
+    if result.is_ok() {
+        pool.put(sock, local_upstream, generation, Instant::now());
+    }
+    result
+}
+
+async fn exchange_local_udp(
+    sock: &UdpSocket,
+    query: &[u8],
+    expected_tx_id: u16,
+    query_timeout: Duration,
+) -> io::Result<Vec<u8>> {
     timeout(query_timeout, sock.send(query))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local DNS send timed out"))??;
@@ -1853,7 +2120,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_rewrites_tx_id_expires_and_evicts_lru() {
+    fn cache_hit_shares_wire_and_evicts_lru() {
         let mut cache = DnsCache::new(2);
         let t0 = Instant::now();
         let q1 = parse_dns_query(&build_query(0x1111, "a.example", 1)).expect("q1");
@@ -1876,10 +2143,11 @@ mod tests {
             30,
         );
 
-        cache.insert(&q1, r1, 30, false, t0);
-        cache.insert(&q2, r2, 30, true, t0);
+        cache.insert(&q1, Arc::from(r1), 30, false, t0);
+        cache.insert(&q2, Arc::from(r2), 30, true, t0);
 
-        // Touch q1 with a different tx_id -> must rewrite tx_id and refresh LRU.
+        // A hit shares the cached wire buffer and refreshes LRU; the cached
+        // buffer keeps its original `tx_id` because the reply path patches it.
         let q1_again = DnsQuery {
             tx_id: 0x9999,
             ..q1.clone()
@@ -1887,10 +2155,10 @@ mod tests {
         let hit = cache
             .get(&q1_again, t0 + Duration::from_secs(5))
             .expect("hit");
-        assert_eq!(u16::from_be_bytes([hit[0], hit[1]]), 0x9999);
+        assert_eq!(u16::from_be_bytes([hit[0], hit[1]]), 0x1111);
 
         // Insert q3 -> evicts LRU (q2).
-        cache.insert(&q3, r3, 30, false, t0 + Duration::from_secs(6));
+        cache.insert(&q3, Arc::from(r3), 30, false, t0 + Duration::from_secs(6));
         assert!(cache.get(&q2, t0 + Duration::from_secs(7)).is_none());
         assert!(cache.get(&q1, t0 + Duration::from_secs(7)).is_some());
 
@@ -1930,22 +2198,22 @@ mod tests {
 
         cache.insert(
             &q_plain,
-            build_a_response(
+            Arc::from(build_a_response(
                 &build_query(0x1234, "dnssec.example", 1),
                 Ipv4Addr::new(1, 2, 3, 4),
                 60,
-            ),
+            )),
             60,
             false,
             now,
         );
         cache.insert(
             &q_signed,
-            build_a_response(
+            Arc::from(build_a_response(
                 &build_query(0x1234, "dnssec.example", 1),
                 Ipv4Addr::new(5, 6, 7, 8),
                 60,
-            ),
+            )),
             60,
             false,
             now,
@@ -2181,6 +2449,248 @@ mod tests {
             u16::from_be_bytes([udp2.payload[0], udp2.payload[1]]),
             0x7002
         );
+        // One upstream miss, one cache hit, no SERVFAIL.
+        let stats = interceptor.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.servfail_upstream, 0);
+        assert_eq!(stats.servfail_mismatch, 0);
+    }
+
+    fn test_interceptor(
+        local_upstream: Option<SocketAddr>,
+    ) -> (DnsInterceptor, mpsc::Receiver<Vec<u8>>) {
+        let (tun_tx, tun_rx) = mpsc::channel(8);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
+            dummy_reality,
+            [2u8; 16],
+        );
+        let mut dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            local_upstream,
+        );
+        dns_cfg.query_timeout = Duration::from_millis(300);
+        (DnsInterceptor::new(client_cfg, dns_cfg, tun_tx), tun_rx)
+    }
+
+    #[tokio::test]
+    async fn counters_track_concurrency_limit_servfail() {
+        let (interceptor, mut tun_rx) = test_interceptor(None);
+        // Hold every inflight permit so the next query hits the limit.
+        let permits = interceptor
+            .inflight
+            .clone()
+            .try_acquire_many_owned(MAX_INFLIGHT_DNS_QUERIES as u32)
+            .expect("reserve inflight permits");
+
+        let wire = build_query(0x8001, "example.com", 1);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 55_001);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        interceptor.handle_query(src, dst, &wire);
+
+        let reply = tun_rx.recv().await.expect("servfail reply");
+        let udp = crate::packet::parse_udp(crate::packet::parse_ip(&reply).expect("ip").payload)
+            .expect("udp");
+        assert_eq!(udp.payload[3] & 0x0f, 2, "must be SERVFAIL");
+        assert_eq!(interceptor.stats().servfail_concurrency, 1);
+        assert_eq!(interceptor.stats().servfail_upstream, 0);
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn counters_track_loop_guard_and_upstream_failures() {
+        // A local upstream whose address equals the query destination triggers
+        // the loop guard before any packet leaves the process.
+        let (interceptor, mut tun_rx) = test_interceptor(Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)),
+            53,
+        )));
+        let wire = build_query(0x8101, "nas.lan", 1);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 55_002);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        interceptor.handle_query(src, dst, &wire);
+        let reply = tun_rx.recv().await.expect("loop-guard servfail");
+        let udp = crate::packet::parse_udp(crate::packet::parse_ip(&reply).expect("ip").payload)
+            .expect("udp");
+        assert_eq!(udp.payload[3] & 0x0f, 2);
+        assert_eq!(interceptor.stats().loop_guard, 1);
+
+        // A tunneled upstream that cannot be reached fails fast and counts an
+        // upstream SERVFAIL (the client config points at a closed loopback port).
+        let (failing, mut failing_rx) = test_interceptor(None);
+        let wire = build_query(0x8202, "example.com", 1);
+        failing.handle_query(src, dst, &wire);
+        let reply = timeout(Duration::from_secs(3), failing_rx.recv())
+            .await
+            .expect("servfail within timeout")
+            .expect("reply");
+        let udp = crate::packet::parse_udp(crate::packet::parse_ip(&reply).expect("ip").payload)
+            .expect("udp");
+        assert_eq!(udp.payload[3] & 0x0f, 2);
+        let stats = failing.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.servfail_upstream, 1);
+        assert_eq!(stats.hits, 0);
+    }
+
+    #[tokio::test]
+    async fn cache_hits_count_tun_tx_full_drops() {
+        // A 1-slot reply channel: the second cached hit cannot be queued.
+        let (tun_tx, tun_rx) = mpsc::channel(1);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
+            dummy_reality,
+            [2u8; 16],
+        );
+        let mut dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainUdp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            None,
+        );
+        dns_cfg.cache_size = 8;
+        let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+
+        let query = parse_dns_query(&build_query(0x9101, "cached.example", 1)).expect("query");
+        interceptor.cache.lock().expect("cache").insert(
+            &query,
+            Arc::from(build_a_response(
+                &build_query(0x9101, "cached.example", 1),
+                Ipv4Addr::new(203, 0, 113, 5),
+                60,
+            )),
+            60,
+            false,
+            Instant::now(),
+        );
+
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 55_010);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        let wire = build_query(0x9101, "cached.example", 1);
+        // The channel holds one reply; every further cached hit is dropped.
+        for _ in 0..4 {
+            interceptor.handle_query(src, dst, &wire);
+        }
+        let stats = interceptor.stats();
+        assert_eq!(stats.hits, 4);
+        assert_eq!(stats.tun_tx_dropped, 3);
+        assert_eq!(tun_rx.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn counters_track_question_mismatch() {
+        // The local server answers with a different question, so the reply is
+        // rejected before it can be cached or delivered.
+        let local_dns = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let local_addr = local_dns.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = local_dns.recv_from(&mut buf).await.expect("recv");
+            assert_eq!(n, build_query(0x8301, "nas.lan", 1).len());
+            // Same tx_id, wrong question name: the socket-level check passes and
+            // the question check is what must reject it.
+            let evil = build_query(0x8301, "evil.example", 1);
+            let resp = build_a_response(&evil, Ipv4Addr::new(6, 6, 6, 6), 60);
+            local_dns.send_to(&resp, peer).await.expect("send");
+        });
+
+        let (interceptor, mut tun_rx) = test_interceptor(Some(local_addr));
+        let wire = build_query(0x8301, "nas.lan", 1);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 55_003);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        interceptor.handle_query(src, dst, &wire);
+        let reply = timeout(Duration::from_secs(2), tun_rx.recv())
+            .await
+            .expect("reply")
+            .expect("packet");
+        let udp = crate::packet::parse_udp(crate::packet::parse_ip(&reply).expect("ip").payload)
+            .expect("udp");
+        assert_eq!(u16::from_be_bytes([udp.payload[0], udp.payload[1]]), 0x8301);
+        assert_eq!(
+            udp.payload[3] & 0x0f,
+            2,
+            "mismatched replies become SERVFAIL"
+        );
+        assert_eq!(interceptor.stats().servfail_mismatch, 1);
+        server.await.expect("server done");
+    }
+
+    #[tokio::test]
+    async fn local_udp_pool_reuses_sockets_and_evicts_stale_ones() {
+        let local_dns = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let local_addr = local_dns.local_addr().expect("addr");
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let peers_srv = Arc::clone(&peers);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let mut buf = [0u8; 512];
+                let (n, peer) = local_dns.recv_from(&mut buf).await.expect("recv");
+                peers_srv.lock().expect("lock").push(peer);
+                let resp = build_a_response(&buf[..n], Ipv4Addr::new(192, 168, 1, 7), 60);
+                local_dns.send_to(&resp, peer).await.expect("send");
+            }
+        });
+
+        let pool = LocalUdpPool::default();
+        let q1 = build_query(0x9001, "nas.lan", 1);
+        resolve_local_udp(&pool, local_addr, &q1, 0x9001, Duration::from_secs(2))
+            .await
+            .expect("first resolve");
+        assert_eq!(
+            pool.len(),
+            1,
+            "successful exchange returns the socket to the pool"
+        );
+
+        let q2 = build_query(0x9002, "nas.lan", 1);
+        resolve_local_udp(&pool, local_addr, &q2, 0x9002, Duration::from_secs(2))
+            .await
+            .expect("second resolve");
+        let used = peers.lock().expect("lock").clone();
+        assert_eq!(used.len(), 2);
+        assert_eq!(
+            used[0], used[1],
+            "the pooled socket must be reused (same source port)"
+        );
+
+        // A generation bump on network change invalidates the pooled socket.
+        pool.clear();
+        assert_eq!(pool.len(), 0);
+        let stale_generation = 0u64;
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        pool.put(sock, local_addr, stale_generation, Instant::now());
+        assert_eq!(
+            pool.len(),
+            0,
+            "a socket dialed before the network change must not be pooled"
+        );
+
+        // A `tx_id` mismatch must drop the socket instead of pooling it.
+        let q3 = build_query(0x9003, "nas.lan", 1);
+        assert!(
+            resolve_local_udp(&pool, local_addr, &q3, 0xffff, Duration::from_secs(2))
+                .await
+                .is_err()
+        );
+        assert_eq!(pool.len(), 0, "mismatched replies must not poison the pool");
+        server.await.expect("server done");
     }
 
     #[test]

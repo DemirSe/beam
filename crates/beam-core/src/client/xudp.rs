@@ -14,7 +14,7 @@ use crate::address::NetLocation;
 use crate::vless::{Addons, Command};
 use crate::xudp::frame::{
     FrameOption, FrameSpec, MAX_PAYLOAD_LEN, SessionStatus, TargetNetwork, encode_frame,
-    parse_frame,
+    encode_frame_header, parse_frame,
 };
 
 use super::{BeamClientConfig, ClientError, dial_vless};
@@ -25,6 +25,11 @@ const DEFAULT_REPLY_QUEUE: usize = 64;
 const READ_BUF_CAPACITY: usize = 16 * 1024;
 const MAX_READ_BUF: usize = 64 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound for one coalesced `write_all` of already-encoded XUDP frames.
+const WRITE_COALESCE_CAP: usize = 64 * 1024;
+/// Header room reserved in a queued datagram so [`XudpSession::send_owned`] can
+/// prepend the frame header without reallocating or copying the payload twice.
+pub const FRAME_HEADER_RESERVE: usize = 32;
 const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Minimum idle timeout applied to the shared XUDP mux reader so short
@@ -142,6 +147,89 @@ impl SessionTable {
     }
 }
 
+/// Drains encoded XUDP frames from `outbound_rx` and writes them as few
+/// `write_all` calls as possible.
+///
+/// Exposed because the mux writer task, the coalescing tests, and the
+/// `xudp_writer` benchmark all drive this exact loop.
+///
+/// The first frame after a wakeup is written together with every frame that is
+/// already queued, up to [`WRITE_COALESCE_CAP`]. Frames are never split or
+/// dropped: a frame that would overflow the batch is carried to the next
+/// iteration and written on its own, and a frame larger than the cap is written
+/// in one call by itself. `flush` runs only when nothing else is queued, which
+/// keeps interactive latency at zero while removing one syscall per queued
+/// frame during bursts.
+pub async fn run_writer<W: AsyncWriteExt + Unpin>(
+    write_half: &mut W,
+    outbound_rx: &mut mpsc::Receiver<Vec<u8>>,
+    writer_closed_rx: &mut watch::Receiver<bool>,
+) {
+    let mut batch: Vec<u8> = Vec::with_capacity(WRITE_COALESCE_CAP);
+    let mut carry: Option<Vec<u8>> = None;
+
+    loop {
+        let first = match carry.take() {
+            Some(frame) => frame,
+            None => tokio::select! {
+                biased;
+                _ = writer_closed_rx.changed() => {
+                    if *writer_closed_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                maybe = outbound_rx.recv() => {
+                    let Some(frame) = maybe else {
+                        break;
+                    };
+                    frame
+                }
+            },
+        };
+
+        batch.clear();
+        batch.extend_from_slice(&first);
+        drop(first);
+
+        let mut disconnected = false;
+        while batch.len() < WRITE_COALESCE_CAP {
+            match outbound_rx.try_recv() {
+                Ok(next) => {
+                    if batch.len().saturating_add(next.len()) > WRITE_COALESCE_CAP {
+                        carry = Some(next);
+                        break;
+                    }
+                    batch.extend_from_slice(&next);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if !matches!(
+            timeout(WRITE_TIMEOUT, write_half.write_all(&batch)).await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+        // `carry` is a frame already popped from the queue, so the channel may
+        // look empty while bytes are still pending.
+        if carry.is_none()
+            && outbound_rx.is_empty()
+            && !matches!(timeout(WRITE_TIMEOUT, write_half.flush()).await, Ok(Ok(())))
+        {
+            return;
+        }
+        if disconnected && carry.is_none() {
+            return;
+        }
+    }
+}
+
 /// Multiplexed XUDP client running over one VLESS `Command::Mux` stream.
 pub struct XudpClient {
     table: Arc<Mutex<SessionTable>>,
@@ -169,33 +257,7 @@ impl XudpClient {
         let writer_table = Arc::clone(&table);
         let writer_closed_tx = closed_tx.clone();
         let writer_task = tokio::spawn(async move {
-            loop {
-                let frame = tokio::select! {
-                    biased;
-                    _ = writer_closed_rx.changed() => {
-                        if *writer_closed_rx.borrow() {
-                            break;
-                        }
-                        continue;
-                    }
-                    maybe = outbound_rx.recv() => {
-                        let Some(frame) = maybe else {
-                            break;
-                        };
-                        frame
-                    }
-                };
-                let res = timeout(WRITE_TIMEOUT, write_half.write_all(&frame)).await;
-                match res {
-                    Ok(Ok(())) => {}
-                    _ => break,
-                }
-                if outbound_rx.is_empty()
-                    && !matches!(timeout(WRITE_TIMEOUT, write_half.flush()).await, Ok(Ok(())))
-                {
-                    break;
-                }
-            }
+            run_writer(&mut write_half, &mut outbound_rx, &mut writer_closed_rx).await;
             let _ = timeout(Duration::from_secs(1), write_half.shutdown()).await;
             let _ = writer_closed_tx.send(true);
             if let Ok(mut guard) = writer_table.lock() {
@@ -394,17 +456,76 @@ impl XudpSession {
         self.send_inner(Some(destination), payload).await
     }
 
+    /// Sends an owned payload to an explicit destination, prepending the frame
+    /// header in place.
+    ///
+    /// The caller should reserve [`FRAME_HEADER_RESERVE`] bytes of extra
+    /// capacity (see [`Self::alloc_payload`]); then no second allocation or
+    /// payload copy is needed compared with [`Self::send_to`].
+    pub async fn send_owned(
+        &mut self,
+        destination: NetLocation,
+        payload: Vec<u8>,
+    ) -> Result<(), XudpClientError> {
+        if !self.is_live() {
+            return Err(XudpClientError::Closed);
+        }
+        if payload.is_empty() || payload.len() > MAX_PAYLOAD_LEN {
+            return Err(XudpClientError::InvalidPayloadLength {
+                length: payload.len(),
+                max: MAX_PAYLOAD_LEN,
+            });
+        }
+        let status = if self.sent_new {
+            SessionStatus::Keep
+        } else {
+            SessionStatus::New
+        };
+        let spec = FrameSpec {
+            session_id: self.session_id,
+            status,
+            option: FrameOption::DATA,
+            network: Some(TargetNetwork::Udp),
+            destination: Some(&destination),
+            global_id: None,
+            payload: &[],
+        };
+        let mut header = Vec::with_capacity(FRAME_HEADER_RESERVE);
+        encode_frame_header(&mut header, spec, payload.len())?;
+        let mut frame = payload;
+        let body_len = frame.len();
+        frame.reserve(header.len());
+        frame.resize(body_len + header.len(), 0);
+        frame.copy_within(0..body_len, header.len());
+        frame[..header.len()].copy_from_slice(&header);
+        self.outbound_tx
+            .send(frame)
+            .await
+            .map_err(|_| XudpClientError::Closed)?;
+        self.sent_new = true;
+        Ok(())
+    }
+
+    /// Allocates a datagram buffer with [`FRAME_HEADER_RESERVE`] bytes of
+    /// headroom so [`Self::send_owned`] can prepend the header without growing.
+    pub fn alloc_payload(size: usize) -> Vec<u8> {
+        Vec::with_capacity(FRAME_HEADER_RESERVE.saturating_add(size))
+    }
+
+    /// Returns `true` while this session is still registered on a live mux.
+    fn is_live(&self) -> bool {
+        self.table
+            .lock()
+            .map(|t| !t.closed && t.sessions.contains_key(&self.session_id))
+            .unwrap_or(false)
+    }
+
     async fn send_inner(
         &mut self,
         destination: Option<NetLocation>,
         payload: &[u8],
     ) -> Result<(), XudpClientError> {
-        let is_live = self
-            .table
-            .lock()
-            .map(|t| !t.closed && t.sessions.contains_key(&self.session_id))
-            .unwrap_or(false);
-        if !is_live {
+        if !self.is_live() {
             return Err(XudpClientError::Closed);
         }
         if payload.is_empty() || payload.len() > MAX_PAYLOAD_LEN {
@@ -481,7 +602,148 @@ impl Drop for XudpSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    /// Async writer that records every `poll_write` call and keeps the bytes.
+    #[derive(Default)]
+    struct CountingSink {
+        writes: usize,
+        flushes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl tokio::io::AsyncWrite for CountingSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn encode_test_frame(session_id: u16, status: SessionStatus, payload: &[u8]) -> Vec<u8> {
+        let dest = NetLocation {
+            address: crate::address::Address::Ipv4(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+            port: 53,
+        };
+        let spec = FrameSpec {
+            session_id,
+            status,
+            option: FrameOption::DATA,
+            network: (status == SessionStatus::New).then_some(TargetNetwork::Udp),
+            destination: (status == SessionStatus::New).then_some(&dest),
+            global_id: None,
+            payload,
+        };
+        let mut out = Vec::new();
+        encode_frame(&mut out, spec).expect("encode frame");
+        out
+    }
+
+    fn decode_all_frames(bytes: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let mut frames = Vec::new();
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let (frame, consumed) = parse_frame(&bytes[offset..])
+                .expect("frame parse")
+                .expect("complete frame");
+            frames.push((frame.session_id, frame.payload.to_vec()));
+            offset += consumed;
+        }
+        assert_eq!(offset, bytes.len(), "trailing bytes after the last frame");
+        frames
+    }
+
+    #[tokio::test]
+    async fn writer_coalesces_queued_frames_without_splitting_them() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (closed_tx, mut closed_rx) = watch::channel(false);
+
+        let payloads: Vec<Vec<u8>> = vec![b"one".to_vec(), b"two-two".to_vec(), vec![0x5a; 300]];
+        let mut encoded = Vec::new();
+        for (idx, payload) in payloads.iter().enumerate() {
+            encoded.push(encode_test_frame(
+                idx as u16 + 1,
+                SessionStatus::New,
+                payload,
+            ));
+        }
+        for frame in &encoded {
+            tx.send(frame.clone()).await.expect("queue frame");
+        }
+        drop(tx);
+
+        let mut sink = CountingSink::default();
+        run_writer(&mut sink, &mut rx, &mut closed_rx).await;
+
+        assert_eq!(
+            sink.writes, 1,
+            "three queued frames must be coalesced into a single write"
+        );
+        assert_eq!(sink.flushes, 1, "flush only when the queue is empty");
+        assert_eq!(
+            sink.bytes.len(),
+            encoded.iter().map(Vec::len).sum::<usize>()
+        );
+        let frames = decode_all_frames(&sink.bytes);
+        assert_eq!(frames.len(), 3);
+        for (idx, (session_id, payload)) in frames.iter().enumerate() {
+            assert_eq!(*session_id, idx as u16 + 1);
+            assert_eq!(
+                payload, &payloads[idx],
+                "frame {idx} payload must be intact"
+            );
+        }
+        drop(closed_tx);
+    }
+
+    #[tokio::test]
+    async fn writer_carries_a_frame_that_would_overflow_the_coalesce_cap() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (_closed_tx, mut closed_rx) = watch::channel(false);
+
+        // Nine near-maximum frames exceed the 64 KiB coalesce cap.
+        let frames = 9;
+        let mut expected_len = 0usize;
+        for idx in 0..frames {
+            let payload = vec![idx as u8; 8000];
+            let frame = encode_test_frame(idx as u16 + 1, SessionStatus::New, &payload);
+            expected_len += frame.len();
+            tx.send(frame).await.expect("queue frame");
+        }
+        drop(tx);
+
+        let mut sink = CountingSink::default();
+        run_writer(&mut sink, &mut rx, &mut closed_rx).await;
+
+        assert_eq!(sink.bytes.len(), expected_len, "no frame byte may be lost");
+        assert!(
+            sink.writes >= 2,
+            "a batch that would exceed the cap must be split, got {} writes",
+            sink.writes
+        );
+        let decoded = decode_all_frames(&sink.bytes);
+        assert_eq!(decoded.len(), frames);
+        for (idx, (session_id, payload)) in decoded.iter().enumerate() {
+            assert_eq!(*session_id, idx as u16 + 1);
+            assert_eq!(payload.len(), 8000);
+            assert!(payload.iter().all(|b| *b == idx as u8));
+        }
+    }
 
     struct DropFlag(Arc<AtomicBool>);
 

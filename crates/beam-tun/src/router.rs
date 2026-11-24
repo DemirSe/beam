@@ -1,5 +1,6 @@
 //! Minimal IPv4 + IPv6 packet routing policy for `beam-tun`.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::packet::{IP_PROTO_TCP, IP_PROTO_UDP, IpPacketView, parse_udp};
@@ -61,6 +62,139 @@ impl IpNet {
     }
 }
 
+/// Sorted, merged, disjoint IPv4/IPv6 prefix index for bypass CIDRs.
+///
+/// Overlapping prefixes are normalized into sorted disjoint inclusive
+/// `(start, end)` ranges at construction time, so a lookup is one binary search
+/// per address family instead of a linear scan over every configured CIDR.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BypassCidrs {
+    v4: Vec<(u32, u32)>,
+    v6: Vec<(u128, u128)>,
+}
+
+impl BypassCidrs {
+    /// Builds the index from raw CIDR prefixes.
+    pub fn new(nets: &[IpNet]) -> Self {
+        let mut v4: Vec<(u32, u32)> = Vec::new();
+        let mut v6: Vec<(u128, u128)> = Vec::new();
+        for net in nets {
+            match *net {
+                IpNet::V4 { net, mask } => v4.push((net, net | !mask)),
+                IpNet::V6 { net, mask } => v6.push((net, net | !mask)),
+            }
+        }
+        Self {
+            v4: merge_ranges(v4),
+            v6: merge_ranges(v6),
+        }
+    }
+
+    /// Returns `true` when no CIDR is configured (the hot-path fast case).
+    pub fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
+    }
+
+    /// Number of indexed prefixes after normalization (both families).
+    pub fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
+    }
+
+    /// Returns `true` when `ip` is inside any indexed prefix.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                let value = u32::from(v4);
+                contains_range(&self.v4, value)
+            }
+            IpAddr::V6(v6) => {
+                let value = u128::from(v6);
+                contains_range(&self.v6, value)
+            }
+        }
+    }
+}
+
+impl From<Vec<IpNet>> for BypassCidrs {
+    fn from(nets: Vec<IpNet>) -> Self {
+        Self::new(&nets)
+    }
+}
+
+impl From<&[IpNet]> for BypassCidrs {
+    fn from(nets: &[IpNet]) -> Self {
+        Self::new(nets)
+    }
+}
+
+/// Sorts and merges overlapping inclusive ranges into sorted disjoint ranges.
+fn merge_ranges<T: Ord + Copy>(mut ranges: Vec<(T, T)>) -> Vec<(T, T)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(T, T)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => {
+                if end > last.1 {
+                    last.1 = end;
+                }
+            }
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+fn contains_range<T: Ord + Copy>(ranges: &[(T, T)], value: T) -> bool {
+    let idx = ranges.partition_point(|(start, _)| *start <= value);
+    idx > 0 && value <= ranges[idx - 1].1
+}
+
+/// Explicit IP exclusions (the `beam` server IP and user entries).
+///
+/// A short list is scanned inline (cheaper than hashing for the typical one or
+/// two entries); longer lists switch to a `HashSet`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExcludeIps {
+    list: Vec<IpAddr>,
+    set: Option<HashSet<IpAddr>>,
+}
+
+impl ExcludeIps {
+    const HASH_THRESHOLD: usize = 8;
+
+    /// Builds the exclusion set from raw entries.
+    pub fn new(entries: &[IpAddr]) -> Self {
+        Self {
+            list: entries.to_vec(),
+            set: (entries.len() > Self::HASH_THRESHOLD).then(|| entries.iter().copied().collect()),
+        }
+    }
+
+    /// Returns `true` when `ip` is explicitly excluded.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match self.set.as_ref() {
+            Some(set) => set.contains(&ip),
+            None => self.list.contains(&ip),
+        }
+    }
+
+    /// Number of excluded entries.
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    /// Returns `true` when nothing is excluded.
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+}
+
+impl From<Vec<IpAddr>> for ExcludeIps {
+    fn from(entries: Vec<IpAddr>) -> Self {
+        Self::new(&entries)
+    }
+}
+
 /// Routing policy applied to packets arriving from the TUN interface.
 #[derive(Clone, Debug)]
 pub struct RoutePolicy {
@@ -77,9 +211,10 @@ pub struct RoutePolicy {
     pub drop_private_destinations: bool,
     /// Explicit IP addresses excluded from tunneling (always includes the
     /// `beam` server IP to prevent routing loops).
-    pub exclude_ips: Vec<IpAddr>,
-    /// Explicit user-configured CIDR prefixes excluded from tunneling.
-    pub bypass_cidrs: Vec<IpNet>,
+    pub exclude_ips: ExcludeIps,
+    /// Explicit user-configured CIDR prefixes excluded from tunneling,
+    /// pre-indexed for O(log N) lookup.
+    pub bypass_cidrs: BypassCidrs,
     /// Intercept UDP/53 packets in the built-in DNS resolver (including
     /// queries addressed to private/TUN DNS IPs).
     pub intercept_dns: bool,
@@ -91,8 +226,8 @@ impl Default for RoutePolicy {
             reject_quic: true,
             reject_ipv6: false,
             drop_private_destinations: true,
-            exclude_ips: Vec::new(),
-            bypass_cidrs: Vec::new(),
+            exclude_ips: ExcludeIps::default(),
+            bypass_cidrs: BypassCidrs::default(),
             intercept_dns: false,
         }
     }
@@ -119,7 +254,7 @@ pub enum RouteDecision {
 impl RoutePolicy {
     /// Classifies an IPv4 or IPv6 packet read from the TUN interface.
     pub fn classify(&self, pkt: &IpPacketView<'_>) -> RouteDecision {
-        if self.exclude_ips.contains(&pkt.dst_ip) {
+        if self.exclude_ips.contains(pkt.dst_ip) {
             return RouteDecision::Drop;
         }
         if self.intercept_dns
@@ -129,7 +264,7 @@ impl RoutePolicy {
         {
             return RouteDecision::InterceptDns;
         }
-        if self.bypass_cidrs.iter().any(|net| net.contains(pkt.dst_ip)) {
+        if !self.bypass_cidrs.is_empty() && self.bypass_cidrs.contains(pkt.dst_ip) {
             return RouteDecision::Drop;
         }
         if self.drop_private_destinations && is_non_global_ip(pkt.dst_ip) {
@@ -276,8 +411,8 @@ mod tests {
             reject_quic: true,
             reject_ipv6: false,
             drop_private_destinations: true,
-            exclude_ips: Vec::new(),
-            bypass_cidrs: vec![net4],
+            exclude_ips: ExcludeIps::default(),
+            bypass_cidrs: BypassCidrs::from(vec![net4]),
             intercept_dns: true,
         };
         let bypassed = build_ipv4_udp_packet(
@@ -381,6 +516,148 @@ mod tests {
             let ip: Ipv4Addr = raw.parse().expect("ipv4");
             assert!(!is_non_global_ipv4(ip), "{raw} must stay global");
         }
+    }
+
+    #[test]
+    fn indexed_bypass_cidrs_match_a_linear_scan() {
+        let mut nets = Vec::new();
+        for cidr in [
+            "10.0.0.0/8",
+            "10.1.0.0/16",
+            "10.1.2.0/24",
+            "0.0.0.0/1",
+            "100.64.0.0/10",
+            "192.168.0.0/16",
+            "198.51.100.0/24",
+            "203.0.113.0/24",
+            "1.1.1.1/32",
+            "172.16.0.0/12",
+            "128.0.0.0/2",
+            "2001:db8::/32",
+            "2001:db8:1::/48",
+            "fd00::/8",
+            "2606:4700::/32",
+            "::1/128",
+            "fe80::/10",
+        ] {
+            nets.push(IpNet::parse_cidr(cidr).expect("cidr"));
+        }
+        let index = BypassCidrs::new(&nets);
+        assert!(!index.is_empty());
+        assert!(
+            index.len() <= nets.len(),
+            "overlapping prefixes must be merged, not duplicated"
+        );
+
+        let mut samples = Vec::new();
+        for raw in [
+            "0.0.0.0",
+            "1.1.1.1",
+            "1.1.1.2",
+            "9.255.255.255",
+            "10.0.0.1",
+            "10.1.0.1",
+            "10.1.2.3",
+            "10.2.3.4",
+            "100.64.0.1",
+            "100.128.0.1",
+            "128.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "198.51.100.42",
+            "203.0.113.9",
+            "223.255.255.255",
+            "255.255.255.255",
+        ] {
+            samples.push(IpAddr::V4(raw.parse().expect("v4")));
+        }
+        for raw in [
+            "::1",
+            "::2",
+            "2001:db8::1",
+            "2001:db8:1::1",
+            "2001:db8:2::1",
+            "2606:4700::1111",
+            "fd00::1",
+            "fe80::1",
+            "2600::1",
+        ] {
+            samples.push(IpAddr::V6(raw.parse().expect("v6")));
+        }
+
+        for ip in samples {
+            let expected = nets.iter().any(|net| net.contains(ip));
+            assert_eq!(index.contains(ip), expected, "mismatch for {ip}");
+        }
+
+        // The empty index is the hot-path fast case.
+        let empty = BypassCidrs::default();
+        assert!(empty.is_empty());
+        assert!(!empty.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+    }
+
+    #[test]
+    fn exclude_ips_matches_across_the_inline_and_hashed_paths() {
+        let few: Vec<IpAddr> = vec![
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            IpAddr::V6("2001:db8::10".parse().expect("v6")),
+        ];
+        let many: Vec<IpAddr> = (1..=16)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(198, 18, 0, i)))
+            .collect();
+
+        for entries in [few, many] {
+            let index = ExcludeIps::new(&entries);
+            assert_eq!(index.len(), entries.len());
+            for ip in &entries {
+                assert!(index.contains(*ip), "{ip} must be excluded");
+            }
+            for ip in [
+                IpAddr::V4(Ipv4Addr::new(198, 18, 1, 1)),
+                IpAddr::V6("2001:db8::11".parse().expect("v6")),
+            ] {
+                if !entries.contains(&ip) {
+                    assert!(!index.contains(ip), "{ip} must not be excluded");
+                }
+            }
+        }
+        assert!(ExcludeIps::default().is_empty());
+    }
+
+    #[test]
+    fn dns_interception_wins_over_a_bypass_cidr_for_udp_53() {
+        let policy = RoutePolicy {
+            bypass_cidrs: BypassCidrs::from(vec![IpNet::parse_cidr("1.1.1.0/24").expect("cidr")]),
+            intercept_dns: true,
+            ..RoutePolicy::default()
+        };
+        let dns = build_ipv4_udp_packet(
+            Ipv4Addr::new(172, 19, 0, 1),
+            55555,
+            Ipv4Addr::new(1, 1, 1, 1),
+            53,
+            b"q",
+        )
+        .expect("udp");
+        assert_eq!(
+            policy.classify(&parse_ip(&dns).expect("ip")),
+            RouteDecision::InterceptDns
+        );
+
+        // The same bypass CIDR still drops non-DNS traffic.
+        let other = build_ipv4_udp_packet(
+            Ipv4Addr::new(172, 19, 0, 1),
+            55555,
+            Ipv4Addr::new(1, 1, 1, 1),
+            853,
+            b"q",
+        )
+        .expect("udp");
+        assert_eq!(
+            policy.classify(&parse_ip(&other).expect("ip")),
+            RouteDecision::Drop
+        );
     }
 
     #[test]

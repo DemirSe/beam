@@ -12,13 +12,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use beam_core::address::{Address, NetLocation};
-use beam_core::client::{BeamClientConfig, XudpClient, XudpClientConfig};
+use beam_core::client::{BeamClientConfig, XudpClient, XudpClientConfig, XudpSession};
 use beam_core::xudp::MAX_PAYLOAD_LEN;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::packet::build_ip_udp_packet;
+use crate::stats::DropCounters;
 
 const DEFAULT_MAX_UDP_SESSIONS: usize = 256;
 const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -66,6 +67,7 @@ pub struct UdpNatBridge {
     next_connect_allowed_ms: u64,
     pending_initial: VecDeque<(SocketAddr, SocketAddr, Vec<u8>)>,
     sessions: HashMap<SocketAddr, NatEntry>,
+    drops: Arc<DropCounters>,
 }
 
 impl UdpNatBridge {
@@ -77,6 +79,7 @@ impl UdpNatBridge {
         bridge_config: UdpBridgeConfig,
         tun_tx: mpsc::Sender<Vec<u8>>,
         waker: Arc<Notify>,
+        drops: Arc<DropCounters>,
     ) -> Self {
         Self {
             start: Instant::now(),
@@ -91,6 +94,7 @@ impl UdpNatBridge {
             next_connect_allowed_ms: 0,
             pending_initial: VecDeque::with_capacity(MAX_PENDING_CONNECT_DATAGRAMS),
             sessions: HashMap::new(),
+            drops,
         }
     }
 
@@ -104,7 +108,12 @@ impl UdpNatBridge {
         self.mux = None;
         self.connect_backoff_ms = 0;
         self.next_connect_allowed_ms = 0;
-        self.pending_initial.clear();
+        if !self.pending_initial.is_empty() {
+            self.drops
+                .udp_pending_full
+                .add(self.pending_initial.len() as u64);
+            self.pending_initial.clear();
+        }
         for (_, entry) in self.sessions.drain() {
             entry.task.abort();
         }
@@ -144,7 +153,12 @@ impl UdpNatBridge {
             Ok(None) | Err(oneshot::error::TryRecvError::Closed) => {
                 self.connecting = None;
                 self.connect_task = None;
-                self.pending_initial.clear();
+                if !self.pending_initial.is_empty() {
+                    self.drops
+                        .udp_pending_full
+                        .add(self.pending_initial.len() as u64);
+                    self.pending_initial.clear();
+                }
                 let next_backoff = if self.connect_backoff_ms == 0 {
                     INITIAL_CONNECT_BACKOFF_MS
                 } else {
@@ -161,6 +175,7 @@ impl UdpNatBridge {
     /// the TUN event loop.
     pub fn handle_datagram(&mut self, src: SocketAddr, dst: SocketAddr, payload: &[u8]) {
         if payload.is_empty() || payload.len() > MAX_PAYLOAD_LEN {
+            self.drops.udp_payload_invalid.incr();
             return;
         }
         self.poll_connect();
@@ -169,7 +184,9 @@ impl UdpNatBridge {
         if let Some(entry) = self.sessions.get_mut(&src) {
             if !entry.tx.is_closed() && !entry.task.is_finished() {
                 entry.last_active_ms.store(now_ms, Ordering::Release);
-                let _ = entry.tx.try_send((dst, payload.to_vec()));
+                if entry.tx.try_send((dst, queued_payload(payload))).is_err() {
+                    self.drops.udp_session_queue_full.incr();
+                }
                 return;
             }
             if let Some(dead) = self.sessions.remove(&src) {
@@ -180,6 +197,7 @@ impl UdpNatBridge {
         if self.sessions.len() >= self.bridge_config.max_sessions {
             self.sweep_idle();
             if self.sessions.len() >= self.bridge_config.max_sessions {
+                self.drops.udp_session_table_full.incr();
                 debug!(%src, "UDP NAT session table full; dropping datagram");
                 return;
             }
@@ -190,9 +208,7 @@ impl UdpNatBridge {
             _ => {
                 self.mux = None;
                 self.start_background_connect();
-                if self.pending_initial.len() < MAX_PENDING_CONNECT_DATAGRAMS {
-                    self.pending_initial.push_back((src, dst, payload.to_vec()));
-                }
+                self.queue_pending(src, dst, payload);
                 return;
             }
         };
@@ -205,18 +221,17 @@ impl UdpNatBridge {
                 if !mux.is_open() {
                     self.mux = None;
                     self.start_background_connect();
-                    if self.pending_initial.len() < MAX_PENDING_CONNECT_DATAGRAMS {
-                        self.pending_initial.push_back((src, dst, payload.to_vec()));
-                    }
+                    self.queue_pending(src, dst, payload);
                 }
                 return;
             }
         };
 
         let (tx, mut rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(PER_SESSION_SEND_QUEUE);
-        let _ = tx.try_send((dst, payload.to_vec()));
+        let _ = tx.try_send((dst, queued_payload(payload)));
 
         let tun_tx = self.tun_tx.clone();
+        let task_drops = Arc::clone(&self.drops);
         let idle = self.bridge_config.idle_timeout;
         let last_active_ms = Arc::new(AtomicU64::new(now_ms));
         let task_active = Arc::clone(&last_active_ms);
@@ -235,7 +250,7 @@ impl UdpNatBridge {
                         }
                         last_dst = target;
                         task_active.store(start.elapsed().as_millis() as u64, Ordering::Release);
-                        if let Err(err) = session.send_to(socket_to_netloc(target), &data).await {
+                        if let Err(err) = session.send_owned(socket_to_netloc(target), data).await {
                             warn!(%target, error = %err, "xudp session send_to failed");
                             break;
                         }
@@ -256,8 +271,9 @@ impl UdpNatBridge {
                             src.ip(),
                             src.port(),
                             &reply.payload,
-                        ) {
-                            let _ = tun_tx.try_send(pkt);
+                        ) && tun_tx.try_send(pkt).is_err()
+                        {
+                            task_drops.tun_tx_full.incr();
                         }
                     }
                     () = tokio::time::sleep(idle) => {
@@ -276,6 +292,17 @@ impl UdpNatBridge {
                 task,
             },
         );
+    }
+
+    /// Queues one datagram for the next mux connect, dropping it (and counting
+    /// the drop) when the bounded queue is full.
+    fn queue_pending(&mut self, src: SocketAddr, dst: SocketAddr, payload: &[u8]) {
+        if self.pending_initial.len() < MAX_PENDING_CONNECT_DATAGRAMS {
+            self.pending_initial
+                .push_back((src, dst, queued_payload(payload)));
+        } else {
+            self.drops.udp_pending_full.incr();
+        }
     }
 
     /// Removes expired or finished NAT entries (checking both outbound and
@@ -359,6 +386,14 @@ impl Drop for UdpNatBridge {
     }
 }
 
+/// Copies one datagram into a queue buffer with XUDP frame-header headroom so
+/// `XudpSession::send_owned` can prepend the header without a second allocation.
+fn queued_payload(payload: &[u8]) -> Vec<u8> {
+    let mut buf = XudpSession::alloc_payload(payload.len());
+    buf.extend_from_slice(payload);
+    buf
+}
+
 fn socket_to_netloc(addr: SocketAddr) -> NetLocation {
     let address = match addr.ip() {
         IpAddr::V4(v4) => Address::Ipv4(v4),
@@ -374,6 +409,10 @@ fn socket_to_netloc(addr: SocketAddr) -> NetLocation {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    fn dummy_drops() -> Arc<DropCounters> {
+        Arc::new(DropCounters::default())
+    }
 
     fn dummy_client_config() -> BeamClientConfig {
         let reality = beam_core::reality::RealityClientConfig::new(
@@ -423,6 +462,7 @@ mod tests {
                 },
                 tun_tx.clone(),
                 Arc::clone(&waker),
+                dummy_drops(),
             );
             assert_eq!(bridge.next_sweep_delay_ms(), None);
 
@@ -445,6 +485,7 @@ mod tests {
             },
             tun_tx,
             waker,
+            dummy_drops(),
         );
 
         let src_active = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_001);
@@ -512,6 +553,7 @@ mod tests {
             },
             tun_tx,
             waker,
+            dummy_drops(),
         );
 
         // Simulate a failed initial XUDP connect to enter reconnect backoff.
@@ -566,6 +608,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drop_counters_track_payload_queue_table_and_pending_drops() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let waker = Arc::new(Notify::new());
+        let drops = dummy_drops();
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig {
+                max_sessions: 1,
+                idle_timeout: Duration::from_secs(60),
+            },
+            tun_tx,
+            waker,
+            Arc::clone(&drops),
+        );
+
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 60_001);
+
+        // Empty and oversize payloads are rejected and counted.
+        bridge.handle_datagram(src, dst, b"");
+        bridge.handle_datagram(src, dst, &vec![0u8; MAX_PAYLOAD_LEN + 1]);
+        assert_eq!(drops.snapshot().udp_payload_invalid, 2);
+
+        // A session whose queue is already full drops the datagram.
+        let (tx, _rx) = mpsc::channel(1);
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        tx.try_send((dst, vec![1u8])).expect("fill session queue");
+        bridge.sessions.insert(
+            src,
+            NatEntry {
+                tx,
+                last_active_ms: Arc::new(AtomicU64::new(bridge.now_ms())),
+                task,
+            },
+        );
+        bridge.handle_datagram(src, dst, b"queue-full");
+        assert_eq!(drops.snapshot().udp_session_queue_full, 1);
+
+        // The table is bounded: a second source with no mux is dropped after the
+        // lazy sweep cannot reclaim the live session.
+        let other = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 60_002);
+        bridge.handle_datagram(other, dst, b"table-full");
+        assert_eq!(drops.snapshot().udp_session_table_full, 1);
+
+        // Clearing the pending queue during a failed reconnect is counted.
+        bridge.sessions.clear();
+        bridge.handle_datagram(other, dst, b"pending");
+        assert!(bridge.pending_initial.len() <= MAX_PENDING_CONNECT_DATAGRAMS);
+    }
+
+    #[tokio::test]
     async fn backoff_queue_is_bounded_by_max_pending_connect_datagrams() {
         let (tun_tx, _tun_rx) = mpsc::channel(8);
         let waker = Arc::new(Notify::new());
@@ -574,6 +669,7 @@ mod tests {
             UdpBridgeConfig::default(),
             tun_tx,
             waker,
+            dummy_drops(),
         );
 
         // Hold bridge in backoff so no background connect spawns.

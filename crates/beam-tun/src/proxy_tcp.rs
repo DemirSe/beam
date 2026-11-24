@@ -15,7 +15,9 @@ use crate::packet::{
     IP_PROTO_TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, build_ip_tcp_packet_slices,
     parse_ip, parse_tcp, parse_tcp_syn_options,
 };
-use crate::stack::{AcceptedTcpStream, FlowWaker, NetStack, TcpStackConfig, TunTcpStream};
+use crate::stack::{
+    AcceptedTcpStream, FlowWaker, NetStack, RelayBufPool, TcpStackConfig, TunTcpStream,
+};
 
 const OUR_WSCALE: u8 = 7; // 128x multiplier -> up to ~8 MiB window; capped at max_rcv_buf
 const MIN_TCP_BUF: usize = 64 * 1024;
@@ -571,7 +573,7 @@ impl TcpConn {
         }
     }
 
-    fn drain_from_relay(&mut self, now_ms: i64) {
+    fn drain_from_relay(&mut self, now_ms: i64, pool: &RelayBufPool) {
         let Some(rx) = self.from_relay.as_mut() else {
             return;
         };
@@ -579,7 +581,10 @@ impl TcpConn {
             match rx.try_recv() {
                 Ok(chunk) => {
                     self.last_activity_ms = now_ms;
-                    self.tx_buf.extend(chunk);
+                    self.tx_buf.extend(chunk.as_slice().iter().copied());
+                    // Recycle the relay buffer so steady-state downloads stop
+                    // allocating one chunk allocation per read (#168).
+                    pool.put(chunk);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -762,6 +767,7 @@ pub struct ProxyTcpStack {
     dirty: Arc<DirtyFlowQueue>,
     timers: BinaryHeap<Reverse<(i64, FlowKey)>>,
     poll_batch: Vec<FlowKey>,
+    relay_pool: Arc<RelayBufPool>,
     #[cfg(test)]
     last_poll_count: usize,
 }
@@ -780,6 +786,7 @@ impl ProxyTcpStack {
             }),
             timers: BinaryHeap::new(),
             poll_batch: Vec::with_capacity(64),
+            relay_pool: RelayBufPool::new(),
             #[cfg(test)]
             last_poll_count: 0,
         }
@@ -1048,6 +1055,7 @@ impl NetStack for ProxyTcpStack {
                             Some(flow_waker),
                             Some(Arc::clone(&conn.in_flight_relay)),
                             Some(Arc::clone(&conn.aborted)),
+                            Arc::clone(&self.relay_pool),
                         ),
                     });
                 }
@@ -1058,7 +1066,7 @@ impl NetStack for ProxyTcpStack {
                     }
                 } else {
                     conn.flush_rcv_to_relay();
-                    conn.drain_from_relay(now_ms);
+                    conn.drain_from_relay(now_ms, &self.relay_pool);
                     conn.flush_tx(now_ms, tx_out);
 
                     // Emit a Window Update ACK promptly when:

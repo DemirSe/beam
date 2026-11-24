@@ -16,16 +16,21 @@ pub mod dns;
 pub mod engine;
 pub mod packet;
 pub mod proxy_tcp;
+pub mod ratelimit;
 pub mod router;
 pub mod stack;
+pub mod stats;
 pub mod udp;
 
 pub use device::{MemoryTun, TunDevice};
 pub use dns::{DnsConfig, DnsInterceptor, DnsUpstream};
 pub use engine::{
-    EngineError, TunEngineConfig, TunnelActivity, run_tun_engine, run_tun_engine_with_activity,
+    DialFailure, DialFailureKind, DialFailureStage, EngineError, TunEngineConfig, TunnelActivity,
+    run_tun_engine, run_tun_engine_with_activity,
 };
 pub use proxy_tcp::ProxyTcpStack;
-pub use router::{IpNet, RouteDecision, RoutePolicy, TUN_V6_NET};
+pub use ratelimit::RateLimiter;
+pub use router::{BypassCidrs, ExcludeIps, IpNet, RouteDecision, RoutePolicy, TUN_V6_NET};
 pub use stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
+pub use stats::{DnsCounters, DnsSnapshot, DropCounters, DropSnapshot};
 pub use udp::{UdpBridgeConfig, UdpNatBridge};

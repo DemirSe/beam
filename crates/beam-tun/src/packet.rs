@@ -100,6 +100,58 @@ pub fn parse_ip(packet: &[u8]) -> Option<IpPacketView<'_>> {
     }
 }
 
+/// Returns `true` when `packet` is a fragmented IPv4 or IPv6 packet.
+///
+/// [`parse_ip`] rejects fragments instead of reassembling them; this helper only
+/// classifies the drop reason for diagnostics and never panics on short input.
+/// IPv6 gives up after four extension headers, which is far more than the
+/// fragment header ever appears behind in practice.
+///
+/// [`parse_ip`]: crate::packet::parse_ip
+pub fn is_fragment(packet: &[u8]) -> bool {
+    match packet.first().map(|first| first >> 4) {
+        Some(4) => {
+            if packet.len() < IPV4_MIN_HEADER_LEN {
+                return false;
+            }
+            let flags_frag = u16::from_be_bytes([packet[6], packet[7]]);
+            (flags_frag & 0x3fff) != 0
+        }
+        Some(6) => {
+            if packet.len() < IPV6_HEADER_LEN {
+                return false;
+            }
+            let mut next = packet[6];
+            let mut offset = IPV6_HEADER_LEN;
+            for _ in 0..4 {
+                match next {
+                    IPV6_NEXT_FRAGMENT => return true,
+                    IPV6_NEXT_HOP_BY_HOP | IPV6_NEXT_ROUTING | IPV6_NEXT_DEST_OPTS => {
+                        let Some(header) = packet.get(offset..) else {
+                            return false;
+                        };
+                        let Some(len_field) = header.first() else {
+                            return false;
+                        };
+                        let header_len = (usize::from(*len_field) + 1) * 8;
+                        let Some(next_byte) = header.get(1) else {
+                            return false;
+                        };
+                        next = *next_byte;
+                        offset = match offset.checked_add(header_len) {
+                            Some(next_offset) => next_offset,
+                            None => return false,
+                        };
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// Parses an IPv4 packet, rejecting truncated, non-IPv4, or fragmented packets.
 pub fn parse_ipv4(packet: &[u8]) -> Option<Ipv4PacketView<'_>> {
     if packet.len() < IPV4_MIN_HEADER_LEN {
@@ -390,6 +442,22 @@ pub fn build_ip_udp_packet(
     dst_port: u16,
     payload: &[u8],
 ) -> Option<Vec<u8>> {
+    build_ip_udp_packet_patched(src_ip, src_port, dst_ip, dst_port, payload, None)
+}
+
+/// Builds a UDP/IPv4 or UDP/IPv6 packet like [`build_ip_udp_packet`], but
+/// overwrites the two payload bytes at `patch.0` with `patch.1` while copying.
+///
+/// The DNS interceptor uses this to rewrite the 2-byte DNS `tx_id` of a cached
+/// reply without cloning the shared wire buffer (#168).
+pub fn build_ip_udp_packet_patched(
+    src_ip: IpAddr,
+    src_port: u16,
+    dst_ip: IpAddr,
+    dst_port: u16,
+    payload: &[u8],
+    patch: Option<(usize, [u8; 2])>,
+) -> Option<Vec<u8>> {
     let udp_len = UDP_HEADER_LEN.checked_add(payload.len())?;
     let udp_len_u16 = u16::try_from(udp_len).ok()?;
 
@@ -413,6 +481,7 @@ pub fn build_ip_udp_packet(
             udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
             udp[4..6].copy_from_slice(&udp_len_u16.to_be_bytes());
             udp[UDP_HEADER_LEN..].copy_from_slice(payload);
+            apply_payload_patch(udp, patch)?;
 
             let cksum = l4_ipv4_checksum(s4, d4, IP_PROTO_UDP, udp);
             let cksum = if cksum == 0 { 0xffff } else { cksum };
@@ -434,6 +503,7 @@ pub fn build_ip_udp_packet(
             udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
             udp[4..6].copy_from_slice(&udp_len_u16.to_be_bytes());
             udp[UDP_HEADER_LEN..].copy_from_slice(payload);
+            apply_payload_patch(udp, patch)?;
 
             let cksum = l4_ipv6_checksum(s6, d6, IP_PROTO_UDP, udp);
             let cksum = if cksum == 0 { 0xffff } else { cksum };
@@ -562,6 +632,18 @@ fn fold_checksum(mut sum: u32) -> u16 {
 
 fn internet_checksum(data: &[u8]) -> u16 {
     fold_checksum(sum_bytes(data))
+}
+
+/// Applies an optional `(offset, bytes)` patch inside a UDP segment, returning
+/// `None` when the patch does not fit.
+fn apply_payload_patch(udp: &mut [u8], patch: Option<(usize, [u8; 2])>) -> Option<()> {
+    let Some((offset, bytes)) = patch else {
+        return Some(());
+    };
+    let start = UDP_HEADER_LEN.checked_add(offset)?;
+    let slot = udp.get_mut(start..start.checked_add(2)?)?;
+    slot.copy_from_slice(&bytes);
+    Some(())
 }
 
 fn l4_ipv4_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, segment: &[u8]) -> u16 {
