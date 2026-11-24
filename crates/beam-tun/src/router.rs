@@ -4,6 +4,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::packet::{IP_PROTO_TCP, IP_PROTO_UDP, IpPacketView, parse_udp};
 
+/// IPv6 TUN subnet `fd00:be:a::/126` as a compile-time constant so the hot
+/// paths never parse the CIDR string.
+pub const TUN_V6_NET: IpNet = IpNet::V6 {
+    net: 0xfd00_00be_000a_0000_0000_0000_0000_0000,
+    mask: u128::MAX << 2,
+};
+
 /// Minimal zero-dependency IPv4/IPv6 CIDR network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpNet {
@@ -64,8 +71,9 @@ pub struct RoutePolicy {
     /// Unreachable for UDP) while keeping IPv6 TUN split routes active to
     /// prevent leaks on IPv4-only upstream servers.
     pub reject_ipv6: bool,
-    /// Drop packets destined for RFC 1918 / ULA / link-local / multicast /
-    /// loopback addresses so they never enter the tunnel.
+    /// Drop packets destined for non-global addresses (RFC 1918, CGNAT,
+    /// documentation/benchmarking/reserved IPv4 ranges, ULA, link-local,
+    /// multicast, loopback) so they never enter the tunnel.
     pub drop_private_destinations: bool,
     /// Explicit IP addresses excluded from tunneling (always includes the
     /// `beam` server IP to prevent routing loops).
@@ -155,8 +163,8 @@ impl RoutePolicy {
     }
 }
 
-/// Returns `true` for loopback, private/ULA, link-local, multicast, broadcast,
-/// or unspecified IP addresses.
+/// Returns `true` for loopback, private/ULA, CGNAT, special-purpose,
+/// link-local, multicast, broadcast, or unspecified IP addresses.
 pub fn is_non_global_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_non_global_ipv4(v4),
@@ -164,14 +172,28 @@ pub fn is_non_global_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Returns `true` for non-global IPv4 addresses.
+/// Returns `true` for non-global IPv4 addresses (RFC 6890 special-purpose
+/// ranges included).
 pub fn is_non_global_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
     ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
         || ip.is_broadcast()
         || ip.is_multicast()
         || ip.is_unspecified()
+        // 100.64.0.0/10 carrier-grade NAT (RFC 6598)
+        || (a == 100 && (64..=127).contains(&b))
+        // 192.0.0.0/24 IETF protocol assignments (RFC 6890)
+        || (a == 192 && b == 0 && c == 0)
+        // 198.18.0.0/15 benchmarking (RFC 2544)
+        || (a == 198 && (18..=19).contains(&b))
+        // 240.0.0.0/4 reserved for future use (RFC 1112)
+        || a >= 240
+        // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 documentation (RFC 5737)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
 }
 
 /// Returns `true` for non-global IPv6 addresses.
@@ -308,5 +330,53 @@ mod tests {
             policy.classify(&parse_ip(&udp).expect("ip")),
             RouteDecision::RejectIcmpUnreachable
         );
+    }
+
+    #[test]
+    fn non_global_ipv4_covers_every_special_purpose_range() {
+        for raw in [
+            "100.64.0.1",      // CGNAT start
+            "100.127.255.255", // CGNAT end
+            "192.0.0.8",       // IETF protocol assignments
+            "198.18.0.1",      // benchmarking start
+            "198.19.255.255",  // benchmarking end
+            "240.0.0.1",       // reserved for future use
+            "255.255.255.254", // reserved, below broadcast
+            "192.0.2.5",       // TEST-NET-1
+            "198.51.100.7",    // TEST-NET-2
+            "203.0.113.9",     // TEST-NET-3
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.1.1",
+        ] {
+            let ip: Ipv4Addr = raw.parse().expect("ipv4");
+            assert!(is_non_global_ipv4(ip), "{raw} must be non-global");
+        }
+
+        for raw in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "100.63.255.255",
+            "100.128.0.0",
+            "9.9.9.9",
+            "198.17.255.255",
+            "198.20.0.0",
+            "223.255.255.255",
+        ] {
+            let ip: Ipv4Addr = raw.parse().expect("ipv4");
+            assert!(!is_non_global_ipv4(ip), "{raw} must stay global");
+        }
+    }
+
+    #[test]
+    fn tun_v6_net_constant_matches_the_documented_cidr() {
+        let parsed = IpNet::parse_cidr("fd00:be:a::/126").expect("tun v6 cidr");
+        assert_eq!(parsed, TUN_V6_NET);
+        assert!(TUN_V6_NET.contains(IpAddr::V6("fd00:be:a::1".parse().expect("v6"))));
+        assert!(TUN_V6_NET.contains(IpAddr::V6("fd00:be:a::3".parse().expect("v6"))));
+        assert!(!TUN_V6_NET.contains(IpAddr::V6("fd00:be:a::4".parse().expect("v6"))));
+        assert!(!TUN_V6_NET.contains(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1))));
     }
 }

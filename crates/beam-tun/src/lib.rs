@@ -26,6 +26,6 @@ pub use engine::{
     EngineError, TunEngineConfig, TunnelActivity, run_tun_engine, run_tun_engine_with_activity,
 };
 pub use proxy_tcp::ProxyTcpStack;
-pub use router::{IpNet, RouteDecision, RoutePolicy};
+pub use router::{IpNet, RouteDecision, RoutePolicy, TUN_V6_NET};
 pub use stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
 pub use udp::{UdpBridgeConfig, UdpNatBridge};
