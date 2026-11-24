@@ -139,6 +139,14 @@ impl TunTcpWriter {
         Ok(())
     }
 
+    /// Waits until the TUN TCP socket closes the write channel (e.g. peer RST
+    /// or `NetStack::reset_all`).
+    pub async fn closed(&self) {
+        if let Some(tx) = self.to_stack.as_ref() {
+            tx.closed().await;
+        }
+    }
+
     /// Closes the write half (triggers TCP FIN on the TUN socket).
     pub fn shutdown(&mut self) {
         self.to_stack.take();

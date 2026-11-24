@@ -179,7 +179,9 @@ impl UdpNatBridge {
             _ => {
                 self.mux = None;
                 self.start_background_connect();
-                if self.pending_initial.len() < MAX_PENDING_CONNECT_DATAGRAMS {
+                if self.connecting.is_some()
+                    && self.pending_initial.len() < MAX_PENDING_CONNECT_DATAGRAMS
+                {
                     self.pending_initial.push_back((src, dst, payload.to_vec()));
                 }
                 return;

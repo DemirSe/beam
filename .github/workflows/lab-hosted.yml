@@ -245,7 +245,9 @@ jobs:
             bench_timeout=$((800 * 10#$reps_override))
             [ "$bench_timeout" -le 6000 ] || bench_timeout=6000
           fi
-          if [ "$loss" != "0" ] && [ "$loss" != "0.0" ] && [ "$bench_timeout" -lt 3600 ]; then
+          if [ "$INPUT_PROFILE" = standard ] \
+            && ! printf '%s' "$loss" | grep -Eq '^0+([.]0+)?$' \
+            && [ "$bench_timeout" -lt 3600 ]; then
             bench_timeout=3600
           fi
           scenarios="${scenarios:-all}"

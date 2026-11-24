@@ -209,10 +209,13 @@ pub enum ConfigError {
 pub struct ValidatedConfig {
     pub tun_name: String,
     pub tun_cidr: String,
+    pub tun_dns_peer: Option<Ipv4Addr>,
     pub mtu: usize,
     pub auto_route: bool,
     pub log_level: String,
-    pub server_ip: Option<Ipv4Addr>,
+    pub server_ip: IpAddr,
+    pub fixed_local_dns: Option<IpAddr>,
+    pub initial_local_dns: Option<IpAddr>,
     pub bypass_cidrs: Vec<String>,
     pub engine: TunEngineConfig,
     pub tcp_stack: TcpStackConfig,
@@ -309,6 +312,8 @@ impl ClientFileConfig {
             bypass_cidrs_raw.push(trimmed.to_owned());
         }
 
+        let mut fixed_local_dns = None;
+        let mut initial_local_dns = None;
         let dns_cfg = if self.dns.enabled {
             if self.dns.cache_size > 16_384 {
                 return Err(ConfigError::Invalid(
@@ -322,11 +327,19 @@ impl ClientFileConfig {
             }
             let upstream = DnsUpstream::parse(&self.dns.upstream)
                 .map_err(|e| ConfigError::Invalid(format!("dns.upstream: {e}")))?;
-            let local_upstream = match self.dns.local_upstream.as_deref() {
-                Some(raw) if !raw.trim().is_empty() => Some(parse_dns_socket_addr(raw)?),
-                _ => detect_system_local_dns(),
+            let (local_upstream, auto_detect) = match self.dns.local_upstream.as_deref() {
+                Some(raw) if !raw.trim().is_empty() => {
+                    let parsed = parse_dns_socket_addr(raw)?;
+                    fixed_local_dns = Some(parsed.ip());
+                    (Some(parsed), false)
+                }
+                _ => (detect_system_local_dns(), true),
             };
+            initial_local_dns = local_upstream.map(|s| s.ip());
             let mut cfg = DnsConfig::new(upstream, local_upstream);
+            if auto_detect {
+                cfg.refresh_local_upstream = Some(std::sync::Arc::new(detect_system_local_dns));
+            }
             cfg.local_suffixes = self.dns.local_suffixes;
             cfg.bypass_domains = self.bypass.domains;
             cfg.cache_size = self.dns.cache_size;
@@ -336,11 +349,13 @@ impl ClientFileConfig {
             None
         };
 
-        let server_ip = match self.server.address.ip() {
-            IpAddr::V4(ip) => Some(ip),
-            IpAddr::V6(_) => None,
+        let tun_dns_peer = if dns_cfg.is_some() {
+            derive_tun_peer_ipv4(&self.tun.address)
+        } else {
+            None
         };
-        let exclude_ips = vec![self.server.address.ip()];
+        let server_ip = self.server.address.ip();
+        let exclude_ips = vec![server_ip];
 
         let route = RoutePolicy {
             reject_quic: self.tun.reject_quic,
@@ -371,10 +386,13 @@ impl ClientFileConfig {
         Ok(ValidatedConfig {
             tun_name: self.tun.name,
             tun_cidr: self.tun.address,
+            tun_dns_peer,
             mtu: self.tun.mtu,
             auto_route: self.tun.auto_route,
             log_level: self.log.level,
             server_ip,
+            fixed_local_dns,
+            initial_local_dns,
             bypass_cidrs: bypass_cidrs_raw,
             engine,
             tcp_stack,
@@ -426,6 +444,17 @@ fn parse_resolv_conf_nameserver(content: &str) -> Option<SocketAddr> {
         return Some(SocketAddr::new(ip, 53));
     }
     None
+}
+
+fn derive_tun_peer_ipv4(cidr: &str) -> Option<Ipv4Addr> {
+    let (addr_str, prefix_str) = cidr.split_once('/')?;
+    let ip: Ipv4Addr = addr_str.parse().ok()?;
+    let prefix: u8 = prefix_str.parse().ok()?;
+    if prefix >= 31 {
+        return None;
+    }
+    let raw = u32::from(ip);
+    Some(Ipv4Addr::from(raw.wrapping_add(1)))
 }
 
 fn validate_ipv4_cidr(cidr: &str) -> Result<(), ConfigError> {

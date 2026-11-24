@@ -513,10 +513,64 @@ async fn tun_dns_split_and_tunneled_tcp_dns_end_to_end() {
 }
 
 #[tokio::test]
-async fn tun_ipv6_tcp_udp_and_quic_reject_work_end_to_end() {
+async fn tun_ipv6_quic_reject_end_to_end() {
+    use beam_tun::packet::{IP_PROTO_ICMPV6, build_ip_udp_packet, parse_ip};
+    use std::net::IpAddr;
+
+    timeout(Duration::from_secs(10), async {
+        let (engine_tun, mut host_tun) = MemoryTun::pair(1500, 128);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let engine_cfg = TunEngineConfig {
+            client: make_client_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 1))),
+            route: RoutePolicy {
+                reject_quic: true,
+                drop_private_destinations: false,
+                exclude_ips: Vec::new(),
+                bypass_cidrs: Vec::new(),
+                intercept_dns: false,
+            },
+            max_tcp_connections: 16,
+            udp: UdpBridgeConfig::default(),
+            dns: None,
+            network_reset: None,
+        };
+        let stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let engine_task = tokio::spawn(run_tun_engine(engine_tun, stack, engine_cfg, shutdown_rx));
+
+        let src_v6 = IpAddr::V6("fd00:be:a::1".parse().expect("src v6"));
+        let quic_v6 = build_ip_udp_packet(
+            src_v6,
+            51_111,
+            IpAddr::V6("2606:4700:4700::1111".parse().expect("v6")),
+            443,
+            b"quic-v6",
+        )
+        .expect("quic v6");
+        host_tun.send(&quic_v6).await.expect("send quic v6");
+
+        let mut buf = vec![0u8; 2048];
+        let n = timeout(Duration::from_secs(2), host_tun.recv(&mut buf))
+            .await
+            .expect("icmpv6 timed out")
+            .expect("recv icmpv6");
+        let icmp6_ip = parse_ip(&buf[..n]).expect("parse icmpv6 ip");
+        assert_eq!(icmp6_ip.protocol, IP_PROTO_ICMPV6);
+        assert_eq!(icmp6_ip.payload[0], 1, "ICMPv6 Destination Unreachable");
+        assert_eq!(icmp6_ip.payload[1], 4, "ICMPv6 Port Unreachable");
+
+        let _ = shutdown_tx.send(true);
+        let _ = engine_task.await;
+    })
+    .await
+    .expect("tun_ipv6_quic_reject_end_to_end timed out");
+}
+
+#[tokio::test]
+#[ignore = "requires unfirewalled host IPv6 ::1 loopback; run explicitly in CI"]
+async fn tun_ipv6_tcp_and_udp_loopback_end_to_end() {
     use beam_tun::packet::{
-        IP_PROTO_ICMPV6, IP_PROTO_TCP, TCP_ACK, TCP_PSH, TCP_SYN, build_ip_tcp_packet_slices,
-        build_ip_udp_packet, parse_ip, parse_tcp,
+        IP_PROTO_TCP, TCP_ACK, TCP_PSH, TCP_SYN, build_ip_tcp_packet_slices, build_ip_udp_packet,
+        parse_ip, parse_tcp,
     };
     use std::net::{IpAddr, Ipv6Addr};
 
@@ -565,151 +619,113 @@ async fn tun_ipv6_tcp_udp_and_quic_reject_work_end_to_end() {
         let dst_v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
         let mut buf = vec![0u8; 2048];
 
-        // 1. IPv6 UDP/443 -> immediate ICMPv6 Destination Unreachable (Type 1, Code 4)
-        let quic_v6 = build_ip_udp_packet(
-            src_v6,
-            51_111,
-            IpAddr::V6("2606:4700:4700::1111".parse().expect("v6")),
-            443,
-            b"quic-v6",
-        )
-        .expect("quic v6");
-        host_tun.send(&quic_v6).await.expect("send quic v6");
+        let tcp_target = TcpListener::bind((Ipv6Addr::LOCALHOST, 0))
+            .await
+            .expect("bind v6 tcp");
+        let udp_target = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
+            .await
+            .expect("bind v6 udp");
+        let tcp_target_port = tcp_target.local_addr().expect("v6 tcp addr").port();
+        let udp_target_port = udp_target.local_addr().expect("v6 udp addr").port();
+
+        let tcp_task = tokio::spawn(async move {
+            let (mut sock, _) = tcp_target.accept().await.expect("accept v6 tcp");
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.expect("v6 tcp read");
+            sock.write_all(&buf[..n]).await.expect("v6 tcp write");
+            let _ = sock.shutdown().await;
+        });
+
+        let udp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let (n, peer) = udp_target.recv_from(&mut buf).await.expect("v6 udp recv");
+            udp_target
+                .send_to(&buf[..n], peer)
+                .await
+                .expect("v6 udp send");
+        });
+
+        // 1. IPv6 UDP echo through XUDP
+        let udp_v6 = build_ip_udp_packet(src_v6, 52_222, dst_v6, udp_target_port, b"v6-udp-ok")
+            .expect("udp v6");
+        host_tun.send(&udp_v6).await.expect("send udp v6");
         let n = timeout(Duration::from_secs(2), host_tun.recv(&mut buf))
             .await
-            .expect("step 1 icmpv6 timed out")
-            .expect("recv icmpv6");
-        let icmp6_ip = parse_ip(&buf[..n]).expect("parse icmpv6 ip");
-        assert_eq!(icmp6_ip.protocol, IP_PROTO_ICMPV6);
-        assert_eq!(icmp6_ip.payload[0], 1, "ICMPv6 Destination Unreachable");
-        assert_eq!(icmp6_ip.payload[1], 4, "ICMPv6 Port Unreachable");
+            .expect("v6 udp timed out")
+            .expect("recv udp v6");
+        let reply_ip = parse_ip(&buf[..n]).expect("parse v6 udp reply");
+        assert_eq!(reply_ip.protocol, IP_PROTO_UDP);
+        assert_eq!(reply_ip.src_ip, dst_v6);
+        let reply_udp = parse_udp(reply_ip.payload).expect("v6 udp");
+        assert_eq!(reply_udp.payload, b"v6-udp-ok");
 
-        // Steps 2 & 3 require host IPv6 loopback (`::1`) sockets permitted by host firewall.
-        let ipv6_loopback_ok = async {
-            let s = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).await.ok()?;
-            let c = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await.ok()?;
-            let addr = s.local_addr().ok()?;
-            c.send_to(b"p", addr).await.ok()?;
-            let mut b = [0u8; 4];
-            timeout(Duration::from_millis(200), s.recv_from(&mut b))
-                .await
-                .ok()?
-                .ok()?;
-            Some(())
-        }
-        .await
-        .is_some();
+        // 2. IPv6 TCP handshake + data echo through ProxyTcpStack -> beam server
+        let syn = build_ip_tcp_packet_slices(
+            src_v6,
+            45_678,
+            dst_v6,
+            tcp_target_port,
+            1000,
+            0,
+            TCP_SYN,
+            65535,
+            &[2, 4, 0x05, 0xa0],
+            &[],
+            &[],
+        )
+        .expect("v6 syn");
+        host_tun.send(&syn).await.expect("send v6 syn");
 
-        if ipv6_loopback_ok {
-            let tcp_target = TcpListener::bind((Ipv6Addr::LOCALHOST, 0))
-                .await
-                .expect("bind v6 tcp");
-            let udp_target = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-                .await
-                .expect("bind v6 udp");
-            let tcp_target_port = tcp_target.local_addr().expect("v6 tcp addr").port();
-            let udp_target_port = udp_target.local_addr().expect("v6 udp addr").port();
+        let n = timeout(Duration::from_secs(2), host_tun.recv(&mut buf))
+            .await
+            .expect("v6 syn-ack timed out")
+            .expect("recv v6 syn-ack");
+        let syn_ack_ip = parse_ip(&buf[..n]).expect("v6 syn-ack ip");
+        assert_eq!(syn_ack_ip.protocol, IP_PROTO_TCP);
+        let syn_ack = parse_tcp(syn_ack_ip.payload).expect("v6 syn-ack");
+        assert_eq!(syn_ack.flags, TCP_SYN | TCP_ACK);
 
-            let tcp_task = tokio::spawn(async move {
-                let (mut sock, _) = tcp_target.accept().await.expect("accept v6 tcp");
-                let mut buf = [0u8; 1024];
-                let n = sock.read(&mut buf).await.expect("v6 tcp read");
-                sock.write_all(&buf[..n]).await.expect("v6 tcp write");
-                let _ = sock.shutdown().await;
-            });
+        let payload = b"ipv6-tcp-echo-works";
+        let ack_data = build_ip_tcp_packet_slices(
+            src_v6,
+            45_678,
+            dst_v6,
+            tcp_target_port,
+            1001,
+            syn_ack.seq.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            65535,
+            &[],
+            payload,
+            &[],
+        )
+        .expect("v6 data");
+        host_tun.send(&ack_data).await.expect("send v6 data");
 
-            let udp_task = tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                let (n, peer) = udp_target.recv_from(&mut buf).await.expect("v6 udp recv");
-                udp_target
-                    .send_to(&buf[..n], peer)
-                    .await
-                    .expect("v6 udp send");
-            });
-
-            // 2. IPv6 UDP echo through XUDP
-            let udp_v6 = build_ip_udp_packet(src_v6, 52_222, dst_v6, udp_target_port, b"v6-udp-ok")
-                .expect("udp v6");
-            host_tun.send(&udp_v6).await.expect("send udp v6");
+        let mut echoed = Vec::new();
+        while echoed.len() < payload.len() {
             let n = timeout(Duration::from_secs(2), host_tun.recv(&mut buf))
                 .await
-                .expect("step 2 v6 udp timed out")
-                .expect("recv udp v6");
-            let reply_ip = parse_ip(&buf[..n]).expect("parse v6 udp reply");
-            assert_eq!(reply_ip.protocol, IP_PROTO_UDP);
-            assert_eq!(reply_ip.src_ip, dst_v6);
-            let reply_udp = parse_udp(reply_ip.payload).expect("v6 udp");
-            assert_eq!(reply_udp.payload, b"v6-udp-ok");
-
-            // 3. IPv6 TCP handshake + data echo through ProxyTcpStack -> beam server
-            let syn = build_ip_tcp_packet_slices(
-                src_v6,
-                45_678,
-                dst_v6,
-                tcp_target_port,
-                1000,
-                0,
-                TCP_SYN,
-                65535,
-                &[2, 4, 0x05, 0xa0],
-                &[],
-                &[],
-            )
-            .expect("v6 syn");
-            host_tun.send(&syn).await.expect("send v6 syn");
-
-            let n = timeout(Duration::from_secs(2), host_tun.recv(&mut buf))
-                .await
-                .expect("step 3a syn-ack timed out")
-                .expect("recv v6 syn-ack");
-            let syn_ack_ip = parse_ip(&buf[..n]).expect("v6 syn-ack ip");
-            assert_eq!(syn_ack_ip.protocol, IP_PROTO_TCP);
-            let syn_ack = parse_tcp(syn_ack_ip.payload).expect("v6 syn-ack");
-            assert_eq!(syn_ack.flags, TCP_SYN | TCP_ACK);
-
-            let payload = b"ipv6-tcp-echo-works";
-            let ack_data = build_ip_tcp_packet_slices(
-                src_v6,
-                45_678,
-                dst_v6,
-                tcp_target_port,
-                1001,
-                syn_ack.seq.wrapping_add(1),
-                TCP_ACK | TCP_PSH,
-                65535,
-                &[],
-                payload,
-                &[],
-            )
-            .expect("v6 data");
-            host_tun.send(&ack_data).await.expect("send v6 data");
-
-            let mut echoed = Vec::new();
-            while echoed.len() < payload.len() {
-                let n = timeout(Duration::from_secs(2), host_tun.recv(&mut buf))
-                    .await
-                    .expect("step 3b v6 tcp data timed out")
-                    .expect("recv v6 tcp");
-                let ip = parse_ip(&buf[..n]).expect("v6 tcp ip");
-                if ip.protocol == IP_PROTO_TCP
-                    && let Some(seg) = parse_tcp(ip.payload)
-                    && !seg.payload.is_empty()
-                {
-                    echoed.extend_from_slice(seg.payload);
-                }
+                .expect("v6 tcp data timed out")
+                .expect("recv v6 tcp");
+            let ip = parse_ip(&buf[..n]).expect("v6 tcp ip");
+            if ip.protocol == IP_PROTO_TCP
+                && let Some(seg) = parse_tcp(ip.payload)
+                && !seg.payload.is_empty()
+            {
+                echoed.extend_from_slice(seg.payload);
             }
-            assert_eq!(echoed, payload);
-
-            let _ = timeout(Duration::from_secs(3), tcp_task).await;
-            let _ = timeout(Duration::from_secs(3), udp_task).await;
         }
+        assert_eq!(echoed, payload);
 
         let _ = shutdown_tx.send(true);
         let _ = engine_task.await;
         drop(host_tun);
+        let _ = timeout(Duration::from_secs(3), tcp_task).await;
+        let _ = timeout(Duration::from_secs(3), udp_task).await;
         server_task.abort();
         drop(cover_listener);
     })
     .await
-    .expect("tun_ipv6_tcp_udp_and_quic_reject_work_end_to_end timed out");
+    .expect("tun_ipv6_tcp_and_udp_loopback_end_to_end timed out");
 }

@@ -79,10 +79,14 @@ static int g_busy;
 static int g_helper_failed;
 static time_t g_cooldown_until;
 
+static int native_tunnel_present(void)
+{
+    return if_nametoindex(TUN_IFACE_NATIVE) != 0;
+}
+
 static int tunnel_present(void)
 {
-    return if_nametoindex(TUN_IFACE_NATIVE) != 0 ||
-           if_nametoindex(TUN_IFACE_LEGACY) != 0;
+    return native_tunnel_present() || if_nametoindex(TUN_IFACE_LEGACY) != 0;
 }
 
 static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
@@ -90,6 +94,7 @@ static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
     FILE *fp;
     char line[128];
     int found_state = 0;
+    long long ts = -1;
 
     state_out[0] = '\0';
     *rtt_out = -1;
@@ -107,24 +112,37 @@ static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
             found_state = 1;
         } else if (strncmp(line, "rtt_ms=", 7) == 0) {
             char *end = NULL;
+            errno = 0;
             long val = strtol(line + 7, &end, 10);
-            if (end != line + 7 && *end == '\0' && val >= 0 && val <= 60000)
+            if (errno == 0 && end != line + 7 && *end == '\0' && val >= 0 && val <= 60000)
                 *rtt_out = val;
+        } else if (strncmp(line, "ts=", 3) == 0) {
+            char *end = NULL;
+            errno = 0;
+            long long val = strtoll(line + 3, &end, 10);
+            if (errno == 0 && end != line + 3 && *end == '\0' && val > 0)
+                ts = val;
         }
     }
     fclose(fp);
-    return found_state;
+    if (!found_state)
+        return 0;
+    /* Ignore stale status files left behind by a crashed/hung daemon (> 90s). */
+    if (ts > 0 && (long long)time(NULL) - ts > 90)
+        return 0;
+    return 1;
 }
 
 static void update_ui(void)
 {
-    int connected = tunnel_present();
+    int native_up = native_tunnel_present();
+    int connected = native_up || if_nametoindex(TUN_IFACE_LEGACY) != 0;
     int cooling = time(NULL) < g_cooldown_until;
     char state[32];
     char label[96];
     long rtt_ms = -1;
-    const char *icon = "network-vpn-disconnected-symbolic";
-    const char *desc = "Disconnected";
+    const char *icon = connected ? "network-vpn-symbolic" : "network-vpn-disconnected-symbolic";
+    const char *desc = connected ? "Interface up" : "Disconnected";
 
     if (g_busy) {
         gtk_menu_item_set_label(g_status_item, "Beam: working...");
@@ -134,7 +152,7 @@ static void update_ui(void)
 
     if (g_helper_failed) {
         gtk_menu_item_set_label(g_status_item, "Beam: error");
-    } else if (connected && read_client_status(state, sizeof(state), &rtt_ms)) {
+    } else if (native_up && read_client_status(state, sizeof(state), &rtt_ms)) {
         if (strcmp(state, "connected") == 0) {
             if (rtt_ms >= 0)
                 snprintf(label, sizeof(label), "Beam: connected (%ld ms)", rtt_ms);
@@ -155,10 +173,6 @@ static void update_ui(void)
     } else {
         gtk_menu_item_set_label(g_status_item,
                                 connected ? "Beam: interface up" : "Beam: interface down");
-        if (connected) {
-            icon = "network-vpn-symbolic";
-            desc = "Interface up";
-        }
     }
     gtk_menu_item_set_label(g_action_item,
                             connected ? "Disconnect" : "Connect");

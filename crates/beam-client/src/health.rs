@@ -1,17 +1,18 @@
 //! Always-on network transition detector, sleep/resume watcher, bounded-backoff
 //! server reachability probe, and atomic status file publisher for `linux-tray`.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info};
 
-use crate::linux_tun::{GatewayState, LinuxRouteGuard, detect_default_ipv4_gateway_excluding};
+use crate::config::detect_system_local_dns;
+use crate::linux_tun::{LinuxRouteGuard, PhysicalGateways, detect_physical_gateways_excluding};
 
 /// Default runtime status file path (owned by `RuntimeDirectory=beam-client`).
 pub const DEFAULT_STATUS_PATH: &str = "/run/beam-client/status";
@@ -19,7 +20,7 @@ pub const DEFAULT_STATUS_PATH: &str = "/run/beam-client/status";
 const MONITOR_TICK: Duration = Duration::from_secs(2);
 const SLEEP_JUMP_THRESHOLD_SECS: u64 = 5;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-const HEALTHY_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+const HEALTHY_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 const INITIAL_OFFLINE_BACKOFF_SECS: u64 = 2;
 const MAX_OFFLINE_BACKOFF_SECS: u64 = 10;
 
@@ -59,16 +60,20 @@ impl Drop for StatusFileGuard {
 }
 
 /// Spawns the always-on network monitor that:
-/// 1. Watches physical default IPv4 gateway changes and wake-from-sleep jumps.
-/// 2. Migrates bypass routes cleanly while keeping the TUN fail-closed.
+/// 1. Watches physical IPv4/IPv6 default gateway changes and wake-from-sleep
+///    jumps (running `ip` commands off Tokio worker threads via `spawn_blocking`).
+/// 2. Reconciles bypass routes (including after same-Wi-Fi suspend/resume or
+///    brief `<2s` link flaps) while keeping the TUN fail-closed.
 /// 3. Increments `network_reset_tx` so `beam-tun` sends immediate TCP RSTs,
-///    resets XUDP mux, and flushes local DNS cache.
-/// 4. Periodically probes `server_addr` with bounded backoff and publishes
-///    status + RTT for `beam-tray`.
+///    resets XUDP mux, and refreshes local DNS cache/upstream.
+/// 4. Probes `server_addr` with low-noise 60 s healthy cadence and bounded
+///    backoff during outages, publishing timestamped status + RTT for `beam-tray`.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_network_monitor(
     ifname: String,
     server_addr: SocketAddr,
     auto_route: bool,
+    fixed_local_dns: Option<IpAddr>,
     routes: Arc<Mutex<LinuxRouteGuard>>,
     network_reset_tx: watch::Sender<u64>,
     mut shutdown: watch::Receiver<bool>,
@@ -76,10 +81,13 @@ pub fn spawn_network_monitor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let _guard = StatusFileGuard::new(status_path.clone());
-        let mut last_gw: GatewayState = if auto_route {
-            detect_default_ipv4_gateway_excluding(&ifname)
+        let mut last_gw = if auto_route {
+            let name = ifname.clone();
+            tokio::task::spawn_blocking(move || detect_physical_gateways_excluding(&name))
+                .await
+                .unwrap_or_default()
         } else {
-            None
+            PhysicalGateways::default()
         };
         let mut last_mono = Instant::now();
         let mut last_wall = SystemTime::now();
@@ -99,34 +107,73 @@ pub fn spawn_network_monitor(
             last_wall = now_wall;
 
             let current_gw = if auto_route {
-                detect_default_ipv4_gateway_excluding(&ifname)
+                let name = ifname.clone();
+                tokio::task::spawn_blocking(move || detect_physical_gateways_excluding(&name))
+                    .await
+                    .unwrap_or_default()
             } else {
-                None
+                PhysicalGateways::default()
+            };
+
+            let bypass_missing = if auto_route {
+                let routes_chk = Arc::clone(&routes);
+                tokio::task::spawn_blocking(move || {
+                    routes_chk
+                        .lock()
+                        .map(|g| !g.server_bypass_installed())
+                        .unwrap_or(false)
+                })
+                .await
+                .unwrap_or(false)
+            } else {
+                false
             };
 
             let gw_changed = auto_route && current_gw != last_gw;
-            if gw_changed || slept_from_suspend {
+            let has_any_gw = current_gw.v4.is_some() || current_gw.v6.is_some();
+
+            if gw_changed || slept_from_suspend || (bypass_missing && has_any_gw) {
                 info!(
                     gw_changed,
                     slept_from_suspend,
+                    bypass_missing,
                     old_gw = ?last_gw,
                     new_gw = ?current_gw,
-                    "network transition or resume detected"
+                    "network transition, resume, or missing bypass route detected"
                 );
-                if gw_changed {
-                    if let Ok(mut guard) = routes.lock() {
-                        guard.update_bypass_gateway(&current_gw);
+                if auto_route {
+                    let routes_upd = Arc::clone(&routes);
+                    let gw_clone = current_gw.clone();
+                    let installed = tokio::task::spawn_blocking(move || {
+                        let local_dns =
+                            fixed_local_dns.or_else(|| detect_system_local_dns().map(|s| s.ip()));
+                        if let Ok(mut guard) = routes_upd.lock() {
+                            guard.update_bypass_gateway(&gw_clone, local_dns);
+                            guard.server_bypass_installed()
+                        } else {
+                            false
+                        }
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if installed || !has_any_gw {
+                        last_gw = current_gw.clone();
                     }
-                    last_gw = current_gw.clone();
                 }
-                generation = generation.wrapping_add(1);
-                let _ = network_reset_tx.send(generation);
+                if gw_changed || slept_from_suspend {
+                    generation = generation.wrapping_add(1);
+                    let _ = network_reset_tx.send(generation);
+                }
                 offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
                 next_probe_at = Instant::now();
             }
 
             if Instant::now() >= next_probe_at {
-                if auto_route && last_gw.is_none() && !server_addr.ip().is_loopback() {
+                let server_has_gw = match server_addr.ip() {
+                    IpAddr::V4(_) => current_gw.v4.is_some(),
+                    IpAddr::V6(_) => current_gw.v6.is_some(),
+                };
+                if auto_route && !server_has_gw && !server_addr.ip().is_loopback() {
                     write_status_atomic(&status_path, LinkState::WaitingNetwork, None, &ifname);
                     next_probe_at = Instant::now() + Duration::from_secs(offline_backoff_secs);
                     offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
@@ -204,9 +251,18 @@ pub fn next_offline_backoff(current_secs: u64) -> u64 {
         .clamp(INITIAL_OFFLINE_BACKOFF_SECS, MAX_OFFLINE_BACKOFF_SECS)
 }
 
-/// Formats status text consumed by `beam-tray`.
+/// Formats status text consumed by `beam-tray` (includes Unix timestamp & PID
+/// so the tray ignores stale files after a crash).
 pub fn format_status(state: LinkState, rtt_ms: Option<u64>, ifname: &str) -> String {
-    let mut out = format!("state={}\nifname={ifname}\n", state.as_str());
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let mut out = format!(
+        "state={}\nifname={ifname}\nts={ts}\npid={pid}\n",
+        state.as_str()
+    );
     if let Some(rtt) = rtt_ms {
         out.push_str(&format!("rtt_ms={rtt}\n"));
     }
@@ -260,6 +316,8 @@ mod tests {
         assert!(text.contains("state=connected\n"));
         assert!(text.contains("rtt_ms=37\n"));
         assert!(text.contains("ifname=beamtun0\n"));
+        assert!(text.contains("ts="));
+        assert!(text.contains("pid="));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

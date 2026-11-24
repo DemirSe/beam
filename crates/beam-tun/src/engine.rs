@@ -25,7 +25,8 @@ const TUN_TX_CHANNEL_CAP: usize = 512;
 const DEFAULT_IDLE_POLL_MS: u64 = 100;
 const RX_BATCH_MAX: usize = 128;
 const C2S_COALESCE_TARGET: usize = 64 * 1024;
-const S2C_READ_BUF_BYTES: usize = 128 * 1024;
+const S2C_READ_BUF_BYTES: usize = 64 * 1024;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Configuration for [`run_tun_engine`].
 #[derive(Clone, Debug)]
@@ -109,7 +110,12 @@ where
         }
 
         for conn in accepted.drain(..) {
-            spawn_tcp_relay(conn, config.client.clone(), Arc::clone(&tcp_permits));
+            spawn_tcp_relay(
+                conn,
+                config.client.clone(),
+                Arc::clone(&tcp_permits),
+                config.network_reset.clone(),
+            );
         }
 
         // Drain any pending UDP/ICMP reply packets immediately.
@@ -215,6 +221,7 @@ fn spawn_tcp_relay(
     conn: AcceptedTcpStream,
     client_config: BeamClientConfig,
     permits: Arc<Semaphore>,
+    mut network_reset: Option<watch::Receiver<u64>>,
 ) {
     let Ok(permit) = permits.try_acquire_owned() else {
         debug!(dst = %conn.dst, "TCP connection limit reached; dropping");
@@ -231,11 +238,22 @@ fn spawn_tcp_relay(
             address,
             port: conn.dst.port(),
         };
-        let upstream = match dial_tcp(&client_config, dest).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                debug!(dst = %conn.dst, error = %err, "dial_tcp failed");
+        let upstream = tokio::select! {
+            biased;
+            Ok(()) = async {
+                match network_reset.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 return;
+            }
+            res = dial_tcp(&client_config, dest) => match res {
+                Ok(stream) => stream,
+                Err(err) => {
+                    debug!(dst = %conn.dst, error = %err, "dial_tcp failed");
+                    return;
+                }
             }
         };
 
@@ -248,7 +266,7 @@ fn spawn_tcp_relay(
                 let mut chunk = match timeout(idle, tun_r.recv_chunk()).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => {
-                        let _ = up_w.shutdown().await;
+                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
                         break;
                     }
                     Err(_) => break,
@@ -276,7 +294,12 @@ fn spawn_tcp_relay(
         let s2c = async {
             let mut buf = vec![0u8; S2C_READ_BUF_BYTES];
             loop {
-                let n = match timeout(idle, up_r.read(&mut buf)).await {
+                let read_res = tokio::select! {
+                    biased;
+                    () = tun_w.closed() => break,
+                    res = timeout(idle, up_r.read(&mut buf)) => res,
+                };
+                let n = match read_res {
                     Ok(Ok(0)) => {
                         tun_w.shutdown();
                         break;
@@ -293,6 +316,15 @@ fn spawn_tcp_relay(
             }
         };
 
-        let _ = tokio::join!(c2s, s2c);
+        tokio::select! {
+            biased;
+            Ok(()) = async {
+                match network_reset.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            _ = async { tokio::join!(c2s, s2c) } => {}
+        }
     });
 }

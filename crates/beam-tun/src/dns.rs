@@ -93,17 +93,26 @@ impl DnsUpstream {
             let addr: SocketAddr = rest
                 .parse()
                 .map_err(|_| format!("invalid tcp:// DNS address: {rest}"))?;
+            if addr.port() == 0 {
+                return Err("tcp:// DNS port must be non-zero".into());
+            }
             return Ok(Self::PlainTcp(addr));
         }
         if let Some(rest) = s.strip_prefix("udp://") {
             let addr: SocketAddr = rest
                 .parse()
                 .map_err(|_| format!("invalid udp:// DNS address: {rest}"))?;
+            if addr.port() == 0 {
+                return Err("udp:// DNS port must be non-zero".into());
+            }
             return Ok(Self::PlainUdp(addr));
         }
         let addr: SocketAddr = s
             .parse()
             .map_err(|_| format!("invalid DNS upstream (use https://, tcp://, or ip:port): {s}"))?;
+        if addr.port() == 0 {
+            return Err("DNS upstream port must be non-zero".into());
+        }
         Ok(Self::PlainUdp(addr))
     }
 }
@@ -144,6 +153,9 @@ fn split_host_port(authority: &str, default_port: u16) -> Result<(&str, u16), St
 /// Callback invoked when a `bypass_domains` query resolves to one or more IPs.
 pub type BypassIpCallback = Arc<dyn Fn(&[IpAddr]) + Send + Sync>;
 
+/// Optional callback invoked on network transitions to refresh the local DNS server.
+pub type LocalDnsRefresh = Arc<dyn Fn() -> Option<SocketAddr> + Send + Sync>;
+
 /// Configuration for the built-in [`DnsInterceptor`].
 #[derive(Clone)]
 pub struct DnsConfig {
@@ -152,6 +164,9 @@ pub struct DnsConfig {
     /// Optional local DNS server reached directly (outside the tunnel) for
     /// `local_suffixes` and `bypass_domains`.
     pub local_upstream: Option<SocketAddr>,
+    /// Optional callback invoked on network transitions to re-detect the
+    /// host's local DNS server when `local_upstream` was auto-detected.
+    pub refresh_local_upstream: Option<LocalDnsRefresh>,
     /// Local-only suffixes (e.g. `["lan", "local", "internal"]`).
     pub local_suffixes: Vec<String>,
     /// Additional user-configured bypass domain suffixes.
@@ -191,6 +206,7 @@ impl DnsConfig {
         Self {
             upstream,
             local_upstream,
+            refresh_local_upstream: None,
             local_suffixes: Self::default_local_suffixes(),
             bypass_domains: Vec::new(),
             cache_size: DEFAULT_CACHE_SIZE,
@@ -308,6 +324,8 @@ pub fn parse_dns_response_meta(wire: &[u8]) -> (Option<u32>, Vec<IpAddr>) {
     if (flags & 0x8000) == 0 {
         return (None, Vec::new());
     }
+    // Never cache truncated (`TC=1`) responses.
+    let truncated = (flags & 0x0200) != 0;
     let rcode = flags & 0x000f;
     let qdcount = usize::from(u16::from_be_bytes([wire[4], wire[5]])).min(MAX_RR_COUNT);
     let ancount = usize::from(u16::from_be_bytes([wire[6], wire[7]])).min(MAX_RR_COUNT);
@@ -330,13 +348,13 @@ pub fn parse_dns_response_meta(wire: &[u8]) -> (Option<u32>, Vec<IpAddr>) {
     let mut ips = Vec::new();
     for _ in 0..ancount {
         let Some((_, next)) = parse_dns_name(wire, pos) else {
-            break;
+            return (None, Vec::new());
         };
         let Some(rd_header_end) = next.checked_add(10) else {
-            break;
+            return (None, Vec::new());
         };
         if rd_header_end > wire.len() {
-            break;
+            return (None, Vec::new());
         }
         let rtype = u16::from_be_bytes([wire[next], wire[next + 1]]);
         let rclass = u16::from_be_bytes([wire[next + 2], wire[next + 3]]);
@@ -348,14 +366,14 @@ pub fn parse_dns_response_meta(wire: &[u8]) -> (Option<u32>, Vec<IpAddr>) {
         ]);
         let rdlength = usize::from(u16::from_be_bytes([wire[next + 8], wire[next + 9]]));
         let Some(rdata_end) = rd_header_end.checked_add(rdlength) else {
-            break;
+            return (None, Vec::new());
         };
         if rdata_end > wire.len() {
-            break;
+            return (None, Vec::new());
         }
         let rdata = &wire[rd_header_end..rdata_end];
         min_ttl = Some(min_ttl.map_or(ttl, |cur| cur.min(ttl)));
-        if rclass == 1 {
+        if rcode == 0 && rclass == 1 {
             if rtype == 1 && rdata.len() == 4 {
                 ips.push(IpAddr::V4(Ipv4Addr::new(
                     rdata[0], rdata[1], rdata[2], rdata[3],
@@ -369,8 +387,16 @@ pub fn parse_dns_response_meta(wire: &[u8]) -> (Option<u32>, Vec<IpAddr>) {
         pos = rdata_end;
     }
 
+    if truncated {
+        return (None, ips);
+    }
+
     let ttl = match rcode {
-        0 => min_ttl.map(|t| t.clamp(MIN_CACHE_TTL_SECS, MAX_CACHE_TTL_SECS)),
+        0 => Some(
+            min_ttl
+                .map(|t| t.clamp(MIN_CACHE_TTL_SECS, MAX_CACHE_TTL_SECS))
+                .unwrap_or(NEGATIVE_CACHE_TTL_SECS), // Cache NOERROR NODATA briefly
+        ),
         3 => Some(NEGATIVE_CACHE_TTL_SECS), // NXDOMAIN
         _ => None,                          // Do not cache SERVFAIL/REFUSED
     };
@@ -534,6 +560,7 @@ impl DnsCache {
 pub struct DnsInterceptor {
     client_config: BeamClientConfig,
     dns_config: DnsConfig,
+    local_upstream: Arc<Mutex<Option<SocketAddr>>>,
     tls_config: Arc<ClientConfig>,
     cache: Arc<Mutex<DnsCache>>,
     inflight: Arc<Semaphore>,
@@ -558,9 +585,11 @@ impl DnsInterceptor {
                 .with_no_client_auth(),
         );
         let cache = Arc::new(Mutex::new(DnsCache::new(dns_config.cache_size)));
+        let local_upstream = Arc::new(Mutex::new(dns_config.local_upstream));
         Self {
             client_config,
             dns_config,
+            local_upstream,
             tls_config,
             cache,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_DNS_QUERIES)),
@@ -568,10 +597,17 @@ impl DnsInterceptor {
         }
     }
 
-    /// Clears local-only cache entries on network transitions.
+    /// Clears local-only cache entries and refreshes auto-detected local DNS
+    /// upstream on network transitions.
     pub fn on_network_change(&self) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear_local();
+        }
+        if let Some(refresher) = self.dns_config.refresh_local_upstream.as_ref() {
+            let refreshed = refresher();
+            if let Ok(mut guard) = self.local_upstream.lock() {
+                *guard = refreshed;
+            }
         }
     }
 
@@ -580,6 +616,20 @@ impl DnsInterceptor {
         let Some(query) = parse_dns_query(wire) else {
             return;
         };
+
+        let current_local = self.local_upstream.lock().ok().and_then(|g| *g);
+        // Loop guard: if a query destined for `local_upstream` itself somehow
+        // re-entered the TUN (e.g. bypass route vanished mid-transition), refuse
+        // to recurse into `resolve_local_udp` so we can never self-DoS.
+        if current_local.is_some_and(|local| local.ip() == dst.ip()) {
+            if let Some(sf) = build_servfail_response(wire)
+                && let Some(pkt) =
+                    build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &sf)
+            {
+                let _ = self.tun_tx.try_send(pkt);
+            }
+            return;
+        }
 
         // Fast path: synchronous cache hit (0 ms latency).
         if let Ok(mut cache) = self.cache.lock()
@@ -608,7 +658,7 @@ impl DnsInterceptor {
             .bypass_domains
             .iter()
             .any(|s| matches_domain_suffix(&query.qname, s));
-        let use_local = (is_local || is_bypass_domain) && self.dns_config.local_upstream.is_some();
+        let use_local = (is_local || is_bypass_domain) && current_local.is_some();
 
         let wire_owned = wire.to_vec();
         let client_cfg = self.client_config.clone();
@@ -620,9 +670,15 @@ impl DnsInterceptor {
         tokio::spawn(async move {
             let _permit = permit;
             let result = if use_local {
-                match dns_cfg.local_upstream {
+                match current_local {
                     Some(local_addr) => {
-                        resolve_local_udp(local_addr, &wire_owned, dns_cfg.query_timeout).await
+                        resolve_local_udp(
+                            local_addr,
+                            &wire_owned,
+                            query.tx_id,
+                            dns_cfg.query_timeout,
+                        )
+                        .await
                     }
                     None => Err(io::Error::other("no local DNS upstream configured")),
                 }
@@ -677,6 +733,7 @@ impl DnsInterceptor {
 async fn resolve_local_udp(
     local_upstream: SocketAddr,
     query: &[u8],
+    expected_tx_id: u16,
     query_timeout: Duration,
 ) -> io::Result<Vec<u8>> {
     let bind_addr: SocketAddr = match local_upstream {
@@ -692,6 +749,19 @@ async fn resolve_local_udp(
     let n = timeout(query_timeout, sock.recv(&mut buf))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local DNS recv timed out"))??;
+    if n < 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local DNS reply too short",
+        ));
+    }
+    let reply_tx_id = u16::from_be_bytes([buf[0], buf[1]]);
+    if reply_tx_id != expected_tx_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local DNS reply tx_id mismatch",
+        ));
+    }
     buf.truncate(n);
     Ok(buf)
 }
@@ -806,11 +876,7 @@ async fn resolve_doh_over_beam(
     let connector = TlsConnector::from(Arc::clone(tls_cfg));
     let mut tls = connector.connect(server_name, beam_stream).await?;
 
-    let host_header = if port == 443 {
-        host.to_owned()
-    } else {
-        format!("{host}:{port}")
-    };
+    let host_header = format_http_host_header(host, port);
     let req = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: {host_header}\r\n\
@@ -827,7 +893,20 @@ async fn resolve_doh_over_beam(
     read_doh_http_response(&mut tls).await
 }
 
-async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
+/// Formats an RFC 9110 §7.2 `Host` header value, bracketing IPv6 literals.
+pub fn format_http_host_header(host: &str, port: u16) -> String {
+    let needs_brackets = host.contains(':') && !host.starts_with('[');
+    match (needs_brackets, port == 443) {
+        (true, true) => format!("[{host}]"),
+        (true, false) => format!("[{host}]:{port}"),
+        (false, true) => host.to_owned(),
+        (false, false) => format!("{host}:{port}"),
+    }
+}
+
+/// Parses an HTTP/1.1 DoH response from `stream` (supporting incremental
+/// `Transfer-Encoding: chunked`, strict `Content-Length`, or bounded EOF).
+pub async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
     stream: &mut S,
 ) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
@@ -874,7 +953,18 @@ async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
             let key = k.trim();
             let val = v.trim();
             if key.eq_ignore_ascii_case("content-length") {
-                content_length = val.parse::<usize>().ok();
+                let parsed = val.parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid DoH Content-Length")
+                })?;
+                if let Some(prev) = content_length
+                    && prev != parsed
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conflicting DoH Content-Length headers",
+                    ));
+                }
+                content_length = Some(parsed);
             } else if key.eq_ignore_ascii_case("transfer-encoding")
                 && val.to_ascii_lowercase().contains("chunked")
             {
@@ -884,6 +974,32 @@ async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
     }
 
     let mut body = buf[header_end + 4..].to_vec();
+
+    // RFC 9112 §6.3: Transfer-Encoding takes precedence over Content-Length.
+    if chunked {
+        loop {
+            match try_decode_chunked_body(&body)? {
+                Some(decoded) => return Ok(decoded),
+                None => {
+                    if body.len() > MAX_DNS_RESPONSE_BYTES + 512 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "chunked DoH stream exceeded bound",
+                        ));
+                    }
+                    let n = stream.read(&mut tmp).await?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF before terminal chunk in DoH body",
+                        ));
+                    }
+                    body.extend_from_slice(&tmp[..n]);
+                }
+            }
+        }
+    }
+
     if let Some(len) = content_length {
         if !(12..=MAX_DNS_RESPONSE_BYTES).contains(&len) {
             return Err(io::Error::new(
@@ -906,8 +1022,8 @@ async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
         return Ok(body);
     }
 
-    // Read until EOF (bounded) for chunked or Connection: close without Content-Length.
-    while body.len() <= MAX_DNS_RESPONSE_BYTES + 256 {
+    // Read until EOF (bounded) for Connection: close without Content-Length.
+    while body.len() <= MAX_DNS_RESPONSE_BYTES {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
             break;
@@ -915,9 +1031,7 @@ async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
         body.extend_from_slice(&tmp[..n]);
     }
 
-    if chunked {
-        decode_chunked_body(&body)
-    } else if body.len() <= MAX_DNS_RESPONSE_BYTES {
+    if body.len() <= MAX_DNS_RESPONSE_BYTES {
         Ok(body)
     } else {
         Err(io::Error::new(
@@ -931,15 +1045,15 @@ fn find_crlf_crlf(data: &[u8]) -> Option<usize> {
     data.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn decode_chunked_body(raw: &[u8]) -> io::Result<Vec<u8>> {
+/// Incrementally decodes an HTTP/1.1 chunked body.
+/// Returns `Ok(Some(body))` once the terminal `0\r\n` chunk and trailing CRLF
+/// have arrived, `Ok(None)` when more bytes are needed, or `Err` on malformed data.
+pub fn try_decode_chunked_body(raw: &[u8]) -> io::Result<Option<Vec<u8>>> {
     let mut out = Vec::new();
     let mut pos = 0usize;
-    while pos < raw.len() {
+    loop {
         let Some(rel_end) = raw[pos..].windows(2).position(|w| w == b"\r\n") else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "malformed chunked DoH size line",
-            ));
+            return Ok(None);
         };
         let size_line = std::str::from_utf8(&raw[pos..pos + rel_end])
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size UTF-8"))?;
@@ -948,23 +1062,45 @@ fn decode_chunked_body(raw: &[u8]) -> io::Result<Vec<u8>> {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size hex"))?;
         pos += rel_end + 2;
         if chunk_len == 0 {
-            return Ok(out);
+            // Require terminating CRLF (or trailers ending in \r\n\r\n).
+            if raw[pos..].starts_with(b"\r\n") {
+                return Ok(Some(out));
+            }
+            if find_crlf_crlf(&raw[pos..]).is_some() {
+                return Ok(Some(out));
+            }
+            return Ok(None);
         }
-        if out.len().saturating_add(chunk_len) > MAX_DNS_RESPONSE_BYTES
-            || pos.saturating_add(chunk_len + 2) > raw.len()
-        {
+        if out.len().saturating_add(chunk_len) > MAX_DNS_RESPONSE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "chunked DoH body exceeded bound",
             ));
         }
-        out.extend_from_slice(&raw[pos..pos + chunk_len]);
-        pos += chunk_len + 2;
+        let Some(data_end) = pos.checked_add(chunk_len) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk length overflow",
+            ));
+        };
+        let Some(after_crlf) = data_end.checked_add(2) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk length overflow",
+            ));
+        };
+        if after_crlf > raw.len() {
+            return Ok(None);
+        }
+        if &raw[data_end..after_crlf] != b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing CRLF after chunk payload",
+            ));
+        }
+        out.extend_from_slice(&raw[pos..data_end]);
+        pos = after_crlf;
     }
-    Err(io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        "missing terminal 0 chunk in DoH body",
-    ))
 }
 
 #[cfg(test)]
@@ -1113,6 +1249,72 @@ mod tests {
         );
         assert!(DnsUpstream::parse("https://evil.com/\r\nX: y").is_err());
         assert!(DnsUpstream::parse("http://1.1.1.1/dns-query").is_err());
+        assert!(DnsUpstream::parse("tcp://1.1.1.1:0").is_err());
+        assert!(DnsUpstream::parse("udp://1.1.1.1:0").is_err());
+    }
+
+    #[tokio::test]
+    async fn doh_http_response_handles_ipv6_host_incremental_chunked_and_te_precedence() {
+        assert_eq!(
+            format_http_host_header("2606:4700:4700::1111", 443),
+            "[2606:4700:4700::1111]"
+        );
+        assert_eq!(
+            format_http_host_header("2606:4700:4700::1111", 8443),
+            "[2606:4700:4700::1111]:8443"
+        );
+        assert_eq!(
+            format_http_host_header("dns.nextdns.io", 443),
+            "dns.nextdns.io"
+        );
+
+        // Incremental chunked response must return immediately on 0\r\n\r\n
+        // without waiting for EOF, and Transfer-Encoding must win over Content-Length.
+        let (mut client, mut server) = tokio::io::duplex(512);
+        let wire_body = build_a_response(
+            &build_query(0x5555, "chunked.test", 1),
+            Ipv4Addr::new(1, 2, 3, 4),
+            60,
+        );
+        let expected = wire_body.clone();
+        let writer = tokio::spawn(async move {
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 9999\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                wire_body.len()
+            );
+            server.write_all(hdr.as_bytes()).await.expect("hdr");
+            server.write_all(&wire_body).await.expect("body");
+            server.write_all(b"\r\n0\r\n\r\n").await.expect("term");
+            // Deliberately keep `server` open to prove we do not wait for EOF!
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let parsed = timeout(Duration::from_secs(1), read_doh_http_response(&mut client))
+            .await
+            .expect("chunked DoH must not block waiting for EOF")
+            .expect("valid chunked response");
+        assert_eq!(parsed, expected);
+        writer.abort();
+
+        // Malformed chunk missing CRLF after payload must error.
+        assert!(try_decode_chunked_body(b"4\r\nabcdXX0\r\n\r\n").is_err());
+
+        // TC=1 truncated DNS response must NOT be cached; NOERROR NODATA must be cached briefly.
+        let mut tc_resp = build_a_response(
+            &build_query(0x6666, "trunc.test", 1),
+            Ipv4Addr::new(5, 6, 7, 8),
+            120,
+        );
+        tc_resp[2] |= 0x02; // TC=1
+        assert_eq!(parse_dns_response_meta(&tc_resp).0, None);
+
+        let mut nodata = build_query(0x7777, "nodata.test", 28);
+        nodata[2] = 0x81;
+        nodata[3] = 0x80; // QR=1, NOERROR, ANCOUNT=0
+        assert_eq!(
+            parse_dns_response_meta(&nodata).0,
+            Some(NEGATIVE_CACHE_TTL_SECS)
+        );
     }
 
     #[test]

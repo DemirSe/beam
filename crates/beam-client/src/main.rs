@@ -136,20 +136,25 @@ async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std:
         cfg.mtu,
         cfg.auto_route,
         cfg.server_ip,
+        cfg.initial_local_dns,
+        cfg.tun_dns_peer,
         &cfg.bypass_cidrs,
     )?));
 
-    // Wire dynamic bypass route installation for resolved `bypass.domains` IPs.
+    // Wire dynamic bypass route installation for resolved `bypass.domains` IPs
+    // (dispatched to blocking pool so DNS tasks never block Tokio worker threads).
     if let Some(dns_cfg) = cfg.engine.dns.as_mut() {
         let routes_cb = Arc::clone(&routes);
         dns_cfg.on_bypass_ips = Some(Arc::new(move |ips: &[IpAddr]| {
-            if let Ok(mut guard) = routes_cb.lock() {
-                for &ip in ips {
-                    if let IpAddr::V4(v4) = ip {
-                        guard.install_dynamic_bypass_ip(v4);
+            let owned: Vec<IpAddr> = ips.to_vec();
+            let routes_bg = Arc::clone(&routes_cb);
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut guard) = routes_bg.lock() {
+                    for ip in owned {
+                        guard.install_dynamic_bypass_ip(ip);
                     }
                 }
-            }
+            });
         }));
     }
 
@@ -161,6 +166,7 @@ async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std:
         actual_name.clone(),
         cfg.engine.client.server_addr,
         cfg.auto_route,
+        cfg.fixed_local_dns,
         Arc::clone(&routes),
         network_reset_tx,
         shutdown_rx.clone(),

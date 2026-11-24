@@ -19,7 +19,9 @@ INPUT_KEYS = (
 )
 
 
-def _resolve(profile: str, reps: str = "") -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+def _resolve(
+    profile: str, reps: str = "", loss_pct: str = ""
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
     lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
     step = lines.index("      - name: Resolve profile")
     run = lines.index("        run: |", step)
@@ -34,6 +36,7 @@ def _resolve(profile: str, reps: str = "") -> tuple[subprocess.CompletedProcess[
         env.update({
             "INPUT_PROFILE": profile,
             "INPUT_REPS": reps,
+            "INPUT_LOSS_PCT": loss_pct,
             "INPUT_SUITE": "bench",
             "INPUT_PUBLISH": "false",
             "INPUT_PERF": "false",
@@ -54,10 +57,15 @@ def _resolve(profile: str, reps: str = "") -> tuple[subprocess.CompletedProcess[
 
 
 class ResolveProfileTests(unittest.TestCase):
-    def _ok(self, profile: str, reps: str = "") -> dict[str, str]:
-        result, values = _resolve(profile, reps)
+    def _ok(self, profile: str, reps: str = "", loss_pct: str = "") -> dict[str, str]:
+        result, values = _resolve(profile, reps, loss_pct)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return values
+
+    def test_lossy_standard_budget_floor_preserves_smoke_and_zero_loss(self) -> None:
+        self.assertEqual(self._ok("standard", "2", "1")["BENCH_TIMEOUT"], "3600")
+        self.assertEqual(self._ok("standard", "2", "0.00")["BENCH_TIMEOUT"], "1600")
+        self.assertEqual(self._ok("smoke", "2", "1")["BENCH_TIMEOUT"], "900")
 
     def test_standard_budget_scales_only_with_a_reps_override(self) -> None:
         self.assertEqual(self._ok("standard")["BENCH_TIMEOUT"], "2400")

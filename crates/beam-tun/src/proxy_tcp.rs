@@ -22,7 +22,7 @@ const MAX_TCP_BUF: usize = 8 * 1024 * 1024;
 const MAX_INCOMING_PACKETS: usize = 2048;
 const MAX_INCOMING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OOO_SEGMENTS: usize = 256;
-const STREAM_CHANNEL_CAP: usize = 96;
+const STREAM_CHANNEL_CAP: usize = 16;
 const RELAY_COALESCE_BYTES: usize = 64 * 1024;
 const INITIAL_RTO_MS: i64 = 200;
 const MAX_RTO_MS: i64 = 4_000;
@@ -845,11 +845,15 @@ impl NetStack for ProxyTcpStack {
 
             // Emit a Window Update ACK promptly when:
             // 1. Reopening from a low/zero advertised window to >= reopen_threshold, OR
-            // 2. Available receive window has grown by >= max(256 KiB, max_rcv_buf / 4)
-            //    above `last_advertised_wnd` (RFC 1122 / Linux tcp_select_window).
+            // 2. Available receive window has grown by >= growth_step above
+            //    `last_advertised_wnd` (RFC 1122 / Linux tcp_select_window).
+            // Thresholds are derived from `effective_max_wnd` so peers without
+            // RFC 7323 Window Scale (`our_wscale == 0`, max 65_535) still reopen.
+            let effective_max_wnd =
+                (conn.max_rcv_buf as u32).min(u32::from(u16::MAX) << conn.our_wscale);
             let current_wnd = conn.rcv_wnd_bytes();
-            let reopen_threshold = (conn.max_rcv_buf as u32 / 4).min(256 * 1024);
-            let growth_step = (conn.max_rcv_buf as u32 / 4).max(256 * 1024);
+            let reopen_threshold = (effective_max_wnd / 4).clamp(1, 256 * 1024);
+            let growth_step = (effective_max_wnd / 4).clamp(1, 1024 * 1024);
             if !conn.need_ack
                 && matches!(
                     conn.state,
@@ -1223,5 +1227,39 @@ mod tests {
                 .and_then(|ip| parse_tcp(ip.payload))
                 .is_some_and(|seg| seg.payload == b"reply-ipv6")
         }));
+    }
+
+    #[tokio::test]
+    async fn zero_window_reopens_without_wscale() {
+        let cfg = TcpStackConfig {
+            socket_buffer_bytes: 4 * 1024 * 1024,
+            ..TcpStackConfig::default()
+        };
+        let mut stack = ProxyTcpStack::new(cfg);
+        // SYN with MSS only (no RFC 7323 WScale -> our_wscale == 0, effective_max_wnd == 65_535).
+        let opts = [2, 4, 0x05, 0xb4];
+        stack.push_ip_tcp(&make_seg(1000, 0, TCP_SYN, 65535, &opts, &[]));
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+        stack.poll(10, &mut tx, &mut accepted);
+        let syn_ack = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        let srv_nxt = syn_ack.seq.wrapping_add(1);
+        stack.push_ip_tcp(&make_seg(1001, srv_nxt, TCP_ACK, 65535, &[], &[]));
+        tx.clear();
+        stack.poll(20, &mut tx, &mut accepted);
+        let (_reader, _writer) = accepted.pop().expect("acc").stream.into_split();
+
+        // Simulate last advertised window = 0 while current_wnd is now full (65_535).
+        let conn = stack.conns.values_mut().next().expect("conn");
+        assert_eq!(conn.our_wscale, 0);
+        conn.last_advertised_wnd = 0;
+        conn.need_ack = false;
+        tx.clear();
+        stack.poll(30, &mut tx, &mut accepted);
+        assert_eq!(
+            tx.len(),
+            1,
+            "zero-window must reopen even when our_wscale == 0"
+        );
     }
 }
