@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use beam_core::address::{Address, NetLocation};
-use beam_core::client::{BeamClientConfig, XudpClient, XudpClientConfig, dial_tcp};
+use beam_core::client::{BeamClientConfig, BeamTcpStream, XudpClient, XudpClientConfig, dial_tcp};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,10 +35,17 @@ const MIN_CACHE_TTL_SECS: u32 = 5;
 const MAX_CACHE_TTL_SECS: u32 = 3600;
 const NEGATIVE_CACHE_TTL_SECS: u32 = 15;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(4);
+const MAX_DOH_POOL_SIZE: usize = 4;
+const DOH_POOL_IDLE_TTL: Duration = Duration::from_secs(30);
 const MAX_DNS_NAME_LEN: usize = 255;
 const MAX_DNS_LABELS: usize = 128;
 const MAX_POINTER_HOPS: usize = 16;
 const MAX_RR_COUNT: usize = 128;
+/// Minimal RFC 6891 EDNS0 OPT pseudo-RR (root `.`, TYPE=41, UDP payload=1232,
+/// extended RCODE/version/flags=0, RDLENGTH=0).
+const EDNS0_OPT_RR: [u8; 11] = [
+    0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
 
 /// Upstream DNS transport used for tunneled queries.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -443,8 +450,91 @@ pub fn build_empty_noerror_response(query_wire: &[u8]) -> Option<Vec<u8>> {
     build_empty_dns_response(query_wire, question_end, 0)
 }
 
+/// Returns `true` if `query_wire` carries an RFC 6891 EDNS0 `OPT` (type 41)
+/// pseudo-RR in its Additional section. Strictly bounded and never panics.
+fn query_has_edns0_opt(query_wire: &[u8]) -> bool {
+    if query_wire.len() < 12 || query_wire.len() > MAX_DNS_QUERY_BYTES {
+        return false;
+    }
+    let qdcount = usize::from(u16::from_be_bytes([query_wire[4], query_wire[5]])).min(MAX_RR_COUNT);
+    let ancount = usize::from(u16::from_be_bytes([query_wire[6], query_wire[7]])).min(MAX_RR_COUNT);
+    let nscount = usize::from(u16::from_be_bytes([query_wire[8], query_wire[9]])).min(MAX_RR_COUNT);
+    let arcount =
+        usize::from(u16::from_be_bytes([query_wire[10], query_wire[11]])).min(MAX_RR_COUNT);
+    if arcount == 0 {
+        return false;
+    }
+
+    let mut pos = 12usize;
+    for _ in 0..qdcount {
+        let Some((_, next)) = parse_dns_name(query_wire, pos) else {
+            return false;
+        };
+        let Some(after_q) = next.checked_add(4) else {
+            return false;
+        };
+        if after_q > query_wire.len() {
+            return false;
+        }
+        pos = after_q;
+    }
+
+    for _ in 0..ancount.saturating_add(nscount) {
+        let Some((_, next)) = parse_dns_name(query_wire, pos) else {
+            return false;
+        };
+        let Some(rd_header_end) = next.checked_add(10) else {
+            return false;
+        };
+        if rd_header_end > query_wire.len() {
+            return false;
+        }
+        let rdlength = usize::from(u16::from_be_bytes([
+            query_wire[next + 8],
+            query_wire[next + 9],
+        ]));
+        let Some(rdata_end) = rd_header_end.checked_add(rdlength) else {
+            return false;
+        };
+        if rdata_end > query_wire.len() {
+            return false;
+        }
+        pos = rdata_end;
+    }
+
+    for _ in 0..arcount {
+        let Some((_, next)) = parse_dns_name(query_wire, pos) else {
+            return false;
+        };
+        let Some(rd_header_end) = next.checked_add(10) else {
+            return false;
+        };
+        if rd_header_end > query_wire.len() {
+            return false;
+        }
+        let rtype = u16::from_be_bytes([query_wire[next], query_wire[next + 1]]);
+        if rtype == 41 {
+            return true;
+        }
+        let rdlength = usize::from(u16::from_be_bytes([
+            query_wire[next + 8],
+            query_wire[next + 9],
+        ]));
+        let Some(rdata_end) = rd_header_end.checked_add(rdlength) else {
+            return false;
+        };
+        if rdata_end > query_wire.len() {
+            return false;
+        }
+        pos = rdata_end;
+    }
+
+    false
+}
+
 fn build_empty_dns_response(query_wire: &[u8], question_end: usize, rcode: u8) -> Option<Vec<u8>> {
-    let mut resp = Vec::with_capacity(question_end);
+    let has_opt = query_has_edns0_opt(query_wire);
+    let mut resp = Vec::with_capacity(question_end + if has_opt { EDNS0_OPT_RR.len() } else { 0 });
     resp.extend_from_slice(&query_wire[..2]); // tx_id
     let rd = query_wire[2] & 0x01;
     resp.push(0x80 | rd); // QR=1, RD preserved
@@ -452,8 +542,11 @@ fn build_empty_dns_response(query_wire: &[u8], question_end: usize, rcode: u8) -
     resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
     resp.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT=0
     resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
-    resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT=0
+    resp.extend_from_slice(&(if has_opt { 1u16 } else { 0u16 }).to_be_bytes()); // ARCOUNT
     resp.extend_from_slice(&query_wire[12..question_end]);
+    if has_opt {
+        resp.extend_from_slice(&EDNS0_OPT_RR);
+    }
     Some(resp)
 }
 
@@ -586,12 +679,56 @@ impl DnsCache {
     }
 }
 
+type DohTlsStream = tokio_rustls::client::TlsStream<BeamTcpStream>;
+
+struct PooledDohConn {
+    stream: DohTlsStream,
+    last_used: Instant,
+}
+
+/// Passive, bounded HTTP/1.1 keep-alive pool for DoH connections.
+///
+/// Uses zero background timers or reaper tasks so idle battery consumption is
+/// strictly zero; stale entries are discarded passively on borrow or cleared
+/// immediately on network transitions.
+#[derive(Default)]
+struct DohPool {
+    idle: Vec<PooledDohConn>,
+}
+
+impl DohPool {
+    fn take(&mut self, now: Instant) -> Option<DohTlsStream> {
+        while let Some(entry) = self.idle.pop() {
+            if now.saturating_duration_since(entry.last_used) < DOH_POOL_IDLE_TTL {
+                return Some(entry.stream);
+            }
+        }
+        None
+    }
+
+    fn put(&mut self, stream: DohTlsStream, now: Instant) {
+        self.idle
+            .retain(|entry| now.saturating_duration_since(entry.last_used) < DOH_POOL_IDLE_TTL);
+        if self.idle.len() < MAX_DOH_POOL_SIZE {
+            self.idle.push(PooledDohConn {
+                stream,
+                last_used: now,
+            });
+        }
+    }
+
+    fn clear(&mut self) {
+        self.idle.clear();
+    }
+}
+
 /// Non-blocking DNS interceptor embedded in `beam-tun`'s engine loop.
 pub struct DnsInterceptor {
     client_config: BeamClientConfig,
     dns_config: DnsConfig,
     local_upstream: Arc<Mutex<Option<SocketAddr>>>,
     tls_config: Arc<ClientConfig>,
+    doh_pool: Arc<Mutex<DohPool>>,
     cache: Arc<Mutex<DnsCache>>,
     inflight: Arc<Semaphore>,
     tun_tx: mpsc::Sender<Vec<u8>>,
@@ -621,17 +758,21 @@ impl DnsInterceptor {
             dns_config,
             local_upstream,
             tls_config,
+            doh_pool: Arc::new(Mutex::new(DohPool::default())),
             cache,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_DNS_QUERIES)),
             tun_tx,
         }
     }
 
-    /// Clears local-only cache entries and refreshes auto-detected local DNS
-    /// upstream on network transitions.
+    /// Clears local-only cache entries, drops pooled DoH connections, and
+    /// refreshes auto-detected local DNS upstream on network transitions.
     pub fn on_network_change(&self) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear_local();
+        }
+        if let Ok(mut pool) = self.doh_pool.lock() {
+            pool.clear();
         }
         if let Some(refresher) = self.dns_config.refresh_local_upstream.as_ref() {
             let refreshed = refresher();
@@ -707,6 +848,7 @@ impl DnsInterceptor {
         let client_cfg = self.client_config.clone();
         let dns_cfg = self.dns_config.clone();
         let tls_cfg = Arc::clone(&self.tls_config);
+        let doh_pool = Arc::clone(&self.doh_pool);
         let cache = Arc::clone(&self.cache);
         let tun_tx = self.tun_tx.clone();
 
@@ -730,6 +872,7 @@ impl DnsInterceptor {
                     &client_cfg,
                     &dns_cfg.upstream,
                     &tls_cfg,
+                    &doh_pool,
                     &wire_owned,
                     dns_cfg.query_timeout,
                 )
@@ -813,13 +956,14 @@ async fn resolve_tunneled(
     client_cfg: &BeamClientConfig,
     upstream: &DnsUpstream,
     tls_cfg: &Arc<ClientConfig>,
+    doh_pool: &Arc<Mutex<DohPool>>,
     query: &[u8],
     query_timeout: Duration,
 ) -> io::Result<Vec<u8>> {
     timeout(query_timeout, async {
         match upstream {
             DnsUpstream::Doh { host, port, path } => {
-                resolve_doh_over_beam(client_cfg, tls_cfg, host, *port, path, query).await
+                resolve_doh_over_beam(client_cfg, tls_cfg, doh_pool, host, *port, path, query).await
             }
             DnsUpstream::PlainTcp(addr) => resolve_tcp_over_beam(client_cfg, *addr, query).await,
             DnsUpstream::PlainUdp(addr) => resolve_udp_over_beam(client_cfg, *addr, query).await,
@@ -893,14 +1037,57 @@ async fn resolve_udp_over_beam(
     Ok(reply.payload)
 }
 
+async fn send_doh_http_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    host_header: &str,
+    path: &str,
+    query: &[u8],
+) -> io::Result<(Vec<u8>, bool)> {
+    let req = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: {host_header}\r\n\
+         Content-Type: application/dns-message\r\n\
+         Accept: application/dns-message\r\n\
+         Content-Length: {}\r\n\
+         Connection: keep-alive\r\n\r\n",
+        query.len()
+    );
+    stream.write_all(req.as_bytes()).await?;
+    stream.write_all(query).await?;
+    stream.flush().await?;
+    read_doh_http_response_keepalive(stream).await
+}
+
 async fn resolve_doh_over_beam(
     client_cfg: &BeamClientConfig,
     tls_cfg: &Arc<ClientConfig>,
+    doh_pool: &Arc<Mutex<DohPool>>,
     host: &str,
     port: u16,
     path: &str,
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
+    let host_header = format_http_host_header(host, port);
+
+    // Fast path: reuse an idle HTTP/1.1 keep-alive DoH connection (1 RTT).
+    let pooled = doh_pool
+        .lock()
+        .ok()
+        .and_then(|mut pool| pool.take(Instant::now()));
+    if let Some(mut tls) = pooled {
+        match send_doh_http_request(&mut tls, &host_header, path, query).await {
+            Ok((body, reusable)) => {
+                if reusable && let Ok(mut pool) = doh_pool.lock() {
+                    pool.put(tls, Instant::now());
+                }
+                return Ok(body);
+            }
+            Err(err) => {
+                debug!(error = %err, "pooled DoH connection stale; retrying with fresh dial");
+            }
+        }
+    }
+
     let address = if let Ok(ip) = host.parse::<IpAddr>() {
         match ip {
             IpAddr::V4(v4) => Address::Ipv4(v4),
@@ -919,21 +1106,11 @@ async fn resolve_doh_over_beam(
     let connector = TlsConnector::from(Arc::clone(tls_cfg));
     let mut tls = connector.connect(server_name, beam_stream).await?;
 
-    let host_header = format_http_host_header(host, port);
-    let req = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: {host_header}\r\n\
-         Content-Type: application/dns-message\r\n\
-         Accept: application/dns-message\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n",
-        query.len()
-    );
-    tls.write_all(req.as_bytes()).await?;
-    tls.write_all(query).await?;
-    tls.flush().await?;
-
-    read_doh_http_response(&mut tls).await
+    let (body, reusable) = send_doh_http_request(&mut tls, &host_header, path, query).await?;
+    if reusable && let Ok(mut pool) = doh_pool.lock() {
+        pool.put(tls, Instant::now());
+    }
+    Ok(body)
 }
 
 /// Formats an RFC 9110 §7.2 `Host` header value, bracketing IPv6 literals.
@@ -952,6 +1129,14 @@ pub fn format_http_host_header(host: &str, port: u16) -> String {
 pub async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
     stream: &mut S,
 ) -> io::Result<Vec<u8>> {
+    read_doh_http_response_keepalive(stream)
+        .await
+        .map(|(body, _)| body)
+}
+
+async fn read_doh_http_response_keepalive<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+) -> io::Result<(Vec<u8>, bool)> {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
     let header_end = loop {
@@ -978,6 +1163,7 @@ pub async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 DoH HTTP headers"))?;
     let mut lines = header_str.split("\r\n");
     let status_line = lines.next().unwrap_or("");
+    let is_http_11 = status_line.starts_with("HTTP/1.1");
     let status_code = status_line
         .split_whitespace()
         .nth(1)
@@ -991,6 +1177,7 @@ pub async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
 
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
+    let mut conn_close = !is_http_11;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();
@@ -1012,6 +1199,13 @@ pub async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
                 && val.to_ascii_lowercase().contains("chunked")
             {
                 chunked = true;
+            } else if key.eq_ignore_ascii_case("connection") {
+                let lower = val.to_ascii_lowercase();
+                if lower.split(',').any(|tok| tok.trim() == "close") {
+                    conn_close = true;
+                } else if lower.split(',').any(|tok| tok.trim() == "keep-alive") {
+                    conn_close = false;
+                }
             }
         }
     }
@@ -1022,7 +1216,11 @@ pub async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
     if chunked {
         loop {
             match try_decode_chunked_body(&body)? {
-                Some(decoded) => return Ok(decoded),
+                Some(decoded) => {
+                    // Only reuse if no unexpected pipelined bytes remain.
+                    let reusable = !conn_close && is_exact_chunked_end(&body);
+                    return Ok((decoded, reusable));
+                }
                 None => {
                     if body.len() > MAX_DNS_RESPONSE_BYTES + 512 {
                         return Err(io::Error::new(
@@ -1050,6 +1248,7 @@ pub async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
                 "DoH Content-Length out of bounds",
             ));
         }
+        let mut extra_bytes = body.len() > len;
         while body.len() < len {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
@@ -1058,14 +1257,17 @@ pub async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
                     "EOF reading DoH body",
                 ));
             }
+            if body.len() + n > len {
+                extra_bytes = true;
+            }
             let take = n.min(len - body.len());
             body.extend_from_slice(&tmp[..take]);
         }
         body.truncate(len);
-        return Ok(body);
+        return Ok((body, !conn_close && !extra_bytes));
     }
 
-    // Read until EOF (bounded) for Connection: close without Content-Length.
+    // Read until EOF (bounded) for close-delimited responses without Content-Length.
     while body.len() <= MAX_DNS_RESPONSE_BYTES {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
@@ -1075,13 +1277,17 @@ pub async fn read_doh_http_response<S: tokio::io::AsyncRead + Unpin>(
     }
 
     if body.len() <= MAX_DNS_RESPONSE_BYTES {
-        Ok(body)
+        Ok((body, false))
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "DoH response body exceeded bound",
         ))
     }
+}
+
+fn is_exact_chunked_end(raw: &[u8]) -> bool {
+    raw.ends_with(b"0\r\n\r\n")
 }
 
 fn find_crlf_crlf(data: &[u8]) -> Option<usize> {
@@ -1438,5 +1644,68 @@ mod tests {
         assert_eq!(resp[2] & 0x80, 0x80); // QR=1
         assert_eq!(resp[3] & 0x0f, 0); // RCODE=0 (NOERROR)
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0); // ANCOUNT=0
+        assert_eq!(u16::from_be_bytes([resp[10], resp[11]]), 0); // ARCOUNT=0 (no OPT in query)
+
+        // When the query includes an EDNS0 OPT record, synthetic replies must
+        // preserve EDNS0 OPT (ARCOUNT=1) so systemd-resolved does not degrade.
+        let mut q_edns = build_query(0x1234, "example.com", 28);
+        q_edns[11] = 1; // ARCOUNT=1
+        q_edns.extend_from_slice(&EDNS0_OPT_RR);
+        assert!(query_has_edns0_opt(&q_edns));
+
+        let resp_edns = build_empty_noerror_response(&q_edns).expect("noerror edns0");
+        assert_eq!(u16::from_be_bytes([resp_edns[10], resp_edns[11]]), 1);
+        assert!(resp_edns.ends_with(&EDNS0_OPT_RR));
+
+        let sf_edns = build_servfail_response(&q_edns).expect("servfail edns0");
+        assert_eq!(sf_edns[3] & 0x0f, 2); // SERVFAIL
+        assert_eq!(u16::from_be_bytes([sf_edns[10], sf_edns[11]]), 1);
+        assert!(sf_edns.ends_with(&EDNS0_OPT_RR));
+
+        // Malformed/truncated Additional section must never panic.
+        let mut q_trunc = build_query(0x5678, "example.com", 28);
+        q_trunc[11] = 1;
+        q_trunc.extend_from_slice(&[0x00, 0x00, 0x29]); // truncated OPT
+        assert!(!query_has_edns0_opt(&q_trunc));
+    }
+
+    #[tokio::test]
+    async fn doh_keepalive_reuses_single_stream_for_sequential_queries() {
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        let q1 = build_query(0x1111, "one.example", 1);
+        let q2 = build_query(0x2222, "two.example", 1);
+        let r1 = build_a_response(&q1, Ipv4Addr::new(1, 1, 1, 1), 60);
+        let r2 = build_a_response(&q2, Ipv4Addr::new(2, 2, 2, 2), 60);
+        let r1_srv = r1.clone();
+        let r2_srv = r2.clone();
+
+        let srv_task = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            for resp in [&r1_srv, &r2_srv] {
+                let n = server.read(&mut buf).await.expect("read req");
+                assert!(n > 0);
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    resp.len()
+                );
+                server.write_all(hdr.as_bytes()).await.expect("write hdr");
+                server.write_all(resp).await.expect("write body");
+                server.flush().await.expect("flush");
+            }
+        });
+
+        let (got1, reusable1) = send_doh_http_request(&mut client, "1.1.1.1", "/dns-query", &q1)
+            .await
+            .expect("req1");
+        assert_eq!(got1, r1);
+        assert!(reusable1, "keep-alive response must be marked reusable");
+
+        let (got2, reusable2) = send_doh_http_request(&mut client, "1.1.1.1", "/dns-query", &q2)
+            .await
+            .expect("req2");
+        assert_eq!(got2, r2);
+        assert!(reusable2);
+
+        srv_task.await.expect("server done");
     }
 }
