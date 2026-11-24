@@ -37,6 +37,17 @@ const UPSTREAM_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const UPSTREAM_TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Handshake stage names, shared by [`ClientError::Timeout`] and
+/// [`ClientError::Io`] so callers classify a failure by stage instead of by
+/// guessing from the error variant.
+pub const STAGE_TCP_CONNECT: &str = "TCP connect";
+/// REALITY TLS handshake stage.
+pub const STAGE_REALITY_HANDSHAKE: &str = "REALITY TLS handshake";
+/// VLESS request write stage.
+pub const STAGE_VLESS_WRITE: &str = "VLESS request write";
+/// VLESS request flush stage.
+pub const STAGE_VLESS_FLUSH: &str = "VLESS request flush";
+
 /// Configuration for connecting to a `beam` server.
 #[derive(Clone)]
 pub struct BeamClientConfig {
@@ -87,9 +98,15 @@ pub enum ClientError {
         stage: &'static str,
     },
 
-    /// Underlying socket I/O error.
-    #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
+    /// Underlying socket I/O error in one handshake stage.
+    #[error("I/O error during {stage}: {source}")]
+    Io {
+        /// Handshake stage that failed.
+        stage: &'static str,
+        /// Underlying socket error.
+        #[source]
+        source: io::Error,
+    },
 
     /// REALITY ClientHello / configuration error.
     #[error("REALITY error: {0}")]
@@ -129,9 +146,13 @@ pub(crate) async fn dial_vless(
     let deadline = Instant::now() + config.handshake_timeout;
 
     let tcp_socket = match config.server_addr {
-        SocketAddr::V4(_) => TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => TcpSocket::new_v6()?,
-    };
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .map_err(|err| ClientError::Io {
+        stage: STAGE_TCP_CONNECT,
+        source: err,
+    })?;
     if let Err(err) = beam_sys::set_tcp_maxseg(tcp_socket.as_raw_fd(), UPSTREAM_TCP_MSS) {
         tracing::debug!(error = %err, mss = UPSTREAM_TCP_MSS, "failed to set upstream TCP_MAXSEG");
     }
@@ -139,8 +160,12 @@ pub(crate) async fn dial_vless(
     let socket = timeout_at(deadline, tcp_socket.connect(config.server_addr))
         .await
         .map_err(|_| ClientError::Timeout {
-            stage: "TCP connect",
-        })??;
+            stage: STAGE_TCP_CONNECT,
+        })?
+        .map_err(|err| ClientError::Io {
+            stage: STAGE_TCP_CONNECT,
+            source: err,
+        })?;
     if let Err(err) = socket.set_nodelay(true) {
         tracing::debug!(error = %err, "failed to set upstream TCP_NODELAY");
     }
@@ -158,7 +183,7 @@ pub(crate) async fn dial_vless(
     let mut tls = timeout_at(deadline, TlsStream::connect(socket, client_conn))
         .await
         .map_err(|_| ClientError::Timeout {
-            stage: "REALITY TLS handshake",
+            stage: STAGE_REALITY_HANDSHAKE,
         })??;
 
     let header = RequestHeader {
@@ -174,13 +199,21 @@ pub(crate) async fn dial_vless(
     timeout_at(deadline, tls.write_all(&encoded))
         .await
         .map_err(|_| ClientError::Timeout {
-            stage: "VLESS request write",
-        })??;
+            stage: STAGE_VLESS_WRITE,
+        })?
+        .map_err(|err| ClientError::Io {
+            stage: STAGE_VLESS_WRITE,
+            source: err,
+        })?;
     timeout_at(deadline, tls.flush())
         .await
         .map_err(|_| ClientError::Timeout {
-            stage: "VLESS request flush",
-        })??;
+            stage: STAGE_VLESS_FLUSH,
+        })?
+        .map_err(|err| ClientError::Io {
+            stage: STAGE_VLESS_FLUSH,
+            source: err,
+        })?;
 
     Ok(VlessClientStream::new(tls))
 }

@@ -79,6 +79,63 @@ static int g_busy;
 static int g_helper_failed;
 static time_t g_cooldown_until;
 
+/*
+ * Last values pushed to GTK/AppIndicator. The poll runs every second, so
+ * repeating an unchanged label or icon would wake the toolkit and the
+ * compositor for no visible change. Every comparison uses the same truncated
+ * copy that is cached, so two long strings that differ only past the truncation
+ * point are treated as equal instead of redrawing the menu every second.
+ */
+static char g_last_status_label[96];
+static char g_last_action_label[24];
+static int g_last_action_sensitive = -1;
+static char g_last_icon[64];
+static char g_last_desc[64];
+
+static void set_status_label(const char *label)
+{
+    char buf[sizeof(g_last_status_label)];
+
+    snprintf(buf, sizeof(buf), "%s", label);
+    if (strcmp(g_last_status_label, buf) == 0)
+        return;
+    memcpy(g_last_status_label, buf, sizeof(buf));
+    gtk_menu_item_set_label(g_status_item, buf);
+}
+
+static void set_action_label(const char *label)
+{
+    char buf[sizeof(g_last_action_label)];
+
+    snprintf(buf, sizeof(buf), "%s", label);
+    if (strcmp(g_last_action_label, buf) == 0)
+        return;
+    memcpy(g_last_action_label, buf, sizeof(buf));
+    gtk_menu_item_set_label(g_action_item, buf);
+}
+
+static void set_action_sensitive(int sensitive)
+{
+    if (sensitive == g_last_action_sensitive)
+        return;
+    g_last_action_sensitive = sensitive;
+    gtk_widget_set_sensitive(g_action_item, sensitive);
+}
+
+static void set_indicator_icon(const char *icon, const char *desc)
+{
+    char icon_buf[sizeof(g_last_icon)];
+    char desc_buf[sizeof(g_last_desc)];
+
+    snprintf(icon_buf, sizeof(icon_buf), "%s", icon);
+    snprintf(desc_buf, sizeof(desc_buf), "%s", desc);
+    if (strcmp(g_last_icon, icon_buf) == 0 && strcmp(g_last_desc, desc_buf) == 0)
+        return;
+    memcpy(g_last_icon, icon_buf, sizeof(icon_buf));
+    memcpy(g_last_desc, desc_buf, sizeof(desc_buf));
+    app_indicator_set_icon_full(g_indicator, icon_buf, desc_buf);
+}
+
 static int native_tunnel_present(void)
 {
     return if_nametoindex(TUN_IFACE_NATIVE) != 0;
@@ -92,7 +149,9 @@ static int tunnel_present(void)
 static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
 {
     FILE *fp;
-    char line[128];
+    /* Wide enough for the longest status line (`drops=...`) without splitting it
+     * into two unparsable halves. */
+    char line[512];
     int found_state = 0;
     long long ts = -1;
     pid_t pid = 0;
@@ -160,13 +219,13 @@ static void update_ui(void)
     const char *desc = connected ? "Interface up" : "Disconnected";
 
     if (g_busy) {
-        gtk_menu_item_set_label(g_status_item, "Beam: working...");
-        gtk_widget_set_sensitive(g_action_item, 0);
+        set_status_label("Beam: working...");
+        set_action_sensitive(0);
         return;
     }
 
     if (g_helper_failed) {
-        gtk_menu_item_set_label(g_status_item, "Beam: error");
+        set_status_label("Beam: error");
     } else if (native_up && read_client_status(state, sizeof(state), &rtt_ms)) {
         if (strcmp(state, "connected") == 0) {
             if (rtt_ms >= 0)
@@ -184,15 +243,13 @@ static void update_ui(void)
             icon = "network-vpn-acquiring-symbolic";
             desc = "Reconnecting";
         }
-        gtk_menu_item_set_label(g_status_item, label);
+        set_status_label(label);
     } else {
-        gtk_menu_item_set_label(g_status_item,
-                                connected ? "Beam: interface up" : "Beam: interface down");
+        set_status_label(connected ? "Beam: interface up" : "Beam: interface down");
     }
-    gtk_menu_item_set_label(g_action_item,
-                            connected ? "Disconnect" : "Connect");
-    gtk_widget_set_sensitive(g_action_item, !cooling);
-    app_indicator_set_icon_full(g_indicator, icon, desc);
+    set_action_label(connected ? "Disconnect" : "Connect");
+    set_action_sensitive(!cooling);
+    set_indicator_icon(icon, desc);
 }
 
 static gboolean poll_state(gpointer data)

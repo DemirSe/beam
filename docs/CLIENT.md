@@ -304,3 +304,27 @@ profile. The TCP/REALITY path is unchanged.
 
 The Windows profile is `$HOME/.config/beam/windows.json`. The installer is
 `$HOME/.config/beam/beam-install-windows.ps1`.
+
+## beam-client diagnostics
+
+`beam-client --check` prints the validated TUN and server policy, then one DNS
+summary line: upstream kind and target, the detected or configured
+`local_upstream`, `cache_size`, `ipv4_only`, and the configured suffix counts.
+The DoH target shows the host and port only. The client omits the path because
+it can contain a provider profile ID or token.
+
+The client publishes `/run/beam-client/status` as `key=value` lines for
+`beam-tray`: `state`, `ifname`, `ts`, `pid`, `rtt_ms`, `reason`, `generation`,
+`bypass_ok`, `dial_failures`, and, when non-zero, `drops`. The tray ignores keys
+it does not know, so this list can grow without breaking an older tray. A
+`reason` of `dial_failures` means authenticated upstream dials keep failing, so
+a bare TCP connect to the server no longer reports the link as connected. The
+client reports this state while a new dial failure is no more than 20 s old, and
+only after three consecutive failures. A gap of more than 30 s between failures
+starts a new failure count.
+
+The `drops` value holds `key:value` pairs. The keys are `tun_tx_full`,
+`ip_parse`, `frag`, `route`, `tcp_limit`, `udp_sess_q`, `udp_pending`,
+`udp_payload`, and `udp_sess_tbl`. `tcp_limit` counts new TCP flows that the
+client resets when it reaches `max_tcp_connections`. These resets are not
+`route` drops.

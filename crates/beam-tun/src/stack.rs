@@ -4,8 +4,8 @@
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -15,6 +15,69 @@ const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
 const DEFAULT_TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000;
+const RELAY_BUF_POOL_MAX: usize = 8;
+
+/// Bounded, passive pool of relay read buffers shared by the TCP relay task and
+/// the stack's server-to-client drain path.
+///
+/// The relay reads into an owned buffer and hands it to the stack; the stack
+/// returns it here after copying the bytes into the TCP TX queue. Steady-state
+/// downloads therefore stop allocating a fresh buffer per read chunk. The pool
+/// holds at most [`RELAY_BUF_POOL_MAX`] buffers and has no background timer.
+#[derive(Debug, Default)]
+pub struct RelayBufPool {
+    free: Mutex<Vec<Vec<u8>>>,
+}
+
+impl RelayBufPool {
+    /// Creates a shared, empty pool.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn take(&self) -> Option<Vec<u8>> {
+        self.free.lock().ok()?.pop()
+    }
+
+    /// Returns `buf` to the pool unless the pool is full.
+    pub fn put(&self, mut buf: Vec<u8>) {
+        let Ok(mut free) = self.free.lock() else {
+            return;
+        };
+        if free.len() >= RELAY_BUF_POOL_MAX {
+            return;
+        }
+        buf.clear();
+        free.push(buf);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.free.lock().map(|f| f.len()).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn relay_buf_pool_reuses_buffers_and_stays_bounded() {
+        let pool = RelayBufPool::new();
+        assert_eq!(pool.len(), 0);
+        assert!(pool.take().is_none());
+
+        for size in 1..=(RELAY_BUF_POOL_MAX + 4) {
+            pool.put(vec![0u8; size]);
+        }
+        assert_eq!(pool.len(), RELAY_BUF_POOL_MAX, "pool must stay bounded");
+
+        let buf = pool.take().expect("pooled buffer");
+        assert!(buf.is_empty(), "returned buffers are cleared");
+        assert!(buf.capacity() > 0);
+        assert_eq!(pool.len(), RELAY_BUF_POOL_MAX - 1);
+    }
+}
 
 /// Tuning parameters for a [`NetStack`] implementation.
 #[derive(Clone, Copy, Debug)]
@@ -106,6 +169,7 @@ pub struct TunTcpStream {
     flow_waker: Option<Arc<dyn FlowWaker>>,
     in_flight_relay: Option<Arc<AtomicUsize>>,
     aborted: Option<Arc<AtomicBool>>,
+    pool: Arc<RelayBufPool>,
 }
 
 /// Owned read half of a [`TunTcpStream`].
@@ -149,6 +213,7 @@ pub struct TunTcpWriter {
     waker: Arc<Notify>,
     flow_waker: Option<Arc<dyn FlowWaker>>,
     aborted: Option<Arc<AtomicBool>>,
+    pool: Arc<RelayBufPool>,
 }
 
 impl TunTcpWriter {
@@ -165,6 +230,24 @@ impl TunTcpWriter {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUN TCP socket closed"))?;
         wake_stack(&self.waker, self.flow_waker.as_ref());
         Ok(())
+    }
+
+    /// Sends `data` using a recycled relay buffer when one is available, so a
+    /// download does not allocate a fresh chunk per read (falls back to a plain
+    /// copy when the pool is empty).
+    pub async fn send_chunk_pooled(&mut self, data: &[u8]) -> io::Result<()> {
+        let mut buf = match self.pool.take() {
+            Some(buf) if buf.capacity() >= data.len() => buf,
+            Some(undersized) => {
+                // Keep the small buffer for a later read instead of dropping it.
+                self.pool.put(undersized);
+                Vec::with_capacity(data.len())
+            }
+            None => Vec::with_capacity(data.len()),
+        };
+        buf.clear();
+        buf.extend_from_slice(data);
+        self.send_chunk(buf).await
     }
 
     /// Waits until the TUN TCP socket closes the write channel (e.g. peer RST
@@ -209,6 +292,7 @@ impl TunTcpStream {
         flow_waker: Option<Arc<dyn FlowWaker>>,
         in_flight_relay: Option<Arc<AtomicUsize>>,
         aborted: Option<Arc<AtomicBool>>,
+        pool: Arc<RelayBufPool>,
     ) -> Self {
         Self {
             from_stack,
@@ -219,6 +303,7 @@ impl TunTcpStream {
             flow_waker,
             in_flight_relay,
             aborted,
+            pool,
         }
     }
 
@@ -240,6 +325,7 @@ impl TunTcpStream {
         let flow_waker = self.flow_waker.take();
         let in_flight_relay = self.in_flight_relay.take();
         let aborted = self.aborted.take();
+        let pool = Arc::clone(&self.pool);
         (
             TunTcpReader {
                 from_stack,
@@ -252,6 +338,7 @@ impl TunTcpStream {
                 waker,
                 flow_waker,
                 aborted,
+                pool,
             },
         )
     }

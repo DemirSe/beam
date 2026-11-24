@@ -114,6 +114,7 @@ fn main() -> ExitCode {
             validated.engine.client.server_addr,
             validated.engine.route.reject_quic
         );
+        println!("{}", describe_dns(&validated.engine.dns));
         return ExitCode::SUCCESS;
     }
 
@@ -140,6 +141,25 @@ fn main() -> ExitCode {
             error!(error = %err, "beam-client exited with error");
             ExitCode::from(1)
         }
+    }
+}
+
+/// One-line DNS summary for `--check` (never prints query data or secrets).
+fn describe_dns(dns: &Option<beam_tun::DnsConfig>) -> String {
+    match dns {
+        Some(cfg) => format!(
+            "DNS: enabled (upstream={} kind={}, local_upstream={}, cache_size={}, ipv4_only={}, local_suffixes={}, bypass_domains={})",
+            cfg.upstream,
+            cfg.upstream.kind(),
+            cfg.local_upstream
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            cfg.cache_size,
+            cfg.ipv4_only,
+            cfg.local_suffixes.len(),
+            cfg.bypass_domains.len()
+        ),
+        None => "DNS: disabled".to_owned(),
     }
 }
 

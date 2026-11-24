@@ -426,7 +426,39 @@ pub fn encode_frame(out: &mut Vec<u8>, spec: FrameSpec<'_>) -> Result<(), XudpEr
     result
 }
 
+/// Encodes only the frame metadata, declaring `payload_len` payload bytes that
+/// the caller appends itself.
+///
+/// This lets a caller that already owns a payload buffer (for example a queued
+/// UDP datagram) prepend the header in place instead of copying the payload
+/// into a fresh frame buffer. `payload_len` must be the number of bytes the
+/// caller appends and must satisfy the same bounds [`encode_frame`] enforces.
+pub fn encode_frame_header(
+    out: &mut Vec<u8>,
+    spec: FrameSpec<'_>,
+    payload_len: usize,
+) -> Result<(), XudpError> {
+    let start = out.len();
+    let result = encode_frame_metadata(out, spec, payload_len);
+    if result.is_err() {
+        out.truncate(start);
+    }
+    result
+}
+
 fn encode_frame_inner(out: &mut Vec<u8>, spec: FrameSpec<'_>) -> Result<(), XudpError> {
+    encode_frame_metadata(out, spec, spec.payload.len())?;
+    if spec.option.has_data() {
+        out.extend_from_slice(spec.payload);
+    }
+    Ok(())
+}
+
+fn encode_frame_metadata(
+    out: &mut Vec<u8>,
+    spec: FrameSpec<'_>,
+    payload_len: usize,
+) -> Result<(), XudpError> {
     let global_id = spec.global_id.filter(|id| id.iter().any(|&byte| byte != 0));
 
     match spec.status {
@@ -465,11 +497,11 @@ fn encode_frame_inner(out: &mut Vec<u8>, spec: FrameSpec<'_>) -> Result<(), Xudp
         return Err(XudpError::UnexpectedGlobalId);
     }
 
-    if !spec.option.has_data() && !spec.payload.is_empty() {
+    if !spec.option.has_data() && payload_len != 0 {
         return Err(XudpError::PayloadWithoutData);
     }
-    if spec.payload.len() > MAX_PAYLOAD_LEN {
-        return Err(XudpError::PayloadTooLarge(spec.payload.len()));
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Err(XudpError::PayloadTooLarge(payload_len));
     }
 
     out.extend_from_slice(&[0, 0]);
@@ -496,10 +528,9 @@ fn encode_frame_inner(out: &mut Vec<u8>, spec: FrameSpec<'_>) -> Result<(), Xudp
     out[prefix_start..metadata_start].copy_from_slice(&metadata_len.to_be_bytes());
 
     if spec.option.has_data() {
-        let payload_len = u16::try_from(spec.payload.len())
-            .map_err(|_| XudpError::PayloadTooLarge(spec.payload.len()))?;
+        let payload_len =
+            u16::try_from(payload_len).map_err(|_| XudpError::PayloadTooLarge(payload_len))?;
         out.extend_from_slice(&payload_len.to_be_bytes());
-        out.extend_from_slice(spec.payload);
     }
 
     Ok(())

@@ -6,10 +6,11 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use beam_sys::LinuxTun;
-use beam_tun::{IpNet, TUN_V6_NET, TunDevice};
+use beam_tun::{IpNet, RateLimiter, TUN_V6_NET, TunDevice};
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, info, warn};
 
@@ -29,6 +30,13 @@ static DYNAMIC_BYPASS_CAP_WARNED_V4_AT: std::sync::Mutex<Option<Instant>> =
     std::sync::Mutex::new(None);
 static DYNAMIC_BYPASS_CAP_WARNED_V6_AT: std::sync::Mutex<Option<Instant>> =
     std::sync::Mutex::new(None);
+
+/// At most 3 exact-route lookup warnings per 60 s window.
+static ROUTE_CHECK_LOG: LazyLock<RateLimiter> =
+    LazyLock::new(|| RateLimiter::new(3, Duration::from_secs(60)));
+/// Resolved `ip` (iproute2) path, cached only on success so a package installed
+/// after startup is still picked up on the next call.
+static IP_BINARY: OnceLock<&'static str> = OnceLock::new();
 
 /// Returns `true` when the cap warning is due, so it fires once per interval.
 fn cap_warn_due(last: Option<Instant>, now: Instant) -> bool {
@@ -286,7 +294,11 @@ impl LinuxRouteGuard {
                     "no physical default gateway detected at startup; running fail-closed until network comes up"
                 );
             }
-            guard.update_bypass_gateway(&detected_gw, local_dns_ip);
+            if !guard.update_bypass_gateway(&detected_gw, local_dns_ip) {
+                warn!(
+                    "initial bypass route reconcile skipped due to ip lookup error; monitor will retry"
+                );
+            }
 
             run_ip(&["route", "replace", "0.0.0.0/1", "dev", ifname])?;
             guard.installed_v4_low = true;
@@ -334,6 +346,10 @@ impl LinuxRouteGuard {
     /// non-loopback local DNS when a matching gateway exists) are installed
     /// (or preserved as pre-existing host routes) and present in the kernel
     /// routing table.
+    ///
+    /// A lookup that cannot be completed ([`RouteCheck::Error`]) counts as
+    /// missing (fail-closed): the monitor keeps retrying, while the rate-limited
+    /// warning from `has_host_route` carries the reason once per window.
     pub fn bypass_routes_installed(&self) -> bool {
         if !self.auto_route {
             return true;
@@ -344,7 +360,7 @@ impl LinuxRouteGuard {
             if self.server_bypass_route.is_none() && !self.server_bypass_preexisting {
                 return false;
             }
-            if !has_host_route(self.server_ip) {
+            if !has_host_route(self.server_ip).is_present() {
                 return false;
             }
         }
@@ -357,7 +373,7 @@ impl LinuxRouteGuard {
             if self.local_dns_bypass_route.is_none() && !self.local_dns_bypass_preexisting {
                 return false;
             }
-            if !has_host_route(dns_ip) {
+            if !has_host_route(dns_ip).is_present() {
                 return false;
             }
         }
@@ -367,14 +383,33 @@ impl LinuxRouteGuard {
     /// Migrates server, local-DNS, and bypass CIDR/domain routes to `new_gw`
     /// while keeping TUN split routes active (fail-closed kill-switch) and
     /// preserving any pre-existing exact routes in the main table.
+    ///
+    /// A failed exact-route lookup (`ip` missing, transient non-zero exit) is
+    /// not treated as "route absent": the whole reconcile is skipped for this
+    /// cycle, so every route keeps its last-known state.
+    ///
+    /// Returns `false` if pre-checking existing routes failed with an `ip`
+    /// execution error and the reconcile was skipped for this cycle, so callers
+    /// know not to clear their retry timer based on a stale `current_gw`.
+    /// `has_host_route` logs the rate-limited warning that carries the signal.
     pub fn update_bypass_gateway(
         &mut self,
         new_gw: &PhysicalGateways,
         new_local_dns: Option<IpAddr>,
-    ) {
+    ) -> bool {
         if !self.auto_route {
-            return;
+            return true;
         }
+        let server_check = (!self.server_ip.is_loopback()).then(|| has_host_route(self.server_ip));
+        let dns_check = new_local_dns
+            .filter(|ip| Some(*ip) == self.local_dns_ip)
+            .map(has_host_route);
+        let lookup_failed = server_check.as_ref().is_some_and(|c| c.error().is_some())
+            || dns_check.as_ref().is_some_and(|c| c.error().is_some());
+        if lookup_failed {
+            return false;
+        }
+
         for (prefix, maybe_gw, dev) in self.extra_bypass_v4.drain(..) {
             let _ = remove_v4_bypass(&prefix, maybe_gw.as_deref(), &dev);
         }
@@ -402,20 +437,28 @@ impl LinuxRouteGuard {
         if !self.server_ip.is_loopback()
             && let Some((maybe_gw, dev)) = gateway_for_ip(new_gw, self.server_ip)
         {
-            if has_host_route(self.server_ip) {
-                info!(ip = %self.server_ip, "preserving pre-existing exact route for beam server");
-                self.server_bypass_preexisting = true;
-            } else {
-                match install_host_bypass(self.server_ip, maybe_gw.as_deref(), dev) {
-                    Ok(()) => {
-                        info!(ip = %self.server_ip, via = ?maybe_gw, dev = %dev, "installed server bypass route");
-                        self.server_bypass_route =
-                            Some((self.server_ip, maybe_gw.clone(), dev.clone()));
-                    }
-                    Err(err) => {
-                        warn!(ip = %self.server_ip, dev = %dev, error = %err, "failed to install server bypass route");
+            // Re-check after removing our own route: only a route that is still
+            // present here was pre-existing and must be preserved.
+            match has_host_route(self.server_ip) {
+                RouteCheck::Present => {
+                    info!(ip = %self.server_ip, "preserving pre-existing exact route for beam server");
+                    self.server_bypass_preexisting = true;
+                }
+                RouteCheck::Absent => {
+                    match install_host_bypass(self.server_ip, maybe_gw.as_deref(), dev) {
+                        Ok(()) => {
+                            info!(ip = %self.server_ip, via = ?maybe_gw, dev = %dev, "installed server bypass route");
+                            self.server_bypass_route =
+                                Some((self.server_ip, maybe_gw.clone(), dev.clone()));
+                        }
+                        Err(err) => {
+                            warn!(ip = %self.server_ip, dev = %dev, error = %err, "failed to install server bypass route");
+                        }
                     }
                 }
+                // The lookup failed again: keep the last-known route state instead
+                // of reinstalling on every monitor cycle.
+                RouteCheck::Error(_) => {}
             }
         }
 
@@ -425,11 +468,12 @@ impl LinuxRouteGuard {
             && !self.is_in_tun_subnet(dns_ip)
             && let Some((maybe_gw, dev)) = gateway_for_ip(new_gw, dns_ip)
         {
-            if has_host_route(dns_ip) {
-                debug!(ip = %dns_ip, "preserving pre-existing exact route for local DNS");
-                self.local_dns_bypass_preexisting = true;
-            } else {
-                match install_host_bypass(dns_ip, maybe_gw.as_deref(), dev) {
+            match has_host_route(dns_ip) {
+                RouteCheck::Present => {
+                    debug!(ip = %dns_ip, "preserving pre-existing exact route for local DNS");
+                    self.local_dns_bypass_preexisting = true;
+                }
+                RouteCheck::Absent => match install_host_bypass(dns_ip, maybe_gw.as_deref(), dev) {
                     Ok(()) => {
                         debug!(ip = %dns_ip, via = ?maybe_gw, dev = %dev, "installed local DNS bypass route");
                         self.local_dns_bypass_route = Some((dns_ip, maybe_gw.clone(), dev.clone()));
@@ -437,13 +481,16 @@ impl LinuxRouteGuard {
                     Err(err) => {
                         warn!(ip = %dns_ip, dev = %dev, error = %err, "failed to install local DNS bypass route");
                     }
-                }
+                },
+                // The lookup failed again: keep the last-known route state instead
+                // of reinstalling on every monitor cycle.
+                RouteCheck::Error(_) => {}
             }
         }
 
         if let Some((maybe_gw, dev)) = new_gw.v4.as_ref() {
             for cidr_entry in &self.configured_bypass_v4 {
-                if has_exact_route("-4", cidr_entry) {
+                if has_exact_route("-4", cidr_entry).is_present() {
                     debug!(cidr = %cidr_entry, "preserving pre-existing exact IPv4 route");
                     continue;
                 }
@@ -456,7 +503,7 @@ impl LinuxRouteGuard {
             }
             for &(ip, _) in &self.dynamic_bypass_v4 {
                 let host = format!("{ip}/32");
-                if has_exact_route("-4", &host) {
+                if has_exact_route("-4", &host).is_present() {
                     debug!(prefix = %host, "preserving pre-existing exact IPv4 route");
                     continue;
                 }
@@ -470,7 +517,7 @@ impl LinuxRouteGuard {
 
         if let Some((maybe_gw, dev)) = new_gw.v6.as_ref() {
             for cidr_entry in &self.configured_bypass_v6 {
-                if has_exact_route("-6", cidr_entry) {
+                if has_exact_route("-6", cidr_entry).is_present() {
                     debug!(cidr = %cidr_entry, "preserving pre-existing exact IPv6 route");
                     continue;
                 }
@@ -483,7 +530,7 @@ impl LinuxRouteGuard {
             }
             for &(ip, _) in &self.dynamic_bypass_v6 {
                 let host = format!("{ip}/128");
-                if has_exact_route("-6", &host) {
+                if has_exact_route("-6", &host).is_present() {
                     debug!(prefix = %host, "preserving pre-existing exact IPv6 route");
                     continue;
                 }
@@ -496,6 +543,7 @@ impl LinuxRouteGuard {
         }
 
         self.persist_routes_state();
+        true
     }
 
     /// Dynamically installs a `/32` or `/128` bypass route for an IP resolved
@@ -537,7 +585,7 @@ impl LinuxRouteGuard {
                 };
                 self.evict_v4_if_needed(now);
                 let host = format!("{v4}/32");
-                if has_exact_route("-4", &host) {
+                if has_exact_route("-4", &host).is_present() {
                     debug!(prefix = %host, "preserving pre-existing exact route for bypass.domains IP");
                     return;
                 }
@@ -573,7 +621,7 @@ impl LinuxRouteGuard {
                 };
                 self.evict_v6_if_needed(now);
                 let host = format!("{v6}/128");
-                if has_exact_route("-6", &host) {
+                if has_exact_route("-6", &host).is_present() {
                     debug!(prefix = %host, "preserving pre-existing exact route for bypass.domains IP");
                     return;
                 }
@@ -938,7 +986,23 @@ fn find_ip_binary(candidates: &[&'static str]) -> io::Result<&'static str> {
 }
 
 fn ip_binary() -> io::Result<&'static str> {
-    find_ip_binary(&IP_BINARY_CANDIDATES)
+    resolve_ip_binary(&IP_BINARY, &IP_BINARY_CANDIDATES)
+}
+
+/// Returns the cached `ip` path, resolving it once.
+///
+/// Only `Ok` results are cached: a missing `iproute2` install is retried on the
+/// next call instead of being remembered forever.
+fn resolve_ip_binary(
+    cache: &OnceLock<&'static str>,
+    candidates: &[&'static str],
+) -> io::Result<&'static str> {
+    if let Some(cached) = cache.get() {
+        return Ok(cached);
+    }
+    let found = find_ip_binary(candidates)?;
+    let _ = cache.set(found);
+    Ok(found)
 }
 
 fn run_ip(args: &[&str]) -> io::Result<()> {
@@ -964,7 +1028,7 @@ fn run_ip(args: &[&str]) -> io::Result<()> {
     }
 }
 
-fn has_host_route(ip: IpAddr) -> bool {
+fn has_host_route(ip: IpAddr) -> RouteCheck {
     let (flag, prefix) = match ip {
         IpAddr::V4(v4) => ("-4", format!("{v4}/32")),
         IpAddr::V6(v6) => ("-6", format!("{v6}/128")),
@@ -972,21 +1036,90 @@ fn has_host_route(ip: IpAddr) -> bool {
     has_exact_route(flag, &prefix)
 }
 
-fn has_exact_route(family_flag: &str, prefix: &str) -> bool {
-    let Ok(ip) = ip_binary() else {
-        return false;
+/// Result of an exact-route lookup, distinguishing a missing route from a
+/// failed lookup instead of silently treating `ip` errors as absent routes.
+#[derive(Debug)]
+pub enum RouteCheck {
+    /// The route exists in the main table.
+    Present,
+    /// The lookup succeeded and found no route.
+    Absent,
+    /// The lookup could not be completed (`ip` missing, exited non-zero, ...).
+    Error(io::Error),
+}
+
+impl RouteCheck {
+    /// Returns `true` only for [`RouteCheck::Present`].
+    pub const fn is_present(&self) -> bool {
+        matches!(self, Self::Present)
+    }
+
+    /// Returns the lookup error, if any.
+    pub const fn error(&self) -> Option<&io::Error> {
+        match self {
+            Self::Error(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+/// Runs `ip -<family> route show exact <prefix>` and classifies the result.
+fn has_exact_route(family_flag: &str, prefix: &str) -> RouteCheck {
+    let ip = match ip_binary() {
+        Ok(ip) => ip,
+        Err(err) => return route_check_error(prefix, err),
     };
-    let Ok(output) = Command::new(ip)
+    let output = match Command::new(ip)
         .args([family_flag, "route", "show", "exact", prefix])
         .output()
-    else {
-        return false;
+    {
+        Ok(output) => output,
+        Err(err) => return route_check_error(prefix, err),
     };
-    if !output.status.success() {
-        return false;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    classify_exact_route_output(
+        prefix,
+        output.status.success(),
+        &output.status.to_string(),
+        &stdout,
+    )
+}
+
+/// Classifies one completed `ip ... route show exact <prefix>` invocation.
+fn classify_exact_route_output(
+    prefix: &str,
+    success: bool,
+    status: &str,
+    stdout: &str,
+) -> RouteCheck {
+    if !success {
+        return route_check_error(
+            prefix,
+            io::Error::other(format!(
+                "`ip route show exact {prefix}` exited with {status}"
+            )),
+        );
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_exact_route_exists(&text)
+    if parse_exact_route_exists(stdout) {
+        RouteCheck::Present
+    } else {
+        RouteCheck::Absent
+    }
+}
+
+/// Logs a failed route lookup at rate-limited `warn` level and returns it.
+fn route_check_error(prefix: &str, err: io::Error) -> RouteCheck {
+    debug!(prefix = %prefix, error = %err, kind = ?err.kind(), "exact route lookup failed");
+    if let Some(suppressed) = ROUTE_CHECK_LOG.allow() {
+        warn!(
+            prefix = %prefix,
+            error = %err,
+            kind = ?err.kind(),
+            suppressed,
+            "exact route lookup failed; treating the route as absent"
+        );
+    }
+    RouteCheck::Error(err)
 }
 
 /// Returns `true` if `ip route show exact <prefix>` output reports an existing
@@ -1262,6 +1395,49 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
         let missing = find_ip_binary(&["/nonexistent/beam/ip"]).expect_err("missing");
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
         assert_eq!(find_ip_binary(&["/bin/sh"]).expect("found"), "/bin/sh");
+    }
+
+    #[test]
+    fn route_check_is_tri_state() {
+        // Present: `ip` printed a route.
+        let present = classify_exact_route_output(
+            "198.51.100.1/32",
+            true,
+            "exit status: 0",
+            "198.51.100.1 via 192.168.1.1 dev wlan0\n",
+        );
+        assert!(present.is_present());
+        assert!(present.error().is_none());
+
+        // Absent: `ip` succeeded but printed nothing.
+        let absent = classify_exact_route_output("198.51.100.2/32", true, "exit status: 0", "\n");
+        assert!(!absent.is_present());
+        assert!(absent.error().is_none());
+
+        // Error: a failing `ip` invocation is not silently treated as absent.
+        let failed = classify_exact_route_output("198.51.100.3/32", false, "exit status: 2", "");
+        assert!(!failed.is_present());
+        let err = failed.error().expect("lookup error is reported");
+        assert!(err.to_string().contains("198.51.100.3/32"), "{err}");
+    }
+
+    #[test]
+    fn ip_binary_caches_only_successful_lookups() {
+        let cache: OnceLock<&'static str> = OnceLock::new();
+        assert!(resolve_ip_binary(&cache, &["/nonexistent/beam/ip"]).is_err());
+        assert!(
+            cache.get().is_none(),
+            "a missing iproute2 install must not be cached, so a late install is picked up"
+        );
+
+        let found = resolve_ip_binary(&cache, &["/nonexistent/beam/ip", "/bin/sh"]).expect("found");
+        assert_eq!(found, "/bin/sh");
+        assert_eq!(cache.get().copied(), Some("/bin/sh"));
+        // Cached: a later lookup ignores the candidate list.
+        assert_eq!(
+            resolve_ip_binary(&cache, &["/nonexistent/beam/other"]).expect("cached"),
+            "/bin/sh"
+        );
     }
 
     #[test]
