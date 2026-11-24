@@ -58,6 +58,8 @@ pub struct TunSection {
     pub auto_route: bool,
     #[serde(default = "default_true")]
     pub reject_quic: bool,
+    #[serde(default)]
+    pub reject_ipv6: bool,
     #[serde(default = "default_true")]
     pub drop_private_destinations: bool,
 }
@@ -70,6 +72,7 @@ impl Default for TunSection {
             mtu: default_mtu(),
             auto_route: true,
             reject_quic: true,
+            reject_ipv6: false,
             drop_private_destinations: true,
         }
     }
@@ -90,6 +93,8 @@ pub struct DnsSection {
     pub cache_size: usize,
     #[serde(default = "default_dns_timeout_ms")]
     pub query_timeout_ms: u64,
+    #[serde(default)]
+    pub ipv4_only: bool,
 }
 
 impl Default for DnsSection {
@@ -101,6 +106,7 @@ impl Default for DnsSection {
             local_suffixes: default_local_suffixes(),
             cache_size: default_dns_cache_size(),
             query_timeout_ms: default_dns_timeout_ms(),
+            ipv4_only: false,
         }
     }
 }
@@ -349,6 +355,7 @@ impl ClientFileConfig {
             cfg.bypass_domains = self.bypass.domains;
             cfg.cache_size = self.dns.cache_size;
             cfg.query_timeout = Duration::from_millis(self.dns.query_timeout_ms);
+            cfg.ipv4_only = self.dns.ipv4_only;
             Some(cfg)
         } else {
             None
@@ -364,6 +371,7 @@ impl ClientFileConfig {
 
         let route = RoutePolicy {
             reject_quic: self.tun.reject_quic,
+            reject_ipv6: self.tun.reject_ipv6,
             drop_private_destinations: self.tun.drop_private_destinations,
             exclude_ips,
             bypass_cidrs: parsed_bypass_cidrs,

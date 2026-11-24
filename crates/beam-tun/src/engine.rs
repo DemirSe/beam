@@ -15,7 +15,7 @@ use tracing::{debug, info};
 
 use crate::device::TunDevice;
 use crate::dns::{DnsConfig, DnsInterceptor};
-use crate::packet::{build_icmp_port_unreachable, parse_ip, parse_udp};
+use crate::packet::{build_icmp_port_unreachable, build_tcp_rst_for_packet, parse_ip, parse_udp};
 use crate::router::{RouteDecision, RoutePolicy};
 use crate::stack::{AcceptedTcpStream, NetStack};
 use crate::udp::{UdpBridgeConfig, UdpNatBridge};
@@ -185,6 +185,11 @@ where
                                         } else {
                                             udp_bridge.handle_datagram(src, dst, udp.payload);
                                         }
+                                    }
+                                }
+                                RouteDecision::RejectTcpRst => {
+                                    if let Some(rst) = build_tcp_rst_for_packet(&ip) {
+                                        let _ = tun_tx.try_send(rst);
                                     }
                                 }
                                 RouteDecision::RejectIcmpUnreachable => {

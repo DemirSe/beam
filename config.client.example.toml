@@ -14,6 +14,9 @@ address = "172.19.0.1/30"
 mtu = 1500
 auto_route = true
 reject_quic = true
+# Set reject_ipv6 = true (with dns.ipv4_only = true) when the upstream server
+# has IPv4-only egress so IPv6 fails fast while split routes prevent leaks.
+reject_ipv6 = false
 
 [dns]
 enabled = true
@@ -25,6 +28,7 @@ upstream = "https://1.1.1.1/dns-query"
 local_suffixes = ["lan", "local", "internal"]
 cache_size = 1024
 query_timeout_ms = 4000
+ipv4_only = false
 
 [bypass]
 # Extra IPv4/IPv6 CIDRs or domain suffixes kept outside the tunnel.

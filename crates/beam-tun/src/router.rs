@@ -60,6 +60,10 @@ pub struct RoutePolicy {
     /// Emit immediate ICMP/ICMPv6 Port Unreachable for UDP/443 so browsers
     /// fall back to HTTP/2 instead of stalling on QUIC-over-TCP.
     pub reject_quic: bool,
+    /// Immediately reject IPv6 traffic (`TCP RST` for TCP, ICMPv6 Port
+    /// Unreachable for UDP) while keeping IPv6 TUN split routes active to
+    /// prevent leaks on IPv4-only upstream servers.
+    pub reject_ipv6: bool,
     /// Drop packets destined for RFC 1918 / ULA / link-local / multicast /
     /// loopback addresses so they never enter the tunnel.
     pub drop_private_destinations: bool,
@@ -77,6 +81,7 @@ impl Default for RoutePolicy {
     fn default() -> Self {
         Self {
             reject_quic: true,
+            reject_ipv6: false,
             drop_private_destinations: true,
             exclude_ips: Vec::new(),
             bypass_cidrs: Vec::new(),
@@ -94,6 +99,9 @@ pub enum RouteDecision {
     ProxyUdp,
     /// Intercept UDP/53 in the built-in DNS resolver (DoH / plain / local split).
     InterceptDns,
+    /// Reply immediately with a TCP `RST` (or `RST|ACK`) so Happy Eyeballs
+    /// fails over without waiting for an upstream dial.
+    RejectTcpRst,
     /// Reply immediately with ICMP/ICMPv6 Port Unreachable.
     RejectIcmpUnreachable,
     /// Silently drop (unsupported protocol, excluded IP, or private address).
@@ -118,6 +126,13 @@ impl RoutePolicy {
         }
         if self.drop_private_destinations && is_non_global_ip(pkt.dst_ip) {
             return RouteDecision::Drop;
+        }
+        if self.reject_ipv6 && pkt.dst_ip.is_ipv6() {
+            return match pkt.protocol {
+                IP_PROTO_TCP => RouteDecision::RejectTcpRst,
+                IP_PROTO_UDP => RouteDecision::RejectIcmpUnreachable,
+                _ => RouteDecision::Drop,
+            };
         }
 
         match pkt.protocol {
@@ -229,6 +244,7 @@ mod tests {
 
         let policy = RoutePolicy {
             reject_quic: true,
+            reject_ipv6: false,
             drop_private_destinations: true,
             exclude_ips: Vec::new(),
             bypass_cidrs: vec![net4],
@@ -258,6 +274,39 @@ mod tests {
         assert_eq!(
             policy.classify(&parse_ip(&dns_priv).expect("ip")),
             RouteDecision::InterceptDns
+        );
+    }
+
+    #[test]
+    fn reject_ipv6_emits_rst_for_tcp_and_icmp_for_udp() {
+        let policy = RoutePolicy {
+            reject_ipv6: true,
+            ..RoutePolicy::default()
+        };
+        let src6 = IpAddr::V6("fd00:be:a::1".parse().expect("v6"));
+        let dst6 = IpAddr::V6("2001:4860:4860::8888".parse().expect("v6"));
+        let syn = crate::packet::build_ip_tcp_packet_slices(
+            src6,
+            40000,
+            dst6,
+            443,
+            100,
+            0,
+            crate::packet::TCP_SYN,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("tcp v6");
+        assert_eq!(
+            policy.classify(&parse_ip(&syn).expect("ip")),
+            RouteDecision::RejectTcpRst
+        );
+        let udp = crate::packet::build_ip_udp_packet(src6, 40001, dst6, 5353, b"x").expect("udp6");
+        assert_eq!(
+            policy.classify(&parse_ip(&udp).expect("ip")),
+            RouteDecision::RejectIcmpUnreachable
         );
     }
 }

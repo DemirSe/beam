@@ -156,6 +156,7 @@ async fn tun_tcp_through_beam_server() {
             client: make_client_config(beam_addr),
             route: RoutePolicy {
                 reject_quic: true,
+                reject_ipv6: false,
                 drop_private_destinations: false,
                 exclude_ips: Vec::new(),
                 bypass_cidrs: Vec::new(),
@@ -298,6 +299,7 @@ async fn tun_udp_and_reject_quic_work_end_to_end() {
             client: make_client_config(beam_addr),
             route: RoutePolicy {
                 reject_quic: true,
+                reject_ipv6: false,
                 drop_private_destinations: false,
                 exclude_ips: Vec::new(),
                 bypass_cidrs: Vec::new(),
@@ -447,6 +449,7 @@ async fn tun_dns_split_and_tunneled_tcp_dns_end_to_end() {
             client: make_client_config(beam_addr),
             route: RoutePolicy {
                 reject_quic: true,
+                reject_ipv6: false,
                 drop_private_destinations: true,
                 exclude_ips: Vec::new(),
                 bypass_cidrs: Vec::new(),
@@ -524,6 +527,7 @@ async fn tun_ipv6_quic_reject_end_to_end() {
             client: make_client_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 1))),
             route: RoutePolicy {
                 reject_quic: true,
+                reject_ipv6: false,
                 drop_private_destinations: false,
                 exclude_ips: Vec::new(),
                 bypass_cidrs: Vec::new(),
@@ -623,6 +627,7 @@ async fn tun_tcp_recovers_after_network_reset() {
             client: make_client_config(beam_addr),
             route: RoutePolicy {
                 reject_quic: true,
+                reject_ipv6: false,
                 drop_private_destinations: false,
                 exclude_ips: Vec::new(),
                 bypass_cidrs: Vec::new(),
@@ -793,6 +798,7 @@ async fn tun_ipv6_tcp_and_udp_loopback_end_to_end() {
             client: make_client_config(beam_addr),
             route: RoutePolicy {
                 reject_quic: true,
+                reject_ipv6: false,
                 drop_private_destinations: false,
                 exclude_ips: Vec::new(),
                 bypass_cidrs: Vec::new(),

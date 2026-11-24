@@ -407,6 +407,44 @@ pub fn build_ip_udp_packet(
     }
 }
 
+/// Builds a TCP `RST` (or `RST|ACK`) reply for a rejected incoming IPv4 or IPv6
+/// TCP segment (RFC 793 §3.4). Returns `None` if the incoming segment already
+/// has `RST` set or is not a valid TCP packet.
+pub fn build_tcp_rst_for_packet(original: &IpPacketView<'_>) -> Option<Vec<u8>> {
+    if original.protocol != IP_PROTO_TCP {
+        return None;
+    }
+    let seg = parse_tcp(original.payload)?;
+    if (seg.flags & TCP_RST) != 0 {
+        return None;
+    }
+    let (seq, ack, flags) = if (seg.flags & TCP_ACK) != 0 {
+        (seg.ack, 0, TCP_RST)
+    } else {
+        let mut seg_len = seg.payload.len() as u32;
+        if (seg.flags & TCP_SYN) != 0 {
+            seg_len = seg_len.wrapping_add(1);
+        }
+        if (seg.flags & TCP_FIN) != 0 {
+            seg_len = seg_len.wrapping_add(1);
+        }
+        (0, seg.seq.wrapping_add(seg_len), TCP_RST | TCP_ACK)
+    };
+    build_ip_tcp_packet_slices(
+        original.dst_ip,
+        seg.dst_port,
+        original.src_ip,
+        seg.src_port,
+        seq,
+        ack,
+        flags,
+        0,
+        &[],
+        &[],
+        &[],
+    )
+}
+
 /// Builds an ICMPv4 (Type 3, Code 3) or ICMPv6 (Type 1, Code 4) Port
 /// Unreachable reply for `original`.
 pub fn build_icmp_port_unreachable(original: &IpPacketView<'_>) -> Option<Vec<u8>> {
@@ -548,5 +586,36 @@ mod tests {
         assert_eq!(reply_ip.protocol, IP_PROTO_ICMP);
         assert_eq!(reply_ip.payload[0], 3);
         assert_eq!(reply_ip.payload[1], 3);
+    }
+
+    #[test]
+    fn tcp_rst_for_ipv6_syn_sets_rst_ack_and_ignores_rst() {
+        let src6 = IpAddr::V6("fd00:be:a::1".parse().expect("v6"));
+        let dst6 = IpAddr::V6("2001:4860:4860::8888".parse().expect("v6"));
+        let syn = build_ip_tcp_packet_slices(
+            src6,
+            51234,
+            dst6,
+            443,
+            1000,
+            0,
+            TCP_SYN,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("syn");
+        let rst = build_tcp_rst_for_packet(&parse_ip(&syn).expect("ip")).expect("rst");
+        let rst_ip = parse_ip(&rst).expect("rst ip");
+        assert_eq!(rst_ip.src_ip, dst6);
+        assert_eq!(rst_ip.dst_ip, src6);
+        let seg = parse_tcp(rst_ip.payload).expect("rst tcp");
+        assert_eq!(seg.src_port, 443);
+        assert_eq!(seg.dst_port, 51234);
+        assert_eq!(seg.flags, TCP_RST | TCP_ACK);
+        assert_eq!(seg.ack, 1001);
+        // Never reply to an incoming RST.
+        assert!(build_tcp_rst_for_packet(&rst_ip).is_none());
     }
 }

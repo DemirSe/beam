@@ -188,6 +188,7 @@ async fn main() {
         client: make_client_config(beam_addr),
         route: RoutePolicy {
             reject_quic: true,
+            reject_ipv6: false,
             drop_private_destinations: false,
             exclude_ips: Vec::new(),
             bypass_cidrs: Vec::new(),

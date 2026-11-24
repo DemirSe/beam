@@ -181,6 +181,10 @@ pub struct DnsConfig {
     pub cache_size: usize,
     /// Per-query upstream timeout.
     pub query_timeout: Duration,
+    /// When `true`, immediately answer tunneled `AAAA` (IPv6) queries with an
+    /// empty `NOERROR` response so IPv4-only upstream servers never cause
+    /// dual-stack clients to stall or close on unreachable IPv6 destinations.
+    pub ipv4_only: bool,
     /// Optional extra trust anchors for DoH TLS verification (used in tests).
     pub custom_root_certs: Vec<CertificateDer<'static>>,
     /// Optional callback notified with resolved IPs for `bypass_domains`.
@@ -196,6 +200,7 @@ impl std::fmt::Debug for DnsConfig {
             .field("bypass_domains", &self.bypass_domains)
             .field("cache_size", &self.cache_size)
             .field("query_timeout", &self.query_timeout)
+            .field("ipv4_only", &self.ipv4_only)
             .field("custom_root_certs_len", &self.custom_root_certs.len())
             .finish()
     }
@@ -217,6 +222,7 @@ impl DnsConfig {
             bypass_domains: Vec::new(),
             cache_size: DEFAULT_CACHE_SIZE,
             query_timeout: DEFAULT_QUERY_TIMEOUT,
+            ipv4_only: false,
             custom_root_certs: Vec::new(),
             on_bypass_ips: None,
         }
@@ -420,11 +426,29 @@ pub fn build_servfail_response(query_wire: &[u8]) -> Option<Vec<u8>> {
     if question_end > query_wire.len() {
         return None;
     }
+    build_empty_dns_response(query_wire, question_end, 2)
+}
+
+/// Builds a minimal `NOERROR` (0 answers) response matching `query_wire`'s
+/// `tx_id` and question (used to suppress `AAAA` records in `ipv4_only` mode).
+pub fn build_empty_noerror_response(query_wire: &[u8]) -> Option<Vec<u8>> {
+    if query_wire.len() < 12 {
+        return None;
+    }
+    let (_, next_offset) = parse_dns_name(query_wire, 12)?;
+    let question_end = next_offset.checked_add(4)?;
+    if question_end > query_wire.len() {
+        return None;
+    }
+    build_empty_dns_response(query_wire, question_end, 0)
+}
+
+fn build_empty_dns_response(query_wire: &[u8], question_end: usize, rcode: u8) -> Option<Vec<u8>> {
     let mut resp = Vec::with_capacity(question_end);
     resp.extend_from_slice(&query_wire[..2]); // tx_id
     let rd = query_wire[2] & 0x01;
     resp.push(0x80 | rd); // QR=1, RD preserved
-    resp.push(0x82); // RA=1, RCODE=2 (SERVFAIL)
+    resp.push(0x80 | (rcode & 0x0f)); // RA=1, RCODE
     resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
     resp.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT=0
     resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
@@ -643,6 +667,19 @@ impl DnsInterceptor {
             if let Some(sf) = build_servfail_response(wire)
                 && let Some(pkt) =
                     build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &sf)
+            {
+                let _ = self.tun_tx.try_send(pkt);
+            }
+            return;
+        }
+
+        // In `ipv4_only` mode, immediately answer tunneled `AAAA` (type 28)
+        // queries with an empty `NOERROR` response so IPv4-only upstream
+        // servers never cause dual-stack apps to stall or fail on IPv6.
+        if self.dns_config.ipv4_only && !use_local && query.qtype == 28 {
+            if let Some(empty) = build_empty_noerror_response(wire)
+                && let Some(pkt) =
+                    build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &empty)
             {
                 let _ = self.tun_tx.try_send(pkt);
             }
@@ -1391,5 +1428,15 @@ mod tests {
             u16::from_be_bytes([udp2.payload[0], udp2.payload[1]]),
             0x7002
         );
+    }
+
+    #[test]
+    fn empty_noerror_response_for_aaaa_in_ipv4_only_mode() {
+        let q = build_query(0xabcd, "example.com", 28);
+        let resp = build_empty_noerror_response(&q).expect("noerror");
+        assert_eq!(&resp[0..2], &[0xab, 0xcd]);
+        assert_eq!(resp[2] & 0x80, 0x80); // QR=1
+        assert_eq!(resp[3] & 0x0f, 0); // RCODE=0 (NOERROR)
+        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0); // ANCOUNT=0
     }
 }
