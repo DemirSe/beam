@@ -73,7 +73,7 @@ const EDNS0_OPT_RR: [u8; 11] = [
 ];
 
 /// Upstream DNS transport used for tunneled queries.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DnsUpstream {
     /// DNS-over-HTTPS (`POST /path`, `application/dns-message`) over `beam`.
     Doh {
@@ -169,6 +169,23 @@ impl std::fmt::Display for DnsUpstream {
             Self::Doh { host, port, .. } => write!(f, "https://{host}:{port}"),
             Self::PlainTcp(addr) => write!(f, "tcp://{addr}"),
             Self::PlainUdp(addr) => write!(f, "udp://{addr}"),
+        }
+    }
+}
+
+impl std::fmt::Debug for DnsUpstream {
+    /// Mirrors [`std::fmt::Display`] redaction so `{:?}` logs can never leak a
+    /// DoH profile ID or token embedded in `path`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Doh { host, port, .. } => f
+                .debug_struct("Doh")
+                .field("host", host)
+                .field("port", port)
+                .field("path", &"<redacted>")
+                .finish(),
+            Self::PlainTcp(addr) => f.debug_tuple("PlainTcp").field(addr).finish(),
+            Self::PlainUdp(addr) => f.debug_tuple("PlainUdp").field(addr).finish(),
         }
     }
 }
@@ -1540,10 +1557,8 @@ async fn exchange_local_udp(
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local DNS recv timed out"))??;
         if n < 12 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "local DNS reply too short",
-            ));
+            clean = false;
+            continue;
         }
         if u16::from_be_bytes([buf[0], buf[1]]) == expected_tx_id {
             buf.truncate(n);
@@ -2347,10 +2362,12 @@ mod tests {
         let doh = DnsUpstream::parse("https://dns.nextdns.io/sekret-profile-id").expect("doh");
         assert_eq!(doh.to_string(), "https://dns.nextdns.io:443");
         assert!(!doh.to_string().contains("sekret-profile-id"));
+        assert!(!format!("{doh:?}").contains("sekret-profile-id"));
 
         let custom = DnsUpstream::parse("https://1.1.1.1:8443/SECRET/dns-query").expect("doh");
         assert_eq!(custom.to_string(), "https://1.1.1.1:8443");
         assert!(!custom.to_string().contains("SECRET"));
+        assert!(!format!("{custom:?}").contains("SECRET"));
 
         assert_eq!(
             DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53))

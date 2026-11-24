@@ -460,8 +460,8 @@ impl XudpSession {
     /// header in place.
     ///
     /// The caller should reserve [`FRAME_HEADER_RESERVE`] bytes of extra
-    /// capacity (see [`Self::alloc_payload`]); then no second allocation or
-    /// payload copy is needed compared with [`Self::send_to`].
+    /// capacity (see [`Self::alloc_payload`]); then no second allocation is
+    /// needed compared with [`Self::send_to`] (one in-buffer move).
     pub async fn send_owned(
         &mut self,
         destination: NetLocation,

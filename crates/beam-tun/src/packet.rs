@@ -123,7 +123,7 @@ pub fn is_fragment(packet: &[u8]) -> bool {
             }
             let mut next = packet[6];
             let mut offset = IPV6_HEADER_LEN;
-            for _ in 0..MAX_IPV6_EXT_HEADERS {
+            for _ in 0..=MAX_IPV6_EXT_HEADERS {
                 match next {
                     IPV6_NEXT_FRAGMENT => return true,
                     IPV6_NEXT_HOP_BY_HOP | IPV6_NEXT_ROUTING | IPV6_NEXT_DEST_OPTS => {

@@ -314,8 +314,8 @@ impl TunnelActivity {
     /// Returns the most recent [`DialFailure`] if it happened within `max_age`.
     pub fn recent_failure(&self, max_age: Duration) -> Option<DialFailure> {
         // Load the timestamp first with `Acquire`: the writer publishes stage and
-        // kind before its `Release` store, so a fresh timestamp can never be
-        // paired with a different failure's stage or kind.
+        // kind before its `Release` store, so a fresh timestamp is never paired
+        // with a stale stage or kind.
         let recorded = self.last_failure_ms_plus_one.load(Ordering::Acquire);
         if recorded == 0 {
             return None;
@@ -809,8 +809,9 @@ fn spawn_tcp_relay(
 /// [`C2S_COALESCE_TARGET`].
 ///
 /// Returns `false` and leaves `scratch` empty when `first` alone already fills
-/// a whole window, so a bulk upload keeps writing the caller's buffer without a
-/// copy. The bound is checked on the accumulated length, never on `first` alone.
+/// a whole window or no second chunk is queued, so single-chunk writes go out
+/// directly from the caller's buffer without an extra copy. The bound is
+/// checked on the accumulated length, never on `first` alone.
 fn coalesce_c2s<F>(first: &[u8], scratch: &mut Vec<u8>, mut next: F) -> bool
 where
     F: FnMut() -> Option<Vec<u8>>,
@@ -819,7 +820,11 @@ where
     if first.len() >= C2S_COALESCE_TARGET {
         return false;
     }
+    let Some(second) = next() else {
+        return false;
+    };
     scratch.extend_from_slice(first);
+    scratch.extend_from_slice(&second);
     while scratch.len() < C2S_COALESCE_TARGET {
         let Some(chunk) = next() else {
             break;
@@ -906,10 +911,10 @@ mod tests {
         assert!(!coalesced);
         assert!(scratch.is_empty());
 
-        // An empty queue leaves the first chunk alone.
+        // An empty queue leaves the first chunk alone without copying into `scratch`.
         let mut scratch = Vec::new();
-        assert!(coalesce_c2s(&first, &mut scratch, || None));
-        assert_eq!(scratch, first);
+        assert!(!coalesce_c2s(&first, &mut scratch, || None));
+        assert!(scratch.is_empty());
     }
 
     #[test]

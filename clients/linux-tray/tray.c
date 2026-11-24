@@ -84,7 +84,7 @@ static time_t g_cooldown_until;
  * repeating an unchanged label or icon would wake the toolkit and the
  * compositor for no visible change. Every comparison uses the same truncated
  * copy that is cached, so two long strings that differ only past the truncation
- * point are still detected.
+ * point are treated as equal instead of redrawing the menu every second.
  */
 static char g_last_status_label[96];
 static char g_last_action_label[24];

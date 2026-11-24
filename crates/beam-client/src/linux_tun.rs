@@ -382,16 +382,19 @@ impl LinuxRouteGuard {
     ///
     /// A failed exact-route lookup (`ip` missing, transient non-zero exit) is
     /// not treated as "route absent": the whole reconcile is skipped for this
-    /// cycle, so every route keeps its last-known state and a broken `ip` cannot
-    /// churn installs in a hot loop. `has_host_route` logs the rate-limited
-    /// warning that carries the signal.
+    /// Reconciles bypass routes for `new_gw` and `new_local_dns`.
+    ///
+    /// Returns `false` if pre-checking existing routes failed with an `ip`
+    /// execution error and the reconcile was skipped for this cycle, so callers
+    /// know not to clear their retry timer based on a stale `current_gw`.
+    /// `has_host_route` logs the rate-limited warning that carries the signal.
     pub fn update_bypass_gateway(
         &mut self,
         new_gw: &PhysicalGateways,
         new_local_dns: Option<IpAddr>,
-    ) {
+    ) -> bool {
         if !self.auto_route {
-            return;
+            return true;
         }
         let server_check = (!self.server_ip.is_loopback()).then(|| has_host_route(self.server_ip));
         let dns_check = new_local_dns
@@ -400,7 +403,7 @@ impl LinuxRouteGuard {
         let lookup_failed = server_check.as_ref().is_some_and(|c| c.error().is_some())
             || dns_check.as_ref().is_some_and(|c| c.error().is_some());
         if lookup_failed {
-            return;
+            return false;
         }
 
         for (prefix, maybe_gw, dev) in self.extra_bypass_v4.drain(..) {
@@ -536,6 +539,7 @@ impl LinuxRouteGuard {
         }
 
         self.persist_routes_state();
+        true
     }
 
     /// Dynamically installs a `/32` or `/128` bypass route for an IP resolved

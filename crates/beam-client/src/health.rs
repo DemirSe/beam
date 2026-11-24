@@ -239,8 +239,8 @@ pub fn spawn_network_monitor(
                             detect_system_local_dns_excluding(Some(tun_net)).map(|s| s.ip())
                         });
                         if let Ok(mut guard) = routes_upd.lock() {
-                            guard.update_bypass_gateway(&gw_clone, local_dns);
-                            guard.bypass_routes_installed()
+                            let reconciled = guard.update_bypass_gateway(&gw_clone, local_dns);
+                            reconciled && guard.bypass_routes_installed()
                         } else {
                             false
                         }
@@ -315,7 +315,7 @@ pub fn spawn_network_monitor(
                     } else {
                         is_connected = false;
                         probe_failed = true;
-                        if failure_streak >= DEGRADED_DIAL_FAILURE_STREAK
+                        if reason == "dial_failures"
                             && let Some(suppressed) = DEGRADED_LOG.allow()
                         {
                             let last = activity.recent_failure(degraded_window);
