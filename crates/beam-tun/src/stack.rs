@@ -5,7 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -81,6 +81,7 @@ pub struct TunTcpStream {
     to_stack: Option<mpsc::Sender<Vec<u8>>>,
     waker: Arc<Notify>,
     in_flight_relay: Option<Arc<AtomicUsize>>,
+    aborted: Option<Arc<AtomicBool>>,
 }
 
 /// Owned read half of a [`TunTcpStream`].
@@ -121,6 +122,7 @@ impl TunTcpReader {
 pub struct TunTcpWriter {
     to_stack: Option<mpsc::Sender<Vec<u8>>>,
     waker: Arc<Notify>,
+    aborted: Option<Arc<AtomicBool>>,
 }
 
 impl TunTcpWriter {
@@ -152,6 +154,15 @@ impl TunTcpWriter {
         self.to_stack.take();
         self.waker.notify_one();
     }
+
+    /// Aborts the write half, signaling the stack to emit TCP `RST` instead of `FIN`.
+    pub fn abort(&mut self) {
+        if let Some(flag) = self.aborted.as_ref() {
+            flag.store(true, Ordering::Release);
+        }
+        self.to_stack.take();
+        self.waker.notify_one();
+    }
 }
 
 impl Drop for TunTcpWriter {
@@ -162,12 +173,14 @@ impl Drop for TunTcpWriter {
 }
 
 impl TunTcpStream {
-    /// Constructs a [`TunTcpStream`] with optional atomic in-flight byte accounting.
+    /// Constructs a [`TunTcpStream`] with optional atomic in-flight byte accounting
+    /// and abort flag.
     pub(crate) fn new_with_accounting(
         from_stack: mpsc::Receiver<Vec<u8>>,
         to_stack: mpsc::Sender<Vec<u8>>,
         waker: Arc<Notify>,
         in_flight_relay: Option<Arc<AtomicUsize>>,
+        aborted: Option<Arc<AtomicBool>>,
     ) -> Self {
         Self {
             from_stack,
@@ -176,7 +189,17 @@ impl TunTcpStream {
             to_stack: Some(to_stack),
             waker,
             in_flight_relay,
+            aborted,
         }
+    }
+
+    /// Aborts the stream, signaling the stack to emit TCP `RST` instead of `FIN`.
+    pub fn abort(&mut self) {
+        if let Some(flag) = self.aborted.as_ref() {
+            flag.store(true, Ordering::Release);
+        }
+        self.to_stack.take();
+        self.waker.notify_one();
     }
 
     /// Splits this stream into spin-free chunked read and write halves.
@@ -186,13 +209,18 @@ impl TunTcpStream {
         let to_stack = self.to_stack.take();
         let waker = Arc::clone(&self.waker);
         let in_flight_relay = self.in_flight_relay.take();
+        let aborted = self.aborted.take();
         (
             TunTcpReader {
                 from_stack,
                 waker: Arc::clone(&waker),
                 in_flight_relay,
             },
-            TunTcpWriter { to_stack, waker },
+            TunTcpWriter {
+                to_stack,
+                waker,
+                aborted,
+            },
         )
     }
 }

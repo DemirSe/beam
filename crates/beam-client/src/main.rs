@@ -8,24 +8,28 @@ mod health;
 mod linux_tun;
 
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use beam_tun::{ProxyTcpStack, run_tun_engine};
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::ClientFileConfig;
 use crate::health::{DEFAULT_STATUS_PATH, spawn_network_monitor};
-use crate::linux_tun::{AsyncLinuxTun, LinuxRouteGuard};
+use crate::linux_tun::{
+    AsyncLinuxTun, DEFAULT_ROUTES_STATE_PATH, LinuxRouteGuard, cleanup_persisted_routes,
+};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/beam/client.toml";
 
 struct CliArgs {
     config_path: PathBuf,
     check_only: bool,
+    cleanup_routes: bool,
     show_version: bool,
 }
 
@@ -33,6 +37,7 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut args = std::env::args().skip(1);
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut check_only = false;
+    let mut cleanup_routes = false;
     let mut show_version = false;
 
     while let Some(arg) = args.next() {
@@ -44,13 +49,15 @@ fn parse_args() -> Result<CliArgs, String> {
                 config_path = PathBuf::from(value);
             }
             "--check" => check_only = true,
+            "--cleanup-routes" => cleanup_routes = true,
             "-V" | "--version" => show_version = true,
             "-h" | "--help" => {
                 println!(
-                    "Usage: beam-client [-c|--config PATH] [--check] [--version]\n\n\
+                    "Usage: beam-client [-c|--config PATH] [--check] [--cleanup-routes] [--version]\n\n\
                      Options:\n  \
                        -c, --config PATH  Path to client TOML config (default: {DEFAULT_CONFIG_PATH})\n  \
                        --check            Validate config and exit without opening TUN\n  \
+                       --cleanup-routes   Remove any orphaned bypass routes recorded in {DEFAULT_ROUTES_STATE_PATH}\n  \
                        -V, --version      Print version and exit"
                 );
                 std::process::exit(0);
@@ -62,6 +69,7 @@ fn parse_args() -> Result<CliArgs, String> {
     Ok(CliArgs {
         config_path,
         check_only,
+        cleanup_routes,
         show_version,
     })
 }
@@ -78,6 +86,16 @@ fn main() -> ExitCode {
     if cli.show_version {
         println!("beam-client {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
+    }
+
+    if cli.cleanup_routes {
+        return match cleanup_persisted_routes(Path::new(DEFAULT_ROUTES_STATE_PATH)) {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("route cleanup error ({DEFAULT_ROUTES_STATE_PATH}): {err}");
+                ExitCode::from(1)
+            }
+        };
     }
 
     let validated = match ClientFileConfig::load(&cli.config_path) {
@@ -162,7 +180,7 @@ async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std:
     let (network_reset_tx, network_reset_rx) = watch::channel(0u64);
     cfg.engine.network_reset = Some(network_reset_rx);
 
-    let monitor_handle = spawn_network_monitor(
+    let mut monitor_handle = spawn_network_monitor(
         actual_name.clone(),
         cfg.tun_net,
         cfg.engine.client.server_addr,
@@ -174,7 +192,8 @@ async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std:
         PathBuf::from(DEFAULT_STATUS_PATH),
     );
 
-    tokio::spawn(async move {
+    let signal_shutdown_tx = shutdown_tx.clone();
+    let signal_handle = tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
@@ -189,12 +208,20 @@ async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std:
             } => {}
         }
         info!("shutdown signal received");
-        let _ = shutdown_tx.send(true);
+        let _ = signal_shutdown_tx.send(true);
     });
 
     let stack = ProxyTcpStack::new(cfg.tcp_stack);
     let res = run_tun_engine(tun, stack, cfg.engine, shutdown_rx).await;
-    let _ = monitor_handle.await;
+    let _ = shutdown_tx.send(true);
+    signal_handle.abort();
+    if tokio::time::timeout(Duration::from_secs(5), &mut monitor_handle)
+        .await
+        .is_err()
+    {
+        monitor_handle.abort();
+        warn!("network monitor did not exit within 5s shutdown bound");
+    }
     res?;
     Ok(())
 }

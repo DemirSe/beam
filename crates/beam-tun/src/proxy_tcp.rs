@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::{Notify, mpsc};
 
@@ -87,6 +87,7 @@ struct TcpConn {
     to_relay: Option<mpsc::Sender<Vec<u8>>>,
     from_relay: Option<mpsc::Receiver<Vec<u8>>>,
     relay_eof: bool,
+    aborted: Arc<AtomicBool>,
 }
 
 impl TcpConn {
@@ -730,6 +731,21 @@ impl NetStack for ProxyTcpStack {
                 conn.on_segment(&seg, now_ms, tx_out);
             } else if (seg.flags & TCP_SYN) != 0 && (seg.flags & TCP_ACK) == 0 {
                 if self.conns.len() >= self.config.max_connections {
+                    if let Some(rst) = build_ip_tcp_packet_slices(
+                        ip.dst_ip,
+                        seg.dst_port,
+                        ip.src_ip,
+                        seg.src_port,
+                        0,
+                        seg.seq.wrapping_add(1),
+                        TCP_RST | TCP_ACK,
+                        0,
+                        &[],
+                        &[],
+                        &[],
+                    ) {
+                        tx_out.push(rst);
+                    }
                     continue;
                 }
                 let (peer_mss, peer_wscale) = parse_tcp_syn_options(seg.options);
@@ -791,6 +807,7 @@ impl NetStack for ProxyTcpStack {
                     to_relay: None,
                     from_relay: None,
                     relay_eof: false,
+                    aborted: Arc::new(AtomicBool::new(false)),
                 };
                 conn.send_syn_ack(now_ms, tx_out);
                 self.conns.insert(flow, conn);
@@ -835,8 +852,16 @@ impl NetStack for ProxyTcpStack {
                         from_relay_tx,
                         Arc::clone(&self.waker),
                         Some(Arc::clone(&conn.in_flight_relay)),
+                        Some(Arc::clone(&conn.aborted)),
                     ),
                 });
+            }
+
+            if conn.aborted.load(Ordering::Acquire) {
+                if conn.state != TcpState::Closed {
+                    conn.send_rst(conn.snd_nxt, tx_out);
+                }
+                return false;
             }
 
             conn.flush_rcv_to_relay();
@@ -1264,5 +1289,72 @@ mod tests {
             1,
             "zero-window must reopen even when our_wscale == 0"
         );
+    }
+
+    #[test]
+    fn syn_rejected_with_rst_ack_when_at_max_connections() {
+        let cfg = TcpStackConfig {
+            max_connections: 1,
+            ..TcpStackConfig::default()
+        };
+        let mut stack = ProxyTcpStack::new(cfg);
+        let (_srv_nxt, _acc) = handshake(&mut stack, 1000);
+        assert_eq!(stack.conns.len(), 1);
+
+        let syn_seq = 7777u32;
+        let second_src_port = SRC_PORT + 1;
+        let syn = build_ip_tcp_packet_slices(
+            SRC_IP,
+            second_src_port,
+            DST_IP,
+            DST_PORT,
+            syn_seq,
+            0,
+            TCP_SYN,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("build second syn");
+        stack.push_ip_tcp(&syn);
+
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+        stack.poll(30, &mut tx, &mut accepted);
+
+        assert!(accepted.is_empty());
+        assert_eq!(stack.conns.len(), 1);
+        assert_eq!(tx.len(), 1, "expected immediate RST|ACK for rejected SYN");
+        let ip = parse_ip(&tx[0]).expect("ip");
+        assert_eq!(ip.src_ip, DST_IP);
+        assert_eq!(ip.dst_ip, SRC_IP);
+        let rst = parse_tcp(ip.payload).expect("tcp");
+        assert_eq!(rst.src_port, DST_PORT);
+        assert_eq!(rst.dst_port, second_src_port);
+        assert_eq!(rst.flags, TCP_RST | TCP_ACK);
+        assert_eq!(rst.seq, 0);
+        assert_eq!(rst.ack, syn_seq.wrapping_add(1));
+    }
+
+    #[test]
+    fn abort_emits_rst_not_fin_and_removes_connection() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let (srv_nxt, mut acc) = handshake(&mut stack, 3000);
+        assert_eq!(stack.conns.len(), 1);
+
+        acc.stream.abort();
+
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+        stack.poll(30, &mut tx, &mut accepted);
+
+        assert!(stack.conns.is_empty(), "aborted connection must be removed");
+        assert_eq!(tx.len(), 1, "expected a single RST packet");
+        let rst = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_ne!(rst.flags & TCP_RST, 0, "expected TCP_RST flag");
+        assert_eq!(rst.flags & TCP_FIN, 0, "must not emit TCP_FIN on abort");
+        assert_eq!(rst.seq, srv_nxt);
+        assert_eq!(rst.ack, 3001);
     }
 }

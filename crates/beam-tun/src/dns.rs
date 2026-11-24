@@ -37,6 +37,9 @@ const NEGATIVE_CACHE_TTL_SECS: u32 = 15;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_DOH_POOL_SIZE: usize = 4;
 const DOH_POOL_IDLE_TTL: Duration = Duration::from_secs(30);
+const MAX_TCP_DNS_POOL_SIZE: usize = 4;
+const TCP_DNS_POOL_IDLE_TTL: Duration = Duration::from_secs(30);
+const DNS_XUDP_REPLY_QUEUE: usize = 8;
 const MAX_DNS_NAME_LEN: usize = 255;
 const MAX_DNS_LABELS: usize = 128;
 const MAX_POINTER_HOPS: usize = 16;
@@ -722,6 +725,164 @@ impl DohPool {
     }
 }
 
+struct PooledTcpDnsConn<S> {
+    stream: S,
+    last_used: Instant,
+}
+
+/// Passive, bounded keep-alive pool for RFC 1035 DNS-over-TCP connections.
+///
+/// Mirrors [`DohPool`]: zero background timers; expired entries are discarded
+/// passively on borrow/return or cleared immediately on network transitions.
+struct TcpDnsPool<S = BeamTcpStream> {
+    idle: Vec<PooledTcpDnsConn<S>>,
+    generation: u64,
+}
+
+impl<S> Default for TcpDnsPool<S> {
+    fn default() -> Self {
+        Self {
+            idle: Vec::new(),
+            generation: 0,
+        }
+    }
+}
+
+impl<S> TcpDnsPool<S> {
+    fn take(&mut self, now: Instant) -> (Option<S>, u64) {
+        let generation = self.generation;
+        while let Some(entry) = self.idle.pop() {
+            if now.saturating_duration_since(entry.last_used) < TCP_DNS_POOL_IDLE_TTL {
+                return (Some(entry.stream), generation);
+            }
+        }
+        (None, generation)
+    }
+
+    fn put(&mut self, stream: S, expected_gen: u64, now: Instant) {
+        if self.generation != expected_gen {
+            return;
+        }
+        self.idle
+            .retain(|entry| now.saturating_duration_since(entry.last_used) < TCP_DNS_POOL_IDLE_TTL);
+        if self.idle.len() < MAX_TCP_DNS_POOL_SIZE {
+            self.idle.push(PooledTcpDnsConn {
+                stream,
+                last_used: now,
+            });
+        }
+    }
+
+    fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.idle.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.idle.len()
+    }
+}
+
+trait MuxHealth {
+    fn is_open(&self) -> bool;
+}
+
+impl MuxHealth for XudpClient {
+    fn is_open(&self) -> bool {
+        XudpClient::is_open(self)
+    }
+}
+
+struct UdpDnsMuxSlot<C> {
+    mux: Option<Arc<C>>,
+    generation: u64,
+}
+
+/// Lazily-connected shared XUDP mux pool for `PlainUdp` DNS queries.
+///
+/// Concurrent queries reuse one open [`XudpClient`] mux; reconnects are
+/// serialized so a burst on a cold or stale mux performs at most one dial.
+/// [`Self::clear`] immediately drops any cached mux and bumps the generation
+/// so an in-flight dial from before a network transition is not cached.
+struct UdpDnsMuxPool<C = XudpClient> {
+    slot: Mutex<UdpDnsMuxSlot<C>>,
+    connect_lock: tokio::sync::Mutex<()>,
+}
+
+impl<C: MuxHealth> UdpDnsMuxPool<C> {
+    fn new() -> Self {
+        Self {
+            slot: Mutex::new(UdpDnsMuxSlot {
+                mux: None,
+                generation: 0,
+            }),
+            connect_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    async fn get_or_connect<F, Fut>(&self, connect: F) -> io::Result<(Arc<C>, bool)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = io::Result<C>>,
+    {
+        if let Ok(guard) = self.slot.lock()
+            && let Some(existing) = guard.mux.as_ref()
+            && existing.is_open()
+        {
+            return Ok((Arc::clone(existing), true));
+        }
+
+        let _connect_guard = self.connect_lock.lock().await;
+        let generation = {
+            let Ok(mut guard) = self.slot.lock() else {
+                return Err(io::Error::other("DNS XUDP mux slot poisoned"));
+            };
+            if let Some(existing) = guard.mux.as_ref() {
+                if existing.is_open() {
+                    return Ok((Arc::clone(existing), true));
+                }
+                guard.mux = None;
+            }
+            guard.generation
+        };
+
+        let fresh = Arc::new(connect().await?);
+        if let Ok(mut guard) = self.slot.lock()
+            && guard.generation == generation
+        {
+            guard.mux = Some(Arc::clone(&fresh));
+        }
+        Ok((fresh, false))
+    }
+
+    fn invalidate(&self, stale: &Arc<C>) {
+        if let Ok(mut guard) = self.slot.lock()
+            && guard
+                .mux
+                .as_ref()
+                .is_some_and(|cur| Arc::ptr_eq(cur, stale))
+        {
+            guard.mux = None;
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut guard) = self.slot.lock() {
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.mux = None;
+        }
+    }
+}
+
+fn dns_xudp_config() -> XudpClientConfig {
+    XudpClientConfig {
+        max_sessions: MAX_INFLIGHT_DNS_QUERIES,
+        outbound_queue: MAX_INFLIGHT_DNS_QUERIES * 2,
+        reply_queue: DNS_XUDP_REPLY_QUEUE,
+    }
+}
+
 /// Non-blocking DNS interceptor embedded in `beam-tun`'s engine loop.
 pub struct DnsInterceptor {
     client_config: BeamClientConfig,
@@ -729,6 +890,8 @@ pub struct DnsInterceptor {
     local_upstream: Arc<Mutex<Option<SocketAddr>>>,
     tls_config: Arc<ClientConfig>,
     doh_pool: Arc<Mutex<DohPool>>,
+    tcp_pool: Arc<Mutex<TcpDnsPool>>,
+    udp_mux_pool: Arc<UdpDnsMuxPool>,
     cache: Arc<Mutex<DnsCache>>,
     inflight: Arc<Semaphore>,
     tun_tx: mpsc::Sender<Vec<u8>>,
@@ -759,14 +922,16 @@ impl DnsInterceptor {
             local_upstream,
             tls_config,
             doh_pool: Arc::new(Mutex::new(DohPool::default())),
+            tcp_pool: Arc::new(Mutex::new(TcpDnsPool::default())),
+            udp_mux_pool: Arc::new(UdpDnsMuxPool::new()),
             cache,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_DNS_QUERIES)),
             tun_tx,
         }
     }
 
-    /// Clears local-only cache entries, drops pooled DoH connections, and
-    /// refreshes auto-detected local DNS upstream on network transitions.
+    /// Clears local-only cache entries, drops pooled DoH/TCP/UDP connections,
+    /// and refreshes auto-detected local DNS upstream on network transitions.
     pub fn on_network_change(&self) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear_local();
@@ -774,6 +939,10 @@ impl DnsInterceptor {
         if let Ok(mut pool) = self.doh_pool.lock() {
             pool.clear();
         }
+        if let Ok(mut pool) = self.tcp_pool.lock() {
+            pool.clear();
+        }
+        self.udp_mux_pool.clear();
         if let Some(refresher) = self.dns_config.refresh_local_upstream.as_ref() {
             let refreshed = refresher();
             if let Ok(mut guard) = self.local_upstream.lock() {
@@ -849,6 +1018,8 @@ impl DnsInterceptor {
         let dns_cfg = self.dns_config.clone();
         let tls_cfg = Arc::clone(&self.tls_config);
         let doh_pool = Arc::clone(&self.doh_pool);
+        let tcp_pool = Arc::clone(&self.tcp_pool);
+        let udp_mux_pool = Arc::clone(&self.udp_mux_pool);
         let cache = Arc::clone(&self.cache);
         let tun_tx = self.tun_tx.clone();
 
@@ -873,6 +1044,8 @@ impl DnsInterceptor {
                     &dns_cfg.upstream,
                     &tls_cfg,
                     &doh_pool,
+                    &tcp_pool,
+                    &udp_mux_pool,
                     &wire_owned,
                     dns_cfg.query_timeout,
                 )
@@ -952,11 +1125,14 @@ async fn resolve_local_udp(
     Ok(buf)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_tunneled(
     client_cfg: &BeamClientConfig,
     upstream: &DnsUpstream,
     tls_cfg: &Arc<ClientConfig>,
     doh_pool: &Arc<Mutex<DohPool>>,
+    tcp_pool: &Arc<Mutex<TcpDnsPool>>,
+    udp_mux_pool: &Arc<UdpDnsMuxPool>,
     query: &[u8],
     query_timeout: Duration,
 ) -> io::Result<Vec<u8>> {
@@ -965,29 +1141,22 @@ async fn resolve_tunneled(
             DnsUpstream::Doh { host, port, path } => {
                 resolve_doh_over_beam(client_cfg, tls_cfg, doh_pool, host, *port, path, query).await
             }
-            DnsUpstream::PlainTcp(addr) => resolve_tcp_over_beam(client_cfg, *addr, query).await,
-            DnsUpstream::PlainUdp(addr) => resolve_udp_over_beam(client_cfg, *addr, query).await,
+            DnsUpstream::PlainTcp(addr) => {
+                resolve_tcp_over_beam(client_cfg, tcp_pool, *addr, query).await
+            }
+            DnsUpstream::PlainUdp(addr) => {
+                resolve_udp_over_beam(client_cfg, udp_mux_pool, *addr, query).await
+            }
         }
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tunneled DNS query timed out"))?
 }
 
-async fn resolve_tcp_over_beam(
-    client_cfg: &BeamClientConfig,
-    addr: SocketAddr,
+async fn send_tcp_dns_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let dest = NetLocation {
-        address: match addr.ip() {
-            IpAddr::V4(ip) => Address::Ipv4(ip),
-            IpAddr::V6(ip) => Address::Ipv6(ip),
-        },
-        port: addr.port(),
-    };
-    let mut stream = dial_tcp(client_cfg, dest)
-        .await
-        .map_err(|e| io::Error::other(e.to_string()))?;
     let len_u16 = u16::try_from(query.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "DNS query too large"))?;
     stream.write_all(&len_u16.to_be_bytes()).await?;
@@ -1008,8 +1177,78 @@ async fn resolve_tcp_over_beam(
     Ok(resp)
 }
 
+async fn resolve_tcp_over_beam(
+    client_cfg: &BeamClientConfig,
+    tcp_pool: &Arc<Mutex<TcpDnsPool>>,
+    addr: SocketAddr,
+    query: &[u8],
+) -> io::Result<Vec<u8>> {
+    // Fast path: reuse an idle DNS-over-TCP connection (1 RTT).
+    let (pooled, pool_gen) = tcp_pool
+        .lock()
+        .ok()
+        .map(|mut pool| pool.take(Instant::now()))
+        .unwrap_or((None, 0));
+    if let Some(mut stream) = pooled {
+        match send_tcp_dns_request(&mut stream, query).await {
+            Ok(resp) => {
+                if let Ok(mut pool) = tcp_pool.lock() {
+                    pool.put(stream, pool_gen, Instant::now());
+                }
+                return Ok(resp);
+            }
+            Err(err) => {
+                debug!(error = %err, "pooled TCP DNS connection stale; retrying with fresh dial");
+            }
+        }
+    }
+
+    let dest = NetLocation {
+        address: match addr.ip() {
+            IpAddr::V4(ip) => Address::Ipv4(ip),
+            IpAddr::V6(ip) => Address::Ipv6(ip),
+        },
+        port: addr.port(),
+    };
+    let mut stream = dial_tcp(client_cfg, dest)
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let resp = send_tcp_dns_request(&mut stream, query).await?;
+    if let Ok(mut pool) = tcp_pool.lock() {
+        pool.put(stream, pool_gen, Instant::now());
+    }
+    Ok(resp)
+}
+
+async fn run_udp_dns_query(
+    mux: &XudpClient,
+    dest: NetLocation,
+    query: &[u8],
+) -> io::Result<Vec<u8>> {
+    let mut session = mux
+        .open_session(dest.clone())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    if let Err(err) = session.send_to(dest, query).await {
+        let _ = session.close().await;
+        return Err(io::Error::other(err.to_string()));
+    }
+    let reply = match session.recv().await {
+        Some(reply) => reply,
+        None => {
+            let _ = session.close().await;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "XUDP closed before DNS reply",
+            ));
+        }
+    };
+    let _ = session.close().await;
+    Ok(reply.payload)
+}
+
 async fn resolve_udp_over_beam(
     client_cfg: &BeamClientConfig,
+    udp_mux_pool: &Arc<UdpDnsMuxPool>,
     addr: SocketAddr,
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
@@ -1020,21 +1259,44 @@ async fn resolve_udp_over_beam(
         },
         port: addr.port(),
     };
-    let mux = XudpClient::connect(client_cfg, XudpClientConfig::default())
-        .await
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    let mut session = mux
-        .open_session(dest.clone())
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    session
-        .send_to(dest, query)
-        .await
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    let reply = session.recv().await.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::UnexpectedEof, "XUDP closed before DNS reply")
-    })?;
-    let _ = session.close().await;
-    Ok(reply.payload)
+
+    let (mux, reused) = udp_mux_pool
+        .get_or_connect(|| async {
+            XudpClient::connect(client_cfg, dns_xudp_config())
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))
+        })
+        .await?;
+
+    match run_udp_dns_query(&mux, dest.clone(), query).await {
+        Ok(payload) => Ok(payload),
+        Err(err) if reused => {
+            debug!(error = %err, "shared DNS XUDP mux stale; retrying with fresh mux");
+            udp_mux_pool.invalidate(&mux);
+            let (fresh_mux, _) = udp_mux_pool
+                .get_or_connect(|| async {
+                    XudpClient::connect(client_cfg, dns_xudp_config())
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                })
+                .await?;
+            match run_udp_dns_query(&fresh_mux, dest, query).await {
+                Ok(payload) => Ok(payload),
+                Err(retry_err) => {
+                    if !fresh_mux.is_open() {
+                        udp_mux_pool.invalidate(&fresh_mux);
+                    }
+                    Err(retry_err)
+                }
+            }
+        }
+        Err(err) => {
+            if !mux.is_open() {
+                udp_mux_pool.invalidate(&mux);
+            }
+            Err(err)
+        }
+    }
 }
 
 async fn send_doh_http_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
@@ -1707,5 +1969,213 @@ mod tests {
         assert!(reusable2);
 
         srv_task.await.expect("server done");
+    }
+
+    #[tokio::test]
+    async fn tcp_dns_pool_reuses_expires_bounds_and_clears() {
+        let t0 = Instant::now();
+        let mut pool: TcpDnsPool<u32> = TcpDnsPool::default();
+
+        // LIFO reuse within idle TTL.
+        let (_, g0) = pool.take(t0);
+        pool.put(1, g0, t0);
+        pool.put(2, g0, t0 + Duration::from_secs(1));
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.take(t0 + Duration::from_secs(5)).0, Some(2));
+        assert_eq!(pool.take(t0 + Duration::from_secs(5)).0, Some(1));
+        assert_eq!(pool.take(t0 + Duration::from_secs(5)).0, None);
+
+        // Idle expiry discards stale streams passively.
+        pool.put(10, g0, t0);
+        assert_eq!(pool.take(t0 + TCP_DNS_POOL_IDLE_TTL).0, None);
+
+        // Bounded to MAX_TCP_DNS_POOL_SIZE.
+        for i in 0..(MAX_TCP_DNS_POOL_SIZE as u32 + 3) {
+            pool.put(i, g0, t0);
+        }
+        assert_eq!(pool.len(), MAX_TCP_DNS_POOL_SIZE);
+
+        // Clear empties the pool and rejects stale-generation puts.
+        pool.clear();
+        assert_eq!(pool.len(), 0);
+        pool.put(99, g0, t0);
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.take(t0).0, None);
+
+        // Sequential RFC 1035 DNS-over-TCP queries reuse a single stream.
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        let q1 = build_query(0x3131, "tcp-one.example", 1);
+        let q2 = build_query(0x3232, "tcp-two.example", 1);
+        let r1 = build_a_response(&q1, Ipv4Addr::new(9, 9, 9, 9), 60);
+        let r2 = build_a_response(&q2, Ipv4Addr::new(8, 8, 4, 4), 60);
+        let r1_srv = r1.clone();
+        let r2_srv = r2.clone();
+
+        let srv = tokio::spawn(async move {
+            for resp in [&r1_srv, &r2_srv] {
+                let mut len_buf = [0u8; 2];
+                server.read_exact(&mut len_buf).await.expect("read len");
+                let qlen = usize::from(u16::from_be_bytes(len_buf));
+                let mut qbuf = vec![0u8; qlen];
+                server.read_exact(&mut qbuf).await.expect("read query");
+
+                let rlen = u16::try_from(resp.len()).expect("resp len");
+                server
+                    .write_all(&rlen.to_be_bytes())
+                    .await
+                    .expect("write rlen");
+                server.write_all(resp).await.expect("write resp");
+                server.flush().await.expect("flush");
+            }
+        });
+
+        assert_eq!(
+            send_tcp_dns_request(&mut client, &q1).await.expect("q1"),
+            r1
+        );
+        assert_eq!(
+            send_tcp_dns_request(&mut client, &q2).await.expect("q2"),
+            r2
+        );
+        srv.await.expect("srv");
+    }
+
+    #[tokio::test]
+    async fn plain_udp_shared_mux_reuses_invalidates_and_resets() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct FakeMux {
+            id: usize,
+            open: AtomicBool,
+        }
+
+        impl MuxHealth for FakeMux {
+            fn is_open(&self) -> bool {
+                self.open.load(Ordering::Acquire)
+            }
+        }
+
+        let pool = Arc::new(UdpDnsMuxPool::<FakeMux>::new());
+        let dials = Arc::new(AtomicUsize::new(0));
+
+        // Initial connect dials once and caches.
+        let dials1 = Arc::clone(&dials);
+        let (m1, reused1) = pool
+            .get_or_connect(|| async move {
+                let id = dials1.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(FakeMux {
+                    id,
+                    open: AtomicBool::new(true),
+                })
+            })
+            .await
+            .expect("first connect");
+        assert_eq!(m1.id, 1);
+        assert!(!reused1);
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+
+        // Concurrent queries reuse the same open mux without re-dialing.
+        let (m1_a, reused_a) = pool
+            .get_or_connect(|| async {
+                dials.fetch_add(1, Ordering::SeqCst);
+                Ok(FakeMux {
+                    id: 99,
+                    open: AtomicBool::new(true),
+                })
+            })
+            .await
+            .expect("reused connect");
+        assert!(reused_a);
+        assert!(Arc::ptr_eq(&m1, &m1_a));
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+
+        // Stale mux invalidation triggers one fresh dial; re-invalidating the
+        // old handle does NOT evict the new mux.
+        pool.invalidate(&m1);
+        let dials2 = Arc::clone(&dials);
+        let (m2, reused2) = pool
+            .get_or_connect(|| async move {
+                let id = dials2.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(FakeMux {
+                    id,
+                    open: AtomicBool::new(true),
+                })
+            })
+            .await
+            .expect("reconnect after invalidate");
+        assert_eq!(m2.id, 2);
+        assert!(!reused2);
+        pool.invalidate(&m1); // stale handle must not evict m2
+        let (m2_again, reused2_again) = pool
+            .get_or_connect(|| async {
+                dials.fetch_add(1, Ordering::SeqCst);
+                Ok(FakeMux {
+                    id: 99,
+                    open: AtomicBool::new(true),
+                })
+            })
+            .await
+            .expect("still m2");
+        assert!(reused2_again);
+        assert!(Arc::ptr_eq(&m2, &m2_again));
+
+        // Closed mux triggers automatic reconnect.
+        m2.open.store(false, Ordering::Release);
+        let dials3 = Arc::clone(&dials);
+        let (m3, reused3) = pool
+            .get_or_connect(|| async move {
+                let id = dials3.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(FakeMux {
+                    id,
+                    open: AtomicBool::new(true),
+                })
+            })
+            .await
+            .expect("reconnect after close");
+        assert_eq!(m3.id, 3);
+        assert!(!reused3);
+
+        // `clear()` (called on network change) drops the cached mux AND
+        // prevents an in-flight dial from an older generation from repopulating.
+        pool.clear();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let pool_bg = Arc::clone(&pool);
+        let entered_bg = Arc::clone(&entered);
+        let proceed_bg = Arc::clone(&proceed);
+        let dials_bg = Arc::clone(&dials);
+        let inflight = tokio::spawn(async move {
+            pool_bg
+                .get_or_connect(|| async move {
+                    entered_bg.notify_one();
+                    proceed_bg.notified().await;
+                    let id = dials_bg.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(FakeMux {
+                        id,
+                        open: AtomicBool::new(true),
+                    })
+                })
+                .await
+        });
+        entered.notified().await;
+        pool.clear(); // network changed mid-dial
+        proceed.notify_one();
+        let (stale_fresh, _) = inflight.await.expect("join").expect("old dial ok");
+        assert_eq!(stale_fresh.id, 4);
+
+        // Next caller must dial again because the generation changed mid-dial.
+        let dials5 = Arc::clone(&dials);
+        let (m5, reused5) = pool
+            .get_or_connect(|| async move {
+                let id = dials5.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(FakeMux {
+                    id,
+                    open: AtomicBool::new(true),
+                })
+            })
+            .await
+            .expect("post-clear dial");
+        assert_eq!(m5.id, 5);
+        assert!(!reused5);
     }
 }

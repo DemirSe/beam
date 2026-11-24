@@ -9,6 +9,7 @@ StartLimitBurst=10
 Type=simple
 ExecStartPre=/usr/local/bin/beam-client --check -c /etc/beam/client.toml
 ExecStart=/usr/local/bin/beam-client -c /etc/beam/client.toml
+ExecStopPost=/usr/local/bin/beam-client --cleanup-routes
 # On desktop hosts running ctrld with /etc/systemd/resolved.conf.d/10-controld.conf,
 # uncomment the two lines below (`+` runs beam-helper as root outside the sandbox):
 # ExecStartPost=+/usr/local/libexec/beam-helper ctrld-off

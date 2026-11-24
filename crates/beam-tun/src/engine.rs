@@ -84,6 +84,7 @@ where
     let mut recv_buf = vec![0u8; device.mtu().clamp(2048, MAX_PACKET_BUF)];
     let mut tx_batch: Vec<Vec<u8>> = Vec::with_capacity(64);
     let mut accepted: Vec<AcceptedTcpStream> = Vec::with_capacity(16);
+    let mut next_udp_sweep_at: Option<Instant> = None;
 
     info!(
         mtu = device.mtu(),
@@ -125,7 +126,18 @@ where
         }
 
         let tcp_delay = stack.poll_delay_ms(start.elapsed().as_millis() as i64);
-        let udp_delay = udp_bridge.next_sweep_delay_ms();
+        let udp_delay = match udp_bridge.next_sweep_delay_ms() {
+            Some(interval_ms) => {
+                let now = Instant::now();
+                let deadline = *next_udp_sweep_at
+                    .get_or_insert_with(|| now + Duration::from_millis(interval_ms));
+                Some(deadline.saturating_duration_since(now).as_millis() as u64)
+            }
+            None => {
+                next_udp_sweep_at = None;
+                None
+            }
+        };
         let next_timer_ms = match (tcp_delay, udp_delay) {
             (Some(a), Some(b)) => Some(a.min(b).max(1)),
             (Some(a), None) | (None, Some(a)) => Some(a.max(1)),
@@ -220,7 +232,10 @@ where
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                udp_bridge.sweep_idle();
+                if next_udp_sweep_at.is_some_and(|deadline| Instant::now() >= deadline) {
+                    udp_bridge.sweep_idle();
+                    next_udp_sweep_at = None;
+                }
             }
         }
     }
@@ -230,13 +245,14 @@ where
 }
 
 fn spawn_tcp_relay(
-    conn: AcceptedTcpStream,
+    mut conn: AcceptedTcpStream,
     client_config: BeamClientConfig,
     permits: Arc<Semaphore>,
     mut network_reset: Option<watch::Receiver<u64>>,
 ) {
     let Ok(permit) = permits.try_acquire_owned() else {
-        debug!(dst = %conn.dst, "TCP connection limit reached; dropping");
+        debug!(dst = %conn.dst, "TCP connection limit reached; aborting with RST");
+        conn.stream.abort();
         return;
     };
 
@@ -258,12 +274,14 @@ fn spawn_tcp_relay(
                     None => std::future::pending().await,
                 }
             } => {
+                conn.stream.abort();
                 return;
             }
             res = dial_tcp(&client_config, dest) => match res {
                 Ok(stream) => stream,
                 Err(err) => {
                     debug!(dst = %conn.dst, error = %err, "dial_tcp failed");
+                    conn.stream.abort();
                     return;
                 }
             }

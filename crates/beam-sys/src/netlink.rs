@@ -10,6 +10,17 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 const MAX_DRAIN_MESSAGES: usize = 64;
 const DRAIN_BUF_BYTES: usize = 8192;
 
+/// Outcome of a bounded, non-blocking drain of queued netlink notifications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetlinkDrain {
+    /// `true` if at least one notification (or `ENOBUFS`) was received.
+    pub saw_event: bool,
+    /// `true` if the socket reached `EAGAIN`/`WouldBlock` (queue empty),
+    /// `false` if the drain hit `MAX_DRAIN_MESSAGES` with more notifications
+    /// potentially still pending.
+    pub exhausted: bool,
+}
+
 /// Non-blocking Linux `NETLINK_ROUTE` socket subscribed to IPv4/IPv6 route and
 /// link multicast notifications.
 pub struct NetlinkRouteWatcher {
@@ -59,14 +70,13 @@ impl NetlinkRouteWatcher {
         Ok(Self { fd })
     }
 
-    /// Drains all currently queued netlink notifications without blocking.
-    ///
-    /// Returns `Ok(true)` if at least one notification was received (or if the
-    /// kernel reported `ENOBUFS`, meaning events occurred and the caller should
-    /// reconcile), or `Ok(false)` if no events were pending.
-    pub fn drain_events(&self) -> io::Result<bool> {
+    /// Drains currently queued netlink notifications without blocking,
+    /// reporting both whether any event was observed and whether the kernel
+    /// socket queue was drained to `EAGAIN`/`WouldBlock`.
+    pub fn drain_events_status(&self) -> io::Result<NetlinkDrain> {
         let mut buf = [0u8; DRAIN_BUF_BYTES];
         let mut saw_event = false;
+        let mut exhausted = false;
 
         for _ in 0..MAX_DRAIN_MESSAGES {
             // SAFETY: `buf` is a valid writable buffer of length `buf.len()`,
@@ -84,23 +94,40 @@ impl NetlinkRouteWatcher {
                 continue;
             }
             if n == 0 {
+                exhausted = true;
                 break;
             }
             let err = io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => break,
-                // Kernel dropped netlink messages due to burst; treat as an
-                // event so the caller reconciles routing state.
-                Some(libc::ENOBUFS) => {
-                    saw_event = true;
-                    break;
-                }
-                _ => return Err(err),
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
+            if err.kind() == io::ErrorKind::WouldBlock {
+                exhausted = true;
+                break;
+            }
+            // Kernel dropped netlink messages due to burst; treat as an
+            // event so the caller reconciles routing state, and keep draining
+            // any remaining buffered notifications within the loop bound.
+            if err.raw_os_error() == Some(libc::ENOBUFS) {
+                saw_event = true;
+                continue;
+            }
+            return Err(err);
         }
 
-        Ok(saw_event)
+        Ok(NetlinkDrain {
+            saw_event,
+            exhausted,
+        })
+    }
+
+    /// Drains all currently queued netlink notifications without blocking.
+    ///
+    /// Returns `Ok(true)` if at least one notification was received (or if the
+    /// kernel reported `ENOBUFS`, meaning events occurred and the caller should
+    /// reconcile), or `Ok(false)` if no events were pending.
+    pub fn drain_events(&self) -> io::Result<bool> {
+        Ok(self.drain_events_status()?.saw_event)
     }
 }
 

@@ -155,7 +155,6 @@ impl UdpNatBridge {
             return;
         }
         self.poll_connect();
-        self.sweep_idle();
 
         let now_ms = self.now_ms();
         if let Some(entry) = self.sessions.get_mut(&src) {
@@ -170,8 +169,11 @@ impl UdpNatBridge {
         }
 
         if self.sessions.len() >= self.bridge_config.max_sessions {
-            debug!(%src, "UDP NAT session table full; dropping datagram");
-            return;
+            self.sweep_idle();
+            if self.sessions.len() >= self.bridge_config.max_sessions {
+                debug!(%src, "UDP NAT session table full; dropping datagram");
+                return;
+            }
         }
 
         let mux = match self.mux.as_ref() {
@@ -344,5 +346,136 @@ fn socket_to_netloc(addr: SocketAddr) -> NetLocation {
     NetLocation {
         address,
         port: addr.port(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn dummy_client_config() -> BeamClientConfig {
+        let reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            reality,
+            [2u8; 16],
+        )
+    }
+
+    fn insert_fake_entry(
+        bridge: &mut UdpNatBridge,
+        src: SocketAddr,
+        last_active_ms: u64,
+    ) -> mpsc::Receiver<(SocketAddr, Vec<u8>)> {
+        let (tx, rx) = mpsc::channel(PER_SESSION_SEND_QUEUE);
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        bridge.sessions.insert(
+            src,
+            NatEntry {
+                tx,
+                last_active_ms: Arc::new(AtomicU64::new(last_active_ms)),
+                task,
+            },
+        );
+        rx
+    }
+
+    #[tokio::test]
+    async fn next_sweep_delay_ms_none_when_idle_and_clamped_when_active() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let waker = Arc::new(Notify::new());
+
+        for (idle_ms, expected_ms) in [(200, 1_000), (5_000, 5_000), (60_000, 10_000)] {
+            let mut bridge = UdpNatBridge::new(
+                dummy_client_config(),
+                UdpBridgeConfig {
+                    max_sessions: 4,
+                    idle_timeout: Duration::from_millis(idle_ms),
+                },
+                tun_tx.clone(),
+                Arc::clone(&waker),
+            );
+            assert_eq!(bridge.next_sweep_delay_ms(), None);
+
+            let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 40_000);
+            let now_ms = bridge.now_ms();
+            let _rx = insert_fake_entry(&mut bridge, src, now_ms);
+            assert_eq!(bridge.next_sweep_delay_ms(), Some(expected_ms));
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_datagram_skips_sweep_on_fast_path_and_sweeps_lazily_at_capacity() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let waker = Arc::new(Notify::new());
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig {
+                max_sessions: 2,
+                idle_timeout: Duration::from_millis(20),
+            },
+            tun_tx,
+            waker,
+        );
+
+        let src_active = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_001);
+        let src_expired = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_002);
+        let src_new = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_003);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+
+        // Ensure `now_ms()` exceeds `idle_timeout` so `last_active_ms = 0` is expired.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let now_ms = bridge.now_ms();
+        let mut rx_active = insert_fake_entry(&mut bridge, src_active, now_ms);
+        let _rx_expired = insert_fake_entry(&mut bridge, src_expired, 0);
+        assert_eq!(bridge.sessions.len(), 2);
+
+        // Steady-state packet for an existing session stays O(1) and does NOT sweep.
+        bridge.handle_datagram(src_active, dst, b"ping");
+        let (got_dst, got_payload) = rx_active.try_recv().expect("forwarded to existing session");
+        assert_eq!(got_dst, dst);
+        assert_eq!(got_payload, b"ping");
+        assert_eq!(
+            bridge.sessions.len(),
+            2,
+            "fast path must not run O(N) sweep_idle on every datagram"
+        );
+
+        // New source at capacity triggers lazy sweep, reclaiming `src_expired`
+        // and allowing the new datagram past the capacity gate.
+        bridge.handle_datagram(src_new, dst, b"new-flow");
+        assert_eq!(
+            bridge.sessions.len(),
+            1,
+            "lazy sweep at capacity must reclaim expired entry"
+        );
+        assert!(bridge.sessions.contains_key(&src_active));
+        assert!(!bridge.sessions.contains_key(&src_expired));
+        assert_eq!(
+            bridge.pending_initial.len(),
+            1,
+            "new datagram should be queued after reclaiming expired slot"
+        );
+
+        // When all slots are genuinely active (non-expired), a new source is dropped.
+        let src_active2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_004);
+        let src_dropped = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_005);
+        let active2_ms = bridge.now_ms();
+        let _rx_active2 = insert_fake_entry(&mut bridge, src_active2, active2_ms);
+        bridge.pending_initial.clear();
+        bridge.handle_datagram(src_dropped, dst, b"overflow");
+        assert_eq!(bridge.sessions.len(), 2);
+        assert!(
+            bridge.pending_initial.is_empty(),
+            "datagram must be dropped when table remains full after lazy sweep"
+        );
     }
 }

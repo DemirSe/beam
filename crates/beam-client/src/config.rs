@@ -13,6 +13,19 @@ use beam_tun::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+const TCP_STACK_BUFFER_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const MIN_TCP_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_TCP_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// Derives per-direction TCP socket buffer size from `max_tcp_connections`
+/// against a 256 MiB aggregate TCP stack budget, clamped to `64 KiB..=4 MiB`,
+/// keeping memory safely under systemd's `MemoryHigh=384M` / `MemoryMax=512M`.
+fn derive_tcp_socket_buffer_bytes(max_tcp_connections: usize) -> usize {
+    let directions = max_tcp_connections.max(1).saturating_mul(2);
+    (TCP_STACK_BUFFER_BUDGET_BYTES / directions)
+        .clamp(MIN_TCP_SOCKET_BUFFER_BYTES, MAX_TCP_SOCKET_BUFFER_BYTES)
+}
+
 /// Top-level `beam-client` TOML configuration.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -393,7 +406,7 @@ impl ClientFileConfig {
         let tcp_stack = TcpStackConfig {
             mtu: self.tun.mtu,
             max_connections: self.limits.max_tcp_connections,
-            ..TcpStackConfig::default()
+            socket_buffer_bytes: derive_tcp_socket_buffer_bytes(self.limits.max_tcp_connections),
         };
 
         Ok(ValidatedConfig {
@@ -604,6 +617,36 @@ mod tests {
         assert_eq!(
             derive_tun_peer_ipv4("172.19.0.2/30"),
             Some(Ipv4Addr::new(172, 19, 0, 1))
+        );
+    }
+
+    #[test]
+    fn tcp_socket_buffer_budget_stays_bounded_across_connection_limits() {
+        // Default 256 connections -> 512 KiB/dir -> 256 MiB aggregate.
+        let default_cfg = ClientFileConfig::parse_and_validate(EXAMPLE).expect("example config");
+        assert_eq!(default_cfg.tcp_stack.max_connections, 256);
+        assert_eq!(default_cfg.tcp_stack.socket_buffer_bytes, 512 * 1024);
+        assert_eq!(
+            2 * default_cfg.tcp_stack.max_connections * default_cfg.tcp_stack.socket_buffer_bytes,
+            256 * 1024 * 1024
+        );
+
+        // Small (16 connections) -> capped at 4 MiB/dir -> 128 MiB aggregate.
+        let small = EXAMPLE.replace("max_tcp_connections = 256", "max_tcp_connections = 16");
+        let small_cfg = ClientFileConfig::parse_and_validate(&small).expect("small config");
+        assert_eq!(small_cfg.tcp_stack.socket_buffer_bytes, 4 * 1024 * 1024);
+        assert_eq!(
+            2 * small_cfg.tcp_stack.max_connections * small_cfg.tcp_stack.socket_buffer_bytes,
+            128 * 1024 * 1024
+        );
+
+        // Max (4096 connections) -> clamped at 64 KiB/dir -> 512 MiB aggregate.
+        let max = EXAMPLE.replace("max_tcp_connections = 256", "max_tcp_connections = 4096");
+        let max_cfg = ClientFileConfig::parse_and_validate(&max).expect("max config");
+        assert_eq!(max_cfg.tcp_stack.socket_buffer_bytes, 64 * 1024);
+        assert!(
+            2 * max_cfg.tcp_stack.max_connections * max_cfg.tcp_stack.socket_buffer_bytes
+                <= 512 * 1024 * 1024
         );
     }
 }

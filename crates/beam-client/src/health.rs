@@ -1,6 +1,7 @@
 //! Always-on network transition detector, sleep/resume watcher, bounded-backoff
 //! server reachability probe, and atomic status file publisher for `linux-tray`.
 
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use beam_sys::NetlinkRouteWatcher;
 use beam_tun::IpNet;
-use tokio::io::unix::AsyncFd;
+use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
@@ -22,6 +23,7 @@ pub const DEFAULT_STATUS_PATH: &str = "/run/beam-client/status";
 
 const FALLBACK_POLL_TICK: Duration = Duration::from_secs(2);
 const SLEEP_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const ROUTE_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const NETLINK_COALESCE_DELAY: Duration = Duration::from_millis(150);
 const SLEEP_JUMP_THRESHOLD_SECS: u64 = 5;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -120,9 +122,12 @@ pub fn spawn_network_monitor(
         let mut last_mono = Instant::now();
         let mut last_wall = SystemTime::now();
         let mut next_probe_at = Instant::now();
+        let mut next_route_check_at = Instant::now() + ROUTE_HEALTH_CHECK_INTERVAL;
+        let mut next_route_retry_at: Option<Instant> = None;
+        let mut route_retry_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
         let mut offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
         let mut generation: u64 = 0;
-        let mut check_routes_now = false;
+        let mut check_routes_now = true;
 
         loop {
             if *shutdown.borrow() {
@@ -136,7 +141,9 @@ pub fn spawn_network_monitor(
             last_wall = now_wall;
 
             // Only fork `ip` to inspect gateways/bypass routes when:
-            // - netlink reported a route/link change,
+            // - initial startup or netlink reported a route/link change,
+            // - a previous bypass route install failed and its backoff expired,
+            // - the slow periodic route-health tick elapsed,
             // - the host woke from suspend,
             // - we are currently missing a gateway for the server, or
             // - netlink is unavailable (fallback polling mode).
@@ -144,12 +151,19 @@ pub fn spawn_network_monitor(
                 IpAddr::V4(_) => last_gw.v4.is_some(),
                 IpAddr::V6(_) => last_gw.v6.is_some(),
             };
+            let route_retry_due = next_route_retry_at.is_some_and(|t| now_mono >= t);
+            let route_periodic_due = now_mono >= next_route_check_at;
             let should_check_routes = auto_route
                 && (check_routes_now
                     || slept_from_suspend
+                    || route_retry_due
+                    || route_periodic_due
                     || netlink.is_none()
                     || !server_currently_has_gw);
             check_routes_now = false;
+            if route_periodic_due {
+                next_route_check_at = now_mono + ROUTE_HEALTH_CHECK_INTERVAL;
+            }
 
             let (current_gw, bypass_missing) = if should_check_routes {
                 let name = ifname.clone();
@@ -161,7 +175,7 @@ pub fn spawn_network_monitor(
                 let missing = tokio::task::spawn_blocking(move || {
                     routes_chk
                         .lock()
-                        .map(|g| !g.server_bypass_installed())
+                        .map(|g| !g.bypass_routes_installed())
                         .unwrap_or(false)
                 })
                 .await
@@ -176,8 +190,9 @@ pub fn spawn_network_monitor(
                 IpAddr::V4(_) => current_gw.v4.is_some(),
                 IpAddr::V6(_) => current_gw.v6.is_some(),
             };
+            let any_gw = current_gw.v4.is_some() || current_gw.v6.is_some();
 
-            if gw_changed || slept_from_suspend || (bypass_missing && server_has_gw) {
+            if gw_changed || slept_from_suspend || (bypass_missing && any_gw) {
                 info!(
                     gw_changed,
                     slept_from_suspend,
@@ -195,15 +210,29 @@ pub fn spawn_network_monitor(
                         });
                         if let Ok(mut guard) = routes_upd.lock() {
                             guard.update_bypass_gateway(&gw_clone, local_dns);
-                            guard.server_bypass_installed()
+                            guard.bypass_routes_installed()
                         } else {
                             false
                         }
                     })
                     .await
                     .unwrap_or(false);
-                    if installed || !server_has_gw {
-                        last_gw = current_gw.clone();
+                    // Advance `last_gw` once we have reconciled for `current_gw` so
+                    // `gw_changed` / `network_reset_tx` fires once per actual gateway
+                    // transition; incomplete bypass routes are still retried via
+                    // `next_route_retry_at`.
+                    last_gw = current_gw.clone();
+                    if installed || !any_gw {
+                        next_route_retry_at = None;
+                        route_retry_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
+                    } else {
+                        warn!(
+                            backoff_secs = route_retry_backoff_secs,
+                            "bypass routes incomplete after reconcile; scheduling retry"
+                        );
+                        next_route_retry_at =
+                            Some(Instant::now() + Duration::from_secs(route_retry_backoff_secs));
+                        route_retry_backoff_secs = next_offline_backoff(route_retry_backoff_secs);
                     }
                 }
                 if gw_changed || slept_from_suspend {
@@ -212,6 +241,9 @@ pub fn spawn_network_monitor(
                 }
                 offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
                 next_probe_at = Instant::now();
+            } else if should_check_routes && !bypass_missing {
+                next_route_retry_at = None;
+                route_retry_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
             }
 
             if Instant::now() >= next_probe_at {
@@ -248,13 +280,22 @@ pub fn spawn_network_monitor(
             }
 
             let wait_dur = {
-                let until_probe = next_probe_at.saturating_duration_since(Instant::now());
+                let now = Instant::now();
+                let until_probe = next_probe_at.saturating_duration_since(now);
+                let until_route_check = next_route_check_at.saturating_duration_since(now);
+                let until_route_retry = next_route_retry_at
+                    .map(|t| t.saturating_duration_since(now))
+                    .unwrap_or(Duration::MAX);
                 let max_sleep = if netlink.is_some() {
                     SLEEP_CHECK_INTERVAL
                 } else {
                     FALLBACK_POLL_TICK
                 };
-                until_probe.min(max_sleep).max(Duration::from_millis(50))
+                until_probe
+                    .min(until_route_check)
+                    .min(until_route_retry)
+                    .min(max_sleep)
+                    .max(Duration::from_millis(50))
             };
 
             tokio::select! {
@@ -272,22 +313,24 @@ pub fn spawn_network_monitor(
                 } => {
                     match nl_res {
                         Ok(mut guard) => {
-                            let saw = match guard.try_io(|inner| inner.get_ref().drain_events()) {
-                                Ok(Ok(saw)) => saw,
-                                Ok(Err(err)) => {
+                            match drain_netlink_guard(&mut guard) {
+                                Ok(true) => {
+                                    // Coalesce bursts of DHCP/NetworkManager route updates.
+                                    sleep(NETLINK_COALESCE_DELAY).await;
+                                    if let Ok(status) = guard.get_inner().drain_events_status()
+                                        && status.exhausted
+                                    {
+                                        guard.clear_ready();
+                                    }
+                                    check_routes_now = true;
+                                }
+                                Ok(false) => {}
+                                Err(err) => {
+                                    drop(guard);
                                     warn!(error = %err, "netlink watcher error; falling back to polling");
                                     netlink = None;
-                                    true
+                                    check_routes_now = true;
                                 }
-                                Err(_would_block) => false,
-                            };
-                            if saw {
-                                // Coalesce bursts of DHCP/NetworkManager route updates.
-                                sleep(NETLINK_COALESCE_DELAY).await;
-                                if let Some(fd) = netlink.as_ref() {
-                                    let _ = fd.get_ref().drain_events();
-                                }
-                                check_routes_now = true;
                             }
                         }
                         Err(err) => {
@@ -301,6 +344,17 @@ pub fn spawn_network_monitor(
             }
         }
     })
+}
+
+/// Drains queued netlink notifications and clears Tokio edge-triggered
+/// readiness whenever the socket reaches `EAGAIN`/`WouldBlock`, preventing a
+/// 100% CPU spin loop on an empty netlink queue.
+fn drain_netlink_guard(guard: &mut AsyncFdReadyGuard<'_, NetlinkRouteWatcher>) -> io::Result<bool> {
+    let status = guard.get_inner().drain_events_status()?;
+    if status.exhausted {
+        guard.clear_ready();
+    }
+    Ok(status.saw_event)
 }
 
 async fn probe_server_rtt(server_addr: SocketAddr) -> Option<u64> {
@@ -404,5 +458,25 @@ mod tests {
         assert!(text.contains("ts="));
         assert!(text.contains("pid="));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn netlink_async_fd_clears_readiness_after_drain() {
+        let watcher = NetlinkRouteWatcher::open().expect("open netlink route watcher");
+        #[allow(deprecated)]
+        let fd = AsyncFd::new(watcher).expect("register netlink AsyncFd");
+
+        // `AsyncFd::new` starts optimistically ready; draining an empty queue
+        // must clear readiness so `readable().await` blocks instead of spinning.
+        for _ in 0..4 {
+            match timeout(Duration::from_millis(50), fd.readable()).await {
+                Ok(Ok(mut guard)) => {
+                    let _ = drain_netlink_guard(&mut guard).expect("drain netlink");
+                }
+                Ok(Err(err)) => panic!("netlink readable failed: {err}"),
+                Err(_elapsed) => return,
+            }
+        }
+        panic!("AsyncFd<NetlinkRouteWatcher> remained permanently ready after draining");
     }
 }
