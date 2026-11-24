@@ -381,17 +381,24 @@ impl LinuxRouteGuard {
 
 impl Drop for LinuxRouteGuard {
     fn drop(&mut self) {
-        if self.installed_v4_low {
-            let _ = run_ip(&["route", "del", "0.0.0.0/1", "dev", &self.ifname]);
-        }
-        if self.installed_v4_high {
-            let _ = run_ip(&["route", "del", "128.0.0.0/1", "dev", &self.ifname]);
-        }
-        if self.installed_v6_low {
-            let _ = run_ip(&["-6", "route", "del", "::/1", "dev", &self.ifname]);
-        }
-        if self.installed_v6_high {
-            let _ = run_ip(&["-6", "route", "del", "8000::/1", "dev", &self.ifname]);
+        // When `AsyncLinuxTun` already closed the TUN fd before this guard
+        // drops, the kernel atomically purges all routes bound to `self.ifname`.
+        // Skip `dev <ifname>` deletions when the interface is gone so shutdown
+        // emits zero spurious `Cannot find device` errors or extra forks.
+        let iface_exists = Path::new("/sys/class/net").join(&self.ifname).exists();
+        if iface_exists {
+            if self.installed_v4_low {
+                let _ = run_ip(&["route", "del", "0.0.0.0/1", "dev", &self.ifname]);
+            }
+            if self.installed_v4_high {
+                let _ = run_ip(&["route", "del", "128.0.0.0/1", "dev", &self.ifname]);
+            }
+            if self.installed_v6_low {
+                let _ = run_ip(&["-6", "route", "del", "::/1", "dev", &self.ifname]);
+            }
+            if self.installed_v6_high {
+                let _ = run_ip(&["-6", "route", "del", "8000::/1", "dev", &self.ifname]);
+            }
         }
         for (cidr_entry, maybe_gw, dev) in &self.extra_bypass_v4 {
             let _ = remove_v4_bypass(cidr_entry, maybe_gw.as_deref(), dev);
@@ -483,14 +490,25 @@ fn ip_binary() -> &'static str {
 }
 
 fn run_ip(args: &[&str]) -> io::Result<()> {
-    let status = Command::new(ip_binary()).args(args).status()?;
-    if status.success() {
+    let output = Command::new(ip_binary()).args(args).output()?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!(
-            "`ip {}` exited with {status}",
-            args.join(" ")
-        )))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            Err(io::Error::other(format!(
+                "`ip {}` exited with {}",
+                args.join(" "),
+                output.status
+            )))
+        } else {
+            Err(io::Error::other(format!(
+                "`ip {}` exited with {}: {detail}",
+                args.join(" "),
+                output.status
+            )))
+        }
     }
 }
 

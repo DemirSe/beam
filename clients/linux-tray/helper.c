@@ -475,9 +475,11 @@ static int switch_dns_on(void)
 
 static int reload_resolved(void)
 {
+    /* Use --no-block so ExecStopPost never deadlocks waiting on a systemd
+     * transaction while beam-client.service itself is stopping. */
     char *const argv[] = {
         SYSTEMCTL, "--no-pager", "--no-ask-password", "--quiet",
-        "reload", "systemd-resolved", NULL
+        "--no-block", "reload", "systemd-resolved", NULL
     };
     return run(argv);
 }
@@ -539,6 +541,31 @@ static int dns_off(void)
     return rc == 0 ? 0 : 1;
 }
 
+/* Native beam-client configures per-link DNS on beamtun0 via resolvectl, so
+ * it only needs ctrld's global drop-in moved aside (without writing a
+ * competing global 99-beam.conf ~. scope). */
+static int ctrld_off(void)
+{
+    int lock = state_lock();
+    int rc = 0;
+
+    if (lock < 0)
+        return 1;
+    if (access(CTRL_DROPIN, F_OK) == 0 && access(CTRL_SAVED, F_OK) != 0) {
+        if (rename(CTRL_DROPIN, CTRL_SAVED) != 0) {
+            log_errno("could not move", CTRL_DROPIN);
+            rc = -1;
+        } else if (reload_resolved() != 0) {
+            syslog(LOG_ERR, "could not reload systemd-resolved after moving ctrld drop-in");
+            (void)restore_dns();
+            (void)reload_resolved();
+            rc = -1;
+        }
+    }
+    close(lock);
+    return rc == 0 ? 0 : 1;
+}
+
 static int do_up(void)
 {
     char *const argv[] = {
@@ -571,7 +598,8 @@ int main(int argc, char **argv)
     command = argv[1];
     if (strcmp(command, "dns-on") == 0 ||
         strcmp(command, "dns-off") == 0 ||
-        strcmp(command, "restore-dns") == 0) {
+        strcmp(command, "restore-dns") == 0 ||
+        strcmp(command, "ctrld-off") == 0) {
         if (getuid() != 0)
             return 1;
     } else if (strcmp(command, "up") != 0 && strcmp(command, "down") != 0) {
@@ -590,5 +618,7 @@ int main(int argc, char **argv)
         return dns_off();
     if (strcmp(command, "restore-dns") == 0)
         return dns_off();
+    if (strcmp(command, "ctrld-off") == 0)
+        return ctrld_off();
     return 1;
 }
