@@ -19,7 +19,7 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{Semaphore, mpsc};
-use tokio::time::timeout;
+use tokio::time::{Instant as TokioInstant, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
@@ -52,6 +52,8 @@ const MAX_TCP_DNS_POOL_SIZE: usize = 4;
 const TCP_DNS_POOL_IDLE_TTL: Duration = Duration::from_secs(30);
 const MAX_LOCAL_UDP_POOL_SIZE: usize = 4;
 const LOCAL_UDP_POOL_IDLE_TTL: Duration = Duration::from_secs(30);
+/// Stale replies discarded while waiting for the reply to the current query.
+const MAX_LOCAL_UDP_STALE_REPLIES: usize = 8;
 const DNS_XUDP_REPLY_QUEUE: usize = 8;
 const MAX_DNS_NAME_LEN: usize = 255;
 const MAX_DNS_LABELS: usize = 128;
@@ -160,9 +162,11 @@ impl DnsUpstream {
 }
 
 impl std::fmt::Display for DnsUpstream {
+    /// Renders the upstream without the DoH path: profile IDs and tokens live in
+    /// that path, and this string reaches startup logs and `--check` stdout.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Doh { host, port, path } => write!(f, "https://{host}:{port}{path}"),
+            Self::Doh { host, port, .. } => write!(f, "https://{host}:{port}"),
             Self::PlainTcp(addr) => write!(f, "tcp://{addr}"),
             Self::PlainUdp(addr) => write!(f, "udp://{addr}"),
         }
@@ -1468,10 +1472,15 @@ fn send_udp_reply(
     let patch = tx_id.map(|id| (0usize, id.to_be_bytes()));
     let pkt =
         build_ip_udp_packet_patched(dst.ip(), dst.port(), src.ip(), src.port(), payload, patch);
-    if let Some(pkt) = pkt
-        && tun_tx.try_send(pkt).is_err()
-    {
-        counters.tun_tx_dropped.incr();
+    match pkt {
+        Some(pkt) => {
+            if tun_tx.try_send(pkt).is_err() {
+                counters.tun_tx_dropped.incr();
+            }
+        }
+        // A payload the packet builder cannot frame is dropped like a full
+        // channel so the loss shows up in diagnostics instead of silently.
+        None => counters.tun_tx_dropped.incr(),
     }
 }
 
@@ -1498,41 +1507,54 @@ async fn resolve_local_udp(
 
     // Any timeout, I/O error, or `tx_id` mismatch drops the socket instead of
     // returning it, so a late reply can never be delivered to a later query.
-    let result = exchange_local_udp(&sock, query, expected_tx_id, query_timeout).await;
-    if result.is_ok() {
-        pool.put(sock, local_upstream, generation, Instant::now());
+    match exchange_local_udp(&sock, query, expected_tx_id, query_timeout).await {
+        Ok((reply, clean)) => {
+            if clean {
+                pool.put(sock, local_upstream, generation, Instant::now());
+            }
+            Ok(reply)
+        }
+        Err(err) => Err(err),
     }
-    result
 }
 
+/// Exchanges one query on `sock`, dropping stale replies that belong to an
+/// earlier query served by the same pooled socket.
+///
+/// Returns the reply and whether the exchange was clean (no stale reply and no
+/// discarded datagram), so only a clean socket goes back to the pool.
 async fn exchange_local_udp(
     sock: &UdpSocket,
     query: &[u8],
     expected_tx_id: u16,
     query_timeout: Duration,
-) -> io::Result<Vec<u8>> {
-    timeout(query_timeout, sock.send(query))
+) -> io::Result<(Vec<u8>, bool)> {
+    let deadline = TokioInstant::now() + query_timeout;
+    timeout_at(deadline, sock.send(query))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local DNS send timed out"))??;
     let mut buf = vec![0u8; MAX_LOCAL_UDP_RECV_BYTES];
-    let n = timeout(query_timeout, sock.recv(&mut buf))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local DNS recv timed out"))??;
-    if n < 12 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "local DNS reply too short",
-        ));
+    let mut clean = true;
+    for _ in 0..=MAX_LOCAL_UDP_STALE_REPLIES {
+        let n = timeout_at(deadline, sock.recv(&mut buf))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local DNS recv timed out"))??;
+        if n < 12 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local DNS reply too short",
+            ));
+        }
+        if u16::from_be_bytes([buf[0], buf[1]]) == expected_tx_id {
+            buf.truncate(n);
+            return Ok((buf, clean));
+        }
+        clean = false;
     }
-    let reply_tx_id = u16::from_be_bytes([buf[0], buf[1]]);
-    if reply_tx_id != expected_tx_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "local DNS reply tx_id mismatch",
-        ));
-    }
-    buf.truncate(n);
-    Ok(buf)
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "local DNS reply tx_id mismatch",
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2318,6 +2340,30 @@ mod tests {
         assert!(DnsUpstream::parse("udp://1.1.1.1:0").is_err());
     }
 
+    #[test]
+    fn dns_upstream_display_omits_the_doh_path() {
+        // Profile IDs and tokens live in the DoH path, and this string reaches
+        // startup logs and `--check` stdout.
+        let doh = DnsUpstream::parse("https://dns.nextdns.io/sekret-profile-id").expect("doh");
+        assert_eq!(doh.to_string(), "https://dns.nextdns.io:443");
+        assert!(!doh.to_string().contains("sekret-profile-id"));
+
+        let custom = DnsUpstream::parse("https://1.1.1.1:8443/SECRET/dns-query").expect("doh");
+        assert_eq!(custom.to_string(), "https://1.1.1.1:8443");
+        assert!(!custom.to_string().contains("SECRET"));
+
+        assert_eq!(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53))
+                .to_string(),
+            "tcp://1.1.1.1:53"
+        );
+        assert_eq!(
+            DnsUpstream::PlainUdp(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5353))
+                .to_string(),
+            "udp://[::1]:5353"
+        );
+    }
+
     #[tokio::test]
     async fn doh_http_response_handles_ipv6_host_incremental_chunked_and_te_precedence() {
         assert_eq!(
@@ -2691,6 +2737,117 @@ mod tests {
         );
         assert_eq!(pool.len(), 0, "mismatched replies must not poison the pool");
         server.await.expect("server done");
+    }
+
+    #[tokio::test]
+    async fn local_udp_pool_evicts_idle_sockets_and_stays_bounded() {
+        let pool = LocalUdpPool::default();
+        let key = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53);
+
+        // The pool is capped: extra sockets are dropped instead of queued.
+        for _ in 0..(MAX_LOCAL_UDP_POOL_SIZE + 2) {
+            let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind");
+            pool.put(sock, key, 0, Instant::now());
+        }
+        assert_eq!(pool.len(), MAX_LOCAL_UDP_POOL_SIZE);
+
+        // A socket past the idle TTL is evicted on the next borrow, never handed out.
+        {
+            let mut state = pool.state.lock().expect("pool state");
+            let stale = Instant::now()
+                .checked_sub(LOCAL_UDP_POOL_IDLE_TTL + Duration::from_secs(1))
+                .expect("monotonic clock");
+            for entry in state.idle.iter_mut() {
+                entry.last_used = stale;
+            }
+        }
+        let (taken, _) = pool.take(key, Instant::now());
+        assert!(taken.is_none(), "an expired socket must not be reused");
+        assert_eq!(pool.len(), 0);
+
+        // A fresh entry is handed out exactly once.
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        pool.put(sock, key, 0, Instant::now());
+        assert!(pool.take(key, Instant::now()).0.is_some());
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_local_udp_reply_is_discarded_and_never_repooled() {
+        let local_dns = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let local_addr = local_dns.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = local_dns.recv_from(&mut buf).await.expect("recv");
+            // A late duplicate from an earlier query on the same socket.
+            let stale = build_a_response(
+                &build_query(0x7001, "nas.lan", 1),
+                Ipv4Addr::new(1, 1, 1, 1),
+                60,
+            );
+            local_dns.send_to(&stale, peer).await.expect("send stale");
+            let resp = build_a_response(&buf[..n], Ipv4Addr::new(192, 168, 1, 9), 60);
+            local_dns.send_to(&resp, peer).await.expect("send valid");
+        });
+
+        let pool = LocalUdpPool::default();
+        let query = build_query(0x7002, "nas.lan", 1);
+        let reply = resolve_local_udp(&pool, local_addr, &query, 0x7002, Duration::from_secs(2))
+            .await
+            .expect("the stale reply must be skipped, not failed on");
+        assert_eq!(u16::from_be_bytes([reply[0], reply[1]]), 0x7002);
+        assert_eq!(
+            pool.len(),
+            0,
+            "a socket that saw a stale reply must not return to the pool"
+        );
+        server.await.expect("server done");
+
+        // The discard loop is bounded: a flood of stale replies still fails.
+        let local_dns = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let local_addr = local_dns.local_addr().expect("addr");
+        let flood = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_n, peer) = local_dns.recv_from(&mut buf).await.expect("recv");
+            let stale = build_a_response(
+                &build_query(0x7003, "nas.lan", 1),
+                Ipv4Addr::new(1, 1, 1, 1),
+                60,
+            );
+            for _ in 0..=MAX_LOCAL_UDP_STALE_REPLIES {
+                local_dns.send_to(&stale, peer).await.expect("send stale");
+            }
+        });
+        let pool = LocalUdpPool::default();
+        assert!(
+            resolve_local_udp(&pool, local_addr, &query, 0x7002, Duration::from_secs(2))
+                .await
+                .is_err(),
+            "a stale-reply flood must give up instead of looping forever"
+        );
+        flood.await.expect("flood done");
+    }
+
+    #[tokio::test]
+    async fn unframeable_dns_reply_counts_as_a_tun_tx_drop() {
+        let (tun_tx, mut tun_rx) = mpsc::channel(4);
+        let counters = DnsCounters::default();
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 55_010);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+
+        // Larger than a UDP datagram can carry: building the packet returns None.
+        send_udp_reply(&tun_tx, &counters, src, dst, &vec![0u8; 70_000], None);
+
+        assert_eq!(counters.tun_tx_dropped.get(), 1);
+        assert!(tun_rx.try_recv().is_err());
     }
 
     #[test]

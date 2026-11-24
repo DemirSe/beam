@@ -34,7 +34,7 @@ fn build_query(tx_id: u16, name: &str) -> Vec<u8> {
     out
 }
 
-fn build_a_response(query: &[u8], ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
+fn build_a_response(query: &[u8], ip: Ipv4Addr, ttl: u32, target_len: usize) -> Vec<u8> {
     let mut out = query.to_vec();
     out[2] = 0x81;
     out[3] = 0x80;
@@ -46,13 +46,40 @@ fn build_a_response(query: &[u8], ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
     out.extend_from_slice(&ttl.to_be_bytes());
     out.extend_from_slice(&4u16.to_be_bytes());
     out.extend_from_slice(&ip.octets());
+    pad_with_edns0(&mut out, target_len);
     out
+}
+
+/// Pads `response` to `target_len` with an RFC 7830 EDNS0 padding option, the
+/// shape a real 512-byte upstream answer has.
+fn pad_with_edns0(response: &mut Vec<u8>, target_len: usize) {
+    // Fixed OPT pseudo-RR (root name, TYPE 41, class, TTL, RDLEN) plus the
+    // 4-byte padding option header.
+    const OPT_OVERHEAD: usize = 11 + 4;
+    if response.len() + OPT_OVERHEAD >= target_len {
+        return;
+    }
+    let padding = target_len - response.len() - OPT_OVERHEAD;
+    response[10..12].copy_from_slice(&1u16.to_be_bytes()); // ARCOUNT = 1
+    response.extend_from_slice(&[0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00]);
+    response.extend_from_slice(&u16::try_from(4 + padding).expect("opt rdlen").to_be_bytes());
+    response.extend_from_slice(&[0x00, 0x0c]); // option code: padding
+    response.extend_from_slice(&u16::try_from(padding).expect("padding len").to_be_bytes());
+    response.resize(response.len() + padding, 0);
 }
 
 fn main() {
     let name = "cache-hit.benchmark.example.test";
     let query_wire = build_query(0x4242, name);
-    let response = build_a_response(&query_wire, Ipv4Addr::new(203, 0, 113, 5), 300);
+    // A realistic full-size upstream answer (512 B, EDNS padding, one A record).
+    const RESPONSE_LEN: usize = 512;
+    let response = build_a_response(
+        &query_wire,
+        Ipv4Addr::new(203, 0, 113, 5),
+        300,
+        RESPONSE_LEN,
+    );
+    assert_eq!(response.len(), RESPONSE_LEN);
     let parsed = parse_dns_query(&query_wire).expect("query");
     let response_len = response.len();
 

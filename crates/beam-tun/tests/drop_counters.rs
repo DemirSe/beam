@@ -141,6 +141,105 @@ async fn engine_counts_parse_fragment_and_route_drops() {
 }
 
 #[tokio::test]
+async fn tcp_connection_limit_drops_are_counted_separately_from_route_drops() {
+    // A listening socket with no `accept` keeps the first relay's upstream dial
+    // blocked in its TLS handshake, so its connection permit stays taken.
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener");
+    let server_addr = listener.local_addr().expect("listener addr");
+
+    let (engine_tun, mut host_tun) = MemoryTun::pair(1500, 64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let activity = Arc::new(TunnelActivity::new());
+    let mut config = engine_config();
+    config.max_tcp_connections = 1;
+    config.client = BeamClientConfig::new(
+        server_addr,
+        RealityClientConfig::new([1u8; 32], "0123456789abcdef", "whatsapp.net").expect("reality"),
+        [2u8; 16],
+    );
+    let engine_task = tokio::spawn(run_tun_engine_with_activity(
+        engine_tun,
+        ProxyTcpStack::new(TcpStackConfig::default()),
+        config,
+        shutdown_rx,
+        Some(Arc::clone(&activity)),
+    ));
+
+    // First flow takes the only permit and blocks on the upstream handshake.
+    open_tcp_flow(&mut host_tun, 41_001, 1_001).await;
+    // Give the relay task time to take the permit before the second flow.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let deadline = Duration::from_secs(5);
+
+    // Second flow is accepted by the local stack but cannot get a permit.
+    open_tcp_flow(&mut host_tun, 41_002, 2_001).await;
+    let snapshot = timeout(deadline, async {
+        loop {
+            let snap = activity.drop_snapshot();
+            if snap.tcp_limit >= 1 {
+                break snap;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("connection-limit drops must be counted");
+
+    assert!(snapshot.tcp_limit >= 1);
+    assert_eq!(
+        snapshot.route, 0,
+        "a connection-limit drop must not be counted as a route drop"
+    );
+
+    let _ = shutdown_tx.send(true);
+    engine_task.await.expect("engine task").expect("engine ok");
+    drop(listener);
+}
+
+/// Runs a full handshake (SYN, SYN-ACK, ACK) for one flow through the engine.
+async fn open_tcp_flow(host_tun: &mut MemoryTun, src_port: u16, iss: u32) {
+    let src = IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+    let segment = |seq: u32, ack: u32, flags: u8| {
+        beam_tun::packet::build_ip_tcp_packet_slices(
+            src,
+            src_port,
+            dst,
+            443,
+            seq,
+            ack,
+            flags,
+            65_535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("tcp segment")
+    };
+
+    host_tun_send(host_tun, &segment(iss, 0, beam_tun::packet::TCP_SYN)).await;
+
+    let mut buf = vec![0u8; 2048];
+    let n = timeout(Duration::from_secs(2), host_tun.recv(&mut buf))
+        .await
+        .expect("syn-ack timeout")
+        .expect("syn-ack");
+    let ip = beam_tun::packet::parse_ip(&buf[..n]).expect("syn-ack ip");
+    let syn_ack = beam_tun::packet::parse_tcp(ip.payload).expect("syn-ack tcp");
+    assert_ne!(syn_ack.flags & beam_tun::packet::TCP_SYN, 0);
+
+    host_tun_send(
+        host_tun,
+        &segment(
+            iss.wrapping_add(1),
+            syn_ack.seq.wrapping_add(1),
+            beam_tun::packet::TCP_ACK,
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn activity_reports_dial_failures_by_stage() {
     let activity = TunnelActivity::new();
     assert_eq!(activity.dial_failure_count(), 0);

@@ -581,7 +581,9 @@ impl TcpConn {
             match rx.try_recv() {
                 Ok(chunk) => {
                     self.last_activity_ms = now_ms;
-                    self.tx_buf.extend(chunk.as_slice().iter().copied());
+                    // `tx_buf` is a `VecDeque`, so this is the bulk slice form
+                    // (`extend_from_slice` exists only on `Vec`).
+                    self.tx_buf.extend(chunk.as_slice());
                     // Recycle the relay buffer so steady-state downloads stop
                     // allocating one chunk allocation per read (#168).
                     pool.put(chunk);

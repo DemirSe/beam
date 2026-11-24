@@ -80,8 +80,14 @@ impl BypassCidrs {
         let mut v6: Vec<(u128, u128)> = Vec::new();
         for net in nets {
             match *net {
-                IpNet::V4 { net, mask } => v4.push((net, net | !mask)),
-                IpNet::V6 { net, mask } => v6.push((net, net | !mask)),
+                IpNet::V4 { net, mask } => {
+                    let net = net & mask;
+                    v4.push((net, net | !mask));
+                }
+                IpNet::V6 { net, mask } => {
+                    let net = net & mask;
+                    v6.push((net, net | !mask));
+                }
             }
         }
         Self {
@@ -591,6 +597,40 @@ mod tests {
             assert_eq!(index.contains(ip), expected, "mismatch for {ip}");
         }
 
+        // A zero prefix matches every address of its family.
+        assert!(
+            IpNet::parse_cidr("0.0.0.0/0")
+                .expect("v4 /0")
+                .contains(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)))
+        );
+        assert!(
+            !IpNet::parse_cidr("0.0.0.0/0")
+                .expect("v4 /0")
+                .contains(IpAddr::V6("2001:db8::1".parse().expect("v6")))
+        );
+        let default_v4 = BypassCidrs::new(&[IpNet::parse_cidr("0.0.0.0/0").expect("v4 /0")]);
+        assert!(default_v4.contains(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255))));
+        assert!(default_v4.contains(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        let default_v6 = BypassCidrs::new(&[IpNet::parse_cidr("::/0").expect("v6 /0")]);
+        assert!(default_v6.contains(IpAddr::V6(Ipv6Addr::from([0xff; 16]))));
+        assert!(!default_v6.contains(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+
+        // A raw (unmasked) network value is normalized at construction time.
+        let unmasked = BypassCidrs::new(&[
+            IpNet::V4 {
+                net: u32::from(Ipv4Addr::new(10, 1, 2, 3)),
+                mask: 0xffff_0000,
+            },
+            IpNet::V6 {
+                net: u128::from("2001:db8:1234::5".parse::<Ipv6Addr>().expect("v6")),
+                mask: u128::MAX << 96,
+            },
+        ]);
+        assert!(unmasked.contains(IpAddr::V4(Ipv4Addr::new(10, 1, 200, 200))));
+        assert!(!unmasked.contains(IpAddr::V4(Ipv4Addr::new(10, 2, 0, 1))));
+        assert!(unmasked.contains(IpAddr::V6("2001:db8:ffff::1".parse().expect("v6"))));
+        assert!(!unmasked.contains(IpAddr::V6("2001:db9::1".parse().expect("v6"))));
+
         // The empty index is the hot-path fast case.
         let empty = BypassCidrs::default();
         assert!(empty.is_empty());
@@ -623,6 +663,30 @@ mod tests {
             }
         }
         assert!(ExcludeIps::default().is_empty());
+    }
+
+    #[test]
+    fn exclude_ips_switches_to_a_hash_set_above_eight_entries() {
+        let entries: Vec<IpAddr> = (1..=9)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(198, 18, 0, i)))
+            .collect();
+
+        // Eight entries stay on the inline scan; the ninth switches to hashing.
+        let inline = ExcludeIps::new(&entries[..8]);
+        assert!(
+            inline.set.is_none(),
+            "eight entries must use the inline scan"
+        );
+        assert!(inline.contains(entries[7]));
+        assert!(!inline.contains(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 9))));
+
+        let hashed = ExcludeIps::new(&entries);
+        assert!(hashed.set.is_some(), "nine entries must use the hash set");
+        for ip in &entries {
+            assert!(hashed.contains(*ip), "{ip} must be excluded");
+        }
+        assert!(!hashed.contains(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 10))));
+        assert_eq!(hashed.len(), 9);
     }
 
     #[test]

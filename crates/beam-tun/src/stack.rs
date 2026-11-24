@@ -238,7 +238,12 @@ impl TunTcpWriter {
     pub async fn send_chunk_pooled(&mut self, data: &[u8]) -> io::Result<()> {
         let mut buf = match self.pool.take() {
             Some(buf) if buf.capacity() >= data.len() => buf,
-            _ => Vec::with_capacity(data.len()),
+            Some(undersized) => {
+                // Keep the small buffer for a later read instead of dropping it.
+                self.pool.put(undersized);
+                Vec::with_capacity(data.len())
+            }
+            None => Vec::with_capacity(data.len()),
         };
         buf.clear();
         buf.extend_from_slice(data);

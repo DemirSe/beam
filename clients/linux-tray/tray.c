@@ -82,7 +82,9 @@ static time_t g_cooldown_until;
 /*
  * Last values pushed to GTK/AppIndicator. The poll runs every second, so
  * repeating an unchanged label or icon would wake the toolkit and the
- * compositor for no visible change.
+ * compositor for no visible change. Every comparison uses the same truncated
+ * copy that is cached, so two long strings that differ only past the truncation
+ * point are still detected.
  */
 static char g_last_status_label[96];
 static char g_last_action_label[24];
@@ -92,18 +94,24 @@ static char g_last_desc[64];
 
 static void set_status_label(const char *label)
 {
-    if (strcmp(g_last_status_label, label) == 0)
+    char buf[sizeof(g_last_status_label)];
+
+    snprintf(buf, sizeof(buf), "%s", label);
+    if (strcmp(g_last_status_label, buf) == 0)
         return;
-    snprintf(g_last_status_label, sizeof(g_last_status_label), "%s", label);
-    gtk_menu_item_set_label(g_status_item, label);
+    memcpy(g_last_status_label, buf, sizeof(buf));
+    gtk_menu_item_set_label(g_status_item, buf);
 }
 
 static void set_action_label(const char *label)
 {
-    if (strcmp(g_last_action_label, label) == 0)
+    char buf[sizeof(g_last_action_label)];
+
+    snprintf(buf, sizeof(buf), "%s", label);
+    if (strcmp(g_last_action_label, buf) == 0)
         return;
-    snprintf(g_last_action_label, sizeof(g_last_action_label), "%s", label);
-    gtk_menu_item_set_label(g_action_item, label);
+    memcpy(g_last_action_label, buf, sizeof(buf));
+    gtk_menu_item_set_label(g_action_item, buf);
 }
 
 static void set_action_sensitive(int sensitive)
@@ -116,11 +124,16 @@ static void set_action_sensitive(int sensitive)
 
 static void set_indicator_icon(const char *icon, const char *desc)
 {
-    if (strcmp(g_last_icon, icon) == 0 && strcmp(g_last_desc, desc) == 0)
+    char icon_buf[sizeof(g_last_icon)];
+    char desc_buf[sizeof(g_last_desc)];
+
+    snprintf(icon_buf, sizeof(icon_buf), "%s", icon);
+    snprintf(desc_buf, sizeof(desc_buf), "%s", desc);
+    if (strcmp(g_last_icon, icon_buf) == 0 && strcmp(g_last_desc, desc_buf) == 0)
         return;
-    snprintf(g_last_icon, sizeof(g_last_icon), "%s", icon);
-    snprintf(g_last_desc, sizeof(g_last_desc), "%s", desc);
-    app_indicator_set_icon_full(g_indicator, icon, desc);
+    memcpy(g_last_icon, icon_buf, sizeof(icon_buf));
+    memcpy(g_last_desc, desc_buf, sizeof(desc_buf));
+    app_indicator_set_icon_full(g_indicator, icon_buf, desc_buf);
 }
 
 static int native_tunnel_present(void)
@@ -136,7 +149,9 @@ static int tunnel_present(void)
 static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
 {
     FILE *fp;
-    char line[128];
+    /* Wide enough for the longest status line (`drops=...`) without splitting it
+     * into two unparsable halves. */
+    char line[512];
     int found_state = 0;
     long long ts = -1;
     pid_t pid = 0;

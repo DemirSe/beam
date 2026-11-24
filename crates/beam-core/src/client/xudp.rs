@@ -668,6 +668,184 @@ mod tests {
         frames
     }
 
+    /// Builds a detached session whose frames land in the returned receiver.
+    ///
+    /// A fresh table gives every session id `1`, so two sessions built this way
+    /// encode identical frames for identical calls.
+    fn new_test_session() -> (
+        XudpSession,
+        mpsc::Receiver<Vec<u8>>,
+        Arc<Mutex<SessionTable>>,
+    ) {
+        let table = Arc::new(Mutex::new(SessionTable::new(4)));
+        let (reply_tx, reply_rx) = mpsc::channel(4);
+        let session_id = table
+            .lock()
+            .expect("session table")
+            .allocate(reply_tx)
+            .expect("allocate session");
+        let (outbound_tx, outbound_rx) = mpsc::channel(16);
+        (
+            XudpSession {
+                session_id,
+                default_dest: test_dest(false),
+                sent_new: false,
+                table: Arc::clone(&table),
+                outbound_tx,
+                reply_rx,
+            },
+            outbound_rx,
+            table,
+        )
+    }
+
+    fn test_dest(ipv6: bool) -> NetLocation {
+        let address = if ipv6 {
+            crate::address::Address::Ipv6("2001:db8::53".parse().expect("ipv6"))
+        } else {
+            crate::address::Address::Ipv4(std::net::Ipv4Addr::new(9, 9, 9, 9))
+        };
+        NetLocation {
+            address,
+            port: if ipv6 { 5353 } else { 53 },
+        }
+    }
+
+    /// Encodes the frame both send paths must produce for the same arguments.
+    fn expected_data_frame(status: SessionStatus, dest: &NetLocation, payload: &[u8]) -> Vec<u8> {
+        let spec = FrameSpec {
+            session_id: 1,
+            status,
+            option: FrameOption::DATA,
+            network: Some(TargetNetwork::Udp),
+            destination: Some(dest),
+            global_id: None,
+            payload,
+        };
+        let mut out = Vec::new();
+        encode_frame(&mut out, spec).expect("encode reference frame");
+        out
+    }
+
+    #[tokio::test]
+    async fn send_owned_produces_the_same_frames_as_send_to() {
+        // Payload sizes cover the reserved headroom, a typical DNS answer, and the
+        // largest accepted datagram.
+        let payloads = [
+            vec![0x01u8; 1],
+            vec![0x02u8; 512],
+            vec![0x03u8; MAX_PAYLOAD_LEN],
+        ];
+        for ipv6 in [false, true] {
+            let dest = test_dest(ipv6);
+            for payload in &payloads {
+                // `New` frame (first send on the session).
+                let (mut by_copy, mut copy_rx, _copy_table) = new_test_session();
+                by_copy
+                    .send_to(dest.clone(), payload)
+                    .await
+                    .expect("send_to new");
+                let copied = copy_rx.try_recv().expect("send_to frame");
+
+                let (mut by_owned, mut owned_rx, _owned_table) = new_test_session();
+                by_owned
+                    .send_owned(dest.clone(), alloc_owned(payload))
+                    .await
+                    .expect("send_owned new");
+                let owned = owned_rx.try_recv().expect("send_owned frame");
+
+                let expected = expected_data_frame(SessionStatus::New, &dest, payload);
+                assert_eq!(copied, expected, "send_to New frame (ipv6={ipv6})");
+                assert_eq!(
+                    owned,
+                    expected,
+                    "send_owned must be byte-identical for New frames (ipv6={ipv6}, {}-byte payload, {}-byte header)",
+                    payload.len(),
+                    expected.len() - payload.len()
+                );
+
+                // `Keep` frame (second send on the same session).
+                let keep_payload = vec![0x04u8; 64];
+                by_copy
+                    .send_to(dest.clone(), &keep_payload)
+                    .await
+                    .expect("send_to keep");
+                let copied = copy_rx.try_recv().expect("send_to keep frame");
+                by_owned
+                    .send_owned(dest.clone(), alloc_owned(&keep_payload))
+                    .await
+                    .expect("send_owned keep");
+                let owned = owned_rx.try_recv().expect("send_owned keep frame");
+                let expected = expected_data_frame(SessionStatus::Keep, &dest, &keep_payload);
+                assert_eq!(copied, expected, "send_to Keep frame (ipv6={ipv6})");
+                assert_eq!(
+                    owned, expected,
+                    "send_owned must be byte-identical for Keep frames (ipv6={ipv6})"
+                );
+
+                // Both frames must decode to the original payloads.
+                let decoded = decode_all_frames(&owned);
+                assert_eq!(decoded.len(), 1);
+                assert_eq!(decoded[0].0, 1);
+                assert_eq!(decoded[0].1, keep_payload);
+            }
+        }
+    }
+
+    /// Copies `payload` into a buffer with [`FRAME_HEADER_RESERVE`] headroom, the
+    /// way callers of [`XudpSession::send_owned`] are expected to allocate.
+    fn alloc_owned(payload: &[u8]) -> Vec<u8> {
+        let mut buf = XudpSession::alloc_payload(payload.len());
+        buf.extend_from_slice(payload);
+        assert!(buf.capacity() >= payload.len() + FRAME_HEADER_RESERVE);
+        buf
+    }
+
+    #[tokio::test]
+    async fn send_owned_rejects_empty_oversize_and_closed_sessions() {
+        let (mut session, mut rx, table) = new_test_session();
+        let dest = test_dest(false);
+
+        let err = session
+            .send_owned(dest.clone(), Vec::new())
+            .await
+            .expect_err("empty payload");
+        assert!(
+            matches!(err, XudpClientError::InvalidPayloadLength { length: 0, .. }),
+            "unexpected error: {err}"
+        );
+
+        let err = session
+            .send_owned(dest.clone(), vec![0u8; MAX_PAYLOAD_LEN + 1])
+            .await
+            .expect_err("oversize payload");
+        assert!(
+            matches!(
+                err,
+                XudpClientError::InvalidPayloadLength { length, max }
+                    if length == MAX_PAYLOAD_LEN + 1 && max == MAX_PAYLOAD_LEN
+            ),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "rejected payloads must not be queued"
+        );
+
+        // A closed mux table makes the session no longer live.
+        table.lock().expect("table").close_all();
+        let err = session
+            .send_owned(dest, vec![1u8; 8])
+            .await
+            .expect_err("closed session");
+        assert!(
+            matches!(err, XudpClientError::Closed),
+            "unexpected error: {err}"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn writer_coalesces_queued_frames_without_splitting_them() {
         let (tx, mut rx) = mpsc::channel(8);

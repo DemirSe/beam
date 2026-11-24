@@ -34,6 +34,9 @@ const SLEEP_JUMP_THRESHOLD_SECS: u64 = 5;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const HEALTHY_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(75);
+/// Window in which a dial-failure streak keeps the link degraded. Shorter than
+/// [`RECENT_ACTIVITY_WINDOW`], so a brief blip does not keep an idle client red.
+const DEGRADED_WINDOW: Duration = Duration::from_secs(20);
 const IDLE_PROBE_JITTER_MAX_SECS: u64 = 15;
 const INITIAL_OFFLINE_BACKOFF_SECS: u64 = 2;
 const MAX_OFFLINE_BACKOFF_SECS: u64 = 10;
@@ -287,129 +290,113 @@ pub fn spawn_network_monitor(
                 // bare TCP connect can succeed while REALITY/VLESS dials fail (wrong
                 // key, expired short id, broken server), so a consecutive failure
                 // streak overrides a successful probe instead of reporting green.
-                let failure_streak = if recent_window.is_zero() {
+                // The streak uses the shorter degraded window so one brief blip does
+                // not keep an idle client red for the whole activity window.
+                let degraded_window = recent_window.min(DEGRADED_WINDOW);
+                let failure_streak = if degraded_window.is_zero() {
                     0
                 } else {
-                    activity.recent_failure_streak(recent_window)
+                    activity.recent_failure_streak(degraded_window)
                 };
-                if auto_route && !server_has_gw && !server_addr.ip().is_loopback() {
-                    is_connected = false;
-                    probe_failed = true;
-                    write_status_atomic(
-                        &status_path,
-                        &StatusInfo::new(
-                            &ifname,
-                            LinkState::WaitingNetwork,
-                            None,
-                            "no_gateway",
-                            generation,
-                            bypass_ok,
-                            &activity,
-                        ),
-                    );
-                    next_probe_at = Instant::now() + Duration::from_secs(offline_backoff_secs);
-                    offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
-                } else if failure_streak >= DEGRADED_DIAL_FAILURE_STREAK {
-                    is_connected = false;
-                    probe_failed = true;
-                    if let Some(suppressed) = DEGRADED_LOG.allow() {
-                        let last = activity.recent_failure(recent_window);
-                        warn!(
-                            streak = failure_streak,
-                            stage = last.map(|f| f.stage.as_str()).unwrap_or("unknown"),
-                            kind = last.map(|f| f.kind.as_str()).unwrap_or("unknown"),
-                            server = %server_addr,
-                            suppressed,
-                            "authenticated tunnel dials keep failing; reporting a degraded link"
-                        );
-                    }
-                    write_status_atomic(
-                        &status_path,
-                        &StatusInfo::new(
-                            &ifname,
-                            LinkState::Reconnecting,
-                            None,
-                            "dial_failures",
-                            generation,
-                            bypass_ok,
-                            &activity,
-                        ),
-                    );
-                    next_probe_at = Instant::now() + Duration::from_secs(offline_backoff_secs);
-                    offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
+                let recent_rtt = if is_connected && !recent_window.is_zero() {
+                    activity.recent_rtt(recent_window)
                 } else {
-                    let recent_rtt = if is_connected && !recent_window.is_zero() {
-                        activity.recent_rtt(recent_window)
-                    } else {
-                        None
-                    };
-                    if let Some(rtt_ms) = recent_rtt {
-                        write_status_atomic(
-                            &status_path,
-                            &StatusInfo::new(
-                                &ifname,
-                                LinkState::Connected,
-                                Some(rtt_ms),
-                                "dial_activity",
-                                generation,
-                                bypass_ok,
-                                &activity,
-                            ),
-                        );
+                    None
+                };
+                let no_gateway = auto_route && !server_has_gw && !server_addr.ip().is_loopback();
+                if let Some((state, reason, rtt_ms)) =
+                    probe_tick_decision(no_gateway, failure_streak, recent_rtt)
+                {
+                    if state == LinkState::Connected {
+                        is_connected = true;
                         offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
                         probe_seq = probe_seq.wrapping_add(1);
                         next_probe_at = Instant::now() + next_healthy_probe_interval(probe_seq);
                     } else {
-                        match probe_server_rtt(server_addr).await {
-                            Ok(rtt_ms) => {
-                                is_connected = true;
-                                write_status_atomic(
-                                    &status_path,
-                                    &StatusInfo::new(
-                                        &ifname,
-                                        LinkState::Connected,
-                                        Some(rtt_ms),
-                                        "probe_ok",
-                                        generation,
-                                        bypass_ok,
-                                        &activity,
-                                    ),
-                                );
-                                offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
-                                probe_seq = probe_seq.wrapping_add(1);
-                                next_probe_at =
-                                    Instant::now() + next_healthy_probe_interval(probe_seq);
-                            }
-                            Err(err) => {
-                                is_connected = false;
-                                probe_failed = true;
-                                log_probe_failure(server_addr, &err);
-                                debug!(%server_addr, backoff_secs = offline_backoff_secs, "retrying after probe failure");
-                                write_status_atomic(
-                                    &status_path,
-                                    &StatusInfo::new(
-                                        &ifname,
-                                        LinkState::Reconnecting,
-                                        None,
-                                        "probe_failed",
-                                        generation,
-                                        bypass_ok,
-                                        &activity,
-                                    ),
-                                );
-                                next_probe_at =
-                                    Instant::now() + Duration::from_secs(offline_backoff_secs);
-                                offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
-                            }
+                        is_connected = false;
+                        probe_failed = true;
+                        if failure_streak >= DEGRADED_DIAL_FAILURE_STREAK
+                            && let Some(suppressed) = DEGRADED_LOG.allow()
+                        {
+                            let last = activity.recent_failure(degraded_window);
+                            warn!(
+                                streak = failure_streak,
+                                stage = last.map(|f| f.stage.as_str()).unwrap_or("unknown"),
+                                kind = last.map(|f| f.kind.as_str()).unwrap_or("unknown"),
+                                server = %server_addr,
+                                suppressed,
+                                "authenticated tunnel dials keep failing; reporting a degraded link"
+                            );
+                        }
+                        next_probe_at = Instant::now() + Duration::from_secs(offline_backoff_secs);
+                        offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
+                    }
+                    write_status_atomic(
+                        &status_path,
+                        &StatusInfo::new(
+                            &ifname, state, rtt_ms, reason, generation, bypass_ok, &activity,
+                        ),
+                    );
+                } else {
+                    // No live dial signal: fall back to a bounded reachability probe.
+                    match probe_server_rtt(server_addr).await {
+                        Ok(rtt_ms) => {
+                            is_connected = true;
+                            write_status_atomic(
+                                &status_path,
+                                &StatusInfo::new(
+                                    &ifname,
+                                    LinkState::Connected,
+                                    Some(rtt_ms),
+                                    "probe_ok",
+                                    generation,
+                                    bypass_ok,
+                                    &activity,
+                                ),
+                            );
+                            offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
+                            probe_seq = probe_seq.wrapping_add(1);
+                            next_probe_at = Instant::now() + next_healthy_probe_interval(probe_seq);
+                        }
+                        Err(err) => {
+                            is_connected = false;
+                            probe_failed = true;
+                            log_probe_failure(server_addr, &err);
+                            debug!(%server_addr, backoff_secs = offline_backoff_secs, "retrying after probe failure");
+                            write_status_atomic(
+                                &status_path,
+                                &StatusInfo::new(
+                                    &ifname,
+                                    LinkState::Reconnecting,
+                                    None,
+                                    "probe_failed",
+                                    generation,
+                                    bypass_ok,
+                                    &activity,
+                                ),
+                            );
+                            next_probe_at =
+                                Instant::now() + Duration::from_secs(offline_backoff_secs);
+                            offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
                         }
                     }
                 }
             }
 
             // Grow the no-netlink fallback poll while gateways, bypass routes, and
-            // probes stay stable; snap back to 2 s on any instability.
-            let stable = !gw_changed && !slept_from_suspend && !bypass_missing && !probe_failed;
-            fallback_poll_secs = next_fallback_poll(fallback_poll_secs, stable);
+            // probes stay stable; snap back to 2 s on any instability, and reset it
+            // as soon as the netlink watcher drives wakeups again.
+            fallback_poll_secs = if auto_route && netlink.is_none() {
+                let stable = fallback_poll_stable(
+                    gw_changed,
+                    slept_from_suspend,
+                    bypass_missing,
+                    probe_failed,
+                );
+                next_fallback_poll(fallback_poll_secs, stable)
+            } else {
+                FALLBACK_POLL_TICK.as_secs()
+            };
 
             let wait_dur = {
                 let now = Instant::now();
@@ -471,6 +458,36 @@ pub fn spawn_network_monitor(
             }
         }
     })
+}
+
+/// Decides the link state for one probe tick without doing any I/O.
+///
+/// Returns `None` when the tick must fall back to a reachability probe. A
+/// dial-failure streak wins over a successful probe, and a degraded or
+/// waiting state never reports an RTT.
+fn probe_tick_decision(
+    no_gateway: bool,
+    failure_streak: u64,
+    recent_rtt: Option<u64>,
+) -> Option<(LinkState, &'static str, Option<u64>)> {
+    if no_gateway {
+        return Some((LinkState::WaitingNetwork, "no_gateway", None));
+    }
+    if failure_streak >= DEGRADED_DIAL_FAILURE_STREAK {
+        return Some((LinkState::Reconnecting, "dial_failures", None));
+    }
+    recent_rtt.map(|rtt| (LinkState::Connected, "dial_activity", Some(rtt)))
+}
+
+/// The no-netlink fallback poll grows only while nothing changed and no probe
+/// failed.
+fn fallback_poll_stable(
+    gw_changed: bool,
+    slept_from_suspend: bool,
+    bypass_missing: bool,
+    probe_failed: bool,
+) -> bool {
+    !gw_changed && !slept_from_suspend && !bypass_missing && !probe_failed
 }
 
 /// Computes one monitor sleep. With `auto_route` and no netlink watcher the
@@ -850,6 +867,80 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(activity.recent_failure_streak(Duration::from_millis(1)), 0);
         assert_eq!(activity.recent_failure_streak(RECENT_ACTIVITY_WINDOW), 1);
+    }
+
+    #[test]
+    fn probe_tick_decision_maps_degraded_recovery_and_waiting_states() {
+        assert_eq!(
+            probe_tick_decision(false, DEGRADED_DIAL_FAILURE_STREAK, Some(30)),
+            Some((LinkState::Reconnecting, "dial_failures", None)),
+            "a failure streak overrides a recent RTT"
+        );
+        assert_eq!(
+            probe_tick_decision(false, DEGRADED_DIAL_FAILURE_STREAK - 1, Some(30)),
+            Some((LinkState::Connected, "dial_activity", Some(30)))
+        );
+        // Recovery: the streak cleared, so live dial activity reports green.
+        assert_eq!(
+            probe_tick_decision(false, 0, Some(21)),
+            Some((LinkState::Connected, "dial_activity", Some(21)))
+        );
+        assert_eq!(
+            probe_tick_decision(true, 0, Some(21)),
+            Some((LinkState::WaitingNetwork, "no_gateway", None)),
+            "a missing gateway wins over dial activity"
+        );
+        assert_eq!(
+            probe_tick_decision(false, 0, None),
+            None,
+            "no live dial signal falls back to a probe"
+        );
+
+        // The status text of a degraded tick carries no RTT.
+        let activity = TunnelActivity::new();
+        for _ in 0..DEGRADED_DIAL_FAILURE_STREAK {
+            activity.record_dial_failure(beam_tun::DialFailure {
+                stage: beam_tun::DialFailureStage::TcpConnect,
+                kind: beam_tun::DialFailureKind::Refused,
+            });
+        }
+        let streak = activity.recent_failure_streak(DEGRADED_WINDOW);
+        let (state, reason, rtt) = probe_tick_decision(false, streak, Some(12)).expect("decision");
+        let text = format_status(&StatusInfo::new(
+            "beamtun0", state, rtt, reason, 7, true, &activity,
+        ));
+        assert!(text.contains("state=reconnecting\n"));
+        assert!(text.contains("reason=dial_failures\n"));
+        assert!(!text.contains("rtt_ms="), "a degraded link reports no RTT");
+
+        // The same status text after recovery reports green with the RTT.
+        activity.record_dial_success(9);
+        let streak = activity.recent_failure_streak(DEGRADED_WINDOW);
+        let (state, reason, rtt) = probe_tick_decision(false, streak, Some(9)).expect("decision");
+        let text = format_status(&StatusInfo::new(
+            "beamtun0", state, rtt, reason, 7, true, &activity,
+        ));
+        assert!(text.contains("state=connected\n"));
+        assert!(text.contains("reason=dial_activity\n"));
+        assert!(text.contains("rtt_ms=9\n"));
+    }
+
+    #[test]
+    fn a_failed_probe_snaps_the_fallback_poll_back_to_two_seconds() {
+        assert!(fallback_poll_stable(false, false, false, false));
+        // Any single instability clears the "stable" flag.
+        assert!(!fallback_poll_stable(true, false, false, false));
+        assert!(!fallback_poll_stable(false, true, false, false));
+        assert!(!fallback_poll_stable(false, false, true, false));
+        assert!(!fallback_poll_stable(false, false, false, true));
+
+        // A probe failure must not leave the fallback poll backed off.
+        let probe_failed = true;
+        let stable = fallback_poll_stable(false, false, false, probe_failed);
+        assert_eq!(
+            next_fallback_poll(FALLBACK_POLL_MAX_SECS, stable),
+            FALLBACK_POLL_TICK.as_secs()
+        );
     }
 
     #[tokio::test]

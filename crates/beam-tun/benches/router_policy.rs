@@ -99,7 +99,7 @@ fn main() {
     let linear_ns = linear.as_secs_f64() * 1e9 / lookups;
     let indexed_ns = indexed.as_secs_f64() * 1e9 / lookups;
     println!(
-        "router byass-CIDR lookup ({} prefixes after merge, {} lookups/round)",
+        "router bypass-CIDR lookup ({} prefixes after merge, {} lookups/round)",
         index.len(),
         IP_SAMPLES
     );

@@ -342,6 +342,10 @@ impl LinuxRouteGuard {
     /// non-loopback local DNS when a matching gateway exists) are installed
     /// (or preserved as pre-existing host routes) and present in the kernel
     /// routing table.
+    ///
+    /// A lookup that cannot be completed ([`RouteCheck::Error`]) counts as
+    /// missing (fail-closed): the monitor keeps retrying, while the rate-limited
+    /// warning from `has_host_route` carries the reason once per window.
     pub fn bypass_routes_installed(&self) -> bool {
         if !self.auto_route {
             return true;
@@ -375,6 +379,12 @@ impl LinuxRouteGuard {
     /// Migrates server, local-DNS, and bypass CIDR/domain routes to `new_gw`
     /// while keeping TUN split routes active (fail-closed kill-switch) and
     /// preserving any pre-existing exact routes in the main table.
+    ///
+    /// A failed exact-route lookup (`ip` missing, transient non-zero exit) is
+    /// not treated as "route absent": the whole reconcile is skipped for this
+    /// cycle, so every route keeps its last-known state and a broken `ip` cannot
+    /// churn installs in a hot loop. `has_host_route` logs the rate-limited
+    /// warning that carries the signal.
     pub fn update_bypass_gateway(
         &mut self,
         new_gw: &PhysicalGateways,
@@ -383,6 +393,16 @@ impl LinuxRouteGuard {
         if !self.auto_route {
             return;
         }
+        let server_check = (!self.server_ip.is_loopback()).then(|| has_host_route(self.server_ip));
+        let dns_check = new_local_dns
+            .filter(|ip| Some(*ip) == self.local_dns_ip)
+            .map(has_host_route);
+        let lookup_failed = server_check.as_ref().is_some_and(|c| c.error().is_some())
+            || dns_check.as_ref().is_some_and(|c| c.error().is_some());
+        if lookup_failed {
+            return;
+        }
+
         for (prefix, maybe_gw, dev) in self.extra_bypass_v4.drain(..) {
             let _ = remove_v4_bypass(&prefix, maybe_gw.as_deref(), &dev);
         }
@@ -410,28 +430,28 @@ impl LinuxRouteGuard {
         if !self.server_ip.is_loopback()
             && let Some((maybe_gw, dev)) = gateway_for_ip(new_gw, self.server_ip)
         {
-            let existing = has_host_route(self.server_ip);
-            if existing.is_present() {
-                info!(ip = %self.server_ip, "preserving pre-existing exact route for beam server");
-                self.server_bypass_preexisting = true;
-            } else {
-                if let Some(err) = existing.error() {
-                    debug!(
-                        ip = %self.server_ip,
-                        error = %err,
-                        "exact route lookup failed; reinstalling the server bypass route"
-                    );
+            // Re-check after removing our own route: only a route that is still
+            // present here was pre-existing and must be preserved.
+            match has_host_route(self.server_ip) {
+                RouteCheck::Present => {
+                    info!(ip = %self.server_ip, "preserving pre-existing exact route for beam server");
+                    self.server_bypass_preexisting = true;
                 }
-                match install_host_bypass(self.server_ip, maybe_gw.as_deref(), dev) {
-                    Ok(()) => {
-                        info!(ip = %self.server_ip, via = ?maybe_gw, dev = %dev, "installed server bypass route");
-                        self.server_bypass_route =
-                            Some((self.server_ip, maybe_gw.clone(), dev.clone()));
-                    }
-                    Err(err) => {
-                        warn!(ip = %self.server_ip, dev = %dev, error = %err, "failed to install server bypass route");
+                RouteCheck::Absent => {
+                    match install_host_bypass(self.server_ip, maybe_gw.as_deref(), dev) {
+                        Ok(()) => {
+                            info!(ip = %self.server_ip, via = ?maybe_gw, dev = %dev, "installed server bypass route");
+                            self.server_bypass_route =
+                                Some((self.server_ip, maybe_gw.clone(), dev.clone()));
+                        }
+                        Err(err) => {
+                            warn!(ip = %self.server_ip, dev = %dev, error = %err, "failed to install server bypass route");
+                        }
                     }
                 }
+                // The lookup failed again: keep the last-known route state instead
+                // of reinstalling on every monitor cycle.
+                RouteCheck::Error(_) => {}
             }
         }
 
@@ -441,19 +461,12 @@ impl LinuxRouteGuard {
             && !self.is_in_tun_subnet(dns_ip)
             && let Some((maybe_gw, dev)) = gateway_for_ip(new_gw, dns_ip)
         {
-            let existing = has_host_route(dns_ip);
-            if existing.is_present() {
-                debug!(ip = %dns_ip, "preserving pre-existing exact route for local DNS");
-                self.local_dns_bypass_preexisting = true;
-            } else {
-                if let Some(err) = existing.error() {
-                    debug!(
-                        ip = %dns_ip,
-                        error = %err,
-                        "exact route lookup failed; reinstalling the local DNS bypass route"
-                    );
+            match has_host_route(dns_ip) {
+                RouteCheck::Present => {
+                    debug!(ip = %dns_ip, "preserving pre-existing exact route for local DNS");
+                    self.local_dns_bypass_preexisting = true;
                 }
-                match install_host_bypass(dns_ip, maybe_gw.as_deref(), dev) {
+                RouteCheck::Absent => match install_host_bypass(dns_ip, maybe_gw.as_deref(), dev) {
                     Ok(()) => {
                         debug!(ip = %dns_ip, via = ?maybe_gw, dev = %dev, "installed local DNS bypass route");
                         self.local_dns_bypass_route = Some((dns_ip, maybe_gw.clone(), dev.clone()));
@@ -461,7 +474,10 @@ impl LinuxRouteGuard {
                     Err(err) => {
                         warn!(ip = %dns_ip, dev = %dev, error = %err, "failed to install local DNS bypass route");
                     }
-                }
+                },
+                // The lookup failed again: keep the last-known route state instead
+                // of reinstalling on every monitor cycle.
+                RouteCheck::Error(_) => {}
             }
         }
 

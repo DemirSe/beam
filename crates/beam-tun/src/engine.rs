@@ -31,6 +31,9 @@ const RX_BATCH_MAX: usize = 128;
 const C2S_COALESCE_TARGET: usize = 64 * 1024;
 const S2C_READ_BUF_BYTES: usize = 64 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Gap after which a new dial failure starts a fresh streak instead of reviving
+/// an ancient one, so one blip never keeps the link degraded for minutes.
+pub const FAILURE_STREAK_WINDOW: Duration = Duration::from_secs(30);
 
 /// At most 3 upstream dial-failure warnings per 10 s window.
 static DIAL_FAILURE_LOG: LazyLock<RateLimiter> =
@@ -96,6 +99,17 @@ impl DialFailureStage {
             2 => Some(Self::RealityHandshake),
             3 => Some(Self::Upstream),
             _ => None,
+        }
+    }
+
+    /// Maps a [`beam_core::client`] stage name to the failing dial stage.
+    /// Anything after the TLS handshake counts as upstream, never as a connect
+    /// failure.
+    fn from_client_stage(stage: &str) -> Self {
+        match stage {
+            beam_core::client::STAGE_TCP_CONNECT => Self::TcpConnect,
+            beam_core::client::STAGE_REALITY_HANDSHAKE => Self::RealityHandshake,
+            _ => Self::Upstream,
         }
     }
 }
@@ -178,16 +192,12 @@ impl DialFailure {
     fn from_client_error(err: &ClientError) -> Self {
         match err {
             ClientError::Timeout { stage } => Self {
-                stage: match *stage {
-                    "TCP connect" => DialFailureStage::TcpConnect,
-                    "REALITY TLS handshake" => DialFailureStage::RealityHandshake,
-                    _ => DialFailureStage::Upstream,
-                },
+                stage: DialFailureStage::from_client_stage(stage),
                 kind: DialFailureKind::Timeout,
             },
-            ClientError::Io(err) => Self {
-                stage: DialFailureStage::TcpConnect,
-                kind: DialFailureKind::from_io_error(err),
+            ClientError::Io { stage, source } => Self {
+                stage: DialFailureStage::from_client_stage(stage),
+                kind: DialFailureKind::from_io_error(source),
             },
             ClientError::Reality(_) | ClientError::Tls(_) => Self {
                 stage: DialFailureStage::RealityHandshake,
@@ -256,8 +266,15 @@ impl TunnelActivity {
     /// Records a failed upstream tunnel dial and its failing stage.
     pub fn record_dial_failure(&self, failure: DialFailure) {
         let elapsed_ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        let previous = self.last_failure_ms_plus_one.load(Ordering::Relaxed);
         self.dial_failures.fetch_add(1, Ordering::Relaxed);
-        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+        // A failure long after the previous one starts a fresh streak instead of
+        // adding to an ancient one, so a brief blip never stays "degraded".
+        if failure_streak_is_stale(previous, elapsed_ms, FAILURE_STREAK_WINDOW) {
+            self.consecutive_failures.store(1, Ordering::Relaxed);
+        } else {
+            self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+        }
         self.last_failure_stage
             .store(failure.stage.code(), Ordering::Relaxed);
         self.last_failure_kind
@@ -296,12 +313,15 @@ impl TunnelActivity {
 
     /// Returns the most recent [`DialFailure`] if it happened within `max_age`.
     pub fn recent_failure(&self, max_age: Duration) -> Option<DialFailure> {
-        let stage = DialFailureStage::from_code(self.last_failure_stage.load(Ordering::Relaxed))?;
-        let kind = DialFailureKind::from_code(self.last_failure_kind.load(Ordering::Relaxed))?;
+        // Load the timestamp first with `Acquire`: the writer publishes stage and
+        // kind before its `Release` store, so a fresh timestamp can never be
+        // paired with a different failure's stage or kind.
         let recorded = self.last_failure_ms_plus_one.load(Ordering::Acquire);
         if recorded == 0 {
             return None;
         }
+        let stage = DialFailureStage::from_code(self.last_failure_stage.load(Ordering::Relaxed))?;
+        let kind = DialFailureKind::from_code(self.last_failure_kind.load(Ordering::Relaxed))?;
         let now_ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
         let age_ms = now_ms.saturating_sub(recorded - 1);
         let max_age_ms = u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX);
@@ -611,7 +631,7 @@ fn spawn_tcp_relay(
                 "TCP connection limit reached; resetting new flow"
             );
         }
-        drops.route.incr();
+        drops.tcp_limit.incr();
         conn.stream.abort();
         return;
     };
@@ -699,18 +719,7 @@ fn spawn_tcp_relay(
                 };
                 // Coalesce immediately-queued small chunks up to C2S_COALESCE_TARGET
                 // so multi-flow uploads write full TLS records with fewer syscalls.
-                let mut coalesced = false;
-                while chunk.len() < C2S_COALESCE_TARGET {
-                    let Some(next) = tun_r.try_recv_chunk() else {
-                        break;
-                    };
-                    if !coalesced {
-                        scratch.clear();
-                        scratch.extend_from_slice(&chunk);
-                        coalesced = true;
-                    }
-                    scratch.extend_from_slice(&next);
-                }
+                let coalesced = coalesce_c2s(&chunk, &mut scratch, || tun_r.try_recv_chunk());
                 let out: &[u8] = if coalesced { &scratch } else { &chunk };
                 match timeout(idle, up_w.write_all(out)).await {
                     Ok(Ok(())) => {}
@@ -722,6 +731,11 @@ fn spawn_tcp_relay(
                         warn_relay_timeout(conn.dst, "write", idle);
                         break;
                     }
+                }
+                // Do not retain more than one coalescing window after an oversize
+                // chunk grew the scratch buffer.
+                if scratch.capacity() > C2S_COALESCE_TARGET {
+                    scratch.shrink_to(C2S_COALESCE_TARGET);
                 }
                 // Flush only when no further chunk is already queued, preserving
                 // 0 ms interactive latency while avoiding per-chunk flush stalls
@@ -791,6 +805,40 @@ fn spawn_tcp_relay(
     });
 }
 
+/// Appends already-queued chunks to `scratch` until it reaches
+/// [`C2S_COALESCE_TARGET`].
+///
+/// Returns `false` and leaves `scratch` empty when `first` alone already fills
+/// a whole window, so a bulk upload keeps writing the caller's buffer without a
+/// copy. The bound is checked on the accumulated length, never on `first` alone.
+fn coalesce_c2s<F>(first: &[u8], scratch: &mut Vec<u8>, mut next: F) -> bool
+where
+    F: FnMut() -> Option<Vec<u8>>,
+{
+    scratch.clear();
+    if first.len() >= C2S_COALESCE_TARGET {
+        return false;
+    }
+    scratch.extend_from_slice(first);
+    while scratch.len() < C2S_COALESCE_TARGET {
+        let Some(chunk) = next() else {
+            break;
+        };
+        scratch.extend_from_slice(&chunk);
+    }
+    true
+}
+
+/// Returns `true` when a failure recorded at `previous_ms_plus_one` is too old
+/// to extend the current streak, so the new failure must start a fresh one.
+fn failure_streak_is_stale(previous_ms_plus_one: u64, now_ms: u64, window: Duration) -> bool {
+    if previous_ms_plus_one == 0 {
+        return true;
+    }
+    now_ms.saturating_sub(previous_ms_plus_one - 1)
+        > u64::try_from(window.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Updates the sticky UDP sweep deadline, shortening it whenever a more urgent
 /// wakeup interval (such as an XUDP reconnect backoff retry) is requested.
 fn update_udp_sweep_deadline(
@@ -818,6 +866,150 @@ fn update_udp_sweep_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    fn test_failure() -> DialFailure {
+        DialFailure {
+            stage: DialFailureStage::TcpConnect,
+            kind: DialFailureKind::Refused,
+        }
+    }
+
+    #[test]
+    fn c2s_coalescing_stops_once_the_target_is_reached() {
+        let chunk_len = C2S_COALESCE_TARGET / 2;
+        let mut queue: VecDeque<Vec<u8>> = (0..4).map(|_| vec![0xab; chunk_len]).collect();
+        let first = vec![0x11u8; 1024];
+        let mut scratch = Vec::new();
+
+        let coalesced = coalesce_c2s(&first, &mut scratch, || queue.pop_front());
+
+        assert!(coalesced);
+        assert!(scratch.starts_with(&first));
+        assert_eq!(
+            scratch.len(),
+            1024 + 2 * chunk_len,
+            "the bound must be checked on the accumulated length, not on the first chunk"
+        );
+        assert_eq!(
+            queue.len(),
+            2,
+            "coalescing must stop once the target is reached"
+        );
+
+        // A chunk that already fills a window is written without a copy or a pull.
+        let mut scratch = Vec::new();
+        let big = vec![7u8; C2S_COALESCE_TARGET];
+        let coalesced = coalesce_c2s(&big, &mut scratch, || -> Option<Vec<u8>> {
+            panic!("an oversize chunk must not pull more data")
+        });
+        assert!(!coalesced);
+        assert!(scratch.is_empty());
+
+        // An empty queue leaves the first chunk alone.
+        let mut scratch = Vec::new();
+        assert!(coalesce_c2s(&first, &mut scratch, || None));
+        assert_eq!(scratch, first);
+    }
+
+    #[test]
+    fn dial_failure_classifies_every_client_stage() {
+        // Every stage a `ClientError` can carry, pinned to its dial stage.
+        let stages = [
+            (
+                beam_core::client::STAGE_TCP_CONNECT,
+                DialFailureStage::TcpConnect,
+            ),
+            (
+                beam_core::client::STAGE_REALITY_HANDSHAKE,
+                DialFailureStage::RealityHandshake,
+            ),
+            (
+                beam_core::client::STAGE_VLESS_WRITE,
+                DialFailureStage::Upstream,
+            ),
+            (
+                beam_core::client::STAGE_VLESS_FLUSH,
+                DialFailureStage::Upstream,
+            ),
+        ];
+        for (stage, expected) in stages {
+            let timeout = DialFailure::from_client_error(&ClientError::Timeout { stage });
+            assert_eq!(timeout.stage, expected, "timeout at {stage}");
+            assert_eq!(timeout.kind, DialFailureKind::Timeout);
+
+            // A post-connect I/O failure keeps its stage instead of being
+            // reported as a TCP connect failure.
+            let io = DialFailure::from_client_error(&ClientError::Io {
+                stage,
+                source: io::Error::from(io::ErrorKind::ConnectionReset),
+            });
+            assert_eq!(io.stage, expected, "I/O error at {stage}");
+            assert_eq!(io.kind, DialFailureKind::Reset);
+        }
+
+        // A connect-refused I/O error stays a connect failure with its kind.
+        let refused = DialFailure::from_client_error(&ClientError::Io {
+            stage: beam_core::client::STAGE_TCP_CONNECT,
+            source: io::Error::from(io::ErrorKind::ConnectionRefused),
+        });
+        assert_eq!(refused.stage, DialFailureStage::TcpConnect);
+        assert_eq!(refused.kind, DialFailureKind::Refused);
+
+        // REALITY/VLESS protocol errors are stage-fixed.
+        let reality = DialFailure::from_client_error(&ClientError::Reality(
+            beam_core::reality::RealityClientError::Clock,
+        ));
+        assert_eq!(reality.stage, DialFailureStage::RealityHandshake);
+        let vless = DialFailure::from_client_error(&ClientError::Vless(
+            beam_core::vless::VlessError::UnsupportedVersion(1),
+        ));
+        assert_eq!(vless.stage, DialFailureStage::Upstream);
+    }
+
+    #[test]
+    fn failure_streak_ages_out_after_the_window() {
+        let window = FAILURE_STREAK_WINDOW;
+        // No previous failure always starts a fresh streak.
+        assert!(failure_streak_is_stale(0, 5_000, window));
+        // Within the window the streak keeps growing (boundary included).
+        assert!(!failure_streak_is_stale(1_001, 2_000, window));
+        assert!(!failure_streak_is_stale(1_001, 31_000, window));
+        assert!(failure_streak_is_stale(1_001, 31_001, window));
+
+        // An aged activity resets the counter instead of reviving the old streak.
+        let aged = TunnelActivity {
+            origin: Instant::now() - window - Duration::from_secs(1),
+            ..TunnelActivity::new()
+        };
+        aged.record_dial_failure(test_failure());
+        assert_eq!(aged.consecutive_failure_count(), 1);
+        // Pretend the last failure was the very first millisecond of the process.
+        aged.last_failure_ms_plus_one.store(1, Ordering::Relaxed);
+        aged.record_dial_failure(test_failure());
+        assert_eq!(
+            aged.consecutive_failure_count(),
+            1,
+            "a failure over the streak window old must not extend the streak"
+        );
+        assert_eq!(aged.dial_failure_count(), 2);
+
+        // Back-to-back failures still accumulate and report the latest stage.
+        let activity = TunnelActivity::new();
+        activity.record_dial_failure(test_failure());
+        activity.record_dial_failure(DialFailure {
+            stage: DialFailureStage::RealityHandshake,
+            kind: DialFailureKind::Other,
+        });
+        assert_eq!(activity.consecutive_failure_count(), 2);
+        assert_eq!(
+            activity.recent_failure(Duration::from_secs(5)),
+            Some(DialFailure {
+                stage: DialFailureStage::RealityHandshake,
+                kind: DialFailureKind::Other,
+            })
+        );
+    }
 
     #[test]
     fn udp_sweep_deadline_shrinks_when_backoff_interval_is_shorter() {

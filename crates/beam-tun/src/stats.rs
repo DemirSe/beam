@@ -40,6 +40,8 @@ pub struct DropCounters {
     pub fragment: Counter,
     /// Packet dropped by routing policy (excluded IP, bypass CIDR, private).
     pub route: Counter,
+    /// New TCP flow aborted with RST because `max_tcp_connections` was reached.
+    pub tcp_limit: Counter,
     /// Per-session UDP send queue full.
     pub udp_session_queue_full: Counter,
     /// Pre-connect UDP queue full or cleared.
@@ -57,6 +59,7 @@ pub struct DropSnapshot {
     pub ip_parse: u64,
     pub fragment: u64,
     pub route: u64,
+    pub tcp_limit: u64,
     pub udp_session_queue_full: u64,
     pub udp_pending_full: u64,
     pub udp_payload_invalid: u64,
@@ -71,6 +74,7 @@ impl DropCounters {
             ip_parse: self.ip_parse.get(),
             fragment: self.fragment.get(),
             route: self.route.get(),
+            tcp_limit: self.tcp_limit.get(),
             udp_session_queue_full: self.udp_session_queue_full.get(),
             udp_pending_full: self.udp_pending_full.get(),
             udp_payload_invalid: self.udp_payload_invalid.get(),
@@ -88,11 +92,12 @@ impl DropSnapshot {
     /// Compact `key:value` form for the `beam-client` status file.
     pub fn as_status_value(&self) -> String {
         format!(
-            "tun_tx_full:{},ip_parse:{},frag:{},route:{},udp_sess_q:{},udp_pending:{},udp_payload:{},udp_sess_tbl:{}",
+            "tun_tx_full:{},ip_parse:{},frag:{},route:{},tcp_limit:{},udp_sess_q:{},udp_pending:{},udp_payload:{},udp_sess_tbl:{}",
             self.tun_tx_full,
             self.ip_parse,
             self.fragment,
             self.route,
+            self.tcp_limit,
             self.udp_session_queue_full,
             self.udp_pending_full,
             self.udp_payload_invalid,
@@ -178,12 +183,15 @@ mod tests {
         assert!(counters.snapshot().is_empty());
         counters.tun_tx_full.incr();
         counters.route.add(2);
+        counters.tcp_limit.incr();
         let snap = counters.snapshot();
         assert_eq!(snap.tun_tx_full, 1);
         assert_eq!(snap.route, 2);
+        assert_eq!(snap.tcp_limit, 1);
         assert!(!snap.is_empty());
         assert!(snap.as_status_value().starts_with("tun_tx_full:1,"));
         assert!(snap.as_status_value().contains("route:2"));
+        assert!(snap.as_status_value().contains("tcp_limit:1"));
 
         let dns = DnsCounters::default();
         dns.hits.incr();

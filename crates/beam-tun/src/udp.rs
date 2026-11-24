@@ -657,7 +657,21 @@ mod tests {
         // Clearing the pending queue during a failed reconnect is counted.
         bridge.sessions.clear();
         bridge.handle_datagram(other, dst, b"pending");
-        assert!(bridge.pending_initial.len() <= MAX_PENDING_CONNECT_DATAGRAMS);
+        let queued = bridge.pending_initial.len();
+        assert_eq!(queued, 1, "a datagram queued while offline stays pending");
+        let pending_drops_before = drops.snapshot().udp_pending_full;
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(None);
+        bridge.connecting = Some(rx);
+        bridge.poll_connect();
+        assert!(
+            bridge.pending_initial.is_empty(),
+            "a failed connect must clear the pending queue"
+        );
+        assert!(
+            drops.snapshot().udp_pending_full >= pending_drops_before + queued as u64,
+            "every cleared pending datagram must be counted"
+        );
     }
 
     #[tokio::test]
