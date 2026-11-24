@@ -200,18 +200,11 @@ where
         }
 
         let tcp_delay = stack.poll_delay_ms(start.elapsed().as_millis() as i64);
-        let udp_delay = match udp_bridge.next_sweep_delay_ms() {
-            Some(interval_ms) => {
-                let now = Instant::now();
-                let deadline = *next_udp_sweep_at
-                    .get_or_insert_with(|| now + Duration::from_millis(interval_ms));
-                Some(deadline.saturating_duration_since(now).as_millis() as u64)
-            }
-            None => {
-                next_udp_sweep_at = None;
-                None
-            }
-        };
+        let udp_delay = update_udp_sweep_deadline(
+            &mut next_udp_sweep_at,
+            udp_bridge.next_sweep_delay_ms(),
+            Instant::now(),
+        );
         let next_timer_ms = match (tcp_delay, udp_delay) {
             (Some(a), Some(b)) => Some(a.min(b).max(1)),
             (Some(a), None) | (None, Some(a)) => Some(a.max(1)),
@@ -440,9 +433,58 @@ fn spawn_tcp_relay(
     });
 }
 
+/// Updates the sticky UDP sweep deadline, shortening it whenever a more urgent
+/// wakeup interval (such as an XUDP reconnect backoff retry) is requested.
+fn update_udp_sweep_deadline(
+    next_udp_sweep_at: &mut Option<Instant>,
+    interval_ms: Option<u64>,
+    now: Instant,
+) -> Option<u64> {
+    match interval_ms {
+        Some(interval_ms) => {
+            let candidate = now + Duration::from_millis(interval_ms);
+            let deadline = match *next_udp_sweep_at {
+                Some(existing) => existing.min(candidate),
+                None => candidate,
+            };
+            *next_udp_sweep_at = Some(deadline);
+            Some(deadline.saturating_duration_since(now).as_millis() as u64)
+        }
+        None => {
+            *next_udp_sweep_at = None;
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_sweep_deadline_shrinks_when_backoff_interval_is_shorter() {
+        let now = Instant::now();
+        let mut deadline = None;
+
+        // Initial idle session sweep sets a 5s deadline.
+        let d1 = update_udp_sweep_deadline(&mut deadline, Some(5_000), now);
+        assert_eq!(d1, Some(5_000));
+
+        // A 250ms XUDP reconnect backoff arrives 10ms later; deadline must shrink.
+        let t1 = now + Duration::from_millis(10);
+        let d2 = update_udp_sweep_deadline(&mut deadline, Some(250), t1);
+        assert_eq!(d2, Some(250));
+        assert_eq!(deadline, Some(t1 + Duration::from_millis(250)));
+
+        // A later larger interval must not push an earlier deadline forward.
+        let t2 = t1 + Duration::from_millis(50);
+        let d3 = update_udp_sweep_deadline(&mut deadline, Some(5_000), t2);
+        assert_eq!(d3, Some(200));
+
+        // Clearing when idle resets the sticky deadline.
+        assert_eq!(update_udp_sweep_deadline(&mut deadline, None, t2), None);
+        assert_eq!(deadline, None);
+    }
 
     #[test]
     fn tunnel_activity_tracks_recent_dial_rtt_and_expires() {

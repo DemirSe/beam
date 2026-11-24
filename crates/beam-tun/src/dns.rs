@@ -739,8 +739,8 @@ impl DnsCache {
 
 type DohTlsStream = tokio_rustls::client::TlsStream<BeamTcpStream>;
 
-struct PooledDohConn {
-    stream: DohTlsStream,
+struct PooledDohConn<S> {
+    stream: S,
     last_used: Instant,
 }
 
@@ -748,23 +748,42 @@ struct PooledDohConn {
 ///
 /// Uses zero background timers or reaper tasks so idle battery consumption is
 /// strictly zero; stale entries are discarded passively on borrow or cleared
-/// immediately on network transitions.
-#[derive(Default)]
-struct DohPool {
-    idle: Vec<PooledDohConn>,
+/// immediately on network transitions. A monotonic generation counter prevents
+/// connections dialed before a network transition from being returned to the
+/// pool after `clear()`.
+struct DohPool<S = DohTlsStream> {
+    idle: Vec<PooledDohConn<S>>,
+    generation: u64,
 }
 
-impl DohPool {
-    fn take(&mut self, now: Instant) -> Option<DohTlsStream> {
-        while let Some(entry) = self.idle.pop() {
-            if now.saturating_duration_since(entry.last_used) < DOH_POOL_IDLE_TTL {
-                return Some(entry.stream);
-            }
+impl<S> Default for DohPool<S> {
+    fn default() -> Self {
+        Self {
+            idle: Vec::new(),
+            generation: 0,
         }
-        None
+    }
+}
+
+impl<S> DohPool<S> {
+    fn generation(&self) -> u64 {
+        self.generation
     }
 
-    fn put(&mut self, stream: DohTlsStream, now: Instant) {
+    fn take(&mut self, now: Instant) -> (Option<S>, u64) {
+        let generation = self.generation;
+        while let Some(entry) = self.idle.pop() {
+            if now.saturating_duration_since(entry.last_used) < DOH_POOL_IDLE_TTL {
+                return (Some(entry.stream), generation);
+            }
+        }
+        (None, generation)
+    }
+
+    fn put(&mut self, stream: S, expected_generation: u64, now: Instant) {
+        if self.generation != expected_generation {
+            return;
+        }
         self.idle
             .retain(|entry| now.saturating_duration_since(entry.last_used) < DOH_POOL_IDLE_TTL);
         if self.idle.len() < MAX_DOH_POOL_SIZE {
@@ -776,6 +795,7 @@ impl DohPool {
     }
 
     fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.idle.clear();
     }
 }
@@ -1332,8 +1352,8 @@ async fn resolve_udp_over_beam(
 
     match run_udp_dns_query(&mux, dest.clone(), query).await {
         Ok(payload) => Ok(payload),
-        Err(err) if reused => {
-            debug!(error = %err, "shared DNS XUDP mux stale; retrying with fresh mux");
+        Err(err) if reused && !mux.is_open() => {
+            debug!(error = %err, "shared DNS XUDP mux closed; retrying with fresh mux");
             udp_mux_pool.invalidate(&mux);
             let (fresh_mux, _) = udp_mux_pool
                 .get_or_connect(|| async {
@@ -1394,15 +1414,16 @@ async fn resolve_doh_over_beam(
     let host_header = format_http_host_header(host, port);
 
     // Fast path: reuse an idle HTTP/1.1 keep-alive DoH connection (1 RTT).
-    let pooled = doh_pool
+    let (pooled, pooled_gen) = doh_pool
         .lock()
         .ok()
-        .and_then(|mut pool| pool.take(Instant::now()));
+        .map(|mut pool| pool.take(Instant::now()))
+        .unwrap_or((None, 0));
     if let Some(mut tls) = pooled {
         match send_doh_http_request(&mut tls, &host_header, path, query).await {
             Ok((body, reusable)) => {
                 if reusable && let Ok(mut pool) = doh_pool.lock() {
-                    pool.put(tls, Instant::now());
+                    pool.put(tls, pooled_gen, Instant::now());
                 }
                 return Ok(body);
             }
@@ -1412,6 +1433,11 @@ async fn resolve_doh_over_beam(
         }
     }
 
+    let dial_gen = doh_pool
+        .lock()
+        .ok()
+        .map(|pool| pool.generation())
+        .unwrap_or(0);
     let address = if let Ok(ip) = host.parse::<IpAddr>() {
         match ip {
             IpAddr::V4(v4) => Address::Ipv4(v4),
@@ -1432,7 +1458,7 @@ async fn resolve_doh_over_beam(
 
     let (body, reusable) = send_doh_http_request(&mut tls, &host_header, path, query).await?;
     if reusable && let Ok(mut pool) = doh_pool.lock() {
-        pool.put(tls, Instant::now());
+        pool.put(tls, dial_gen, Instant::now());
     }
     Ok(body)
 }
@@ -2492,5 +2518,30 @@ mod tests {
                 .expect("case-insensitive application/dns-message with params must succeed");
             assert_eq!(got, valid_body);
         }
+    }
+
+    #[test]
+    fn doh_pool_generation_rejects_stale_put_after_clear() {
+        let mut pool: DohPool<u32> = DohPool::default();
+        let now = Instant::now();
+        let gen0 = pool.generation();
+        pool.put(1, gen0, now);
+
+        let (taken, taken_gen) = pool.take(now);
+        assert_eq!(taken, Some(1));
+        assert_eq!(taken_gen, gen0);
+
+        // Network change clears the pool and advances generation.
+        pool.clear();
+        assert_ne!(pool.generation(), gen0);
+
+        // Returning the pre-transition stream must be silently dropped.
+        pool.put(1, taken_gen, now);
+        assert_eq!(pool.take(now).0, None);
+
+        // A freshly dialed stream at the current generation is accepted.
+        let gen1 = pool.generation();
+        pool.put(2, gen1, now);
+        assert_eq!(pool.take(now).0, Some(2));
     }
 }

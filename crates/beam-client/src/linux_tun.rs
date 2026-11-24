@@ -769,8 +769,11 @@ pub fn write_routes_state_atomic(path: &Path, routes: &[PersistedRoute]) {
     }
     let tmp = path.with_extension("state.tmp");
     let body = format_routes_state(routes);
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+    if let Ok(mut file) = std::fs::File::create(&tmp) {
+        use std::io::Write as _;
+        if file.write_all(body.as_bytes()).is_ok() && file.sync_all().is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
     }
 }
 
