@@ -466,6 +466,11 @@ fn parse_dns_socket_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
             "dns.local_upstream must be IP or IP:port, got: {trimmed}"
         )));
     };
+    if sock.ip().is_unspecified() {
+        return Err(ConfigError::Invalid(
+            "dns.local_upstream must not use an unspecified IP address".into(),
+        ));
+    }
     if sock.port() == 0 {
         return Err(ConfigError::Invalid(
             "dns.local_upstream must not use port 0".into(),
@@ -810,6 +815,8 @@ mod tests {
         );
         assert!(parse_dns_socket_addr("192.168.1.1:0").is_err());
         assert!(parse_dns_socket_addr("[fd00::1]:0").is_err());
+        assert!(parse_dns_socket_addr("0.0.0.0:53").is_err());
+        assert!(parse_dns_socket_addr("[::]:53").is_err());
 
         let zero_port = EXAMPLE.replace(
             "# local_upstream = \"192.168.1.1:53\"",

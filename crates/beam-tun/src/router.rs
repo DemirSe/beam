@@ -181,11 +181,14 @@ pub fn is_non_global_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_link_local()
         || ip.is_broadcast()
         || ip.is_multicast()
-        || ip.is_unspecified()
+        // 0.0.0.0/8 "this network" (RFC 1122 / RFC 6890, subsumes 0.0.0.0)
+        || a == 0
         // 100.64.0.0/10 carrier-grade NAT (RFC 6598)
         || (a == 100 && (64..=127).contains(&b))
         // 192.0.0.0/24 IETF protocol assignments (RFC 6890)
         || (a == 192 && b == 0 && c == 0)
+        // 192.88.99.0/24 deprecated 6to4 relay anycast (RFC 7526)
+        || (a == 192 && b == 88 && c == 99)
         // 198.18.0.0/15 benchmarking (RFC 2544)
         || (a == 198 && (18..=19).contains(&b))
         // 240.0.0.0/4 reserved for future use (RFC 1112)
@@ -335,9 +338,12 @@ mod tests {
     #[test]
     fn non_global_ipv4_covers_every_special_purpose_range() {
         for raw in [
+            "0.0.0.0",         // unspecified
+            "0.1.2.3",         // 0.0.0.0/8 "this network"
             "100.64.0.1",      // CGNAT start
             "100.127.255.255", // CGNAT end
             "192.0.0.8",       // IETF protocol assignments
+            "192.88.99.1",     // deprecated 6to4 relay anycast
             "198.18.0.1",      // benchmarking start
             "198.19.255.255",  // benchmarking end
             "240.0.0.1",       // reserved for future use

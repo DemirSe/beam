@@ -18,7 +18,12 @@ CLIENT_CONFIG = ROOT / "config.client.example.toml"
 
 
 def unit_settings(path):
-    """Parses a systemd unit file into `{(section, key): value}`."""
+    """Parses a systemd unit file into `{(section, key): value}` (last wins)."""
+    return {k: v[-1] for k, v in unit_settings_all(path).items()}
+
+
+def unit_settings_all(path):
+    """Parses a systemd unit file into `{(section, key): [values...]}`."""
     section = None
     values = {}
     for line in path.read_text().splitlines():
@@ -30,8 +35,12 @@ def unit_settings(path):
             continue
         if "=" in line:
             key, value = line.split("=", 1)
-            values[(section, key)] = value.strip()
+            values.setdefault((section, key), []).append(value.strip())
     return values
+
+
+def parse_seconds(value):
+    return int(value[:-1]) if value[-1] == "s" else int(value)
 
 
 def config_values(text):
@@ -135,13 +144,19 @@ class NativeClientUnitTest(unittest.TestCase):
         self.assertIn('/run/beam-client/status', source)
 
     def test_check_and_cleanup_run_around_the_service(self):
-        unit = self.unit()
-        self.assertIn("--check -c /etc/beam/client.toml", unit[("Service", "ExecStartPre")])
-        self.assertIn("-c /etc/beam/client.toml", unit[("Service", "ExecStart")])
-        exec_start = unit[("Service", "ExecStart")].split()
-        exec_pre = unit[("Service", "ExecStartPre")].split()
-        self.assertEqual(exec_start[0], exec_pre[0])
-        self.assertIn("--cleanup-routes", unit[("Service", "ExecStopPost")])
+        all_settings = unit_settings_all(DEPLOY / "beam-client.service")
+        exec_start = all_settings[("Service", "ExecStart")]
+        exec_pre = all_settings[("Service", "ExecStartPre")]
+        exec_stop_post = all_settings[("Service", "ExecStopPost")]
+        self.assertEqual(len(exec_start), 1)
+        self.assertTrue(
+            any("--check -c /etc/beam/client.toml" in cmd for cmd in exec_pre)
+        )
+        self.assertIn("-c /etc/beam/client.toml", exec_start[0])
+        self.assertEqual(exec_start[0].split()[0], exec_pre[0].split()[0])
+        self.assertTrue(
+            any("--cleanup-routes" in cmd for cmd in exec_stop_post)
+        )
 
     def test_memory_and_descriptor_bounds_are_explicit(self):
         unit = self.unit()
@@ -151,10 +166,7 @@ class NativeClientUnitTest(unittest.TestCase):
         self.assertEqual(unit[("Service", "OOMPolicy")], "stop")
         self.assertEqual(unit[("Service", "Restart")], "always")
         self.assertGreater(int(unit[("Unit", "StartLimitBurst")]), 1)
-        self.assertGreater(self.seconds(unit[("Unit", "StartLimitIntervalSec")]), 0)
-
-    def seconds(self, value):
-        return int(value[:-1]) if value[-1] == "s" else int(value)
+        self.assertGreater(parse_seconds(unit[("Unit", "StartLimitIntervalSec")]), 0)
 
     def test_sandbox_directives_are_present(self):
         unit = self.unit()
@@ -201,6 +213,7 @@ class NativeClientUnitTest(unittest.TestCase):
         self.assertLessEqual(mtu, 9000)
 
         # The example's TCP socket budget must fit inside the unit's MemoryMax.
+        # Mirrors `derive_tcp_socket_buffer_bytes` in `crates/beam-client/src/config.rs`.
         connections = int(cfg[("limits", "max_tcp_connections")])
         self.assertLessEqual(connections, 4096)
         per_direction = min(

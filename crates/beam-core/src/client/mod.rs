@@ -332,18 +332,17 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VlessClientStream<S> {
 
 /// Returns a fresh Vision padding RNG seed from the system CSPRNG, so the
 /// padding of one connection does not predict the next. A failed RNG read
-/// falls back to the monotonic clock and counter instead of panicking.
+/// falls back to the system clock and counter instead of panicking.
 fn vision_seed() -> u64 {
+    static RNG: std::sync::OnceLock<&'static dyn rustls::crypto::SecureRandom> =
+        std::sync::OnceLock::new();
+    let rng = *RNG.get_or_init(|| rustls::crypto::aws_lc_rs::default_provider().secure_random);
+    let mut buf = [0u8; 8];
+    if rng.fill(&mut buf).is_ok() {
+        return u64::from_be_bytes(buf);
+    }
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut buf = [0u8; 8];
-    if rustls::crypto::aws_lc_rs::default_provider()
-        .secure_random
-        .fill(&mut buf)
-        .is_ok()
-    {
-        return u64::from_ne_bytes(buf);
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)

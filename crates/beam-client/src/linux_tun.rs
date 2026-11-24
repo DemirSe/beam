@@ -21,10 +21,13 @@ pub const DEFAULT_ROUTES_STATE_PATH: &str = "/run/beam-client/routes.state";
 const MAX_DYNAMIC_BYPASS_IPS: usize = 256;
 const DYNAMIC_BYPASS_TTL: Duration = Duration::from_secs(3600);
 const MAX_PERSISTED_ROUTES: usize = 1024;
-/// At most one `warn!` for a full dynamic-bypass table per interval, so a busy
-/// host with `bypass.domains` cannot flood the journal.
+/// At most one `warn!` for a full dynamic-bypass table per interval and address
+/// family, so a busy host with `bypass.domains` cannot flood the journal and an
+/// IPv4 warning does not silence IPv6.
 const DYNAMIC_BYPASS_CAP_WARN_INTERVAL: Duration = Duration::from_secs(600);
-static DYNAMIC_BYPASS_CAP_WARNED_AT: std::sync::Mutex<Option<Instant>> =
+static DYNAMIC_BYPASS_CAP_WARNED_V4_AT: std::sync::Mutex<Option<Instant>> =
+    std::sync::Mutex::new(None);
+static DYNAMIC_BYPASS_CAP_WARNED_V6_AT: std::sync::Mutex<Option<Instant>> =
     std::sync::Mutex::new(None);
 
 /// Returns `true` when the cap warning is due, so it fires once per interval.
@@ -34,7 +37,12 @@ fn cap_warn_due(last: Option<Instant>, now: Instant) -> bool {
 
 fn warn_dynamic_bypass_cap(family: &'static str) {
     let now = Instant::now();
-    let Ok(mut last) = DYNAMIC_BYPASS_CAP_WARNED_AT.lock() else {
+    let slot = if family == "ipv6" {
+        &DYNAMIC_BYPASS_CAP_WARNED_V6_AT
+    } else {
+        &DYNAMIC_BYPASS_CAP_WARNED_V4_AT
+    };
+    let Ok(mut last) = slot.lock() else {
         return;
     };
     if !cap_warn_due(*last, now) {

@@ -484,12 +484,12 @@ impl TcpConn {
     }
 
     fn drain_ooo(&mut self) {
-        // Every out-of-order segment is stored ahead of `rcv_nxt` and the
-        // receive window stays far below 2^31, so a segment is ready exactly
-        // when it starts at or before `rcv_nxt` in wrapping sequence order.
-        // `BTreeMap` returns the nearest such key in O(log n), instead of the
-        // full scan this loop used to do for every segment.
-        while let Some(&seq) = self.ooo.range(..=self.rcv_nxt).next_back().map(|(k, _)| k) {
+        // A queued segment `k` is ready iff `(k.wrapping_sub(rcv_nxt) as i32) <= 0`,
+        // i.e. `k` lies in the wrapping half-space `[rcv_nxt - 2^31, rcv_nxt]`.
+        // Splitting that interval at `u32::MAX` gives at most two numeric ranges
+        // in `BTreeMap`, so we always pop the oldest ready segment in wrapping
+        // sequence order in O(log n).
+        while let Some(seq) = self.next_ready_ooo_seq() {
             // The key was just found in the same map, so the removal cannot
             // miss; `break` keeps the loop terminating regardless.
             let Some(seg) = self.ooo.remove(&seq) else {
@@ -509,6 +509,19 @@ impl TcpConn {
                     }
                 }
             }
+        }
+    }
+
+    fn next_ready_ooo_seq(&self) -> Option<u32> {
+        let lo = self.rcv_nxt.wrapping_sub(0x8000_0000);
+        if lo <= self.rcv_nxt {
+            self.ooo.range(lo..=self.rcv_nxt).next().map(|(&k, _)| k)
+        } else {
+            self.ooo
+                .range(lo..=u32::MAX)
+                .next()
+                .or_else(|| self.ooo.range(0..=self.rcv_nxt).next())
+                .map(|(&k, _)| k)
         }
     }
 
@@ -1155,18 +1168,17 @@ impl NetStack for ProxyTcpStack {
 
 /// Returns a fresh TCP initial sequence number from the system CSPRNG, so the
 /// ISN of one connection does not predict the ISN of the next. A failed RNG
-/// read falls back to the monotonic clock and counter instead of panicking.
+/// read falls back to the system clock and counter instead of panicking.
 fn next_iss() -> u32 {
+    static RNG: std::sync::OnceLock<&'static dyn rustls::crypto::SecureRandom> =
+        std::sync::OnceLock::new();
+    let rng = *RNG.get_or_init(|| rustls::crypto::aws_lc_rs::default_provider().secure_random);
+    let mut buf = [0u8; 4];
+    if rng.fill(&mut buf).is_ok() {
+        return u32::from_be_bytes(buf);
+    }
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut buf = [0u8; 4];
-    if rustls::crypto::aws_lc_rs::default_provider()
-        .secure_random
-        .fill(&mut buf)
-        .is_ok()
-    {
-        return u32::from_ne_bytes(buf);
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -1329,6 +1341,53 @@ mod tests {
         assert_eq!(conn.rcv_nxt, 106);
         assert_eq!(conn.ooo.keys().copied().collect::<Vec<_>>(), vec![112]);
         assert_eq!(conn.ooo_bytes, 3);
+    }
+
+    #[test]
+    fn drain_ooo_preserves_future_and_drains_stale_across_wraparound() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let (_srv_nxt, _acc) = handshake(&mut stack, 1000);
+        let conn = stack.conns.values_mut().next().expect("conn");
+
+        // Hole right before u32::MAX: wrapped future segments at 0 and 2 must
+        // stay queued, NOT be discarded as stale.
+        conn.rcv_nxt = u32::MAX - 1;
+        conn.rcv_coalesce.clear();
+        conn.ooo.clear();
+        conn.ooo_bytes = 0;
+        conn.ooo.insert(0, b"cd".to_vec());
+        conn.ooo.insert(2, b"ef".to_vec());
+        conn.ooo_bytes = 4;
+        conn.drain_ooo();
+        assert!(conn.rcv_coalesce.is_empty());
+        assert_eq!(conn.rcv_nxt, u32::MAX - 1);
+        assert_eq!(conn.ooo.keys().copied().collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(conn.ooo_bytes, 4);
+
+        // Stale segment behind u32::MAX when rcv_nxt has already wrapped to 1
+        // must be drained so it cannot pin ooo_bytes forever.
+        conn.rcv_nxt = 1;
+        conn.ooo.clear();
+        conn.ooo.insert(u32::MAX - 1, b"ab".to_vec()); // bytes MAX-1..=MAX (stale)
+        conn.ooo.insert(3, b"gh".to_vec()); // future: stays
+        conn.ooo_bytes = 4;
+        conn.drain_ooo();
+        assert!(conn.rcv_coalesce.is_empty());
+        assert_eq!(conn.rcv_nxt, 1);
+        assert_eq!(conn.ooo.keys().copied().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(conn.ooo_bytes, 2);
+
+        // Overlapping ready segments resolve oldest-first.
+        conn.rcv_nxt = 100;
+        conn.ooo.clear();
+        conn.ooo.insert(98, b"xxOLD!".to_vec()); // covers 98..104 -> "OLD!"
+        conn.ooo.insert(100, b"NEW!".to_vec()); // covers 100..104 -> skipped after 98 advances rcv_nxt
+        conn.ooo_bytes = 10;
+        conn.drain_ooo();
+        assert_eq!(conn.rcv_coalesce, b"OLD!");
+        assert_eq!(conn.rcv_nxt, 104);
+        assert!(conn.ooo.is_empty());
+        assert_eq!(conn.ooo_bytes, 0);
     }
 
     #[test]

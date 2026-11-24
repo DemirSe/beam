@@ -272,7 +272,7 @@ pub fn parse_dns_query(wire: &[u8]) -> Option<DnsQuery> {
         return None;
     }
     let qdcount = u16::from_be_bytes([wire[4], wire[5]]);
-    if qdcount == 0 {
+    if qdcount != 1 {
         return None;
     }
     let (qname, next_offset) = parse_dns_name(wire, 12)?;
@@ -290,15 +290,20 @@ pub fn parse_dns_query(wire: &[u8]) -> Option<DnsQuery> {
     })
 }
 
-/// Returns `true` when the response's first question matches the query.
+/// Returns `true` when the response has `QR=1`, `QDCOUNT=1`, and its question
+/// matches the query.
 ///
-/// An upstream resolver is untrusted: a reply for a different name, type, or
-/// class is rejected before it is delivered or cached.
+/// An upstream resolver is untrusted: a reply with extra questions or for a
+/// different name, type, or class is rejected before it is delivered or cached.
 fn response_question_matches(query: &DnsQuery, resp: &[u8]) -> bool {
     if resp.len() < 12 || resp.len() > MAX_DOH_RESPONSE_BYTES {
         return false;
     }
-    if u16::from_be_bytes([resp[4], resp[5]]) == 0 {
+    let flags = u16::from_be_bytes([resp[2], resp[3]]);
+    if (flags & 0x8000) == 0 {
+        return false;
+    }
+    if u16::from_be_bytes([resp[4], resp[5]]) != 1 {
         return false;
     }
     let Some((qname, next)) = parse_dns_name(resp, 12) else {
@@ -1346,20 +1351,17 @@ async fn resolve_tcp_over_beam(
         },
         port: addr.port(),
     };
-    // Capture the pool generation just before dialing, so a network transition
-    // during the dial drops this connection instead of pooling it under the
-    // old generation.
-    let pool_gen = tcp_pool
-        .lock()
-        .ok()
-        .map(|pool| pool.generation())
-        .unwrap_or(0);
+    // Sample the current pool generation right before dialing a fresh
+    // connection (after any stale-pooled attempt above), so a post-reset dial
+    // is pooled under the current generation while a transition during dial
+    // still drops it.
+    let pool_gen = tcp_pool.lock().ok().map(|pool| pool.generation());
     let mut stream = dial_tcp(client_cfg, dest)
         .await
         .map_err(|e| io::Error::other(e.to_string()))?;
     let resp = send_tcp_dns_request(&mut stream, query).await?;
-    if let Ok(mut pool) = tcp_pool.lock() {
-        pool.put(stream, pool_gen, Instant::now());
+    if let (Some(gen_id), Ok(mut pool)) = (pool_gen, tcp_pool.lock()) {
+        pool.put(stream, gen_id, Instant::now());
     }
     Ok(resp)
 }
@@ -1995,12 +1997,26 @@ mod tests {
         let wrong_class = build_a_response(&class_query, Ipv4Addr::new(1, 2, 3, 4), 60);
         assert!(!response_question_matches(&query, &wrong_class));
 
-        // Truncated and question-less responses never match.
+        // Truncated, question-less, multi-question, and QR=0 responses never match.
         assert!(!response_question_matches(&query, &matching[..11]));
         let mut no_question = matching.clone();
         no_question[4] = 0;
         no_question[5] = 0;
         assert!(!response_question_matches(&query, &no_question));
+
+        let mut two_questions = matching.clone();
+        two_questions[4] = 0;
+        two_questions[5] = 2;
+        assert!(!response_question_matches(&query, &two_questions));
+
+        let mut qr_zero = matching.clone();
+        qr_zero[2] &= !0x80;
+        assert!(!response_question_matches(&query, &qr_zero));
+
+        let mut multi_q_query = build_query(0x1111, "good.example", 1);
+        multi_q_query[4] = 0;
+        multi_q_query[5] = 2;
+        assert!(parse_dns_query(&multi_q_query).is_none());
     }
 
     #[test]

@@ -13,11 +13,12 @@ The server runbook is in [`DEPLOY.md`](DEPLOY.md).
 ## Linux tray and DNS switch
 
 This section documents the sing-box tray install. That install writes its own
-`beam-client.service` with `/usr/local/lib/beam/sing-box` and a `sbtun0`
-interface. Do not combine it with the native `beam-client` unit
-([`deploy/beam-client.service`](../deploy/beam-client.service)). The native unit
-runs `/usr/local/bin/beam-client` on `beamtun0` and uses per-link DNS instead
-of `99-beam.conf`. See
+`/etc/systemd/system/beam-client.service` with `/usr/local/lib/beam/sing-box`
+and a `sbtun0` interface. Do not combine it with the native `beam-client` unit
+([`deploy/beam-client.service`](../deploy/beam-client.service)), which is
+installed to the same `/etc/systemd/system/beam-client.service` path, runs
+`/usr/local/bin/beam-client` on `beamtun0`, and uses per-link DNS instead of
+`99-beam.conf`. See
 [`clients/linux-tray/README.md`](../clients/linux-tray/README.md) for the
 install-path comparison.
 

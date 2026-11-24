@@ -602,11 +602,14 @@ future Windows `WinTun` and Android `VpnService` backends).
   IPv6 extension headers (Hop-by-Hop, Routing, Destination Options) and drops
   fragmented IPv4 and IPv6 packets.
 - **Destination policy:** unless `drop_private_destinations = false`, the stack
-  drops destinations outside global unicast: RFC 1918, CGNAT
-  (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`), benchmarking
-  (`198.18.0.0/15`), documentation (`192.0.2.0/24`, `198.51.100.0/24`,
-  `203.0.113.0/24`), reserved (`240.0.0.0/4`), ULA, link-local, multicast, and
-  loopback.
+  drops destinations outside global unicast: `0.0.0.0/8`, RFC 1918, CGNAT
+  (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`), deprecated
+  6to4 relay anycast (`192.88.99.0/24`), benchmarking (`198.18.0.0/15`),
+  documentation (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), reserved
+  (`240.0.0.0/4`), ULA, link-local, multicast, and loopback. Hosts that
+  intentionally reach Tailscale/CGNAT or private endpoints over the tunnel
+  should add them to `bypass.cidrs` (for direct LAN reach) or set
+  `drop_private_destinations = false`.
 - **Built-in DNS & bypass:** optional `[dns]` interceptor supporting DoH
   (`https://1.1.1.1/dns-query`) and plain DNS (`tcp://` / `udp://`) through the
   tunnel with a bounded LRU TTL cache, automatic `.lan`/`.local`/`.internal` + `[bypass]`
