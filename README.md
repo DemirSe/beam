@@ -601,9 +601,15 @@ future Windows `WinTun` and Android `VpnService` backends).
   out-of-order segments, and prompt window updates. The packet parser walks
   IPv6 extension headers (Hop-by-Hop, Routing, Destination Options) and drops
   fragmented IPv4 and IPv6 packets.
+- **Destination policy:** unless `drop_private_destinations = false`, the stack
+  drops destinations outside global unicast: RFC 1918, CGNAT
+  (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`), benchmarking
+  (`198.18.0.0/15`), documentation (`192.0.2.0/24`, `198.51.100.0/24`,
+  `203.0.113.0/24`), reserved (`240.0.0.0/4`), ULA, link-local, multicast, and
+  loopback.
 - **Built-in DNS & bypass:** optional `[dns]` interceptor supporting DoH
-  (`https://...`) and plain DNS (`tcp://` / `udp://`) through the tunnel with a
-  bounded LRU TTL cache, automatic `.lan`/`.local`/`.internal` + `[bypass]`
+  (`https://1.1.1.1/dns-query`) and plain DNS (`tcp://` / `udp://`) through the
+  tunnel with a bounded LRU TTL cache, automatic `.lan`/`.local`/`.internal` + `[bypass]`
   (`cidrs` and `domains`) split to the pre-VPN local DNS, and `reject_quic = true`
   by default (immediate ICMP/ICMPv6 Port Unreachable on UDP/443 so browsers
   fall back cleanly to TCP/HTTPS + Vision Direct). Note the LAN DNS trust
@@ -611,7 +617,9 @@ future Windows `WinTun` and Android `VpnService` backends).
   local LAN resolver (`dns.local_upstream` or auto-detected system DNS), and
   resolved IPs receive temporary, bounded, `info`-logged `/32` or `/128` host
   bypass routes (preserving any pre-existing exact routes); on untrusted LANs,
-  prefer static `bypass.cidrs` or leave `bypass.domains` empty.
+  prefer static `bypass.cidrs` or leave `bypass.domains` empty. Non-empty
+  `bypass.domains` is rejected unless `dns.enabled = true`, because only the
+  built-in resolver applies that split.
 - **Always-on resilience & crash contract:** fail-closed kill-switch split
   routes (`0.0.0.0/1`, `128.0.0.0/1`, `::/1`, `8000::/1`), automatic physical
   gateway & wake-from-sleep detection that migrates bypass routes, sends
@@ -625,7 +633,10 @@ future Windows `WinTun` and Android `VpnService` backends).
   without touching pre-existing host routes.
 - **Service & config:** start from [`config.client.example.toml`](config.client.example.toml)
   and [`deploy/beam-client.service`](deploy/beam-client.service); validate with
-  `beam-client --check -c /etc/beam/client.toml`.
+  `beam-client --check -c /etc/beam/client.toml`. The native unit (`beamtun0`,
+  per-link DNS) and the sing-box tray install (`sbtun0`, global `99-beam.conf`)
+  write the same unit name, so install only one of them. See
+  [`clients/linux-tray/README.md`](clients/linux-tray/README.md).
 
 ## Security notes
 
