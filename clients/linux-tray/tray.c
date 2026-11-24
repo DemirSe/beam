@@ -95,6 +95,7 @@ static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
     char line[128];
     int found_state = 0;
     long long ts = -1;
+    pid_t pid = 0;
 
     state_out[0] = '\0';
     *rtt_out = -1;
@@ -126,10 +127,20 @@ static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
             long long val = strtoll(line + 3, &end, 10);
             if (errno == 0 && end != line + 3 && *end == '\0' && val > 0)
                 ts = val;
+        } else if (strncmp(line, "pid=", 4) == 0) {
+            char *end = NULL;
+            errno = 0;
+            long long val = strtoll(line + 4, &end, 10);
+            if (errno == 0 && end != line + 4 && *end == '\0' && val > 0 &&
+                (long long)(pid_t)val == val)
+                pid = (pid_t)val;
         }
     }
     fclose(fp);
     if (!found_state)
+        return 0;
+    /* Reject stale status files from a crashed/SIGKILL'd daemon immediately. */
+    if (pid > 0 && !(kill(pid, 0) == 0 || errno == EPERM))
         return 0;
     /* Ignore stale status files left behind by a crashed/hung daemon (> 90s). */
     if (ts > 0 && (long long)time(NULL) - ts > 90)

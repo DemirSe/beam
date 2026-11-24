@@ -26,7 +26,16 @@ use tracing::debug;
 use crate::packet::build_ip_udp_packet;
 
 const MAX_DNS_QUERY_BYTES: usize = 1232;
-const MAX_DNS_RESPONSE_BYTES: usize = 4096;
+/// Maximum DNS response size accepted from DoH or DNS-over-TCP upstreams
+/// (e.g. large TXT, DNSSEC, or SVCB responses).
+const MAX_DOH_RESPONSE_BYTES: usize = 16_384;
+/// Maximum DNS response size delivered over UDP back to the local TUN stub
+/// (RFC 9715 / IPv6 minimum-MTU fragmentation-safe ceiling).
+const MAX_UDP_DNS_RESPONSE_BYTES: usize = 1232;
+/// Classic RFC 1035 UDP DNS payload limit when the client query omits EDNS0 OPT.
+const CLASSIC_UDP_DNS_RESPONSE_BYTES: usize = 512;
+/// Receive buffer size for local UDP DNS upstream replies.
+const MAX_LOCAL_UDP_RECV_BYTES: usize = 4096;
 const MAX_HTTP_HEADER_BYTES: usize = 8192;
 const MAX_INFLIGHT_DNS_QUERIES: usize = 128;
 const DEFAULT_CACHE_SIZE: usize = 1024;
@@ -339,7 +348,7 @@ fn parse_dns_name(wire: &[u8], start: usize) -> Option<(String, usize)> {
 /// Extracts `(cache_ttl_secs, resolved_ips)` from an RFC 1035 DNS response.
 /// Never panics on malformed input.
 pub fn parse_dns_response_meta(wire: &[u8]) -> (Option<u32>, Vec<IpAddr>) {
-    if wire.len() < 12 || wire.len() > MAX_DNS_RESPONSE_BYTES {
+    if wire.len() < 12 || wire.len() > MAX_DOH_RESPONSE_BYTES {
         return (None, Vec::new());
     }
     let flags = u16::from_be_bytes([wire[2], wire[3]]);
@@ -453,11 +462,32 @@ pub fn build_empty_noerror_response(query_wire: &[u8]) -> Option<Vec<u8>> {
     build_empty_dns_response(query_wire, question_end, 0)
 }
 
-/// Returns `true` if `query_wire` carries an RFC 6891 EDNS0 `OPT` (type 41)
-/// pseudo-RR in its Additional section. Strictly bounded and never panics.
-fn query_has_edns0_opt(query_wire: &[u8]) -> bool {
+/// Builds a minimal RFC 1035 `NOERROR` response with `TC=1` (truncated)
+/// matching `query_wire`'s `tx_id`, question section, and optional EDNS0 OPT
+/// record so local UDP stubs fall back cleanly to TCP.
+pub fn build_truncated_response(query_wire: &[u8]) -> Option<Vec<u8>> {
+    build_truncated_response_with_rcode(query_wire, 0)
+}
+
+fn build_truncated_response_with_rcode(query_wire: &[u8], rcode: u8) -> Option<Vec<u8>> {
     if query_wire.len() < 12 || query_wire.len() > MAX_DNS_QUERY_BYTES {
-        return false;
+        return None;
+    }
+    let (_, q_end) = parse_dns_name(query_wire, 12)?;
+    let question_end = q_end.checked_add(4)?;
+    if question_end > query_wire.len() {
+        return None;
+    }
+    build_synthetic_dns_response(query_wire, question_end, rcode, true)
+}
+
+/// Returns the client's advertised RFC 6891 EDNS0 UDP payload size (clamped to
+/// at least 512 bytes per RFC 6891 §6.2.3) if `query_wire` carries an `OPT`
+/// (type 41) pseudo-RR in its Additional section. Strictly bounded and never
+/// panics.
+fn query_edns0_udp_payload_size(query_wire: &[u8]) -> Option<usize> {
+    if query_wire.len() < 12 || query_wire.len() > MAX_DNS_QUERY_BYTES {
+        return None;
     }
     let qdcount = usize::from(u16::from_be_bytes([query_wire[4], query_wire[5]])).min(MAX_RR_COUNT);
     let ancount = usize::from(u16::from_be_bytes([query_wire[6], query_wire[7]])).min(MAX_RR_COUNT);
@@ -465,82 +495,107 @@ fn query_has_edns0_opt(query_wire: &[u8]) -> bool {
     let arcount =
         usize::from(u16::from_be_bytes([query_wire[10], query_wire[11]])).min(MAX_RR_COUNT);
     if arcount == 0 {
-        return false;
+        return None;
     }
 
     let mut pos = 12usize;
     for _ in 0..qdcount {
-        let Some((_, next)) = parse_dns_name(query_wire, pos) else {
-            return false;
-        };
-        let Some(after_q) = next.checked_add(4) else {
-            return false;
-        };
+        let (_, next) = parse_dns_name(query_wire, pos)?;
+        let after_q = next.checked_add(4)?;
         if after_q > query_wire.len() {
-            return false;
+            return None;
         }
         pos = after_q;
     }
 
     for _ in 0..ancount.saturating_add(nscount) {
-        let Some((_, next)) = parse_dns_name(query_wire, pos) else {
-            return false;
-        };
-        let Some(rd_header_end) = next.checked_add(10) else {
-            return false;
-        };
+        let (_, next) = parse_dns_name(query_wire, pos)?;
+        let rd_header_end = next.checked_add(10)?;
         if rd_header_end > query_wire.len() {
-            return false;
+            return None;
         }
         let rdlength = usize::from(u16::from_be_bytes([
             query_wire[next + 8],
             query_wire[next + 9],
         ]));
-        let Some(rdata_end) = rd_header_end.checked_add(rdlength) else {
-            return false;
-        };
+        let rdata_end = rd_header_end.checked_add(rdlength)?;
         if rdata_end > query_wire.len() {
-            return false;
+            return None;
         }
         pos = rdata_end;
     }
 
     for _ in 0..arcount {
-        let Some((_, next)) = parse_dns_name(query_wire, pos) else {
-            return false;
-        };
-        let Some(rd_header_end) = next.checked_add(10) else {
-            return false;
-        };
+        let (_, next) = parse_dns_name(query_wire, pos)?;
+        let rd_header_end = next.checked_add(10)?;
         if rd_header_end > query_wire.len() {
-            return false;
+            return None;
         }
         let rtype = u16::from_be_bytes([query_wire[next], query_wire[next + 1]]);
         if rtype == 41 {
-            return true;
+            let advertised = usize::from(u16::from_be_bytes([
+                query_wire[next + 2],
+                query_wire[next + 3],
+            ]));
+            return Some(advertised.max(CLASSIC_UDP_DNS_RESPONSE_BYTES));
         }
         let rdlength = usize::from(u16::from_be_bytes([
             query_wire[next + 8],
             query_wire[next + 9],
         ]));
-        let Some(rdata_end) = rd_header_end.checked_add(rdlength) else {
-            return false;
-        };
+        let rdata_end = rd_header_end.checked_add(rdlength)?;
         if rdata_end > query_wire.len() {
-            return false;
+            return None;
         }
         pos = rdata_end;
     }
 
-    false
+    None
+}
+
+/// Returns `true` if `query_wire` carries an RFC 6891 EDNS0 `OPT` (type 41)
+/// pseudo-RR in its Additional section.
+fn query_has_edns0_opt(query_wire: &[u8]) -> bool {
+    query_edns0_udp_payload_size(query_wire).is_some()
+}
+
+/// Computes the safe UDP DNS reply size limit for `query_wire`, respecting the
+/// client's EDNS0 UDP payload size (or classic 512 bytes when EDNS0 is absent)
+/// while never exceeding [`MAX_UDP_DNS_RESPONSE_BYTES`] for MTU safety.
+fn udp_dns_response_limit(query_wire: &[u8]) -> usize {
+    match query_edns0_udp_payload_size(query_wire) {
+        Some(client_max) => client_max.min(MAX_UDP_DNS_RESPONSE_BYTES),
+        None => CLASSIC_UDP_DNS_RESPONSE_BYTES,
+    }
+}
+
+/// Returns `resp` unchanged if it fits within the client's safe UDP DNS reply
+/// limit, or synthesizes a `TC=1` truncated DNS response so the stub retries
+/// cleanly over TCP.
+fn fit_response_for_udp(query_wire: &[u8], resp: Vec<u8>) -> Option<Vec<u8>> {
+    if resp.len() <= udp_dns_response_limit(query_wire) {
+        return Some(resp);
+    }
+    let rcode = resp.get(3).map_or(0, |b| b & 0x0f);
+    build_truncated_response_with_rcode(query_wire, rcode)
 }
 
 fn build_empty_dns_response(query_wire: &[u8], question_end: usize, rcode: u8) -> Option<Vec<u8>> {
+    build_synthetic_dns_response(query_wire, question_end, rcode, false)
+}
+
+fn build_synthetic_dns_response(
+    query_wire: &[u8],
+    question_end: usize,
+    rcode: u8,
+    truncated: bool,
+) -> Option<Vec<u8>> {
     let has_opt = query_has_edns0_opt(query_wire);
     let mut resp = Vec::with_capacity(question_end + if has_opt { EDNS0_OPT_RR.len() } else { 0 });
     resp.extend_from_slice(&query_wire[..2]); // tx_id
     let rd = query_wire[2] & 0x01;
-    resp.push(0x80 | rd); // QR=1, RD preserved
+    let tc = if truncated { 0x02 } else { 0x00 };
+    resp.push(0x80 | tc | rd); // QR=1, optional TC=1, RD preserved
     resp.push(0x80 | (rcode & 0x0f)); // RA=1, RCODE
     resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
     resp.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT=0
@@ -639,7 +694,7 @@ impl DnsCache {
         is_local: bool,
         now: Instant,
     ) {
-        if self.max_entries == 0 || wire.len() < 12 || wire.len() > MAX_DNS_RESPONSE_BYTES {
+        if self.max_entries == 0 || wire.len() < 12 || wire.len() > MAX_DOH_RESPONSE_BYTES {
             return;
         }
         let key = CacheKey {
@@ -1000,8 +1055,9 @@ impl DnsInterceptor {
         if let Ok(mut cache) = self.cache.lock()
             && let Some(cached) = cache.get(&query, Instant::now())
         {
-            if let Some(pkt) =
-                build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &cached)
+            if let Some(reply) = fit_response_for_udp(wire, cached)
+                && let Some(pkt) =
+                    build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &reply)
             {
                 let _ = self.tun_tx.try_send(pkt);
             }
@@ -1009,7 +1065,13 @@ impl DnsInterceptor {
         }
 
         let Ok(permit) = Arc::clone(&self.inflight).try_acquire_owned() else {
-            debug!(qname = %query.qname, "DNS concurrency limit reached; dropping query");
+            debug!(qname = %query.qname, "DNS concurrency limit reached; replying with SERVFAIL");
+            if let Some(sf) = build_servfail_response(wire)
+                && let Some(pkt) =
+                    build_ip_udp_packet(dst.ip(), dst.port(), src.ip(), src.port(), &sf)
+            {
+                let _ = self.tun_tx.try_send(pkt);
+            }
             return;
         };
 
@@ -1053,7 +1115,7 @@ impl DnsInterceptor {
             };
 
             let reply_wire = match result {
-                Ok(mut resp) if resp.len() >= 12 && resp.len() <= MAX_DNS_RESPONSE_BYTES => {
+                Ok(mut resp) if resp.len() >= 12 && resp.len() <= MAX_DOH_RESPONSE_BYTES => {
                     // Ensure tx_id matches the client query.
                     let id = query.tx_id.to_be_bytes();
                     resp[0] = id[0];
@@ -1070,7 +1132,7 @@ impl DnsInterceptor {
                     {
                         guard.insert(&query, resp.clone(), ttl, use_local, Instant::now());
                     }
-                    Some(resp)
+                    fit_response_for_udp(&wire_owned, resp)
                 }
                 Ok(_) => build_servfail_response(&wire_owned),
                 Err(err) => {
@@ -1104,7 +1166,7 @@ async fn resolve_local_udp(
     timeout(query_timeout, sock.send(query))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local DNS send timed out"))??;
-    let mut buf = vec![0u8; MAX_DNS_RESPONSE_BYTES];
+    let mut buf = vec![0u8; MAX_LOCAL_UDP_RECV_BYTES];
     let n = timeout(query_timeout, sock.recv(&mut buf))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local DNS recv timed out"))??;
@@ -1166,7 +1228,7 @@ async fn send_tcp_dns_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
     let mut len_buf = [0u8; 2];
     stream.read_exact(&mut len_buf).await?;
     let resp_len = usize::from(u16::from_be_bytes(len_buf));
-    if !(12..=MAX_DNS_RESPONSE_BYTES).contains(&resp_len) {
+    if !(12..=MAX_DOH_RESPONSE_BYTES).contains(&resp_len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid DNS-over-TCP response length",
@@ -1440,6 +1502,7 @@ async fn read_doh_http_response_keepalive<S: tokio::io::AsyncRead + Unpin>(
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
     let mut conn_close = !is_http_11;
+    let mut content_type_valid = false;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();
@@ -1457,6 +1520,15 @@ async fn read_doh_http_response_keepalive<S: tokio::io::AsyncRead + Unpin>(
                     ));
                 }
                 content_length = Some(parsed);
+            } else if key.eq_ignore_ascii_case("content-type") {
+                let media_type = val.split(';').next().unwrap_or("").trim();
+                if !media_type.eq_ignore_ascii_case("application/dns-message") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected DoH Content-Type: {media_type}"),
+                    ));
+                }
+                content_type_valid = true;
             } else if key.eq_ignore_ascii_case("transfer-encoding")
                 && val.to_ascii_lowercase().contains("chunked")
             {
@@ -1471,6 +1543,12 @@ async fn read_doh_http_response_keepalive<S: tokio::io::AsyncRead + Unpin>(
             }
         }
     }
+    if !content_type_valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing DoH Content-Type header",
+        ));
+    }
 
     let mut body = buf[header_end + 4..].to_vec();
 
@@ -1484,7 +1562,7 @@ async fn read_doh_http_response_keepalive<S: tokio::io::AsyncRead + Unpin>(
                     return Ok((decoded, reusable));
                 }
                 None => {
-                    if body.len() > MAX_DNS_RESPONSE_BYTES + 512 {
+                    if body.len() > MAX_DOH_RESPONSE_BYTES + 512 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "chunked DoH stream exceeded bound",
@@ -1504,7 +1582,7 @@ async fn read_doh_http_response_keepalive<S: tokio::io::AsyncRead + Unpin>(
     }
 
     if let Some(len) = content_length {
-        if !(12..=MAX_DNS_RESPONSE_BYTES).contains(&len) {
+        if !(12..=MAX_DOH_RESPONSE_BYTES).contains(&len) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "DoH Content-Length out of bounds",
@@ -1530,7 +1608,7 @@ async fn read_doh_http_response_keepalive<S: tokio::io::AsyncRead + Unpin>(
     }
 
     // Read until EOF (bounded) for close-delimited responses without Content-Length.
-    while body.len() <= MAX_DNS_RESPONSE_BYTES {
+    while body.len() <= MAX_DOH_RESPONSE_BYTES {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
             break;
@@ -1538,7 +1616,7 @@ async fn read_doh_http_response_keepalive<S: tokio::io::AsyncRead + Unpin>(
         body.extend_from_slice(&tmp[..n]);
     }
 
-    if body.len() <= MAX_DNS_RESPONSE_BYTES {
+    if body.len() <= MAX_DOH_RESPONSE_BYTES {
         Ok((body, false))
     } else {
         Err(io::Error::new(
@@ -1582,7 +1660,7 @@ pub fn try_decode_chunked_body(raw: &[u8]) -> io::Result<Option<Vec<u8>>> {
             }
             return Ok(None);
         }
-        if out.len().saturating_add(chunk_len) > MAX_DNS_RESPONSE_BYTES {
+        if out.len().saturating_add(chunk_len) > MAX_DOH_RESPONSE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "chunked DoH body exceeded bound",
@@ -1791,7 +1869,7 @@ mod tests {
         let expected = wire_body.clone();
         let writer = tokio::spawn(async move {
             let hdr = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: 9999\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: 9999\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
                 wire_body.len()
             );
             server.write_all(hdr.as_bytes()).await.expect("hdr");
@@ -2177,5 +2255,242 @@ mod tests {
             .expect("post-clear dial");
         assert_eq!(m5.id, 5);
         assert!(!reused5);
+    }
+
+    fn build_query_with_edns0(
+        tx_id: u16,
+        name: &str,
+        qtype: u16,
+        udp_payload_size: u16,
+    ) -> Vec<u8> {
+        let mut q = build_query(tx_id, name, qtype);
+        q[11] = 1; // ARCOUNT = 1
+        q.push(0x00); // root name
+        q.extend_from_slice(&41u16.to_be_bytes()); // TYPE = OPT
+        q.extend_from_slice(&udp_payload_size.to_be_bytes()); // CLASS = UDP payload size
+        q.extend_from_slice(&0u32.to_be_bytes()); // extended RCODE / version / flags
+        q.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH = 0
+        q
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_full_replies_with_servfail() {
+        let (tun_tx, mut tun_rx) = mpsc::channel(8);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            dummy_reality,
+            [2u8; 16],
+        );
+        let dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            None,
+        );
+        let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+
+        // Exhaust all inflight DNS query permits.
+        let _held_permits = interceptor
+            .inflight
+            .acquire_many(MAX_INFLIGHT_DNS_QUERIES as u32)
+            .await
+            .expect("acquire all permits");
+
+        let q = build_query_with_edns0(0xBEEF, "saturated.example", 1, 1232);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_123);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        interceptor.handle_query(src, dst, &q);
+
+        let pkt = tun_rx
+            .try_recv()
+            .expect("concurrency saturation must reply with SERVFAIL immediately");
+        let ip = crate::packet::parse_ip(&pkt).expect("ip");
+        let udp = crate::packet::parse_udp(ip.payload).expect("udp");
+        assert_eq!(udp.src_port, 53);
+        assert_eq!(udp.dst_port, 54_123);
+        assert_eq!(u16::from_be_bytes([udp.payload[0], udp.payload[1]]), 0xBEEF);
+        assert_eq!(udp.payload[2] & 0x80, 0x80); // QR=1
+        assert_eq!(udp.payload[3] & 0x0f, 2); // RCODE=2 (SERVFAIL)
+        assert_eq!(u16::from_be_bytes([udp.payload[10], udp.payload[11]]), 1); // EDNS0 OPT preserved
+        assert!(udp.payload.ends_with(&EDNS0_OPT_RR));
+    }
+
+    #[tokio::test]
+    async fn doh_oversized_response_parsed_cleanly_and_truncated_for_udp() {
+        let q_edns = build_query_with_edns0(0xCAFE, "large.example", 16, 4096);
+        let q_plain = build_query(0xCAFE, "large.example", 16);
+
+        // Build a valid DNS response > 4096 bytes: 1 A record + 25 TXT records (~5.3 KiB).
+        let mut big_resp = build_a_response(&q_plain, Ipv4Addr::new(203, 0, 113, 42), 120);
+        let txt_records: u16 = 25;
+        let total_ancount: u16 = 1 + txt_records;
+        big_resp[6..8].copy_from_slice(&total_ancount.to_be_bytes());
+        for _ in 0..txt_records {
+            big_resp.extend_from_slice(&[0xc0, 0x0c]); // pointer to qname
+            big_resp.extend_from_slice(&16u16.to_be_bytes()); // TXT
+            big_resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+            big_resp.extend_from_slice(&120u32.to_be_bytes()); // TTL
+            big_resp.extend_from_slice(&201u16.to_be_bytes()); // RDLENGTH
+            big_resp.push(200u8); // TXT string length
+            big_resp.extend_from_slice(&[b'x'; 200]);
+        }
+        assert!(
+            big_resp.len() > 4096 && big_resp.len() <= MAX_DOH_RESPONSE_BYTES,
+            "test response should exceed legacy 4096 cap (len={})",
+            big_resp.len()
+        );
+
+        let (mut client, mut server) = tokio::io::duplex(16_384);
+        let wire_for_srv = big_resp.clone();
+        let srv = tokio::spawn(async move {
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: Application/DNS-Message; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+                wire_for_srv.len()
+            );
+            server.write_all(hdr.as_bytes()).await.expect("hdr");
+            server.write_all(&wire_for_srv).await.expect("body");
+            server.flush().await.expect("flush");
+        });
+
+        let parsed = read_doh_http_response(&mut client)
+            .await
+            .expect("oversized DoH response up to MAX_DOH_RESPONSE_BYTES must parse cleanly");
+        srv.await.expect("srv");
+        assert_eq!(parsed, big_resp);
+
+        let (ttl, ips) = parse_dns_response_meta(&parsed);
+        assert_eq!(ttl, Some(120));
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42))]);
+
+        // For UDP delivery, oversized response must be synthesized as TC=1
+        // preserving tx_id, question, and EDNS0 OPT.
+        let udp_reply_edns =
+            fit_response_for_udp(&q_edns, parsed.clone()).expect("truncated edns reply");
+        assert!(udp_reply_edns.len() <= MAX_UDP_DNS_RESPONSE_BYTES);
+        assert_eq!(
+            u16::from_be_bytes([udp_reply_edns[0], udp_reply_edns[1]]),
+            0xCAFE
+        );
+        assert_eq!(udp_reply_edns[2] & 0x80, 0x80); // QR=1
+        assert_eq!(udp_reply_edns[2] & 0x02, 0x02); // TC=1
+        assert_eq!(udp_reply_edns[3] & 0x0f, 0); // NOERROR
+        assert_eq!(
+            u16::from_be_bytes([udp_reply_edns[4], udp_reply_edns[5]]),
+            1
+        ); // QDCOUNT=1
+        assert_eq!(
+            u16::from_be_bytes([udp_reply_edns[6], udp_reply_edns[7]]),
+            0
+        ); // ANCOUNT=0
+        assert_eq!(
+            u16::from_be_bytes([udp_reply_edns[10], udp_reply_edns[11]]),
+            1
+        ); // ARCOUNT=1 (EDNS0 OPT preserved)
+        assert!(udp_reply_edns.ends_with(&EDNS0_OPT_RR));
+
+        // Non-EDNS0 query must truncate without adding OPT.
+        let udp_reply_plain =
+            fit_response_for_udp(&q_plain, parsed).expect("truncated plain reply");
+        assert!(udp_reply_plain.len() <= CLASSIC_UDP_DNS_RESPONSE_BYTES);
+        assert_eq!(udp_reply_plain[2] & 0x02, 0x02); // TC=1
+        assert_eq!(
+            u16::from_be_bytes([udp_reply_plain[10], udp_reply_plain[11]]),
+            0
+        );
+
+        // Client EDNS0 UDP payload size (e.g. 600 bytes) is respected when smaller than 1232.
+        let q_edns_600 = build_query_with_edns0(0x1234, "mid.example", 16, 600);
+        let mut resp_550 = build_a_response(
+            &build_query(0x1234, "mid.example", 16),
+            Ipv4Addr::new(1, 2, 3, 4),
+            60,
+        );
+        resp_550.resize(550, 0);
+        assert_eq!(
+            fit_response_for_udp(&q_edns_600, resp_550.clone()).expect("fits 600"),
+            resp_550
+        );
+        let mut resp_700 = resp_550;
+        resp_700.resize(700, 0);
+        let trunc_700 = fit_response_for_udp(&q_edns_600, resp_700).expect("exceeds 600");
+        assert_eq!(trunc_700[2] & 0x02, 0x02); // TC=1
+    }
+
+    #[tokio::test]
+    async fn doh_rejects_invalid_or_missing_content_type() {
+        let valid_body = build_a_response(
+            &build_query(0x9001, "ct.example", 1),
+            Ipv4Addr::new(9, 9, 9, 9),
+            60,
+        );
+
+        // 1. HTML error page with 200 status must be rejected.
+        {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            let html = b"<html><body>Captive portal</body></html>";
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+                html.len()
+            );
+            server.write_all(hdr.as_bytes()).await.expect("hdr");
+            server.write_all(html).await.expect("body");
+            drop(server);
+            let err = read_doh_http_response(&mut client)
+                .await
+                .expect_err("text/html must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // 2. Non-DNS application/* Content-Type must be rejected.
+        {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                valid_body.len()
+            );
+            server.write_all(hdr.as_bytes()).await.expect("hdr");
+            server.write_all(&valid_body).await.expect("body");
+            drop(server);
+            let err = read_doh_http_response(&mut client)
+                .await
+                .expect_err("application/json must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // 3. Missing Content-Type must be rejected.
+        {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                valid_body.len()
+            );
+            server.write_all(hdr.as_bytes()).await.expect("hdr");
+            server.write_all(&valid_body).await.expect("body");
+            drop(server);
+            let err = read_doh_http_response(&mut client)
+                .await
+                .expect_err("missing Content-Type must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // 4. Case-insensitive application/dns-message with parameters must succeed.
+        {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: APPLICATION/DNS-MESSAGE; charset=binary\r\nContent-Length: {}\r\n\r\n",
+                valid_body.len()
+            );
+            server.write_all(hdr.as_bytes()).await.expect("hdr");
+            server.write_all(&valid_body).await.expect("body");
+            drop(server);
+            let got = read_doh_http_response(&mut client)
+                .await
+                .expect("case-insensitive application/dns-message with params must succeed");
+            assert_eq!(got, valid_body);
+        }
     }
 }

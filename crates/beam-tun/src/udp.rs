@@ -114,9 +114,18 @@ impl UdpNatBridge {
         self.start.elapsed().as_millis() as u64
     }
 
-    /// Polls any in-flight background XUDP mux connection and flushes queued
-    /// initial datagrams once connected. Non-blocking.
+    /// Polls any in-flight background XUDP mux connection, triggers a new
+    /// connect attempt once reconnect backoff elapses while datagrams are
+    /// queued, and flushes queued initial datagrams once connected.
+    /// Non-blocking.
     pub fn poll_connect(&mut self) {
+        if self.connecting.is_none() {
+            if !self.pending_initial.is_empty() && self.mux.as_ref().is_none_or(|m| !m.is_open()) {
+                self.mux = None;
+                self.start_background_connect();
+            }
+            return;
+        }
         let Some(rx) = self.connecting.as_mut() else {
             return;
         };
@@ -181,9 +190,7 @@ impl UdpNatBridge {
             _ => {
                 self.mux = None;
                 self.start_background_connect();
-                if self.connecting.is_some()
-                    && self.pending_initial.len() < MAX_PENDING_CONNECT_DATAGRAMS
-                {
+                if self.pending_initial.len() < MAX_PENDING_CONNECT_DATAGRAMS {
                     self.pending_initial.push_back((src, dst, payload.to_vec()));
                 }
                 return;
@@ -286,15 +293,29 @@ impl UdpNatBridge {
         });
     }
 
-    /// Returns the next timer delay needed for idle UDP session sweeping, or
-    /// `None` when no UDP sessions are active (allowing the TUN engine to sleep
-    /// with zero idle wakeups).
+    /// Returns the next timer delay needed for idle UDP session sweeping or
+    /// XUDP reconnect backoff retry when datagrams are queued, or `None` when
+    /// idle (allowing the TUN engine to sleep with zero idle wakeups).
     pub fn next_sweep_delay_ms(&self) -> Option<u64> {
-        if self.sessions.is_empty() {
-            return None;
+        let session_delay = if self.sessions.is_empty() {
+            None
+        } else {
+            let idle_ms = self.bridge_config.idle_timeout.as_millis() as u64;
+            Some(idle_ms.clamp(1_000, 10_000))
+        };
+        let backoff_delay = if !self.pending_initial.is_empty()
+            && self.connecting.is_none()
+            && self.mux.as_ref().is_none_or(|m| !m.is_open())
+        {
+            Some(self.next_connect_allowed_ms.saturating_sub(self.now_ms()))
+        } else {
+            None
+        };
+        match (session_delay, backoff_delay) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
         }
-        let idle_ms = self.bridge_config.idle_timeout.as_millis() as u64;
-        Some(idle_ms.clamp(1_000, 10_000))
     }
 
     fn start_background_connect(&mut self) {
@@ -476,6 +497,101 @@ mod tests {
         assert!(
             bridge.pending_initial.is_empty(),
             "datagram must be dropped when table remains full after lazy sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn backoff_queues_datagrams_reports_remaining_delay_and_retries_after_expiry() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let waker = Arc::new(Notify::new());
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig {
+                max_sessions: 4,
+                idle_timeout: Duration::from_secs(5),
+            },
+            tun_tx,
+            waker,
+        );
+
+        // Simulate a failed initial XUDP connect to enter reconnect backoff.
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(None);
+        bridge.connecting = Some(rx);
+        bridge.poll_connect();
+        assert_eq!(bridge.connect_backoff_ms, INITIAL_CONNECT_BACKOFF_MS);
+        assert!(bridge.next_connect_allowed_ms > bridge.now_ms());
+        assert_eq!(
+            bridge.next_sweep_delay_ms(),
+            None,
+            "idle bridge in backoff with no queued datagrams must not wake"
+        );
+
+        // Incoming datagram during backoff must be queued rather than dropped.
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 51_001);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+        bridge.handle_datagram(src, dst, b"queued-during-backoff");
+        assert!(bridge.connecting.is_none());
+        assert_eq!(bridge.pending_initial.len(), 1);
+        let delay = bridge
+            .next_sweep_delay_ms()
+            .expect("queued datagram during backoff must schedule retry wakeup");
+        assert!(
+            delay <= INITIAL_CONNECT_BACKOFF_MS,
+            "delay {delay}ms should not exceed backoff window"
+        );
+
+        // With an active session whose sweep interval is 5_000ms, the shorter
+        // backoff delay must still win.
+        let active_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 51_002);
+        let now_ms = bridge.now_ms();
+        let _rx = insert_fake_entry(&mut bridge, active_src, now_ms);
+        let combined_delay = bridge
+            .next_sweep_delay_ms()
+            .expect("active session + backoff delay");
+        assert!(
+            combined_delay <= INITIAL_CONNECT_BACKOFF_MS,
+            "backoff delay ({combined_delay}ms) must take precedence over 5000ms session sweep"
+        );
+
+        // Once backoff elapses, `poll_connect()` must automatically start a
+        // background reconnect while keeping the queued datagram for flushing.
+        bridge.next_connect_allowed_ms = bridge.now_ms();
+        bridge.poll_connect();
+        assert!(
+            bridge.connecting.is_some(),
+            "poll_connect must trigger background connect after backoff expires"
+        );
+        assert_eq!(bridge.pending_initial.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backoff_queue_is_bounded_by_max_pending_connect_datagrams() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let waker = Arc::new(Notify::new());
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig::default(),
+            tun_tx,
+            waker,
+        );
+
+        // Hold bridge in backoff so no background connect spawns.
+        bridge.connect_backoff_ms = MAX_CONNECT_BACKOFF_MS;
+        bridge.next_connect_allowed_ms = bridge.now_ms().saturating_add(60_000);
+
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+        for i in 0..(MAX_PENDING_CONNECT_DATAGRAMS + 25) {
+            let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 52_000 + i as u16);
+            bridge.handle_datagram(src, dst, format!("pkt-{i}").as_bytes());
+        }
+
+        assert!(bridge.connecting.is_none());
+        assert_eq!(bridge.pending_initial.len(), MAX_PENDING_CONNECT_DATAGRAMS);
+        assert_eq!(bridge.pending_initial[0].2, b"pkt-0");
+        assert_eq!(
+            bridge.pending_initial[MAX_PENDING_CONNECT_DATAGRAMS - 1].2,
+            format!("pkt-{}", MAX_PENDING_CONNECT_DATAGRAMS - 1).as_bytes()
         );
     }
 }

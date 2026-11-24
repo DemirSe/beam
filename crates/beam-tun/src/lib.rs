@@ -22,7 +22,9 @@ pub mod udp;
 
 pub use device::{MemoryTun, TunDevice};
 pub use dns::{DnsConfig, DnsInterceptor, DnsUpstream};
-pub use engine::{EngineError, TunEngineConfig, run_tun_engine};
+pub use engine::{
+    EngineError, TunEngineConfig, TunnelActivity, run_tun_engine, run_tun_engine_with_activity,
+};
 pub use proxy_tcp::ProxyTcpStack;
 pub use router::{IpNet, RouteDecision, RoutePolicy};
 pub use stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};

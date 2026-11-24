@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beam_tun::{ProxyTcpStack, run_tun_engine};
+use beam_tun::{ProxyTcpStack, TunnelActivity, run_tun_engine_with_activity};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -180,6 +180,8 @@ async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std:
     let (network_reset_tx, network_reset_rx) = watch::channel(0u64);
     cfg.engine.network_reset = Some(network_reset_rx);
 
+    let activity = Arc::new(TunnelActivity::new());
+
     let mut monitor_handle = spawn_network_monitor(
         actual_name.clone(),
         cfg.tun_net,
@@ -187,6 +189,7 @@ async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std:
         cfg.auto_route,
         cfg.fixed_local_dns,
         Arc::clone(&routes),
+        Arc::clone(&activity),
         network_reset_tx,
         shutdown_rx.clone(),
         PathBuf::from(DEFAULT_STATUS_PATH),
@@ -212,7 +215,8 @@ async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std:
     });
 
     let stack = ProxyTcpStack::new(cfg.tcp_stack);
-    let res = run_tun_engine(tun, stack, cfg.engine, shutdown_rx).await;
+    let res =
+        run_tun_engine_with_activity(tun, stack, cfg.engine, shutdown_rx, Some(activity)).await;
     let _ = shutdown_tx.send(true);
     signal_handle.abort();
     if tokio::time::timeout(Duration::from_secs(5), &mut monitor_handle)

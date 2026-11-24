@@ -1,6 +1,8 @@
 //! Strict TOML configuration for `beam-client`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -244,6 +246,9 @@ pub struct ValidatedConfig {
 impl ClientFileConfig {
     /// Loads and validates a TOML configuration file from disk.
     pub fn load(path: &Path) -> Result<ValidatedConfig, ConfigError> {
+        if let Some(warning) = check_config_permissions(path) {
+            eprintln!("{warning}");
+        }
         let raw = std::fs::read_to_string(path)?;
         Self::parse_and_validate(&raw)
     }
@@ -407,6 +412,8 @@ impl ClientFileConfig {
             mtu: self.tun.mtu,
             max_connections: self.limits.max_tcp_connections,
             socket_buffer_bytes: derive_tcp_socket_buffer_bytes(self.limits.max_tcp_connections),
+            handshake_timeout_ms: self.limits.handshake_timeout_ms,
+            idle_timeout_ms: self.limits.idle_timeout_ms,
         };
 
         Ok(ValidatedConfig {
@@ -509,6 +516,35 @@ fn derive_tun_peer_ipv4(cidr: &str) -> Option<Ipv4Addr> {
         return None;
     };
     Some(Ipv4Addr::from(candidate))
+}
+
+/// Checks whether a secrets-bearing client config file has overly permissive
+/// Unix mode bits (world-accessible `0o007` or group-writable `0o020`).
+///
+/// Mirrors `beam` server's mode check: group-readable (`0640`) is permitted
+/// for service deployments while world access (`0644`) and group write (`0660`)
+/// return an operator-facing warning string.
+#[cfg(unix)]
+pub fn check_config_permissions(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let mode = metadata.permissions().mode();
+    let reason = if mode & 0o007 != 0 {
+        "is accessible to other users; use 0600, or 0640 with a trusted group"
+    } else if mode & 0o020 != 0 {
+        "is group-writable; use 0600, or 0640 with a trusted group"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "warning: config file {} has mode {:03o} and {reason}",
+        path.display(),
+        mode & 0o777
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn check_config_permissions(_path: &Path) -> Option<String> {
+    None
 }
 
 fn validate_ipv4_cidr(cidr: &str) -> Result<(), ConfigError> {
@@ -648,5 +684,51 @@ mod tests {
             2 * max_cfg.tcp_stack.max_connections * max_cfg.tcp_stack.socket_buffer_bytes
                 <= 512 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn custom_timeouts_propagate_into_tcp_stack_config() {
+        let custom = EXAMPLE
+            .replace(
+                "handshake_timeout_ms = 10000",
+                "handshake_timeout_ms = 4500",
+            )
+            .replace("idle_timeout_ms = 300000", "idle_timeout_ms = 90000");
+        let cfg = ClientFileConfig::parse_and_validate(&custom).expect("custom timeouts valid");
+        assert_eq!(cfg.tcp_stack.handshake_timeout_ms, 4500);
+        assert_eq!(cfg.tcp_stack.idle_timeout_ms, 90_000);
+        assert_eq!(
+            cfg.engine.client.handshake_timeout,
+            Duration::from_millis(4500)
+        );
+        assert_eq!(
+            cfg.engine.client.idle_timeout,
+            Duration::from_millis(90_000)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_permission_check_flags_world_accessible_and_group_writable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("beam-client-perm-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("client.toml");
+        std::fs::write(&path, EXAMPLE).expect("write temp config");
+
+        for (mode, expect_warn) in [(0o600, false), (0o640, false), (0o644, true), (0o660, true)] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set permissions");
+            let warning = check_config_permissions(&path);
+            assert_eq!(
+                warning.is_some(),
+                expect_warn,
+                "unexpected warning state for mode {mode:03o}: {warning:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

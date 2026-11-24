@@ -4,6 +4,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use beam_core::address::{Address, NetLocation};
@@ -45,6 +46,62 @@ pub struct TunEngineConfig {
     pub network_reset: Option<watch::Receiver<u64>>,
 }
 
+/// Lock-free tracker of recent tunnel dial liveness and RTT.
+///
+/// Updated on every successful upstream `dial_tcp` handshake so health
+/// monitors can observe live tunnel liveness without extra probes.
+#[derive(Debug)]
+pub struct TunnelActivity {
+    origin: Instant,
+    /// Elapsed milliseconds since `origin` + 1 (`0` means no dial recorded yet).
+    last_success_ms_plus_one: AtomicU64,
+    /// Last recorded dial RTT in milliseconds.
+    last_rtt_ms: AtomicU64,
+}
+
+impl TunnelActivity {
+    /// Creates an empty [`TunnelActivity`] tracker with no recorded dials.
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            last_success_ms_plus_one: AtomicU64::new(0),
+            last_rtt_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Records a successful upstream tunnel dial with its observed RTT in ms.
+    pub fn record_dial_success(&self, rtt_ms: u64) {
+        let elapsed_ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        self.last_rtt_ms.store(rtt_ms, Ordering::Relaxed);
+        self.last_success_ms_plus_one
+            .store(elapsed_ms.saturating_add(1), Ordering::Release);
+    }
+
+    /// Returns the most recently recorded dial RTT in ms if a dial succeeded
+    /// within `max_age`, or `None` otherwise.
+    pub fn recent_rtt(&self, max_age: Duration) -> Option<u64> {
+        let recorded = self.last_success_ms_plus_one.load(Ordering::Acquire);
+        if recorded == 0 {
+            return None;
+        }
+        let recorded_ms = recorded - 1;
+        let now_ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let age_ms = now_ms.saturating_sub(recorded_ms);
+        let max_age_ms = u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX);
+        if age_ms <= max_age_ms {
+            Some(self.last_rtt_ms.load(Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for TunnelActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Errors returned by [`run_tun_engine`].
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -56,10 +113,26 @@ pub enum EngineError {
 /// Runs the TUN packet engine until `shutdown` becomes `true` or the TUN device
 /// returns an error/EOF.
 pub async fn run_tun_engine<D, S>(
+    device: D,
+    stack: S,
+    config: TunEngineConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), EngineError>
+where
+    D: TunDevice,
+    S: NetStack,
+{
+    run_tun_engine_with_activity(device, stack, config, shutdown, None).await
+}
+
+/// Runs the TUN packet engine with an optional [`TunnelActivity`] tracker that
+/// records upstream dial RTTs on every successful `dial_tcp`.
+pub async fn run_tun_engine_with_activity<D, S>(
     mut device: D,
     mut stack: S,
     config: TunEngineConfig,
     mut shutdown: watch::Receiver<bool>,
+    activity: Option<Arc<TunnelActivity>>,
 ) -> Result<(), EngineError>
 where
     D: TunDevice,
@@ -115,6 +188,7 @@ where
                 config.client.clone(),
                 Arc::clone(&tcp_permits),
                 network_reset.clone(),
+                activity.clone(),
             );
         }
 
@@ -249,6 +323,7 @@ fn spawn_tcp_relay(
     client_config: BeamClientConfig,
     permits: Arc<Semaphore>,
     mut network_reset: Option<watch::Receiver<u64>>,
+    activity: Option<Arc<TunnelActivity>>,
 ) {
     let Ok(permit) = permits.try_acquire_owned() else {
         debug!(dst = %conn.dst, "TCP connection limit reached; aborting with RST");
@@ -266,6 +341,7 @@ fn spawn_tcp_relay(
             address,
             port: conn.dst.port(),
         };
+        let dial_start = Instant::now();
         let upstream = tokio::select! {
             biased;
             Ok(()) = async {
@@ -278,7 +354,14 @@ fn spawn_tcp_relay(
                 return;
             }
             res = dial_tcp(&client_config, dest) => match res {
-                Ok(stream) => stream,
+                Ok(stream) => {
+                    if let Some(tracker) = activity.as_ref() {
+                        let rtt_ms = u64::try_from(dial_start.elapsed().as_millis())
+                            .unwrap_or(u64::MAX);
+                        tracker.record_dial_success(rtt_ms);
+                    }
+                    stream
+                }
                 Err(err) => {
                     debug!(dst = %conn.dst, error = %err, "dial_tcp failed");
                     conn.stream.abort();
@@ -355,4 +438,25 @@ fn spawn_tcp_relay(
             _ = async { tokio::join!(c2s, s2c) } => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunnel_activity_tracks_recent_dial_rtt_and_expires() {
+        let activity = TunnelActivity::new();
+        assert_eq!(activity.recent_rtt(Duration::from_secs(10)), None);
+
+        activity.record_dial_success(42);
+        assert_eq!(activity.recent_rtt(Duration::from_secs(10)), Some(42));
+
+        activity.record_dial_success(17);
+        assert_eq!(activity.recent_rtt(Duration::from_secs(10)), Some(17));
+
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(activity.recent_rtt(Duration::from_millis(5)), None);
+        assert_eq!(activity.recent_rtt(Duration::from_secs(10)), Some(17));
+    }
 }

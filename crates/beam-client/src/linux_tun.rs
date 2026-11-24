@@ -61,6 +61,12 @@ impl TunDevice for AsyncLinuxTun {
     async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             match self.inner.get_ref().read_packet(buf) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TUN device returned EOF",
+                    ));
+                }
                 Ok(n) => return Ok(n),
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
@@ -70,6 +76,12 @@ impl TunDevice for AsyncLinuxTun {
         loop {
             let mut guard = self.inner.readable().await?;
             match guard.try_io(|inner| inner.get_ref().read_packet(buf)) {
+                Ok(Ok(0)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TUN device returned EOF",
+                    ));
+                }
                 Ok(Ok(n)) => return Ok(n),
                 Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Ok(Err(err)) => return Err(err),
@@ -81,6 +93,12 @@ impl TunDevice for AsyncLinuxTun {
     fn try_recv_into(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
         loop {
             match self.inner.get_ref().read_packet(buf) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TUN device returned EOF",
+                    ));
+                }
                 Ok(n) => return Ok(Some(n)),
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
@@ -230,15 +248,20 @@ impl LinuxRouteGuard {
 
             // Route IPv6 into the TUN as well so dual-stack hosts do not leak
             // IPv6 outside the tunnel; ignore on IPv4-only kernels.
-            if run_ip(&["-6", "addr", "replace", "fd00:be:a::1/126", "dev", ifname]).is_ok() {
-                if run_ip(&["-6", "route", "replace", "::/1", "dev", ifname]).is_ok() {
+            match run_ip(&["-6", "addr", "replace", "fd00:be:a::1/126", "dev", ifname]) {
+                Ok(()) => {
+                    run_ip(&["-6", "route", "replace", "::/1", "dev", ifname])?;
                     guard.installed_v6_low = true;
-                }
-                if run_ip(&["-6", "route", "replace", "8000::/1", "dev", ifname]).is_ok() {
+                    run_ip(&["-6", "route", "replace", "8000::/1", "dev", ifname])?;
                     guard.installed_v6_high = true;
-                }
-                if guard.installed_v6_low && guard.installed_v6_high {
                     info!(dev = %ifname, "installed IPv6 TUN split routes (::/1, 8000::/1)");
+                }
+                Err(err) => {
+                    debug!(
+                        dev = %ifname,
+                        error = %err,
+                        "IPv6 TUN address unavailable; skipping IPv6 split routes"
+                    );
                 }
             }
 

@@ -19,7 +19,7 @@ use std::time::Duration;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::TcpSocket;
 use tokio::time::{Instant, timeout_at};
 
 use crate::address::NetLocation;
@@ -32,6 +32,10 @@ pub use xudp::{XudpClient, XudpClientConfig, XudpClientError, XudpReply, XudpSes
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const UPSTREAM_TCP_MSS: u16 = 1400;
+const UPSTREAM_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const UPSTREAM_TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for connecting to a `beam` server.
 #[derive(Clone)]
@@ -124,12 +128,21 @@ pub(crate) async fn dial_vless(
 ) -> Result<VlessClientStream<TlsStream>, ClientError> {
     let deadline = Instant::now() + config.handshake_timeout;
 
-    let socket = timeout_at(deadline, TcpStream::connect(config.server_addr))
+    let tcp_socket = match config.server_addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    let _ = beam_sys::set_tcp_maxseg(tcp_socket.as_raw_fd(), UPSTREAM_TCP_MSS);
+
+    let socket = timeout_at(deadline, tcp_socket.connect(config.server_addr))
         .await
         .map_err(|_| ClientError::Timeout {
             stage: "TCP connect",
         })??;
     let _ = socket.set_nodelay(true);
+    let fd = socket.as_raw_fd();
+    let _ = beam_sys::set_tcp_keepalive(fd, UPSTREAM_KEEPALIVE_IDLE, UPSTREAM_KEEPALIVE_INTERVAL);
+    let _ = beam_sys::set_tcp_user_timeout(fd, UPSTREAM_TCP_USER_TIMEOUT);
 
     let client_conn = build_client_connection(&config.reality)?;
     let mut tls = timeout_at(deadline, TlsStream::connect(socket, client_conn))

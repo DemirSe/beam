@@ -598,7 +598,9 @@ future Windows `WinTun` and Android `VpnService` backends).
   from a 256 MiB aggregate budget — 512 KiB/direction at the default 256
   connections, clamped to `64 KiB..=4 MiB` to stay under `MemoryMax=512M`),
   zero-copy `VecDeque::as_slices()` TX segmentation, immediate dup-ACKs on
-  out-of-order segments, and prompt window updates.
+  out-of-order segments, and prompt window updates. The packet parser walks
+  IPv6 extension headers (Hop-by-Hop, Routing, Destination Options) and drops
+  fragmented IPv4 and IPv6 packets.
 - **Built-in DNS & bypass:** optional `[dns]` interceptor supporting DoH
   (`https://...`) and plain DNS (`tcp://` / `udp://`) through the tunnel with a
   bounded LRU TTL cache, automatic `.lan`/`.local`/`.internal` + `[bypass]`

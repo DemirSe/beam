@@ -8,6 +8,13 @@ pub const IP_PROTO_TCP: u8 = 6;
 pub const IP_PROTO_UDP: u8 = 17;
 pub const IP_PROTO_ICMPV6: u8 = 58;
 
+/// IPv6 extension header next-header values (RFC 8200).
+const IPV6_NEXT_HOP_BY_HOP: u8 = 0;
+const IPV6_NEXT_ROUTING: u8 = 43;
+const IPV6_NEXT_FRAGMENT: u8 = 44;
+const IPV6_NEXT_DEST_OPTS: u8 = 60;
+const MAX_IPV6_EXT_HEADERS: usize = 8;
+
 /// Minimum IPv4 header length in bytes.
 pub const IPV4_MIN_HEADER_LEN: usize = 20;
 /// Fixed IPv6 header length in bytes.
@@ -27,7 +34,7 @@ pub const TCP_ACK: u8 = 0x10;
 /// Parsed view of an IPv4 or IPv6 packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpPacketView<'a> {
-    /// IP header length in bytes (`20..=60` for IPv4, `40` for IPv6).
+    /// IP header length in bytes (`20..=60` for IPv4, `>= 40` for IPv6 including extension headers).
     pub header_len: usize,
     /// Transport protocol (`IP_PROTO_TCP`, `IP_PROTO_UDP`, etc.).
     pub protocol: u8,
@@ -131,7 +138,8 @@ pub fn parse_ipv4(packet: &[u8]) -> Option<Ipv4PacketView<'_>> {
     })
 }
 
-/// Parses an IPv6 packet without extension headers (direct TCP/UDP/ICMPv6).
+/// Parses an IPv6 packet, walking standard extension headers (Hop-by-Hop,
+/// Routing, Destination Options) and rejecting fragmented or malformed packets.
 pub fn parse_ipv6(packet: &[u8]) -> Option<IpPacketView<'_>> {
     if packet.len() < IPV6_HEADER_LEN {
         return None;
@@ -144,17 +152,46 @@ pub fn parse_ipv6(packet: &[u8]) -> Option<IpPacketView<'_>> {
     if total_len > packet.len() {
         return None;
     }
-    let protocol = packet[6];
     let src_bytes: [u8; 16] = packet[8..24].try_into().ok()?;
     let dst_bytes: [u8; 16] = packet[24..40].try_into().ok()?;
     let raw = &packet[..total_len];
+
+    let mut protocol = packet[6];
+    let mut offset = IPV6_HEADER_LEN;
+    let mut ext_hops = 0usize;
+    loop {
+        match protocol {
+            IPV6_NEXT_HOP_BY_HOP | IPV6_NEXT_ROUTING | IPV6_NEXT_DEST_OPTS => {
+                if ext_hops >= MAX_IPV6_EXT_HEADERS {
+                    return None;
+                }
+                let prefix_end = offset.checked_add(2)?;
+                if prefix_end > total_len {
+                    return None;
+                }
+                let next_header = raw[offset];
+                let ext_len = usize::from(raw[offset + 1])
+                    .checked_add(1)?
+                    .checked_mul(8)?;
+                offset = offset.checked_add(ext_len)?;
+                if offset > total_len {
+                    return None;
+                }
+                protocol = next_header;
+                ext_hops += 1;
+            }
+            IPV6_NEXT_FRAGMENT => return None,
+            _ => break,
+        }
+    }
+
     Some(IpPacketView {
-        header_len: IPV6_HEADER_LEN,
+        header_len: offset,
         protocol,
         src_ip: IpAddr::V6(Ipv6Addr::from(src_bytes)),
         dst_ip: IpAddr::V6(Ipv6Addr::from(dst_bytes)),
         raw,
-        payload: &raw[IPV6_HEADER_LEN..total_len],
+        payload: &raw[offset..total_len],
     })
 }
 
@@ -617,5 +654,104 @@ mod tests {
         assert_eq!(seg.ack, 1001);
         // Never reply to an incoming RST.
         assert!(build_tcp_rst_for_packet(&rst_ip).is_none());
+    }
+
+    fn build_ipv6_with_headers(
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        first_next_header: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; IPV6_HEADER_LEN + body.len()];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&(body.len() as u16).to_be_bytes());
+        pkt[6] = first_next_header;
+        pkt[7] = 64;
+        pkt[8..24].copy_from_slice(&src.octets());
+        pkt[24..40].copy_from_slice(&dst.octets());
+        pkt[IPV6_HEADER_LEN..].copy_from_slice(body);
+        pkt
+    }
+
+    #[test]
+    fn ipv6_walks_valid_extension_headers() {
+        let src: Ipv6Addr = "fd00:1::1".parse().expect("src");
+        let dst: Ipv6Addr = "fd00:2::2".parse().expect("dst");
+        let udp_payload = b"ext-hdr-ok";
+        let mut udp = vec![0u8; UDP_HEADER_LEN + udp_payload.len()];
+        udp[0..2].copy_from_slice(&50000u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+        let udp_len = udp.len() as u16;
+        udp[4..6].copy_from_slice(&udp_len.to_be_bytes());
+        udp[UDP_HEADER_LEN..].copy_from_slice(udp_payload);
+
+        // Hop-by-Hop (8 bytes, hdr_ext_len = 0) -> Routing (16 bytes, hdr_ext_len = 1)
+        // -> Destination Options (8 bytes, hdr_ext_len = 0) -> UDP (17).
+        let mut body = Vec::new();
+        body.extend_from_slice(&[IPV6_NEXT_ROUTING, 0, 0, 0, 0, 0, 0, 0]);
+        let mut routing = vec![0u8; 16];
+        routing[0] = IPV6_NEXT_DEST_OPTS;
+        routing[1] = 1;
+        body.extend_from_slice(&routing);
+        body.extend_from_slice(&[IP_PROTO_UDP, 0, 0, 0, 0, 0, 0, 0]);
+        body.extend_from_slice(&udp);
+
+        let pkt = build_ipv6_with_headers(src, dst, IPV6_NEXT_HOP_BY_HOP, &body);
+        let parsed = parse_ipv6(&pkt).expect("parse ipv6 with ext headers");
+        assert_eq!(parsed.header_len, IPV6_HEADER_LEN + 8 + 16 + 8);
+        assert_eq!(parsed.protocol, IP_PROTO_UDP);
+        assert_eq!(parsed.src_ip, IpAddr::V6(src));
+        assert_eq!(parsed.dst_ip, IpAddr::V6(dst));
+        let parsed_udp = parse_udp(parsed.payload).expect("udp");
+        assert_eq!(parsed_udp.payload, udp_payload);
+    }
+
+    #[test]
+    fn ipv6_rejects_fragment_header() {
+        let src: Ipv6Addr = "fd00:1::1".parse().expect("src");
+        let dst: Ipv6Addr = "fd00:2::2".parse().expect("dst");
+
+        // Direct Fragment header (next_header = 44).
+        let frag_body = [IP_PROTO_UDP, 0, 0, 0, 0, 0, 0, 1, 1, 2, 3, 4];
+        let direct = build_ipv6_with_headers(src, dst, IPV6_NEXT_FRAGMENT, &frag_body);
+        assert!(parse_ipv6(&direct).is_none());
+
+        // Hop-by-Hop followed by Fragment header.
+        let mut chained_body = vec![IPV6_NEXT_FRAGMENT, 0, 0, 0, 0, 0, 0, 0];
+        chained_body.extend_from_slice(&frag_body);
+        let chained = build_ipv6_with_headers(src, dst, IPV6_NEXT_HOP_BY_HOP, &chained_body);
+        assert!(parse_ipv6(&chained).is_none());
+    }
+
+    #[test]
+    fn ipv6_rejects_malformed_truncated_and_excessive_extension_headers() {
+        let src: Ipv6Addr = "fd00:1::1".parse().expect("src");
+        let dst: Ipv6Addr = "fd00:2::2".parse().expect("dst");
+
+        // Truncated before 2-byte extension header prefix.
+        let tiny = build_ipv6_with_headers(src, dst, IPV6_NEXT_HOP_BY_HOP, &[IP_PROTO_TCP]);
+        assert!(parse_ipv6(&tiny).is_none());
+
+        // Truncated extension header body (claims 16 bytes, only 8 bytes present).
+        let truncated = build_ipv6_with_headers(
+            src,
+            dst,
+            IPV6_NEXT_DEST_OPTS,
+            &[IP_PROTO_TCP, 1, 0, 0, 0, 0, 0, 0],
+        );
+        assert!(parse_ipv6(&truncated).is_none());
+
+        // Exceeds MAX_IPV6_EXT_HEADERS (9 chained Destination Options headers).
+        let mut deep_body = Vec::new();
+        for i in 0..=MAX_IPV6_EXT_HEADERS {
+            let next = if i == MAX_IPV6_EXT_HEADERS {
+                IP_PROTO_TCP
+            } else {
+                IPV6_NEXT_DEST_OPTS
+            };
+            deep_body.extend_from_slice(&[next, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        let deep = build_ipv6_with_headers(src, dst, IPV6_NEXT_DEST_OPTS, &deep_body);
+        assert!(parse_ipv6(&deep).is_none());
     }
 }

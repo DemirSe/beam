@@ -25,6 +25,15 @@ const DEFAULT_REPLY_QUEUE: usize = 64;
 const READ_BUF_CAPACITY: usize = 16 * 1024;
 const MAX_READ_BUF: usize = 64 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Minimum idle timeout applied to the shared XUDP mux reader so short
+/// per-session idle timeouts do not thrash the multiplexed stream.
+pub const MIN_MUX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn effective_mux_idle_timeout(configured: Duration) -> Duration {
+    configured.max(MIN_MUX_IDLE_TIMEOUT)
+}
 
 /// Tuning parameters for [`XudpClient`].
 #[derive(Clone, Copy, Debug)]
@@ -195,7 +204,7 @@ impl XudpClient {
         });
 
         let reader_table = Arc::clone(&table);
-        let idle_timeout = config.idle_timeout;
+        let idle_timeout = effective_mux_idle_timeout(config.idle_timeout);
         let reader_task = tokio::spawn(async move {
             let mut buf = Vec::with_capacity(READ_BUF_CAPACITY);
             let mut offset = 0usize;
@@ -318,10 +327,23 @@ impl XudpClient {
     }
 
     /// Gracefully flushes queued frames and sends TLS `close_notify` before closing.
-    pub async fn close(mut self) {
+    pub async fn close(self) {
+        self.close_with_timeout(CLOSE_FLUSH_TIMEOUT).await;
+    }
+
+    async fn close_with_timeout(mut self, flush_timeout: Duration) {
         self.outbound_tx.take();
-        if let Some(writer) = self.writer_task.take() {
-            let _ = timeout(Duration::from_secs(2), writer).await;
+        if let Some(writer) = self.writer_task.as_mut() {
+            tokio::select! {
+                _ = &mut *writer => {
+                    self.writer_task = None;
+                }
+                () = tokio::time::sleep(flush_timeout) => {
+                    writer.abort();
+                    let _ = writer.await;
+                    self.writer_task = None;
+                }
+            }
         }
         if let Ok(mut t) = self.table.lock() {
             t.close_all();
@@ -453,5 +475,72 @@ impl XudpSession {
 impl Drop for XudpSession {
     fn drop(&mut self) {
         self.send_end_best_effort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_aborts_stalled_writer_on_timeout() {
+        let writer_dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&writer_dropped));
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let table = Arc::new(Mutex::new(SessionTable::new(1)));
+
+        let writer_task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let reader_task = tokio::spawn(std::future::pending::<()>());
+
+        let client = XudpClient {
+            table,
+            outbound_tx: Some(outbound_tx),
+            reply_queue: 1,
+            reader_task,
+            writer_task: Some(writer_task),
+        };
+
+        client.close_with_timeout(Duration::from_millis(20)).await;
+
+        assert!(
+            writer_dropped.load(Ordering::SeqCst),
+            "stalled writer task must be aborted on close timeout rather than detached"
+        );
+    }
+
+    #[test]
+    fn mux_idle_timeout_enforces_minimum_floor() {
+        assert_eq!(
+            effective_mux_idle_timeout(Duration::ZERO),
+            MIN_MUX_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            effective_mux_idle_timeout(Duration::from_secs(1)),
+            MIN_MUX_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            effective_mux_idle_timeout(Duration::from_secs(29)),
+            MIN_MUX_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            effective_mux_idle_timeout(MIN_MUX_IDLE_TIMEOUT),
+            MIN_MUX_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            effective_mux_idle_timeout(Duration::from_secs(300)),
+            Duration::from_secs(300)
+        );
     }
 }

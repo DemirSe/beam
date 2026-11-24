@@ -57,6 +57,16 @@ pub fn set_tcp_keepalive(fd: RawFd, idle: Duration, interval: Duration) -> io::R
     setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)
 }
 
+/// Sets `TCP_USER_TIMEOUT` on `fd`.
+///
+/// The timeout is expressed in milliseconds as a positive `c_int`. Zero
+/// (sub-millisecond) durations and values that overflow `c_int` are rejected
+/// before any socket option is changed.
+pub fn set_tcp_user_timeout(fd: RawFd, timeout: Duration) -> io::Result<()> {
+    let millis = duration_millis(timeout, "TCP user timeout")?;
+    setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, millis)
+}
+
 /// Sets the TCP maximum segment size for `fd`.
 ///
 /// On Linux this must be called before `connect` to change the MSS advertised
@@ -117,6 +127,23 @@ pub fn set_udp_recv_buffer(fd: RawFd, bytes: usize) -> io::Result<()> {
         ));
     }
     setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size)
+}
+
+fn duration_millis(value: Duration, name: &str) -> io::Result<libc::c_int> {
+    let millis = value.as_millis();
+    if millis == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} duration must be at least one millisecond"),
+        ));
+    }
+
+    libc::c_int::try_from(millis).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} duration does not fit in c_int"),
+        )
+    })
 }
 
 fn duration_secs(value: Duration, name: &str) -> io::Result<libc::c_int> {
@@ -192,7 +219,8 @@ fn setsockopt_int(
 mod tests {
     use super::{
         AcceptError, get_ipv6_v6only, get_tcp_maxseg, getsockopt_int, set_reuse_addr,
-        set_tcp_keepalive, set_tcp_maxseg, set_tcp_nodelay, set_udp_recv_buffer,
+        set_tcp_keepalive, set_tcp_maxseg, set_tcp_nodelay, set_tcp_user_timeout,
+        set_udp_recv_buffer,
     };
     use std::io;
     use std::net::{TcpListener, TcpStream, UdpSocket};
@@ -415,5 +443,30 @@ mod tests {
                 assert_eq!(effective, sysctl != 0);
             }
         }
+    }
+
+    #[test]
+    fn tcp_user_timeout_round_trips_and_validates_bounds() {
+        let (client, _server) = loopback_pair();
+
+        set_tcp_user_timeout(client.as_raw_fd(), Duration::from_secs(30)).unwrap();
+        let observed = getsockopt_int(
+            client.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(observed, 30_000);
+
+        let zero_err = set_tcp_user_timeout(client.as_raw_fd(), Duration::ZERO).unwrap_err();
+        assert_eq!(zero_err.kind(), io::ErrorKind::InvalidInput);
+
+        let sub_ms_err =
+            set_tcp_user_timeout(client.as_raw_fd(), Duration::from_micros(500)).unwrap_err();
+        assert_eq!(sub_ms_err.kind(), io::ErrorKind::InvalidInput);
+
+        let overflow = Duration::from_millis(libc::c_int::MAX as u64 + 1);
+        let overflow_err = set_tcp_user_timeout(client.as_raw_fd(), overflow).unwrap_err();
+        assert_eq!(overflow_err.kind(), io::ErrorKind::InvalidInput);
     }
 }

@@ -13,6 +13,8 @@ use tokio::sync::{Notify, mpsc};
 
 const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
 const DEFAULT_TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000;
 
 /// Tuning parameters for a [`NetStack`] implementation.
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +25,10 @@ pub struct TcpStackConfig {
     pub max_connections: usize,
     /// Per-socket TCP receive/send buffer ceiling in bytes.
     pub socket_buffer_bytes: usize,
+    /// Timeout in milliseconds for completing the initial TCP 3-way handshake.
+    pub handshake_timeout_ms: u64,
+    /// Idle timeout in milliseconds before established/close-wait sockets are reclaimed.
+    pub idle_timeout_ms: u64,
 }
 
 impl Default for TcpStackConfig {
@@ -31,7 +37,24 @@ impl Default for TcpStackConfig {
             mtu: 1500,
             max_connections: DEFAULT_MAX_TCP_CONNECTIONS,
             socket_buffer_bytes: DEFAULT_TCP_BUFFER_BYTES,
+            handshake_timeout_ms: DEFAULT_HANDSHAKE_TIMEOUT_MS,
+            idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS,
         }
+    }
+}
+
+/// Per-flow dirty notification callback used by [`NetStack`] implementations
+/// to avoid O(N) scans across idle connections on wakeup.
+pub(crate) trait FlowWaker: Send + Sync {
+    fn wake(&self);
+}
+
+#[inline]
+fn wake_stack(waker: &Arc<Notify>, flow_waker: Option<&Arc<dyn FlowWaker>>) {
+    if let Some(fw) = flow_waker {
+        fw.wake();
+    } else {
+        waker.notify_one();
     }
 }
 
@@ -80,6 +103,7 @@ pub struct TunTcpStream {
     read_offset: usize,
     to_stack: Option<mpsc::Sender<Vec<u8>>>,
     waker: Arc<Notify>,
+    flow_waker: Option<Arc<dyn FlowWaker>>,
     in_flight_relay: Option<Arc<AtomicUsize>>,
     aborted: Option<Arc<AtomicBool>>,
 }
@@ -88,6 +112,7 @@ pub struct TunTcpStream {
 pub struct TunTcpReader {
     from_stack: mpsc::Receiver<Vec<u8>>,
     waker: Arc<Notify>,
+    flow_waker: Option<Arc<dyn FlowWaker>>,
     in_flight_relay: Option<Arc<AtomicUsize>>,
 }
 
@@ -98,7 +123,7 @@ impl TunTcpReader {
         if let Some(counter) = self.in_flight_relay.as_ref() {
             counter.fetch_sub(chunk.len(), Ordering::AcqRel);
         }
-        self.waker.notify_one();
+        wake_stack(&self.waker, self.flow_waker.as_ref());
         Some(chunk)
     }
 
@@ -108,7 +133,7 @@ impl TunTcpReader {
         if let Some(counter) = self.in_flight_relay.as_ref() {
             counter.fetch_sub(chunk.len(), Ordering::AcqRel);
         }
-        self.waker.notify_one();
+        wake_stack(&self.waker, self.flow_waker.as_ref());
         Some(chunk)
     }
 
@@ -122,6 +147,7 @@ impl TunTcpReader {
 pub struct TunTcpWriter {
     to_stack: Option<mpsc::Sender<Vec<u8>>>,
     waker: Arc<Notify>,
+    flow_waker: Option<Arc<dyn FlowWaker>>,
     aborted: Option<Arc<AtomicBool>>,
 }
 
@@ -137,7 +163,7 @@ impl TunTcpWriter {
         tx.send(data)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUN TCP socket closed"))?;
-        self.waker.notify_one();
+        wake_stack(&self.waker, self.flow_waker.as_ref());
         Ok(())
     }
 
@@ -152,7 +178,7 @@ impl TunTcpWriter {
     /// Closes the write half (triggers TCP FIN on the TUN socket).
     pub fn shutdown(&mut self) {
         self.to_stack.take();
-        self.waker.notify_one();
+        wake_stack(&self.waker, self.flow_waker.as_ref());
     }
 
     /// Aborts the write half, signaling the stack to emit TCP `RST` instead of `FIN`.
@@ -161,24 +187,26 @@ impl TunTcpWriter {
             flag.store(true, Ordering::Release);
         }
         self.to_stack.take();
-        self.waker.notify_one();
+        wake_stack(&self.waker, self.flow_waker.as_ref());
     }
 }
 
 impl Drop for TunTcpWriter {
     fn drop(&mut self) {
-        self.to_stack.take();
-        self.waker.notify_one();
+        if self.to_stack.take().is_some() {
+            wake_stack(&self.waker, self.flow_waker.as_ref());
+        }
     }
 }
 
 impl TunTcpStream {
-    /// Constructs a [`TunTcpStream`] with optional atomic in-flight byte accounting
-    /// and abort flag.
+    /// Constructs a [`TunTcpStream`] with optional atomic in-flight byte accounting,
+    /// abort flag, and per-flow dirty waker.
     pub(crate) fn new_with_accounting(
         from_stack: mpsc::Receiver<Vec<u8>>,
         to_stack: mpsc::Sender<Vec<u8>>,
         waker: Arc<Notify>,
+        flow_waker: Option<Arc<dyn FlowWaker>>,
         in_flight_relay: Option<Arc<AtomicUsize>>,
         aborted: Option<Arc<AtomicBool>>,
     ) -> Self {
@@ -188,6 +216,7 @@ impl TunTcpStream {
             read_offset: 0,
             to_stack: Some(to_stack),
             waker,
+            flow_waker,
             in_flight_relay,
             aborted,
         }
@@ -199,7 +228,7 @@ impl TunTcpStream {
             flag.store(true, Ordering::Release);
         }
         self.to_stack.take();
-        self.waker.notify_one();
+        wake_stack(&self.waker, self.flow_waker.as_ref());
     }
 
     /// Splits this stream into spin-free chunked read and write halves.
@@ -208,17 +237,20 @@ impl TunTcpStream {
         let from_stack = std::mem::replace(&mut self.from_stack, dummy_rx);
         let to_stack = self.to_stack.take();
         let waker = Arc::clone(&self.waker);
+        let flow_waker = self.flow_waker.take();
         let in_flight_relay = self.in_flight_relay.take();
         let aborted = self.aborted.take();
         (
             TunTcpReader {
                 from_stack,
                 waker: Arc::clone(&waker),
+                flow_waker: flow_waker.clone(),
                 in_flight_relay,
             },
             TunTcpWriter {
                 to_stack,
                 waker,
+                flow_waker,
                 aborted,
             },
         )
@@ -245,7 +277,7 @@ impl AsyncRead for TunTcpStream {
                 this.read_buf.clear();
                 this.read_offset = 0;
             }
-            this.waker.notify_one();
+            wake_stack(&this.waker, this.flow_waker.as_ref());
             return Poll::Ready(Ok(()));
         }
 
@@ -262,7 +294,7 @@ impl AsyncRead for TunTcpStream {
                     this.read_buf = chunk;
                     this.read_offset = n;
                 }
-                this.waker.notify_one();
+                wake_stack(&this.waker, this.flow_waker.as_ref());
                 Poll::Ready(Ok(()))
             }
         }
@@ -289,7 +321,7 @@ impl AsyncWrite for TunTcpStream {
         let chunk_len = buf.len().min(64 * 1024);
         match tx.try_send(buf[..chunk_len].to_vec()) {
             Ok(()) => {
-                this.waker.notify_one();
+                wake_stack(&this.waker, this.flow_waker.as_ref());
                 Poll::Ready(Ok(chunk_len))
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
@@ -297,7 +329,7 @@ impl AsyncWrite for TunTcpStream {
                 "TUN TCP socket closed",
             ))),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                this.waker.notify_one();
+                wake_stack(&this.waker, this.flow_waker.as_ref());
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
@@ -305,21 +337,22 @@ impl AsyncWrite for TunTcpStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.waker.notify_one();
+        wake_stack(&self.waker, self.flow_waker.as_ref());
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.to_stack.take();
-        this.waker.notify_one();
+        wake_stack(&this.waker, this.flow_waker.as_ref());
         Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for TunTcpStream {
     fn drop(&mut self) {
-        self.to_stack.take();
-        self.waker.notify_one();
+        if self.to_stack.take().is_some() {
+            wake_stack(&self.waker, self.flow_waker.as_ref());
+        }
     }
 }

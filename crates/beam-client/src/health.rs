@@ -1,14 +1,14 @@
 //! Always-on network transition detector, sleep/resume watcher, bounded-backoff
 //! server reachability probe, and atomic status file publisher for `linux-tray`.
 
-use std::io;
+use std::io::{self, Write as _};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use beam_sys::NetlinkRouteWatcher;
-use beam_tun::IpNet;
+use beam_sys::{NetlinkRouteWatcher, boottime_offset};
+use beam_tun::{IpNet, TunnelActivity};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -28,6 +28,8 @@ const NETLINK_COALESCE_DELAY: Duration = Duration::from_millis(150);
 const SLEEP_JUMP_THRESHOLD_SECS: u64 = 5;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const HEALTHY_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(75);
+const IDLE_PROBE_JITTER_MAX_SECS: u64 = 15;
 const INITIAL_OFFLINE_BACKOFF_SECS: u64 = 2;
 const MAX_OFFLINE_BACKOFF_SECS: u64 = 10;
 
@@ -73,8 +75,9 @@ impl Drop for StatusFileGuard {
 ///    brief `<2s` link flaps) while keeping the TUN fail-closed.
 /// 3. Increments `network_reset_tx` so `beam-tun` sends immediate TCP RSTs,
 ///    resets XUDP mux, and refreshes local DNS cache/upstream.
-/// 4. Probes `server_addr` with low-noise 60 s healthy cadence and bounded
-///    backoff during outages, publishing timestamped status + RTT for `beam-tray`.
+/// 4. Tracks liveness from live tunnel dials (`TunnelActivity`) during active
+///    traffic, falling back to jittered reachability probes only when idle or
+///    recovering from outages, publishing timestamped status + RTT for `beam-tray`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_network_monitor(
     ifname: String,
@@ -83,6 +86,7 @@ pub fn spawn_network_monitor(
     auto_route: bool,
     fixed_local_dns: Option<IpAddr>,
     routes: Arc<Mutex<LinuxRouteGuard>>,
+    activity: Arc<TunnelActivity>,
     network_reset_tx: watch::Sender<u64>,
     mut shutdown: watch::Receiver<bool>,
     status_path: PathBuf,
@@ -119,8 +123,7 @@ pub fn spawn_network_monitor(
         } else {
             PhysicalGateways::default()
         };
-        let mut last_mono = Instant::now();
-        let mut last_wall = SystemTime::now();
+        let mut last_boottime_offset = boottime_offset().ok();
         let mut next_probe_at = Instant::now();
         let mut next_route_check_at = Instant::now() + ROUTE_HEALTH_CHECK_INTERVAL;
         let mut next_route_retry_at: Option<Instant> = None;
@@ -128,6 +131,9 @@ pub fn spawn_network_monitor(
         let mut offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
         let mut generation: u64 = 0;
         let mut check_routes_now = true;
+        let mut is_connected = false;
+        let mut last_reset_at: Option<Instant> = None;
+        let mut probe_seq: u64 = u64::from(std::process::id());
 
         loop {
             if *shutdown.borrow() {
@@ -135,10 +141,14 @@ pub fn spawn_network_monitor(
             }
 
             let now_mono = Instant::now();
-            let now_wall = SystemTime::now();
-            let slept_from_suspend = detect_sleep_jump(last_mono, now_mono, last_wall, now_wall);
-            last_mono = now_mono;
-            last_wall = now_wall;
+            let now_boottime_offset = boottime_offset().ok();
+            let slept_from_suspend = match (last_boottime_offset, now_boottime_offset) {
+                (Some(prev), Some(now)) => detect_boottime_sleep_jump(prev, now),
+                _ => false,
+            };
+            if now_boottime_offset.is_some() {
+                last_boottime_offset = now_boottime_offset;
+            }
 
             // Only fork `ip` to inspect gateways/bypass routes when:
             // - initial startup or netlink reported a route/link change,
@@ -238,6 +248,8 @@ pub fn spawn_network_monitor(
                 if gw_changed || slept_from_suspend {
                     generation = generation.wrapping_add(1);
                     let _ = network_reset_tx.send(generation);
+                    is_connected = false;
+                    last_reset_at = Some(Instant::now());
                 }
                 offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
                 next_probe_at = Instant::now();
@@ -248,32 +260,59 @@ pub fn spawn_network_monitor(
 
             if Instant::now() >= next_probe_at {
                 if auto_route && !server_has_gw && !server_addr.ip().is_loopback() {
+                    is_connected = false;
                     write_status_atomic(&status_path, LinkState::WaitingNetwork, None, &ifname);
                     next_probe_at = Instant::now() + Duration::from_secs(offline_backoff_secs);
                     offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
                 } else {
-                    match probe_server_rtt(server_addr).await {
-                        Some(rtt_ms) => {
-                            write_status_atomic(
-                                &status_path,
-                                LinkState::Connected,
-                                Some(rtt_ms),
-                                &ifname,
-                            );
-                            offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
-                            next_probe_at = Instant::now() + HEALTHY_PROBE_INTERVAL;
-                        }
-                        None => {
-                            debug!(%server_addr, backoff_secs = offline_backoff_secs, "server reachability probe failed");
-                            write_status_atomic(
-                                &status_path,
-                                LinkState::Reconnecting,
-                                None,
-                                &ifname,
-                            );
-                            next_probe_at =
-                                Instant::now() + Duration::from_secs(offline_backoff_secs);
-                            offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
+                    let recent_window = match last_reset_at {
+                        Some(reset_at) => RECENT_ACTIVITY_WINDOW
+                            .min(Instant::now().saturating_duration_since(reset_at)),
+                        None => RECENT_ACTIVITY_WINDOW,
+                    };
+                    let recent_rtt = if is_connected && !recent_window.is_zero() {
+                        activity.recent_rtt(recent_window)
+                    } else {
+                        None
+                    };
+                    if let Some(rtt_ms) = recent_rtt {
+                        write_status_atomic(
+                            &status_path,
+                            LinkState::Connected,
+                            Some(rtt_ms),
+                            &ifname,
+                        );
+                        offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
+                        probe_seq = probe_seq.wrapping_add(1);
+                        next_probe_at = Instant::now() + next_healthy_probe_interval(probe_seq);
+                    } else {
+                        match probe_server_rtt(server_addr).await {
+                            Some(rtt_ms) => {
+                                is_connected = true;
+                                write_status_atomic(
+                                    &status_path,
+                                    LinkState::Connected,
+                                    Some(rtt_ms),
+                                    &ifname,
+                                );
+                                offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
+                                probe_seq = probe_seq.wrapping_add(1);
+                                next_probe_at =
+                                    Instant::now() + next_healthy_probe_interval(probe_seq);
+                            }
+                            None => {
+                                is_connected = false;
+                                debug!(%server_addr, backoff_secs = offline_backoff_secs, "server reachability probe failed");
+                                write_status_atomic(
+                                    &status_path,
+                                    LinkState::Reconnecting,
+                                    None,
+                                    &ifname,
+                                );
+                                next_probe_at =
+                                    Instant::now() + Duration::from_secs(offline_backoff_secs);
+                                offline_backoff_secs = next_offline_backoff(offline_backoff_secs);
+                            }
                         }
                     }
                 }
@@ -368,19 +407,25 @@ async fn probe_server_rtt(server_addr: SocketAddr) -> Option<u64> {
     }
 }
 
-/// Detects a suspend/resume jump when wall-clock time advanced significantly
-/// further than monotonic elapsed time.
-pub fn detect_sleep_jump(
-    prev_mono: Instant,
-    now_mono: Instant,
-    prev_wall: SystemTime,
-    now_wall: SystemTime,
-) -> bool {
-    let mono_delta = now_mono.saturating_duration_since(prev_mono);
-    let Ok(wall_delta) = now_wall.duration_since(prev_wall) else {
-        return false;
-    };
-    wall_delta.saturating_sub(mono_delta) >= Duration::from_secs(SLEEP_JUMP_THRESHOLD_SECS)
+/// Detects a suspend/resume jump when `CLOCK_BOOTTIME - CLOCK_MONOTONIC`
+/// advances by at least [`SLEEP_JUMP_THRESHOLD_SECS`].
+///
+/// Both clocks are monotonic and unaffected by NTP or wall-clock steps, so
+/// forward NTP adjustments cannot trigger false network resets.
+pub fn detect_boottime_sleep_jump(prev_offset: Duration, now_offset: Duration) -> bool {
+    now_offset.saturating_sub(prev_offset) >= Duration::from_secs(SLEEP_JUMP_THRESHOLD_SECS)
+}
+
+/// Computes the next healthy/idle probe interval with deterministic
+/// pseudo-random jitter (`HEALTHY_PROBE_INTERVAL + 0..=15 s`) so idle probes
+/// do not emit a fixed-period beacon.
+pub fn next_healthy_probe_interval(seed: u64) -> Duration {
+    let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    let jitter_secs = z % (IDLE_PROBE_JITTER_MAX_SECS + 1);
+    HEALTHY_PROBE_INTERVAL + Duration::from_secs(jitter_secs)
 }
 
 /// Bounded exponential backoff for offline/reconnecting probes.
@@ -408,7 +453,7 @@ pub fn format_status(state: LinkState, rtt_ms: Option<u64>, ifname: &str) -> Str
     out
 }
 
-/// Atomically writes the status file if its parent directory exists.
+/// Atomically writes and fsyncs the status file if its parent directory exists.
 pub fn write_status_atomic(path: &Path, state: LinkState, rtt_ms: Option<u64>, ifname: &str) {
     let Some(parent) = path.parent() else {
         return;
@@ -418,7 +463,11 @@ pub fn write_status_atomic(path: &Path, state: LinkState, rtt_ms: Option<u64>, i
     }
     let tmp = path.with_extension("tmp");
     let body = format_status(state, rtt_ms, ifname);
-    if std::fs::write(&tmp, body).is_ok() {
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(body.as_bytes())?;
+        file.sync_all()
+    });
+    if written.is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
 }
@@ -436,13 +485,51 @@ mod tests {
     }
 
     #[test]
-    fn detects_wall_clock_sleep_jump() {
-        let m0 = Instant::now();
-        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let w_normal = w0 + Duration::from_secs(2);
-        let w_jumped = w0 + Duration::from_secs(60);
-        assert!(!detect_sleep_jump(m0, m0, w0, w_normal));
-        assert!(detect_sleep_jump(m0, m0, w0, w_jumped));
+    fn boottime_sleep_jump_ignores_ntp_and_detects_suspend() {
+        // An NTP wall-clock step does not change `CLOCK_BOOTTIME - CLOCK_MONOTONIC`.
+        let offset = Duration::from_secs(120);
+        assert!(!detect_boottime_sleep_jump(offset, offset));
+        assert!(!detect_boottime_sleep_jump(
+            offset,
+            offset + Duration::from_secs(4)
+        ));
+        // Backward or zero delta never triggers.
+        assert!(!detect_boottime_sleep_jump(
+            offset,
+            offset - Duration::from_secs(10)
+        ));
+        // Suspend jump >= 5s triggers.
+        assert!(detect_boottime_sleep_jump(
+            offset,
+            offset + Duration::from_secs(SLEEP_JUMP_THRESHOLD_SECS)
+        ));
+        assert!(detect_boottime_sleep_jump(
+            offset,
+            offset + Duration::from_secs(60)
+        ));
+
+        // Live kernel clocks should be readable and show no spurious jump across back-to-back reads.
+        let t0 = boottime_offset().expect("read CLOCK_BOOTTIME - CLOCK_MONOTONIC");
+        let t1 = boottime_offset().expect("read CLOCK_BOOTTIME - CLOCK_MONOTONIC");
+        assert!(!detect_boottime_sleep_jump(t0, t1));
+    }
+
+    #[test]
+    fn healthy_probe_interval_is_jittered_within_bounds() {
+        let mut saw_distinct = false;
+        let first = next_healthy_probe_interval(1);
+        for seed in 1..=32 {
+            let interval = next_healthy_probe_interval(seed);
+            assert!(interval >= HEALTHY_PROBE_INTERVAL);
+            assert!(
+                interval
+                    <= HEALTHY_PROBE_INTERVAL + Duration::from_secs(IDLE_PROBE_JITTER_MAX_SECS)
+            );
+            if interval != first {
+                saw_distinct = true;
+            }
+        }
+        assert!(saw_distinct, "probe intervals should vary across seeds");
     }
 
     #[test]

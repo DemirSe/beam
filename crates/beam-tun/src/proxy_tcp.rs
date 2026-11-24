@@ -3,10 +3,11 @@
 //! bounded receive backpressure, zero-window persist, OOO FIN handling, and
 //! cumulative ACK coalescing.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Notify, mpsc};
 
@@ -14,7 +15,7 @@ use crate::packet::{
     IP_PROTO_TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, build_ip_tcp_packet_slices,
     parse_ip, parse_tcp, parse_tcp_syn_options,
 };
-use crate::stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
+use crate::stack::{AcceptedTcpStream, FlowWaker, NetStack, TcpStackConfig, TunTcpStream};
 
 const OUR_WSCALE: u8 = 7; // 128x multiplier -> up to ~8 MiB window; capped at max_rcv_buf
 const MIN_TCP_BUF: usize = 64 * 1024;
@@ -27,11 +28,47 @@ const RELAY_COALESCE_BYTES: usize = 64 * 1024;
 const INITIAL_RTO_MS: i64 = 200;
 const MAX_RTO_MS: i64 = 4_000;
 const MAX_RETRIES: u8 = 8;
-const HANDSHAKE_TIMEOUT_MS: i64 = 10_000;
 const CLOSING_TIMEOUT_MS: i64 = 5_000;
-const IDLE_TIMEOUT_MS: i64 = 300_000;
 
 type FlowKey = (IpAddr, u16, IpAddr, u16);
+
+struct DirtyFlowQueue {
+    queue: Mutex<VecDeque<FlowKey>>,
+    waker: Arc<Notify>,
+}
+
+struct FlowDirtyHandle {
+    flow: FlowKey,
+    queued: AtomicBool,
+    dirty: Arc<DirtyFlowQueue>,
+}
+
+impl FlowDirtyHandle {
+    fn new(flow: FlowKey, dirty: Arc<DirtyFlowQueue>) -> Self {
+        Self {
+            flow,
+            queued: AtomicBool::new(false),
+            dirty,
+        }
+    }
+
+    fn clear_queued(&self) {
+        self.queued.store(false, Ordering::SeqCst);
+    }
+}
+
+impl FlowWaker for FlowDirtyHandle {
+    fn wake(&self) {
+        if !self.queued.swap(true, Ordering::SeqCst) {
+            self.dirty
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(self.flow);
+        }
+        self.dirty.waker.notify_one();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpState {
@@ -82,8 +119,13 @@ struct TcpConn {
     retries: u8,
     state_deadline_ms: Option<i64>,
     last_activity_ms: i64,
+    /// Earliest deadline currently pushed to `ProxyTcpStack::timers` for this flow.
+    heap_deadline_ms: Option<i64>,
+    /// Deduplication guard while building the per-poll dirty batch.
+    in_poll_batch: bool,
     // Async relay channels
     accepted: bool,
+    dirty_handle: Option<Arc<FlowDirtyHandle>>,
     to_relay: Option<mpsc::Sender<Vec<u8>>>,
     from_relay: Option<mpsc::Receiver<Vec<u8>>>,
     relay_eof: bool,
@@ -264,33 +306,39 @@ impl TcpConn {
         }
 
         let mut emit_dup_ack = false;
-        if !seg.payload.is_empty()
-            && matches!(
+        if !seg.payload.is_empty() {
+            if matches!(
                 self.state,
                 TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
-            )
-        {
-            if self.process_data(seg.seq, seg.payload) {
-                emit_dup_ack = true;
-            } else {
+            ) {
+                if self.process_data(seg.seq, seg.payload) {
+                    emit_dup_ack = true;
+                } else {
+                    self.need_ack = true;
+                }
+            } else if matches!(self.state, TcpState::CloseWait | TcpState::LastAck) {
+                // Peer already sent FIN; emit a cumulative ACK for duplicate or
+                // retransmitted bytes to avoid peer retransmit storms.
                 self.need_ack = true;
             }
         }
 
         // Handle in-order or out-of-order FIN.
-        if (seg.flags & TCP_FIN) != 0
-            && matches!(
+        if (seg.flags & TCP_FIN) != 0 {
+            if matches!(
                 self.state,
                 TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
-            )
-        {
-            let fin_seq = seg.seq.wrapping_add(seg.payload.len() as u32);
-            if fin_seq == self.rcv_nxt {
-                self.consume_peer_fin(now_ms, tx_out);
-            } else if (fin_seq.wrapping_sub(self.rcv_nxt) as i32) > 0 {
-                // Record OOO FIN so it triggers once preceding data arrives.
-                self.peer_fin_seq = Some(fin_seq);
-                emit_dup_ack = true;
+            ) {
+                let fin_seq = seg.seq.wrapping_add(seg.payload.len() as u32);
+                if fin_seq == self.rcv_nxt {
+                    self.consume_peer_fin(now_ms, tx_out);
+                } else if (fin_seq.wrapping_sub(self.rcv_nxt) as i32) > 0 {
+                    // Record OOO FIN so it triggers once preceding data arrives.
+                    self.peer_fin_seq = Some(fin_seq);
+                    emit_dup_ack = true;
+                }
+            } else if matches!(self.state, TcpState::CloseWait | TcpState::LastAck) {
+                self.need_ack = true;
             }
         }
 
@@ -596,7 +644,24 @@ impl TcpConn {
         }
     }
 
-    fn check_timers(&mut self, now_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
+    fn next_deadline_ms(&self, idle_timeout_ms: i64) -> Option<i64> {
+        if self.state == TcpState::Closed {
+            return None;
+        }
+        let idle_deadline = matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            .then_some(self.last_activity_ms.saturating_add(idle_timeout_ms));
+        [
+            self.rto_deadline_ms,
+            self.persist_deadline_ms,
+            self.state_deadline_ms,
+            idle_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    fn check_timers(&mut self, now_ms: i64, idle_timeout_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
         if let Some(deadline) = self.state_deadline_ms
             && now_ms >= deadline
         {
@@ -611,7 +676,7 @@ impl TcpConn {
         // Bound idle `Established` / `CloseWait` connections so abandoned flows
         // cannot leak indefinitely.
         if matches!(self.state, TcpState::Established | TcpState::CloseWait)
-            && now_ms.saturating_sub(self.last_activity_ms) >= IDLE_TIMEOUT_MS
+            && now_ms.saturating_sub(self.last_activity_ms) >= idle_timeout_ms
         {
             self.send_rst(self.snd_nxt, tx_out);
             return;
@@ -679,7 +744,11 @@ pub struct ProxyTcpStack {
     conns: HashMap<FlowKey, TcpConn>,
     incoming_buf: Vec<u8>,
     incoming_lens: Vec<usize>,
-    waker: Arc<Notify>,
+    dirty: Arc<DirtyFlowQueue>,
+    timers: BinaryHeap<Reverse<(i64, FlowKey)>>,
+    poll_batch: Vec<FlowKey>,
+    #[cfg(test)]
+    last_poll_count: usize,
 }
 
 impl ProxyTcpStack {
@@ -690,7 +759,44 @@ impl ProxyTcpStack {
             conns: HashMap::new(),
             incoming_buf: Vec::with_capacity(64 * 1024),
             incoming_lens: Vec::with_capacity(128),
-            waker: Arc::new(Notify::new()),
+            dirty: Arc::new(DirtyFlowQueue {
+                queue: Mutex::new(VecDeque::with_capacity(64)),
+                waker: Arc::new(Notify::new()),
+            }),
+            timers: BinaryHeap::new(),
+            poll_batch: Vec::with_capacity(64),
+            #[cfg(test)]
+            last_poll_count: 0,
+        }
+    }
+
+    fn handshake_timeout_ms(&self) -> i64 {
+        i64::try_from(self.config.handshake_timeout_ms)
+            .unwrap_or(i64::MAX)
+            .max(1)
+    }
+
+    fn idle_timeout_ms(&self) -> i64 {
+        i64::try_from(self.config.idle_timeout_ms)
+            .unwrap_or(i64::MAX)
+            .max(1)
+    }
+
+    fn schedule_conn_timer(
+        timers: &mut BinaryHeap<Reverse<(i64, FlowKey)>>,
+        flow: FlowKey,
+        conn: &mut TcpConn,
+        idle_timeout_ms: i64,
+    ) {
+        if let Some(actual) = conn.next_deadline_ms(idle_timeout_ms) {
+            let need_push = match conn.heap_deadline_ms {
+                None => true,
+                Some(h) => actual < h,
+            };
+            if need_push {
+                conn.heap_deadline_ms = Some(actual);
+                timers.push(Reverse((actual, flow)));
+            }
         }
     }
 }
@@ -711,6 +817,10 @@ impl NetStack for ProxyTcpStack {
         tx_out: &mut Vec<Vec<u8>>,
         accepted: &mut Vec<AcceptedTcpStream>,
     ) {
+        let handshake_timeout_ms = self.handshake_timeout_ms();
+        let idle_timeout_ms = self.idle_timeout_ms();
+        self.poll_batch.clear();
+
         let mut offset = 0usize;
         for idx in 0..self.incoming_lens.len() {
             let len = self.incoming_lens[idx];
@@ -729,6 +839,10 @@ impl NetStack for ProxyTcpStack {
 
             if let Some(conn) = self.conns.get_mut(&flow) {
                 conn.on_segment(&seg, now_ms, tx_out);
+                if !conn.in_poll_batch {
+                    conn.in_poll_batch = true;
+                    self.poll_batch.push(flow);
+                }
             } else if (seg.flags & TCP_SYN) != 0 && (seg.flags & TCP_ACK) == 0 {
                 if self.conns.len() >= self.config.max_connections {
                     if let Some(rst) = build_ip_tcp_packet_slices(
@@ -801,9 +915,12 @@ impl NetStack for ProxyTcpStack {
                     persist_ms: INITIAL_RTO_MS,
                     persist_deadline_ms: None,
                     retries: 0,
-                    state_deadline_ms: Some(now_ms + HANDSHAKE_TIMEOUT_MS),
+                    state_deadline_ms: Some(now_ms.saturating_add(handshake_timeout_ms)),
                     last_activity_ms: now_ms,
+                    heap_deadline_ms: None,
+                    in_poll_batch: true,
                     accepted: false,
+                    dirty_handle: None,
                     to_relay: None,
                     from_relay: None,
                     relay_eof: false,
@@ -811,6 +928,7 @@ impl NetStack for ProxyTcpStack {
                 };
                 conn.send_syn_ack(now_ms, tx_out);
                 self.conns.insert(flow, conn);
+                self.poll_batch.push(flow);
             } else if (seg.flags & TCP_RST) == 0 {
                 let rst_seq = if (seg.flags & TCP_ACK) != 0 {
                     seg.ack
@@ -837,94 +955,186 @@ impl NetStack for ProxyTcpStack {
         self.incoming_buf.clear();
         self.incoming_lens.clear();
 
-        self.conns.retain(|_, conn| {
-            if !conn.accepted && matches!(conn.state, TcpState::Established | TcpState::CloseWait) {
-                let (to_relay_tx, to_relay_rx) = mpsc::channel(STREAM_CHANNEL_CAP);
-                let (from_relay_tx, from_relay_rx) = mpsc::channel(STREAM_CHANNEL_CAP);
-                conn.accepted = true;
-                conn.to_relay = Some(to_relay_tx);
-                conn.from_relay = Some(from_relay_rx);
-                accepted.push(AcceptedTcpStream {
-                    src: SocketAddr::new(conn.flow.0, conn.flow.1),
-                    dst: SocketAddr::new(conn.flow.2, conn.flow.3),
-                    stream: TunTcpStream::new_with_accounting(
-                        to_relay_rx,
-                        from_relay_tx,
-                        Arc::clone(&self.waker),
-                        Some(Arc::clone(&conn.in_flight_relay)),
-                        Some(Arc::clone(&conn.aborted)),
-                    ),
-                });
-            }
-
-            if conn.aborted.load(Ordering::Acquire) {
-                if conn.state != TcpState::Closed {
-                    conn.send_rst(conn.snd_nxt, tx_out);
+        // Drain flows dirtied by async relay tasks (`TunTcpStream` / Reader / Writer).
+        {
+            let mut q = self.dirty.queue.lock().unwrap_or_else(|e| e.into_inner());
+            while let Some(flow) = q.pop_front() {
+                if let Some(conn) = self.conns.get_mut(&flow) {
+                    if let Some(handle) = conn.dirty_handle.as_ref() {
+                        handle.clear_queued();
+                    }
+                    if !conn.in_poll_batch {
+                        conn.in_poll_batch = true;
+                        self.poll_batch.push(flow);
+                    }
                 }
-                return false;
             }
+        }
 
-            conn.flush_rcv_to_relay();
-            conn.drain_from_relay(now_ms);
-            conn.flush_tx(now_ms, tx_out);
-
-            // Emit a Window Update ACK promptly when:
-            // 1. Reopening from a low/zero advertised window to >= reopen_threshold, OR
-            // 2. Available receive window has grown by >= growth_step above
-            //    `last_advertised_wnd` (RFC 1122 / Linux tcp_select_window).
-            // Thresholds are derived from `effective_max_wnd` so peers without
-            // RFC 7323 Window Scale (`our_wscale == 0`, max 65_535) still reopen.
-            let effective_max_wnd =
-                (conn.max_rcv_buf as u32).min(u32::from(u16::MAX) << conn.our_wscale);
-            let current_wnd = conn.rcv_wnd_bytes();
-            let reopen_threshold = (effective_max_wnd / 4).clamp(1, 256 * 1024);
-            let growth_step = (effective_max_wnd / 4).clamp(1, 1024 * 1024);
-            if !conn.need_ack
-                && matches!(
-                    conn.state,
-                    TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
-                )
-                && ((conn.last_advertised_wnd < reopen_threshold
-                    && current_wnd >= reopen_threshold)
-                    || current_wnd.saturating_sub(conn.last_advertised_wnd) >= growth_step)
-            {
-                conn.need_ack = true;
+        // Pop flows whose timer deadline is due (`<= now_ms`), lazily rescheduling
+        // flows whose true deadline moved forward since insertion.
+        while let Some(&Reverse((deadline, flow))) = self.timers.peek() {
+            if deadline > now_ms {
+                break;
             }
-
-            if conn.need_ack && conn.state != TcpState::Closed {
-                if let Some(pkt) = conn.build_packet_slices(TCP_ACK, &[], &[], &[], conn.snd_nxt) {
-                    tx_out.push(pkt);
+            self.timers.pop();
+            let Some(conn) = self.conns.get_mut(&flow) else {
+                continue;
+            };
+            if conn.heap_deadline_ms != Some(deadline) {
+                continue;
+            }
+            conn.heap_deadline_ms = None;
+            if let Some(actual) = conn.next_deadline_ms(idle_timeout_ms) {
+                if actual <= now_ms {
+                    if !conn.in_poll_batch {
+                        conn.in_poll_batch = true;
+                        self.poll_batch.push(flow);
+                    }
+                } else {
+                    conn.heap_deadline_ms = Some(actual);
+                    self.timers.push(Reverse((actual, flow)));
                 }
-                conn.need_ack = false;
             }
+        }
 
-            conn.check_timers(now_ms, tx_out);
-            conn.state != TcpState::Closed
-        });
+        #[cfg(test)]
+        {
+            self.last_poll_count = self.poll_batch.len();
+        }
+
+        let mut poll_batch = std::mem::take(&mut self.poll_batch);
+        for flow in poll_batch.drain(..) {
+            let mut keep = false;
+            if let Some(conn) = self.conns.get_mut(&flow) {
+                conn.in_poll_batch = false;
+                if let Some(handle) = conn.dirty_handle.as_ref() {
+                    handle.clear_queued();
+                }
+
+                if !conn.accepted
+                    && matches!(conn.state, TcpState::Established | TcpState::CloseWait)
+                {
+                    let (to_relay_tx, to_relay_rx) = mpsc::channel(STREAM_CHANNEL_CAP);
+                    let (from_relay_tx, from_relay_rx) = mpsc::channel(STREAM_CHANNEL_CAP);
+                    let handle = Arc::new(FlowDirtyHandle::new(flow, Arc::clone(&self.dirty)));
+                    let flow_waker: Arc<dyn FlowWaker> = Arc::clone(&handle) as Arc<dyn FlowWaker>;
+                    conn.accepted = true;
+                    conn.dirty_handle = Some(handle);
+                    conn.to_relay = Some(to_relay_tx);
+                    conn.from_relay = Some(from_relay_rx);
+                    accepted.push(AcceptedTcpStream {
+                        src: SocketAddr::new(conn.flow.0, conn.flow.1),
+                        dst: SocketAddr::new(conn.flow.2, conn.flow.3),
+                        stream: TunTcpStream::new_with_accounting(
+                            to_relay_rx,
+                            from_relay_tx,
+                            Arc::clone(&self.dirty.waker),
+                            Some(flow_waker),
+                            Some(Arc::clone(&conn.in_flight_relay)),
+                            Some(Arc::clone(&conn.aborted)),
+                        ),
+                    });
+                }
+
+                if conn.aborted.load(Ordering::Acquire) {
+                    if conn.state != TcpState::Closed {
+                        conn.send_rst(conn.snd_nxt, tx_out);
+                    }
+                } else {
+                    conn.flush_rcv_to_relay();
+                    conn.drain_from_relay(now_ms);
+                    conn.flush_tx(now_ms, tx_out);
+
+                    // Emit a Window Update ACK promptly when:
+                    // 1. Reopening from a low/zero advertised window to >= reopen_threshold, OR
+                    // 2. Available receive window has grown by >= growth_step above
+                    //    `last_advertised_wnd` (RFC 1122 / Linux tcp_select_window).
+                    // Thresholds are derived from `effective_max_wnd` so peers without
+                    // RFC 7323 Window Scale (`our_wscale == 0`, max 65_535) still reopen.
+                    let effective_max_wnd =
+                        (conn.max_rcv_buf as u32).min(u32::from(u16::MAX) << conn.our_wscale);
+                    let current_wnd = conn.rcv_wnd_bytes();
+                    let reopen_threshold = (effective_max_wnd / 4).clamp(1, 256 * 1024);
+                    let growth_step = (effective_max_wnd / 4).clamp(1, 1024 * 1024);
+                    if !conn.need_ack
+                        && matches!(
+                            conn.state,
+                            TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
+                        )
+                        && ((conn.last_advertised_wnd < reopen_threshold
+                            && current_wnd >= reopen_threshold)
+                            || current_wnd.saturating_sub(conn.last_advertised_wnd) >= growth_step)
+                    {
+                        conn.need_ack = true;
+                    }
+
+                    if conn.need_ack && conn.state != TcpState::Closed {
+                        if let Some(pkt) =
+                            conn.build_packet_slices(TCP_ACK, &[], &[], &[], conn.snd_nxt)
+                        {
+                            tx_out.push(pkt);
+                        }
+                        conn.need_ack = false;
+                    }
+
+                    conn.check_timers(now_ms, idle_timeout_ms, tx_out);
+                    keep = conn.state != TcpState::Closed;
+                    if keep {
+                        Self::schedule_conn_timer(&mut self.timers, flow, conn, idle_timeout_ms);
+                    }
+                }
+            }
+            if !keep {
+                self.conns.remove(&flow);
+            }
+        }
+        self.poll_batch = poll_batch;
+
+        // Keep the timer heap strictly bounded against stale entries.
+        let max_heap_entries = self.conns.len().saturating_mul(4).saturating_add(64);
+        if self.timers.len() > max_heap_entries {
+            self.timers.clear();
+            for (&flow, conn) in &mut self.conns {
+                conn.heap_deadline_ms = conn.next_deadline_ms(idle_timeout_ms);
+                if let Some(d) = conn.heap_deadline_ms {
+                    self.timers.push(Reverse((d, flow)));
+                }
+            }
+        }
     }
 
     fn poll_delay_ms(&mut self, now_ms: i64) -> Option<u64> {
-        let mut earliest: Option<i64> = None;
-        for conn in self.conns.values() {
-            let idle_deadline = matches!(conn.state, TcpState::Established | TcpState::CloseWait)
-                .then_some(conn.last_activity_ms.saturating_add(IDLE_TIMEOUT_MS));
-            for d in [
-                conn.rto_deadline_ms,
-                conn.persist_deadline_ms,
-                conn.state_deadline_ms,
-                idle_deadline,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                earliest = Some(earliest.map_or(d, |cur| cur.min(d)));
+        let idle_timeout_ms = self.idle_timeout_ms();
+        while let Some(&Reverse((deadline, flow))) = self.timers.peek() {
+            let Some(conn) = self.conns.get_mut(&flow) else {
+                self.timers.pop();
+                continue;
+            };
+            if conn.heap_deadline_ms != Some(deadline) {
+                self.timers.pop();
+                continue;
+            }
+            match conn.next_deadline_ms(idle_timeout_ms) {
+                None => {
+                    conn.heap_deadline_ms = None;
+                    self.timers.pop();
+                }
+                Some(actual) if actual > deadline => {
+                    self.timers.pop();
+                    conn.heap_deadline_ms = Some(actual);
+                    self.timers.push(Reverse((actual, flow)));
+                }
+                Some(actual) => {
+                    return Some(actual.saturating_sub(now_ms).max(1) as u64);
+                }
             }
         }
-        earliest.map(|d| d.saturating_sub(now_ms).max(1) as u64)
+        None
     }
 
     fn waker(&self) -> Arc<Notify> {
-        Arc::clone(&self.waker)
+        Arc::clone(&self.dirty.waker)
     }
 
     fn reset_all(&mut self, tx_out: &mut Vec<Vec<u8>>) {
@@ -933,6 +1143,13 @@ impl NetStack for ProxyTcpStack {
         }
         self.incoming_buf.clear();
         self.incoming_lens.clear();
+        self.timers.clear();
+        self.poll_batch.clear();
+        self.dirty
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -1101,6 +1318,7 @@ mod tests {
         // Queue data from relay -> triggers persist timer.
         let conn = stack.conns.values_mut().next().expect("conn");
         conn.tx_buf.extend(b"blocked-by-zero-window");
+        conn.dirty_handle.as_ref().expect("dirty handle").wake();
         tx.clear();
         stack.poll(40, &mut tx, &mut accepted);
         assert!(tx.is_empty(), "must not transmit into zero window");
@@ -1109,10 +1327,11 @@ mod tests {
         stack.poll(40 + INITIAL_RTO_MS, &mut tx, &mut accepted);
         assert_eq!(tx.len(), 1, "persist probe ACK must be emitted");
 
-        // Advance past IDLE_TIMEOUT_MS -> stalled connection must be reclaimed.
+        // Advance past default idle_timeout_ms -> stalled connection must be reclaimed.
+        let idle_timeout_ms = TcpStackConfig::default().idle_timeout_ms as i64;
         drop(writer);
         tx.clear();
-        stack.poll(40 + IDLE_TIMEOUT_MS + 1000, &mut tx, &mut accepted);
+        stack.poll(40 + idle_timeout_ms + 1000, &mut tx, &mut accepted);
         assert!(stack.conns.is_empty(), "idle connection must be reclaimed");
     }
 
@@ -1282,6 +1501,7 @@ mod tests {
         assert_eq!(conn.our_wscale, 0);
         conn.last_advertised_wnd = 0;
         conn.need_ack = false;
+        conn.dirty_handle.as_ref().expect("dirty handle").wake();
         tx.clear();
         stack.poll(30, &mut tx, &mut accepted);
         assert_eq!(
@@ -1356,5 +1576,208 @@ mod tests {
         assert_eq!(rst.flags & TCP_FIN, 0, "must not emit TCP_FIN on abort");
         assert_eq!(rst.seq, srv_nxt);
         assert_eq!(rst.ack, 3001);
+    }
+
+    #[tokio::test]
+    async fn dirty_queue_avoids_polling_idle_flows_and_tracks_earliest_deadline() {
+        let cfg = TcpStackConfig {
+            max_connections: 64,
+            idle_timeout_ms: 10_000,
+            ..TcpStackConfig::default()
+        };
+        let mut stack = ProxyTcpStack::new(cfg);
+        let mut streams = Vec::new();
+        let mut srv_nxts = Vec::new();
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+
+        // Establish 32 flows staggered by 100 ms each (last_activity_ms = 1000 + i * 100).
+        for i in 0u16..32 {
+            let port = SRC_PORT + i;
+            let now = 1000 + i64::from(i) * 100;
+            let syn = build_ip_tcp_packet_slices(
+                SRC_IP,
+                port,
+                DST_IP,
+                DST_PORT,
+                1000,
+                0,
+                TCP_SYN,
+                65535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("syn");
+            stack.push_ip_tcp(&syn);
+            tx.clear();
+            stack.poll(now, &mut tx, &mut accepted);
+            let syn_ack = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+            let srv_nxt = syn_ack.seq.wrapping_add(1);
+            let ack = build_ip_tcp_packet_slices(
+                SRC_IP,
+                port,
+                DST_IP,
+                DST_PORT,
+                1001,
+                srv_nxt,
+                TCP_ACK,
+                65535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("ack");
+            stack.push_ip_tcp(&ack);
+            tx.clear();
+            stack.poll(now, &mut tx, &mut accepted);
+            srv_nxts.push(srv_nxt);
+            streams.push(accepted.pop().expect("accepted").stream.into_split());
+        }
+        assert_eq!(stack.conns.len(), 32);
+
+        // Earliest deadline is flow 0 at 1000 + 10_000 = 11_000.
+        assert_eq!(stack.poll_delay_ms(5000), Some(6000));
+
+        // Wake only flow 5 via relay writer -> poll must touch ONLY flow 5, not the 31 idle flows.
+        streams[5]
+            .1
+            .send_chunk(b"only-flow-5".to_vec())
+            .await
+            .expect("send");
+        tx.clear();
+        stack.poll(5100, &mut tx, &mut accepted);
+        assert_eq!(
+            stack.last_poll_count, 1,
+            "idle flows must not be re-polled on single-flow wakeup"
+        );
+        assert_eq!(tx.len(), 1);
+        // Flow 5 now has an RTO deadline at 5100 + INITIAL_RTO_MS = 5300 (earlier than flow 0's 11_000).
+        assert_eq!(stack.poll_delay_ms(5100), Some(INITIAL_RTO_MS as u64));
+
+        // ACK flow 5's data so its RTO clears; earliest deadline must lazily return to flow 0 (11_000).
+        let ack5 = build_ip_tcp_packet_slices(
+            SRC_IP,
+            SRC_PORT + 5,
+            DST_IP,
+            DST_PORT,
+            1001,
+            srv_nxts[5].wrapping_add(11),
+            TCP_ACK,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("ack5");
+        stack.push_ip_tcp(&ack5);
+        tx.clear();
+        stack.poll(5150, &mut tx, &mut accepted);
+        assert_eq!(stack.last_poll_count, 1);
+        assert_eq!(stack.poll_delay_ms(5150), Some(11_000 - 5150));
+
+        // reset_all must clear conns, dirty queue, and timers cleanly.
+        tx.clear();
+        stack.reset_all(&mut tx);
+        assert!(stack.conns.is_empty());
+        assert_eq!(tx.len(), 32);
+        assert_eq!(stack.poll_delay_ms(5200), None);
+    }
+
+    #[tokio::test]
+    async fn data_arriving_in_close_wait_and_last_ack_emits_cumulative_ack() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let (srv_nxt, acc) = handshake(&mut stack, 2000);
+        let (_reader, mut writer) = acc.stream.into_split();
+
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+
+        // Peer sends data ("abc") + FIN -> state transitions to CloseWait, rcv_nxt = 2005.
+        stack.push_ip_tcp(&make_seg(
+            2001,
+            srv_nxt,
+            TCP_ACK | TCP_FIN,
+            1024,
+            &[],
+            b"abc",
+        ));
+        stack.poll(30, &mut tx, &mut accepted);
+        let conn = stack.conns.values().next().expect("conn");
+        assert_eq!(conn.state, TcpState::CloseWait);
+        assert_eq!(conn.rcv_nxt, 2005);
+
+        // Retransmitted/duplicate data arrives in CloseWait -> must emit cumulative ACK (ack = 2005).
+        tx.clear();
+        stack.push_ip_tcp(&make_seg(2001, srv_nxt, TCP_ACK, 1024, &[], b"abc"));
+        stack.poll(40, &mut tx, &mut accepted);
+        assert_eq!(tx.len(), 1, "expected cumulative ACK in CloseWait");
+        let ack_cw = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_eq!(ack_cw.flags, TCP_ACK);
+        assert_eq!(ack_cw.ack, 2005);
+        assert_eq!(stack.conns.values().next().expect("conn").rcv_nxt, 2005);
+
+        // Relay shuts down write side -> stack sends FIN and transitions to LastAck.
+        writer.shutdown();
+        tx.clear();
+        stack.poll(50, &mut tx, &mut accepted);
+        assert_eq!(
+            stack.conns.values().next().expect("conn").state,
+            TcpState::LastAck
+        );
+
+        // Retransmitted/duplicate data arrives in LastAck -> must emit cumulative ACK (ack = 2005).
+        tx.clear();
+        stack.push_ip_tcp(&make_seg(2001, srv_nxt, TCP_ACK, 1024, &[], b"abc"));
+        stack.poll(60, &mut tx, &mut accepted);
+        assert_eq!(tx.len(), 1, "expected cumulative ACK in LastAck");
+        let ack_la = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_eq!(ack_la.flags, TCP_ACK);
+        assert_eq!(ack_la.ack, 2005);
+        assert_eq!(stack.conns.values().next().expect("conn").rcv_nxt, 2005);
+    }
+
+    #[test]
+    fn custom_handshake_and_idle_timeouts_take_effect() {
+        let cfg = TcpStackConfig {
+            handshake_timeout_ms: 1_500,
+            idle_timeout_ms: 4_000,
+            ..TcpStackConfig::default()
+        };
+        let mut stack = ProxyTcpStack::new(cfg);
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+
+        // 1. Half-open SYN expires at custom handshake_timeout_ms (1_500 ms), not 10_000 ms.
+        stack.push_ip_tcp(&make_seg(100, 0, TCP_SYN, 65535, &[], &[]));
+        stack.poll(100, &mut tx, &mut accepted);
+        assert_eq!(stack.conns.len(), 1);
+        tx.clear();
+        stack.poll(1599, &mut tx, &mut accepted);
+        assert_eq!(stack.conns.len(), 1);
+        tx.clear();
+        stack.poll(1600, &mut tx, &mut accepted);
+        assert!(
+            stack.conns.is_empty(),
+            "half-open handshake must expire at custom handshake_timeout_ms"
+        );
+
+        // 2. Established connection expires at custom idle_timeout_ms (4_000 ms), not 300_000 ms.
+        let (_srv_nxt, _acc) = handshake(&mut stack, 500);
+        assert_eq!(stack.conns.len(), 1);
+        // `handshake()` completes at now_ms = 20, so idle deadline is 4020.
+        assert_eq!(stack.poll_delay_ms(20), Some(4_000));
+        tx.clear();
+        stack.poll(4019, &mut tx, &mut accepted);
+        assert_eq!(stack.conns.len(), 1);
+        tx.clear();
+        stack.poll(4020, &mut tx, &mut accepted);
+        assert!(
+            stack.conns.is_empty(),
+            "established connection must expire at custom idle_timeout_ms"
+        );
+        assert_eq!(tx.len(), 1, "idle expiration must emit RST");
+        let rst = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_ne!(rst.flags & TCP_RST, 0);
     }
 }
