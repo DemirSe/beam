@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use rustls::ServerConnection;
+use rustls::{ClientConnection, Connection, ServerConnection};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
@@ -94,7 +94,7 @@ pub trait RawTlsHandoff: AsyncRead + AsyncWrite + Unpin {
 /// TLS stream that reads one record at a time from the socket.
 pub struct TlsStream {
     socket: TcpStream,
-    conn: ServerConnection,
+    conn: Connection,
     record: RecordRead,
     pending: Vec<u8>,
     pending_offset: usize,
@@ -127,9 +127,35 @@ impl TlsStream {
         }
         let mut stream = Self {
             socket,
-            conn,
+            conn: Connection::Server(conn),
             record: RecordRead::default(),
             pending: client_hello,
+            pending_offset: 0,
+            plaintext: Vec::new(),
+            plaintext_offset: 0,
+            outgoing: Vec::new(),
+            outgoing_offset: 0,
+            pending_write: None,
+            read_raw: false,
+            write_raw: false,
+            closed: false,
+        };
+        poll_fn(|cx| stream.poll_handshake(cx)).await?;
+        Ok(stream)
+    }
+
+    /// Drives a client TLS handshake over `socket`.
+    ///
+    /// The caller is responsible for bounding this future with a timeout.
+    pub async fn connect(
+        socket: TcpStream,
+        conn: ClientConnection,
+    ) -> Result<Self, TlsStreamError> {
+        let mut stream = Self {
+            socket,
+            conn: Connection::Client(conn),
+            record: RecordRead::default(),
+            pending: Vec::new(),
             pending_offset: 0,
             plaintext: Vec::new(),
             plaintext_offset: 0,
@@ -924,7 +950,7 @@ mod tests {
         let conn = ServerConnection::new(test_server_config()).expect("server connection");
         TlsStream {
             socket,
-            conn,
+            conn: Connection::Server(conn),
             record: RecordRead::default(),
             pending: Vec::new(),
             pending_offset: 0,

@@ -339,6 +339,37 @@ impl<'a> RequestHeader<'a> {
     pub fn is_vision(&self) -> bool {
         self.addons.is_vision()
     }
+
+    /// Encodes this request header into `out`.
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), VlessError> {
+        if self.version != VLESS_VERSION {
+            return Err(VlessError::UnsupportedVersion(self.version));
+        }
+        let addons_len = u8::try_from(self.addons.raw.len())
+            .map_err(|_| malformed_addons("addons exceed the one-byte length limit"))?;
+        let start_len = out.len();
+        out.push(self.version);
+        out.extend_from_slice(&self.user_id);
+        out.push(addons_len);
+        out.extend_from_slice(self.addons.raw);
+        out.push(self.command.as_u8());
+        if self.command.has_destination() {
+            let destination = self
+                .destination
+                .as_ref()
+                .ok_or(VlessError::Address(AddressError::InvalidAddress))?;
+            destination.encode(out)?;
+        }
+        let encoded_len = out.len().saturating_sub(start_len);
+        if encoded_len > MAX_REQUEST_HEADER_LEN {
+            out.truncate(start_len);
+            return Err(VlessError::HeaderTooLarge {
+                length: encoded_len,
+                max: MAX_REQUEST_HEADER_LEN,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The VLESS response header.
@@ -355,6 +386,18 @@ impl ResponseHeader {
     /// Creates a response header.
     pub const fn new() -> Self {
         Self
+    }
+
+    /// Parses a VLESS response header and returns it with any trailing body bytes.
+    pub fn parse(input: &[u8]) -> Result<(Self, &[u8]), VlessError> {
+        let mut reader = Reader::new(input);
+        let version = reader.u8()?;
+        if version != VLESS_VERSION {
+            return Err(VlessError::UnsupportedVersion(version));
+        }
+        let addons_len = usize::from(reader.u8()?);
+        let _addons = Addons::parse(reader.take(addons_len)?)?;
+        Ok((Self, reader.remaining()))
     }
 
     /// Appends the response header to `out`.

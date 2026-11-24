@@ -116,6 +116,11 @@ def main() -> int:
     parser.add_argument("--listen", required=True, help="beam listen address, e.g. 10.10.1.1:443")
     parser.add_argument("--cover", required=True, help="REALITY cover address")
     parser.add_argument("--singbox", action="store_true", help="also render singbox.json")
+    parser.add_argument(
+        "--beam-client",
+        action="store_true",
+        help="also render beam-client.toml (TUN client config for lab A/B)",
+    )
     parser.add_argument("--xray", action="store_true", help="also render xray-server.json")
     parser.add_argument(
         "--xray-client",
@@ -201,6 +206,36 @@ def main() -> int:
             json.dumps(singbox, indent=2) + "\n", encoding="utf-8"
         )
         (out / "singbox.json").chmod(0o600)
+
+    if args.beam_client:
+        tun_mtu = int(os.environ.get("TUN_MTU", "1500"))
+        beam_client_toml = (
+            "[server]\n"
+            f'address = "{args.listen}"\n'
+            f'sni = "{server_names[0]}"\n'
+            f'public_key = "{public_key}"\n'
+            f'short_id = "{short_ids[0]}"\n'
+            f'user_id = "{user_id}"\n'
+            "\n"
+            "[tun]\n"
+            'name = "tun0"\n'
+            'address = "198.18.0.1/15"\n'
+            f"mtu = {tun_mtu}\n"
+            "auto_route = false\n"
+            "reject_quic = false\n"
+            "drop_private_destinations = false\n"
+            "\n"
+            "[limits]\n"
+            "max_tcp_connections = 512\n"
+            "max_udp_sessions = 256\n"
+            "handshake_timeout_ms = 15000\n"
+            "idle_timeout_ms = 300000\n"
+            "\n"
+            "[log]\n"
+            f'level = "{args.log_level}"\n'
+        )
+        (out / "beam-client.toml").write_text(beam_client_toml, encoding="utf-8")
+        (out / "beam-client.toml").chmod(0o600)
 
     if args.xray:
         xray_level = "warning" if args.log_level == "warn" else args.log_level

@@ -583,6 +583,50 @@ VLESS with `xtls-rprx-vision` is expected to work.
   change. Client TUN profiles use MTU 1500; lowering that MTU loses some
   HTTP/3 paths and stalls large H3 bodies in gVisor.
 
+## Client (`beam-client`)
+
+`beam-client` is a lightweight, single-purpose Rust TUN client for `beam`
+(`crates/beam-client` + `crates/beam-tun`), designed as a low-CPU, always-on
+replacement for `sing-box` on Linux (with a platform-independent core for
+future Windows `WinTun` and Android `VpnService` backends).
+
+- **Protocol & cover:** pure-Rust REALITY TLS 1.3 (`rustls` + `aws-lc-rs`,
+  default cover SNI `whatsapp.net`), VLESS + Vision Direct handoff, and
+  non-blocking full-cone XUDP.
+- **Custom proxy TCP/IP stack (`ProxyTcpStack`):** zero external TCP stack
+  dependencies, IPv4 + IPv6, RFC 7323 Window Scaling (socket buffers derived
+  from a 256 MiB aggregate budget — 512 KiB/direction at the default 256
+  connections, clamped to `64 KiB..=4 MiB` to stay under `MemoryMax=512M`),
+  zero-copy `VecDeque::as_slices()` TX segmentation, immediate dup-ACKs on
+  out-of-order segments, and prompt window updates. The packet parser walks
+  IPv6 extension headers (Hop-by-Hop, Routing, Destination Options) and drops
+  fragmented IPv4 and IPv6 packets.
+- **Built-in DNS & bypass:** optional `[dns]` interceptor supporting DoH
+  (`https://...`) and plain DNS (`tcp://` / `udp://`) through the tunnel with a
+  bounded LRU TTL cache, automatic `.lan`/`.local`/`.internal` + `[bypass]`
+  (`cidrs` and `domains`) split to the pre-VPN local DNS, and `reject_quic = true`
+  by default (immediate ICMP/ICMPv6 Port Unreachable on UDP/443 so browsers
+  fall back cleanly to TCP/HTTPS + Vision Direct). Note the LAN DNS trust
+  boundary for `bypass.domains`: those names are resolved via the unauthenticated
+  local LAN resolver (`dns.local_upstream` or auto-detected system DNS), and
+  resolved IPs receive temporary, bounded, `info`-logged `/32` or `/128` host
+  bypass routes (preserving any pre-existing exact routes); on untrusted LANs,
+  prefer static `bypass.cidrs` or leave `bypass.domains` empty.
+- **Always-on resilience & crash contract:** fail-closed kill-switch split
+  routes (`0.0.0.0/1`, `128.0.0.0/1`, `::/1`, `8000::/1`), automatic physical
+  gateway & wake-from-sleep detection that migrates bypass routes, sends
+  immediate `TCP RST` to dead flows, resets XUDP/local DNS, and publishes live
+  state + RTT to `/run/beam-client/status` for `clients/linux-tray/tray.c`.
+  Because the TUN interface is process-scoped (non-persistent), an abrupt
+  crash (`SIGKILL`/OOM) causes the kernel to tear down `beamtun0` and its split
+  routes automatically (ending the TUN kill-switch until systemd restarts the
+  service), while `ExecStopPost=/usr/local/bin/beam-client --cleanup-routes`
+  removes any orphaned bypass routes recorded in `/run/beam-client/routes.state`
+  without touching pre-existing host routes.
+- **Service & config:** start from [`config.client.example.toml`](config.client.example.toml)
+  and [`deploy/beam-client.service`](deploy/beam-client.service); validate with
+  `beam-client --check -c /etc/beam/client.toml`.
+
 ## Security notes
 
 - **Single-user only.** One user ID, one inbound, and no account system. beam

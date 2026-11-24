@@ -1,0 +1,597 @@
+//! Non-blocking UDP NAT bridge translating TUN IPv4/IPv6 UDP packets into
+//! `beam-core` XUDP sessions and synthesizing IPv4/IPv6 UDP reply packets
+//! (preserving full-cone source addresses).
+//!
+//! XUDP mux (re)connection runs in a background task so it never blocks the
+//! main TUN packet loop or stalls active TCP flows.
+
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use beam_core::address::{Address, NetLocation};
+use beam_core::client::{BeamClientConfig, XudpClient, XudpClientConfig};
+use beam_core::xudp::MAX_PAYLOAD_LEN;
+use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tracing::{debug, warn};
+
+use crate::packet::build_ip_udp_packet;
+
+const DEFAULT_MAX_UDP_SESSIONS: usize = 256;
+const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const PER_SESSION_SEND_QUEUE: usize = 32;
+const MAX_PENDING_CONNECT_DATAGRAMS: usize = 64;
+const INITIAL_CONNECT_BACKOFF_MS: u64 = 250;
+const MAX_CONNECT_BACKOFF_MS: u64 = 10_000;
+
+/// Tuning parameters for [`UdpNatBridge`].
+#[derive(Clone, Copy, Debug)]
+pub struct UdpBridgeConfig {
+    /// Maximum concurrent `(src_ip, src_port)` NAT entries.
+    pub max_sessions: usize,
+    /// Idle expiry for a NAT session with no outbound or inbound traffic.
+    pub idle_timeout: Duration,
+}
+
+impl Default for UdpBridgeConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: DEFAULT_MAX_UDP_SESSIONS,
+            idle_timeout: DEFAULT_UDP_IDLE_TIMEOUT,
+        }
+    }
+}
+
+struct NatEntry {
+    tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    last_active_ms: Arc<AtomicU64>,
+    task: JoinHandle<()>,
+}
+
+/// Bridges TUN UDP packets (IPv4 and IPv6) over a shared [`XudpClient`] mux,
+/// reconnecting the mux asynchronously in the background if it closes.
+pub struct UdpNatBridge {
+    start: Instant,
+    client_config: BeamClientConfig,
+    bridge_config: UdpBridgeConfig,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+    waker: Arc<Notify>,
+    mux: Option<Arc<XudpClient>>,
+    connecting: Option<oneshot::Receiver<Option<Arc<XudpClient>>>>,
+    connect_task: Option<JoinHandle<()>>,
+    connect_backoff_ms: u64,
+    next_connect_allowed_ms: u64,
+    pending_initial: VecDeque<(SocketAddr, SocketAddr, Vec<u8>)>,
+    sessions: HashMap<SocketAddr, NatEntry>,
+}
+
+impl UdpNatBridge {
+    /// Creates a new UDP NAT bridge that writes synthesized IPv4/IPv6 UDP reply
+    /// packets into `tun_tx` and notifies `waker` when a background XUDP mux
+    /// connect finishes.
+    pub fn new(
+        client_config: BeamClientConfig,
+        bridge_config: UdpBridgeConfig,
+        tun_tx: mpsc::Sender<Vec<u8>>,
+        waker: Arc<Notify>,
+    ) -> Self {
+        Self {
+            start: Instant::now(),
+            client_config,
+            bridge_config,
+            tun_tx,
+            waker,
+            mux: None,
+            connecting: None,
+            connect_task: None,
+            connect_backoff_ms: 0,
+            next_connect_allowed_ms: 0,
+            pending_initial: VecDeque::with_capacity(MAX_PENDING_CONNECT_DATAGRAMS),
+            sessions: HashMap::new(),
+        }
+    }
+
+    /// Aborts active XUDP mux & NAT sessions and clears reconnect backoff
+    /// (called on network/gateway transitions or wake-from-sleep).
+    pub fn reset(&mut self) {
+        if let Some(handle) = self.connect_task.take() {
+            handle.abort();
+        }
+        self.connecting = None;
+        self.mux = None;
+        self.connect_backoff_ms = 0;
+        self.next_connect_allowed_ms = 0;
+        self.pending_initial.clear();
+        for (_, entry) in self.sessions.drain() {
+            entry.task.abort();
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    /// Polls any in-flight background XUDP mux connection, triggers a new
+    /// connect attempt once reconnect backoff elapses while datagrams are
+    /// queued, and flushes queued initial datagrams once connected.
+    /// Non-blocking.
+    pub fn poll_connect(&mut self) {
+        if self.connecting.is_none() {
+            if !self.pending_initial.is_empty() && self.mux.as_ref().is_none_or(|m| !m.is_open()) {
+                self.mux = None;
+                self.start_background_connect();
+            }
+            return;
+        }
+        let Some(rx) = self.connecting.as_mut() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Some(client)) => {
+                self.mux = Some(client);
+                self.connecting = None;
+                self.connect_task = None;
+                self.connect_backoff_ms = 0;
+                self.next_connect_allowed_ms = 0;
+                let queued = std::mem::take(&mut self.pending_initial);
+                for (src, dst, payload) in queued {
+                    self.handle_datagram(src, dst, &payload);
+                }
+            }
+            Ok(None) | Err(oneshot::error::TryRecvError::Closed) => {
+                self.connecting = None;
+                self.connect_task = None;
+                self.pending_initial.clear();
+                let next_backoff = if self.connect_backoff_ms == 0 {
+                    INITIAL_CONNECT_BACKOFF_MS
+                } else {
+                    (self.connect_backoff_ms * 2).min(MAX_CONNECT_BACKOFF_MS)
+                };
+                self.connect_backoff_ms = next_backoff;
+                self.next_connect_allowed_ms = self.now_ms().saturating_add(next_backoff);
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Handles one outbound UDP datagram from `src` to `dst` without blocking
+    /// the TUN event loop.
+    pub fn handle_datagram(&mut self, src: SocketAddr, dst: SocketAddr, payload: &[u8]) {
+        if payload.is_empty() || payload.len() > MAX_PAYLOAD_LEN {
+            return;
+        }
+        self.poll_connect();
+
+        let now_ms = self.now_ms();
+        if let Some(entry) = self.sessions.get_mut(&src) {
+            if !entry.tx.is_closed() && !entry.task.is_finished() {
+                entry.last_active_ms.store(now_ms, Ordering::Release);
+                let _ = entry.tx.try_send((dst, payload.to_vec()));
+                return;
+            }
+            if let Some(dead) = self.sessions.remove(&src) {
+                dead.task.abort();
+            }
+        }
+
+        if self.sessions.len() >= self.bridge_config.max_sessions {
+            self.sweep_idle();
+            if self.sessions.len() >= self.bridge_config.max_sessions {
+                debug!(%src, "UDP NAT session table full; dropping datagram");
+                return;
+            }
+        }
+
+        let mux = match self.mux.as_ref() {
+            Some(existing) if existing.is_open() => Arc::clone(existing),
+            _ => {
+                self.mux = None;
+                self.start_background_connect();
+                if self.pending_initial.len() < MAX_PENDING_CONNECT_DATAGRAMS {
+                    self.pending_initial.push_back((src, dst, payload.to_vec()));
+                }
+                return;
+            }
+        };
+
+        let first_dest = socket_to_netloc(dst);
+        let mut session = match mux.open_session(first_dest) {
+            Ok(session) => session,
+            Err(err) => {
+                debug!(%src, error = %err, "failed to open XUDP session");
+                if !mux.is_open() {
+                    self.mux = None;
+                    self.start_background_connect();
+                    if self.pending_initial.len() < MAX_PENDING_CONNECT_DATAGRAMS {
+                        self.pending_initial.push_back((src, dst, payload.to_vec()));
+                    }
+                }
+                return;
+            }
+        };
+
+        let (tx, mut rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(PER_SESSION_SEND_QUEUE);
+        let _ = tx.try_send((dst, payload.to_vec()));
+
+        let tun_tx = self.tun_tx.clone();
+        let idle = self.bridge_config.idle_timeout;
+        let last_active_ms = Arc::new(AtomicU64::new(now_ms));
+        let task_active = Arc::clone(&last_active_ms);
+        let start = self.start;
+
+        let task = tokio::spawn(async move {
+            let mut last_dst = dst;
+            loop {
+                tokio::select! {
+                    maybe_out = rx.recv() => {
+                        let Some((target, data)) = maybe_out else {
+                            break;
+                        };
+                        if data.is_empty() || data.len() > MAX_PAYLOAD_LEN {
+                            continue;
+                        }
+                        last_dst = target;
+                        task_active.store(start.elapsed().as_millis() as u64, Ordering::Release);
+                        if let Err(err) = session.send_to(socket_to_netloc(target), &data).await {
+                            warn!(%target, error = %err, "xudp session send_to failed");
+                            break;
+                        }
+                    }
+                    maybe_reply = session.recv() => {
+                        let Some(reply) = maybe_reply else {
+                            break;
+                        };
+                        task_active.store(start.elapsed().as_millis() as u64, Ordering::Release);
+                        let (src_ip, src_port) = match reply.source {
+                            Some(NetLocation { address: Address::Ipv4(ip), port }) => (IpAddr::V4(ip), port),
+                            Some(NetLocation { address: Address::Ipv6(ip), port }) => (IpAddr::V6(ip), port),
+                            _ => (last_dst.ip(), last_dst.port()),
+                        };
+                        if let Some(pkt) = build_ip_udp_packet(
+                            src_ip,
+                            src_port,
+                            src.ip(),
+                            src.port(),
+                            &reply.payload,
+                        ) {
+                            let _ = tun_tx.try_send(pkt);
+                        }
+                    }
+                    () = tokio::time::sleep(idle) => {
+                        break;
+                    }
+                }
+            }
+            let _ = session.close().await;
+        });
+
+        self.sessions.insert(
+            src,
+            NatEntry {
+                tx,
+                last_active_ms,
+                task,
+            },
+        );
+    }
+
+    /// Removes expired or finished NAT entries (checking both outbound and
+    /// inbound activity timestamps).
+    pub fn sweep_idle(&mut self) {
+        let now_ms = self.now_ms();
+        let idle_ms = self.bridge_config.idle_timeout.as_millis() as u64;
+        self.sessions.retain(|_, entry| {
+            let last = entry.last_active_ms.load(Ordering::Acquire);
+            let alive = !entry.task.is_finished() && now_ms.saturating_sub(last) < idle_ms;
+            if !alive {
+                entry.task.abort();
+            }
+            alive
+        });
+    }
+
+    /// Returns the next timer delay needed for idle UDP session sweeping or
+    /// XUDP reconnect backoff retry when datagrams are queued, or `None` when
+    /// idle (allowing the TUN engine to sleep with zero idle wakeups).
+    pub fn next_sweep_delay_ms(&self) -> Option<u64> {
+        let session_delay = if self.sessions.is_empty() {
+            None
+        } else {
+            let idle_ms = self.bridge_config.idle_timeout.as_millis() as u64;
+            Some(idle_ms.clamp(1_000, 10_000))
+        };
+        let backoff_delay = if !self.pending_initial.is_empty()
+            && self.connecting.is_none()
+            && self.mux.as_ref().is_none_or(|m| !m.is_open())
+        {
+            Some(self.next_connect_allowed_ms.saturating_sub(self.now_ms()))
+        } else {
+            None
+        };
+        match (session_delay, backoff_delay) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
+    }
+
+    fn start_background_connect(&mut self) {
+        if self.connecting.is_some() {
+            return;
+        }
+        if self.now_ms() < self.next_connect_allowed_ms {
+            return;
+        }
+        let (tx, rx) = oneshot::channel();
+        let client_cfg = self.client_config.clone();
+        let xudp_cfg = XudpClientConfig {
+            max_sessions: self.bridge_config.max_sessions,
+            ..XudpClientConfig::default()
+        };
+        let waker = Arc::clone(&self.waker);
+        let handle = tokio::spawn(async move {
+            let result = match XudpClient::connect(&client_cfg, xudp_cfg).await {
+                Ok(client) => Some(Arc::new(client)),
+                Err(err) => {
+                    warn!(error = %err, "failed to connect XUDP mux to beam server");
+                    None
+                }
+            };
+            let _ = tx.send(result);
+            waker.notify_one();
+        });
+        self.connecting = Some(rx);
+        self.connect_task = Some(handle);
+    }
+}
+
+impl Drop for UdpNatBridge {
+    fn drop(&mut self) {
+        if let Some(handle) = self.connect_task.take() {
+            handle.abort();
+        }
+        for (_, entry) in self.sessions.drain() {
+            entry.task.abort();
+        }
+    }
+}
+
+fn socket_to_netloc(addr: SocketAddr) -> NetLocation {
+    let address = match addr.ip() {
+        IpAddr::V4(v4) => Address::Ipv4(v4),
+        IpAddr::V6(v6) => Address::Ipv6(v6),
+    };
+    NetLocation {
+        address,
+        port: addr.port(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn dummy_client_config() -> BeamClientConfig {
+        let reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            reality,
+            [2u8; 16],
+        )
+    }
+
+    fn insert_fake_entry(
+        bridge: &mut UdpNatBridge,
+        src: SocketAddr,
+        last_active_ms: u64,
+    ) -> mpsc::Receiver<(SocketAddr, Vec<u8>)> {
+        let (tx, rx) = mpsc::channel(PER_SESSION_SEND_QUEUE);
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        bridge.sessions.insert(
+            src,
+            NatEntry {
+                tx,
+                last_active_ms: Arc::new(AtomicU64::new(last_active_ms)),
+                task,
+            },
+        );
+        rx
+    }
+
+    #[tokio::test]
+    async fn next_sweep_delay_ms_none_when_idle_and_clamped_when_active() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let waker = Arc::new(Notify::new());
+
+        for (idle_ms, expected_ms) in [(200, 1_000), (5_000, 5_000), (60_000, 10_000)] {
+            let mut bridge = UdpNatBridge::new(
+                dummy_client_config(),
+                UdpBridgeConfig {
+                    max_sessions: 4,
+                    idle_timeout: Duration::from_millis(idle_ms),
+                },
+                tun_tx.clone(),
+                Arc::clone(&waker),
+            );
+            assert_eq!(bridge.next_sweep_delay_ms(), None);
+
+            let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 40_000);
+            let now_ms = bridge.now_ms();
+            let _rx = insert_fake_entry(&mut bridge, src, now_ms);
+            assert_eq!(bridge.next_sweep_delay_ms(), Some(expected_ms));
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_datagram_skips_sweep_on_fast_path_and_sweeps_lazily_at_capacity() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let waker = Arc::new(Notify::new());
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig {
+                max_sessions: 2,
+                idle_timeout: Duration::from_millis(20),
+            },
+            tun_tx,
+            waker,
+        );
+
+        let src_active = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_001);
+        let src_expired = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_002);
+        let src_new = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_003);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+
+        // Ensure `now_ms()` exceeds `idle_timeout` so `last_active_ms = 0` is expired.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let now_ms = bridge.now_ms();
+        let mut rx_active = insert_fake_entry(&mut bridge, src_active, now_ms);
+        let _rx_expired = insert_fake_entry(&mut bridge, src_expired, 0);
+        assert_eq!(bridge.sessions.len(), 2);
+
+        // Steady-state packet for an existing session stays O(1) and does NOT sweep.
+        bridge.handle_datagram(src_active, dst, b"ping");
+        let (got_dst, got_payload) = rx_active.try_recv().expect("forwarded to existing session");
+        assert_eq!(got_dst, dst);
+        assert_eq!(got_payload, b"ping");
+        assert_eq!(
+            bridge.sessions.len(),
+            2,
+            "fast path must not run O(N) sweep_idle on every datagram"
+        );
+
+        // New source at capacity triggers lazy sweep, reclaiming `src_expired`
+        // and allowing the new datagram past the capacity gate.
+        bridge.handle_datagram(src_new, dst, b"new-flow");
+        assert_eq!(
+            bridge.sessions.len(),
+            1,
+            "lazy sweep at capacity must reclaim expired entry"
+        );
+        assert!(bridge.sessions.contains_key(&src_active));
+        assert!(!bridge.sessions.contains_key(&src_expired));
+        assert_eq!(
+            bridge.pending_initial.len(),
+            1,
+            "new datagram should be queued after reclaiming expired slot"
+        );
+
+        // When all slots are genuinely active (non-expired), a new source is dropped.
+        let src_active2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_004);
+        let src_dropped = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50_005);
+        let active2_ms = bridge.now_ms();
+        let _rx_active2 = insert_fake_entry(&mut bridge, src_active2, active2_ms);
+        bridge.pending_initial.clear();
+        bridge.handle_datagram(src_dropped, dst, b"overflow");
+        assert_eq!(bridge.sessions.len(), 2);
+        assert!(
+            bridge.pending_initial.is_empty(),
+            "datagram must be dropped when table remains full after lazy sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn backoff_queues_datagrams_reports_remaining_delay_and_retries_after_expiry() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let waker = Arc::new(Notify::new());
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig {
+                max_sessions: 4,
+                idle_timeout: Duration::from_secs(5),
+            },
+            tun_tx,
+            waker,
+        );
+
+        // Simulate a failed initial XUDP connect to enter reconnect backoff.
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(None);
+        bridge.connecting = Some(rx);
+        bridge.poll_connect();
+        assert_eq!(bridge.connect_backoff_ms, INITIAL_CONNECT_BACKOFF_MS);
+        assert!(bridge.next_connect_allowed_ms > bridge.now_ms());
+        assert_eq!(
+            bridge.next_sweep_delay_ms(),
+            None,
+            "idle bridge in backoff with no queued datagrams must not wake"
+        );
+
+        // Incoming datagram during backoff must be queued rather than dropped.
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 51_001);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+        bridge.handle_datagram(src, dst, b"queued-during-backoff");
+        assert!(bridge.connecting.is_none());
+        assert_eq!(bridge.pending_initial.len(), 1);
+        let delay = bridge
+            .next_sweep_delay_ms()
+            .expect("queued datagram during backoff must schedule retry wakeup");
+        assert!(
+            delay <= INITIAL_CONNECT_BACKOFF_MS,
+            "delay {delay}ms should not exceed backoff window"
+        );
+
+        // With an active session whose sweep interval is 5_000ms, the shorter
+        // backoff delay must still win.
+        let active_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 51_002);
+        let now_ms = bridge.now_ms();
+        let _rx = insert_fake_entry(&mut bridge, active_src, now_ms);
+        let combined_delay = bridge
+            .next_sweep_delay_ms()
+            .expect("active session + backoff delay");
+        assert!(
+            combined_delay <= INITIAL_CONNECT_BACKOFF_MS,
+            "backoff delay ({combined_delay}ms) must take precedence over 5000ms session sweep"
+        );
+
+        // Once backoff elapses, `poll_connect()` must automatically start a
+        // background reconnect while keeping the queued datagram for flushing.
+        bridge.next_connect_allowed_ms = bridge.now_ms();
+        bridge.poll_connect();
+        assert!(
+            bridge.connecting.is_some(),
+            "poll_connect must trigger background connect after backoff expires"
+        );
+        assert_eq!(bridge.pending_initial.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backoff_queue_is_bounded_by_max_pending_connect_datagrams() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let waker = Arc::new(Notify::new());
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig::default(),
+            tun_tx,
+            waker,
+        );
+
+        // Hold bridge in backoff so no background connect spawns.
+        bridge.connect_backoff_ms = MAX_CONNECT_BACKOFF_MS;
+        bridge.next_connect_allowed_ms = bridge.now_ms().saturating_add(60_000);
+
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+        for i in 0..(MAX_PENDING_CONNECT_DATAGRAMS + 25) {
+            let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 52_000 + i as u16);
+            bridge.handle_datagram(src, dst, format!("pkt-{i}").as_bytes());
+        }
+
+        assert!(bridge.connecting.is_none());
+        assert_eq!(bridge.pending_initial.len(), MAX_PENDING_CONNECT_DATAGRAMS);
+        assert_eq!(bridge.pending_initial[0].2, b"pkt-0");
+        assert_eq!(
+            bridge.pending_initial[MAX_PENDING_CONNECT_DATAGRAMS - 1].2,
+            format!("pkt-{}", MAX_PENDING_CONNECT_DATAGRAMS - 1).as_bytes()
+        );
+    }
+}

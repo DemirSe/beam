@@ -1,0 +1,55 @@
+[Unit]
+Description=beam-client VLESS REALITY Vision TUN client
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/beam-client --check -c /etc/beam/client.toml
+ExecStart=/usr/local/bin/beam-client -c /etc/beam/client.toml
+ExecStopPost=/usr/local/bin/beam-client --cleanup-routes
+# On desktop hosts running ctrld with /etc/systemd/resolved.conf.d/10-controld.conf,
+# uncomment the two lines below (`+` runs beam-helper as root outside the sandbox):
+# ExecStartPost=+/usr/local/libexec/beam-helper ctrld-off
+# ExecStopPost=+/usr/local/libexec/beam-helper dns-off
+Restart=always
+RestartSec=3s
+RestartSteps=4
+RestartMaxDelaySec=60s
+TimeoutStartSec=20s
+TimeoutStopSec=45s
+RuntimeDirectory=beam-client
+RuntimeDirectoryMode=0755
+TasksMax=1024
+OOMPolicy=stop
+LimitNOFILE=65536
+MemoryHigh=384M
+MemoryMax=512M
+LimitCORE=0
+UMask=0022
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

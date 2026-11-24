@@ -469,6 +469,20 @@ int main(void)
     CHECK(file_is(CTRL_SAVED, CTRLD_DNS));
     CHECK(file_is(CTRL_DROPIN, OTHER_DNS));
 
+    /* Native beam-client ctrld-off path: moves ctrld aside without writing a
+     * competing global 99-beam.conf, and dns-off cleanly restores ctrld. */
+    reset_state();
+    write_file(CTRL_DROPIN, CTRLD_DNS);
+    CHECK(ctrld_off() == 0);
+    CHECK(!exists(CTRL_DROPIN));
+    CHECK(file_is(CTRL_SAVED, CTRLD_DNS));
+    CHECK(!exists(BEAM_DROPIN));
+    CHECK(!exists(BEAM_OWNED));
+    CHECK(dns_off() == 0);
+    CHECK(file_is(CTRL_DROPIN, CTRLD_DNS));
+    CHECK(!exists(CTRL_SAVED));
+    CHECK(!exists(BEAM_DROPIN));
+
     /* A clean host has nothing to restore and must exit 0. */
     reset_state();
     CHECK(dns_off() == 0);

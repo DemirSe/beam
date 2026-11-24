@@ -12,31 +12,41 @@ compile_error!("beam-sys only supports Linux targets; beam is a Linux-only serve
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 pub mod eventfd;
 #[cfg(target_os = "linux")]
 pub mod fd;
 #[cfg(target_os = "linux")]
+pub mod netlink;
+#[cfg(target_os = "linux")]
 pub mod poll;
 #[cfg(target_os = "linux")]
 pub mod socket;
 #[cfg(target_os = "linux")]
 pub mod splice;
+#[cfg(target_os = "linux")]
+pub mod tun;
 
 #[cfg(target_os = "linux")]
 pub use eventfd::EventFd;
 #[cfg(target_os = "linux")]
 pub use fd::{set_cloexec, set_nonblocking};
 #[cfg(target_os = "linux")]
+pub use netlink::NetlinkRouteWatcher;
+#[cfg(target_os = "linux")]
 pub use poll::{PollEvents, PollFd, poll};
 #[cfg(target_os = "linux")]
 pub use socket::{
     AcceptError, get_ipv6_v6only, get_tcp_maxseg, set_reuse_addr, set_tcp_keepalive,
-    set_tcp_maxseg, set_tcp_nodelay, set_udp_recv_buffer,
+    set_tcp_maxseg, set_tcp_nodelay, set_tcp_user_timeout, set_udp_recv_buffer,
 };
 #[cfg(target_os = "linux")]
 pub use splice::{SpliceFlags, pipe, splice};
+#[cfg(target_os = "linux")]
+pub use tun::{LinuxTun, MAX_IFNAME_LEN, validate_ifname};
 
 /// Resizes the kernel buffer of a pipe.
 ///
@@ -172,6 +182,47 @@ pub fn shutdown_write(fd: RawFd) -> io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// Returns the cumulative time the system has spent suspended, computed as
+/// `CLOCK_BOOTTIME - CLOCK_MONOTONIC` (saturating at zero).
+///
+/// Both clocks are monotonic and unaffected by NTP or wall-clock jumps, so
+/// their difference advances only across system suspend/resume transitions.
+#[cfg(target_os = "linux")]
+pub fn boottime_offset() -> io::Result<Duration> {
+    let boottime = read_clock(libc::CLOCK_BOOTTIME)?;
+    let monotonic = read_clock(libc::CLOCK_MONOTONIC)?;
+    Ok(boottime.saturating_sub(monotonic))
+}
+
+#[cfg(target_os = "linux")]
+fn read_clock(clock_id: libc::clockid_t) -> io::Result<Duration> {
+    let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` initializes `ts` on success and does not retain
+    // the pointer beyond the syscall.
+    let result = unsafe { libc::clock_gettime(clock_id, ts.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `clock_gettime` returned 0, so `ts` is fully initialized.
+    let ts = unsafe { ts.assume_init() };
+    let secs = u64::try_from(ts.tv_sec).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "clock_gettime returned negative seconds",
+        )
+    })?;
+    let nanos = u32::try_from(ts.tv_nsec)
+        .ok()
+        .filter(|&n| n < 1_000_000_000)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "clock_gettime returned out-of-range nanoseconds",
+            )
+        })?;
+    Ok(Duration::new(secs, nanos))
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -342,5 +393,16 @@ mod tests {
         assert_eq!(parse_positive_u32("0\n"), None);
         assert_eq!(parse_positive_u32("-1\n"), None);
         assert_eq!(parse_positive_u32("not-a-number"), None);
+    }
+
+    #[test]
+    fn boottime_offset_succeeds_and_is_stable() {
+        let first = boottime_offset().unwrap();
+        let second = boottime_offset().unwrap();
+        let diff = first.abs_diff(second);
+        assert!(
+            diff < Duration::from_secs(1),
+            "back-to-back boottime_offset calls diverged by {diff:?}"
+        );
     }
 }
