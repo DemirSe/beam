@@ -22,7 +22,6 @@ use crate::udp::{UdpBridgeConfig, UdpNatBridge};
 
 const MAX_PACKET_BUF: usize = 65_536;
 const TUN_TX_CHANNEL_CAP: usize = 512;
-const DEFAULT_IDLE_POLL_MS: u64 = 100;
 const RX_BATCH_MAX: usize = 128;
 const C2S_COALESCE_TARGET: usize = 64 * 1024;
 const S2C_READ_BUF_BYTES: usize = 64 * 1024;
@@ -125,10 +124,13 @@ where
             }
         }
 
-        let delay_ms = stack
-            .poll_delay_ms(start.elapsed().as_millis() as i64)
-            .unwrap_or(DEFAULT_IDLE_POLL_MS)
-            .clamp(1, DEFAULT_IDLE_POLL_MS);
+        let tcp_delay = stack.poll_delay_ms(start.elapsed().as_millis() as i64);
+        let udp_delay = udp_bridge.next_sweep_delay_ms();
+        let next_timer_ms = match (tcp_delay, udp_delay) {
+            (Some(a), Some(b)) => Some(a.min(b).max(1)),
+            (Some(a), None) | (None, Some(a)) => Some(a.max(1)),
+            (None, None) => None,
+        };
 
         tokio::select! {
             biased;
@@ -212,7 +214,12 @@ where
                 }
             }
             () = stack_waker.notified() => {}
-            () = sleep(Duration::from_millis(delay_ms)) => {
+            () = async {
+                match next_timer_ms {
+                    Some(ms) => sleep(Duration::from_millis(ms)).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 udp_bridge.sweep_idle();
             }
         }

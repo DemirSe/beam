@@ -881,10 +881,13 @@ impl NetStack for ProxyTcpStack {
     fn poll_delay_ms(&mut self, now_ms: i64) -> Option<u64> {
         let mut earliest: Option<i64> = None;
         for conn in self.conns.values() {
+            let idle_deadline = matches!(conn.state, TcpState::Established | TcpState::CloseWait)
+                .then_some(conn.last_activity_ms.saturating_add(IDLE_TIMEOUT_MS));
             for d in [
                 conn.rto_deadline_ms,
                 conn.persist_deadline_ms,
                 conn.state_deadline_ms,
+                idle_deadline,
             ]
             .into_iter()
             .flatten()

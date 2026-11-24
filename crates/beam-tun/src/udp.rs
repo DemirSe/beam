@@ -284,6 +284,17 @@ impl UdpNatBridge {
         });
     }
 
+    /// Returns the next timer delay needed for idle UDP session sweeping, or
+    /// `None` when no UDP sessions are active (allowing the TUN engine to sleep
+    /// with zero idle wakeups).
+    pub fn next_sweep_delay_ms(&self) -> Option<u64> {
+        if self.sessions.is_empty() {
+            return None;
+        }
+        let idle_ms = self.bridge_config.idle_timeout.as_millis() as u64;
+        Some(idle_ms.clamp(1_000, 10_000))
+    }
+
     fn start_background_connect(&mut self) {
         if self.connecting.is_some() {
             return;

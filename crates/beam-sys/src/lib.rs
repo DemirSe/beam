@@ -18,6 +18,8 @@ pub mod eventfd;
 #[cfg(target_os = "linux")]
 pub mod fd;
 #[cfg(target_os = "linux")]
+pub mod netlink;
+#[cfg(target_os = "linux")]
 pub mod poll;
 #[cfg(target_os = "linux")]
 pub mod socket;
@@ -30,6 +32,8 @@ pub mod tun;
 pub use eventfd::EventFd;
 #[cfg(target_os = "linux")]
 pub use fd::{set_cloexec, set_nonblocking};
+#[cfg(target_os = "linux")]
+pub use netlink::NetlinkRouteWatcher;
 #[cfg(target_os = "linux")]
 pub use poll::{PollEvents, PollFd, poll};
 #[cfg(target_os = "linux")]

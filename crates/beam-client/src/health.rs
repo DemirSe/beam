@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use beam_sys::NetlinkRouteWatcher;
 use beam_tun::IpNet;
+use tokio::io::unix::AsyncFd;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::detect_system_local_dns_excluding;
 use crate::linux_tun::{LinuxRouteGuard, PhysicalGateways, detect_physical_gateways_excluding};
@@ -18,7 +20,9 @@ use crate::linux_tun::{LinuxRouteGuard, PhysicalGateways, detect_physical_gatewa
 /// Default runtime status file path (owned by `RuntimeDirectory=beam-client`).
 pub const DEFAULT_STATUS_PATH: &str = "/run/beam-client/status";
 
-const MONITOR_TICK: Duration = Duration::from_secs(2);
+const FALLBACK_POLL_TICK: Duration = Duration::from_secs(2);
+const SLEEP_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const NETLINK_COALESCE_DELAY: Duration = Duration::from_millis(150);
 const SLEEP_JUMP_THRESHOLD_SECS: u64 = 5;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const HEALTHY_PROBE_INTERVAL: Duration = Duration::from_secs(60);
@@ -83,6 +87,28 @@ pub fn spawn_network_monitor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let _guard = StatusFileGuard::new(status_path.clone());
+        let mut netlink = if auto_route {
+            match NetlinkRouteWatcher::open() {
+                Ok(watcher) => {
+                    // `NetlinkRouteWatcher` owns its `OwnedFd` for its full lifetime.
+                    #[allow(deprecated)]
+                    match AsyncFd::new(watcher) {
+                        Ok(fd) => Some(fd),
+                        Err(err) => {
+                            warn!(error = %err, "failed to register netlink watcher with Tokio; falling back to polling");
+                            None
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "failed to open AF_NETLINK route watcher; falling back to polling");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut last_gw = if auto_route {
             let name = ifname.clone();
             tokio::task::spawn_blocking(move || detect_physical_gateways_excluding(&name))
@@ -96,6 +122,7 @@ pub fn spawn_network_monitor(
         let mut next_probe_at = Instant::now();
         let mut offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
         let mut generation: u64 = 0;
+        let mut check_routes_now = false;
 
         loop {
             if *shutdown.borrow() {
@@ -108,27 +135,40 @@ pub fn spawn_network_monitor(
             last_mono = now_mono;
             last_wall = now_wall;
 
-            let current_gw = if auto_route {
-                let name = ifname.clone();
-                tokio::task::spawn_blocking(move || detect_physical_gateways_excluding(&name))
-                    .await
-                    .unwrap_or_default()
-            } else {
-                PhysicalGateways::default()
+            // Only fork `ip` to inspect gateways/bypass routes when:
+            // - netlink reported a route/link change,
+            // - the host woke from suspend,
+            // - we are currently missing a gateway for the server, or
+            // - netlink is unavailable (fallback polling mode).
+            let server_currently_has_gw = match server_addr.ip() {
+                IpAddr::V4(_) => last_gw.v4.is_some(),
+                IpAddr::V6(_) => last_gw.v6.is_some(),
             };
+            let should_check_routes = auto_route
+                && (check_routes_now
+                    || slept_from_suspend
+                    || netlink.is_none()
+                    || !server_currently_has_gw);
+            check_routes_now = false;
 
-            let bypass_missing = if auto_route {
+            let (current_gw, bypass_missing) = if should_check_routes {
+                let name = ifname.clone();
+                let gw =
+                    tokio::task::spawn_blocking(move || detect_physical_gateways_excluding(&name))
+                        .await
+                        .unwrap_or_default();
                 let routes_chk = Arc::clone(&routes);
-                tokio::task::spawn_blocking(move || {
+                let missing = tokio::task::spawn_blocking(move || {
                     routes_chk
                         .lock()
                         .map(|g| !g.server_bypass_installed())
                         .unwrap_or(false)
                 })
                 .await
-                .unwrap_or(false)
+                .unwrap_or(false);
+                (gw, missing)
             } else {
-                false
+                (last_gw.clone(), false)
             };
 
             let gw_changed = auto_route && current_gw != last_gw;
@@ -207,6 +247,16 @@ pub fn spawn_network_monitor(
                 }
             }
 
+            let wait_dur = {
+                let until_probe = next_probe_at.saturating_duration_since(Instant::now());
+                let max_sleep = if netlink.is_some() {
+                    SLEEP_CHECK_INTERVAL
+                } else {
+                    FALLBACK_POLL_TICK
+                };
+                until_probe.min(max_sleep).max(Duration::from_millis(50))
+            };
+
             tokio::select! {
                 biased;
                 _ = shutdown.changed() => {
@@ -214,7 +264,40 @@ pub fn spawn_network_monitor(
                         break;
                     }
                 }
-                () = sleep(MONITOR_TICK) => {}
+                nl_res = async {
+                    match netlink.as_ref() {
+                        Some(fd) => fd.readable().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match nl_res {
+                        Ok(mut guard) => {
+                            let saw = match guard.try_io(|inner| inner.get_ref().drain_events()) {
+                                Ok(Ok(saw)) => saw,
+                                Ok(Err(err)) => {
+                                    warn!(error = %err, "netlink watcher error; falling back to polling");
+                                    netlink = None;
+                                    true
+                                }
+                                Err(_would_block) => false,
+                            };
+                            if saw {
+                                // Coalesce bursts of DHCP/NetworkManager route updates.
+                                sleep(NETLINK_COALESCE_DELAY).await;
+                                if let Some(fd) = netlink.as_ref() {
+                                    let _ = fd.get_ref().drain_events();
+                                }
+                                check_routes_now = true;
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "netlink readiness wait failed; falling back to polling");
+                            netlink = None;
+                            check_routes_now = true;
+                        }
+                    }
+                }
+                () = sleep(wait_dur) => {}
             }
         }
     })
