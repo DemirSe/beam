@@ -172,7 +172,11 @@ stateDiagram-v2
 ### 4. Build Tooling & CI
 - `scripts/android-setup-local.sh`: installs `aarch64-linux-android` rustup target and guides/installs Android NDK r27c + SDK 35 + JDK 17.
 - `scripts/android-build.sh`: cross-compiles `libbeam_android.so` (`--release`, stripped) with NDK `CC_aarch64_linux_android` (for `aws-lc-sys`), copies to `jniLibs/arm64-v8a/`, builds APK via Gradle, optional `--install` for `adb install -r`.
-- `.github/workflows/android-build.yml`: runs `cargo test -p beam-android`, builds `libbeam_android.so`, runs `./gradlew testDebugUnitTest lintDebug assembleRelease`, uploads APK artifact.
+- `.github/workflows/android-build.yml` (GitHub Actions):
+  - `build-and-test` runs `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test -p beam-sys -p beam-android`, builds the aarch64 `libbeam_android.so`, runs `./gradlew testDebugUnitTest lintDebug assembleRelease`, and uploads the release APK.
+  - `emulator-lab` builds the x86_64 `libbeam_android.so`, starts an x86_64 API 31 emulator on the KVM worker, and runs `./gradlew -Pbeam.includeX86_64=true connectedDebugAndroidTest`.
+  - `-Pbeam.includeX86_64=true` adds `x86_64` to `abiFilters`. The default production build stays `arm64-v8a` only.
+  - `NativeBridgeSmokeTest.kt` proves the JNI link parser and the Keystore stores work inside the emulator.
 
 ---
 

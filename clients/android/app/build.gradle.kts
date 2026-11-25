@@ -3,6 +3,10 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Production APK stays arm64-only. `-Pbeam.includeX86_64=true` adds x86_64 for
+// the GitHub Actions KVM emulator (debug builds only in practice).
+val includeX86_64 = providers.gradleProperty("beam.includeX86_64").orNull == "true"
+
 android {
     namespace = "com.beam.android"
     compileSdk = 35
@@ -13,9 +17,10 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += listOf("arm64-v8a") + if (includeX86_64) listOf("x86_64") else emptyList()
         }
     }
 
@@ -69,4 +74,7 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }
