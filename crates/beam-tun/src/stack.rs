@@ -522,8 +522,11 @@ mod accounting_tests {
                 }
             });
 
-            drop(reader);
+            // Wait for any concurrent reader-side activity to finish before
+            // the terminal drop (in production only the dropped reader ever
+            // subtracts from `in_flight_relay`).
             racer.join().expect("racer thread");
+            drop(reader);
 
             assert_eq!(
                 counter.load(Ordering::Acquire),

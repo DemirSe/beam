@@ -1588,17 +1588,28 @@ impl DnsInterceptor {
                         if is_bypass_domain
                             && !ips.is_empty()
                             && let Some(cb) = dns_cfg.on_bypass_ips.as_ref()
-                            && let Ok(_bypass_permit) = bypass_permits.clone().try_acquire_owned()
                         {
-                            let handle = cb(ips);
-                            if !matches!(timeout(BYPASS_ROUTE_TIMEOUT, handle).await, Ok(Ok(())))
-                                && let Some(suppressed) = DNS_BYPASS_LOG.allow()
-                            {
+                            if let Ok(_bypass_permit) = bypass_permits.clone().try_acquire_owned() {
+                                let ip_count = ips.len();
+                                let handle = cb(ips);
+                                if !matches!(
+                                    timeout(BYPASS_ROUTE_TIMEOUT, handle).await,
+                                    Ok(Ok(()))
+                                ) && let Some(suppressed) = DNS_BYPASS_LOG.allow()
+                                {
+                                    warn!(
+                                        ip_count,
+                                        stage = "bypass_route_timeout",
+                                        suppressed,
+                                        "bypass route install did not finish cleanly; replying without waiting"
+                                    );
+                                }
+                            } else if let Some(suppressed) = DNS_BYPASS_LOG.allow() {
                                 warn!(
-                                    qname = %query.qname,
-                                    stage = "bypass_route_timeout",
+                                    ip_count = ips.len(),
+                                    stage = "bypass_route_saturated",
                                     suppressed,
-                                    "bypass route install did not finish cleanly; replying without waiting"
+                                    "bypass route install skipped because all permits are busy"
                                 );
                             }
                         }
