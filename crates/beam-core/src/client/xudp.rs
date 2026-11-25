@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -116,6 +116,7 @@ struct SessionTable {
 struct SessionEntry {
     tx: mpsc::Sender<XudpReply>,
     dropped_replies: Arc<AtomicU64>,
+    live: Arc<AtomicBool>,
 }
 
 impl SessionTable {
@@ -138,7 +139,7 @@ impl SessionTable {
     fn allocate(
         &mut self,
         tx: mpsc::Sender<XudpReply>,
-    ) -> Result<(u16, Arc<AtomicU64>), XudpClientError> {
+    ) -> Result<(u16, Arc<AtomicU64>, Arc<AtomicBool>), XudpClientError> {
         if self.closed {
             return Err(XudpClientError::Closed);
         }
@@ -146,6 +147,7 @@ impl SessionTable {
             return Err(XudpClientError::SessionLimit);
         }
         let dropped_replies = Arc::new(AtomicU64::new(0));
+        let live = Arc::new(AtomicBool::new(true));
         for _ in 0..u16::MAX {
             let id = self.next_id;
             self.next_id = self.next_id.wrapping_add(1);
@@ -158,21 +160,26 @@ impl SessionTable {
                     SessionEntry {
                         tx,
                         dropped_replies: Arc::clone(&dropped_replies),
+                        live: Arc::clone(&live),
                     },
                 );
-                return Ok((id, dropped_replies));
+                return Ok((id, dropped_replies, live));
             }
         }
         Err(XudpClientError::SessionLimit)
     }
 
     fn remove(&mut self, id: u16) {
-        self.sessions.remove(&id);
+        if let Some(entry) = self.sessions.remove(&id) {
+            entry.live.store(false, Ordering::Release);
+        }
     }
 
     fn close_all(&mut self) {
         self.closed = true;
-        self.sessions.clear();
+        for (_, entry) in self.sessions.drain() {
+            entry.live.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -410,7 +417,7 @@ impl XudpClient {
             .ok_or(XudpClientError::Closed)?
             .clone();
         let (reply_tx, reply_rx) = mpsc::channel(self.reply_queue);
-        let (session_id, dropped_replies) = {
+        let (session_id, dropped_replies, live) = {
             let mut guard = self.table.lock().map_err(|_| XudpClientError::Closed)?;
             guard.allocate(reply_tx)?
         };
@@ -422,6 +429,7 @@ impl XudpClient {
             outbound_tx,
             reply_rx,
             dropped_replies,
+            live,
         })
     }
 
@@ -473,6 +481,8 @@ pub struct XudpSession {
     reply_rx: mpsc::Receiver<XudpReply>,
     /// Replies the mux reader dropped for this session; only this session bumps it.
     dropped_replies: Arc<AtomicU64>,
+    /// Cleared by the mux when the session is removed, so liveness needs no lock.
+    live: Arc<AtomicBool>,
 }
 
 impl XudpSession {
@@ -614,10 +624,7 @@ impl XudpSession {
 
     /// Returns `true` while this session is still registered on a live mux.
     fn is_live(&self) -> bool {
-        self.table
-            .lock()
-            .map(|t| !t.closed && t.sessions.contains_key(&self.session_id))
-            .unwrap_or(false)
+        self.live.load(Ordering::Acquire)
     }
 
     async fn send_inner(
@@ -779,7 +786,7 @@ mod tests {
     ) {
         let table = Arc::new(Mutex::new(SessionTable::new(4)));
         let (reply_tx, reply_rx) = mpsc::channel(4);
-        let (session_id, dropped_replies) = table
+        let (session_id, dropped_replies, live) = table
             .lock()
             .expect("session table")
             .allocate(reply_tx)
@@ -794,6 +801,7 @@ mod tests {
                 outbound_tx,
                 reply_rx,
                 dropped_replies,
+                live,
             },
             outbound_rx,
             table,
@@ -912,7 +920,7 @@ mod tests {
                 payload: b"pong".to_vec(),
             })
             .expect("queue reply");
-        let (session_id, dropped_replies) = table
+        let (session_id, dropped_replies, live) = table
             .lock()
             .expect("session table")
             .allocate(reply_tx)
@@ -927,6 +935,7 @@ mod tests {
             outbound_tx,
             reply_rx,
             dropped_replies,
+            live,
         };
 
         // The full mux queue must fail fast instead of stalling the caller, so
@@ -960,7 +969,7 @@ mod tests {
     fn take_dropped_replies_is_per_session_and_clears() {
         let (session, _rx, table) = new_test_session();
         let (other_reply_tx, _other_reply_rx) = mpsc::channel(4);
-        let (other_id, other_dropped) = table
+        let (other_id, other_dropped, _other_live) = table
             .lock()
             .expect("table")
             .allocate(other_reply_tx)
@@ -1029,6 +1038,17 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_liveness_flips_without_reading_the_table() {
+        let (session, _rx, table) = new_test_session();
+        assert!(session.is_live());
+        table.lock().expect("table").remove(session.session_id);
+        assert!(
+            !session.is_live(),
+            "removal must clear the live flag, not the table entry only"
+        );
     }
 
     #[tokio::test]

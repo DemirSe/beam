@@ -24,6 +24,10 @@ harness = false
 name = "dns_cache_hit"
 harness = false
 
+[[bench]]
+name = "packet_checksum"
+harness = false
+
 [dev-dependencies]
 smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "alloc"] }
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }

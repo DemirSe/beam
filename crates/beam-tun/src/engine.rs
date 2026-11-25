@@ -11,7 +11,7 @@ use beam_core::address::{Address, NetLocation};
 use beam_core::client::{BeamClientConfig, ClientError, dial_tcp};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc, watch};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::device::TunDevice;
@@ -423,6 +423,10 @@ where
     let mut tx_batch: Vec<Vec<u8>> = Vec::with_capacity(64);
     let mut accepted: Vec<AcceptedTcpStream> = Vec::with_capacity(16);
     let mut next_udp_sweep_at: Option<Instant> = None;
+    // One pinned timer for the whole engine loop: resetting it is much cheaper
+    // than registering and dropping a fresh `sleep` on every iteration.
+    let mut timer_deadline: Option<Instant> = None;
+    let mut timer_sleep = std::pin::pin!(tokio::time::sleep_until(tokio::time::Instant::now()));
 
     info!(
         mtu = device.mtu(),
@@ -476,6 +480,17 @@ where
             (Some(a), None) | (None, Some(a)) => Some(a.max(1)),
             (None, None) => None,
         };
+
+        let now = Instant::now();
+        if timer_deadline.is_some_and(|deadline| deadline <= now) {
+            timer_deadline = None;
+        }
+        if let Some(deadline) = rearm_deadline(timer_deadline, now, next_timer_ms) {
+            timer_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::from_std(deadline));
+            timer_deadline = Some(deadline);
+        }
 
         tokio::select! {
             biased;
@@ -568,11 +583,12 @@ where
             }
             () = stack_waker.notified() => {}
             () = async {
-                match next_timer_ms {
-                    Some(ms) => sleep(Duration::from_millis(ms)).await,
+                match timer_deadline {
+                    Some(_) => (&mut timer_sleep).await,
                     None => std::future::pending::<()>().await,
                 }
             } => {
+                timer_deadline = None;
                 if next_udp_sweep_at.is_some_and(|deadline| Instant::now() >= deadline) {
                     udp_bridge.sweep_idle();
                     next_udp_sweep_at = None;
@@ -845,6 +861,16 @@ fn failure_streak_is_stale(previous_ms_plus_one: u64, now_ms: u64, window: Durat
         > u64::try_from(window.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Returns the absolute deadline the engine timer must be reset to, or `None`
+/// while the armed timer is already the earliest wakeup.
+fn rearm_deadline(armed: Option<Instant>, now: Instant, delay_ms: Option<u64>) -> Option<Instant> {
+    let deadline = now + Duration::from_millis(delay_ms?);
+    match armed {
+        Some(armed) if armed <= deadline => None,
+        _ => Some(deadline),
+    }
+}
+
 /// Updates the sticky UDP sweep deadline, shortening it whenever a more urgent
 /// wakeup interval (such as an XUDP reconnect backoff retry) is requested.
 fn update_udp_sweep_deadline(
@@ -1040,6 +1066,26 @@ mod tests {
         // Clearing when idle resets the sticky deadline.
         assert_eq!(update_udp_sweep_deadline(&mut deadline, None, t2), None);
         assert_eq!(deadline, None);
+    }
+
+    #[test]
+    fn rearm_deadline_keeps_the_armed_timer_and_only_resets_for_earlier_wakeups() {
+        let now = Instant::now();
+        assert_eq!(rearm_deadline(None, now, None), None, "no wakeup, no arm");
+
+        let armed = rearm_deadline(None, now, Some(5)).expect("armed");
+        assert_eq!(armed, now + Duration::from_millis(5));
+
+        // Time passing re-computes a later deadline: keep the armed timer.
+        assert_eq!(
+            rearm_deadline(Some(armed), now + Duration::from_millis(1), Some(5)),
+            None
+        );
+
+        // A shrinking deadline must re-arm to the earlier instant.
+        let sooner =
+            rearm_deadline(Some(armed), now + Duration::from_millis(1), Some(2)).expect("re-armed");
+        assert_eq!(sooner, now + Duration::from_millis(3));
     }
 
     #[test]
