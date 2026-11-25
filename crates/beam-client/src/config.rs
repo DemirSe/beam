@@ -421,6 +421,7 @@ impl ClientFileConfig {
             client,
             route,
             max_tcp_connections: self.limits.max_tcp_connections,
+            // `None` leaves `tcp_stack.idle_timeout_ms` as the sole TCP idle bound.
             tcp_relay_idle_timeout: None,
             udp: UdpBridgeConfig {
                 max_sessions: self.limits.max_udp_sessions,

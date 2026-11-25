@@ -6,6 +6,11 @@
 //! rejected instead of ignored: a silently ignored `security` or `pbk` value
 //! would otherwise produce a connection attempt the user did not configure.
 //!
+//! `fp` is accepted as standard VLESS URI metadata and preserved on
+//! [`ParsedClientLink::fingerprint`]. `beam-core` uses its own TLS
+//! ClientHello profile when dialing and does not change behavior based on
+//! `fp`.
+//!
 //! Every input byte is hostile. The parser allocates only relative to the
 //! bounded input length and never panics.
 
@@ -143,7 +148,9 @@ pub struct ParsedClientLink {
     pub public_key: [u8; PUBLIC_KEY_LEN],
     /// REALITY short id, 1 to 8 bytes.
     pub short_id: Vec<u8>,
-    /// Client fingerprint name, if the link names one.
+    /// Client fingerprint name from `fp`, preserved as standard VLESS URI
+    /// metadata. `beam-core` uses its own TLS ClientHello profile when
+    /// dialing and ignores this value.
     pub fingerprint: Option<String>,
     /// Percent-decoded link fragment used as a display name.
     pub label: Option<String>,
@@ -220,10 +227,12 @@ pub fn parse_client_link(uri: &str) -> Result<ParsedClientLink, ClientLinkError>
     if host_port.contains('@') {
         return Err(ClientLinkError::Authority);
     }
-    let user_id = Uuid::parse_str(user)
-        .map_err(|_| ClientLinkError::UserId)?
-        .into_bytes();
+    let user_id = parse_canonical_user_id(user)?;
     let (host, port) = parse_host_port(host_port)?;
+
+    if query.is_empty() {
+        return Err(ClientLinkError::Security);
+    }
 
     let mut seen = 0u16;
     let mut server_name = None;
@@ -297,6 +306,26 @@ pub fn parse_client_link(uri: &str) -> Result<ParsedClientLink, ClientLinkError>
     })
 }
 
+/// Parses a canonical 36-char hyphenated UUID (`8-4-4-4-12`) into raw bytes.
+///
+/// The hyphen-position check runs before [`Uuid::parse_str`] so 32-char
+/// unhyphenated, braced, or otherwise non-canonical forms fail as
+/// [`ClientLinkError::UserId`] instead of parsing as an equivalent UUID.
+fn parse_canonical_user_id(user: &str) -> Result<[u8; 16], ClientLinkError> {
+    let bytes = user.as_bytes();
+    if user.len() != 36
+        || bytes[8] != b'-'
+        || bytes[13] != b'-'
+        || bytes[18] != b'-'
+        || bytes[23] != b'-'
+    {
+        return Err(ClientLinkError::UserId);
+    }
+    Ok(Uuid::parse_str(user)
+        .map_err(|_| ClientLinkError::UserId)?
+        .into_bytes())
+}
+
 /// Splits and validates `host:port`, accepting bracketed IPv6 hosts.
 fn parse_host_port(input: &str) -> Result<(String, u16), ClientLinkError> {
     if let Some(bracketed) = input.strip_prefix('[') {
@@ -328,7 +357,23 @@ fn parse_port(text: &str) -> Result<u16, ClientLinkError> {
 }
 
 /// Accepts an IPv4 address or a hostname.
+///
+/// All-numeric dotted forms (e.g. `999.999.999.999`, `1.2.3`) must parse as
+/// [`Ipv4Addr`]; they are never accepted as hostnames, so a mistyped numeric
+/// address cannot route as a DNS name.
 fn validate_host(host: &str) -> Result<(), ClientLinkError> {
+    if host.is_empty() {
+        return Err(ClientLinkError::Host);
+    }
+    if host.contains('.')
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return Ipv4Addr::from_str(host)
+            .map(|_| ())
+            .map_err(|_| ClientLinkError::Host);
+    }
     if is_hostname(host) || Ipv4Addr::from_str(host).is_ok() {
         Ok(())
     } else {
@@ -381,6 +426,9 @@ fn parse_short_id(value: &[u8]) -> Result<Vec<u8>, ClientLinkError> {
 }
 
 /// Accepts a short ASCII fingerprint name such as `chrome`.
+///
+/// The value is preserved as standard VLESS URI metadata only; `beam-core`
+/// dials with its own TLS ClientHello profile.
 fn parse_fingerprint(value: &[u8]) -> Result<String, ClientLinkError> {
     let name = std::str::from_utf8(value).map_err(|_| ClientLinkError::Fingerprint)?;
     if name.is_empty()
@@ -763,6 +811,69 @@ mod tests {
                 "rejected link: {uri}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_non_canonical_uuid_forms() {
+        let good = good_query();
+        let unhyphenated = USER_ID.replace('-', "");
+        assert_eq!(unhyphenated.len(), 32);
+        for (user, expected) in [
+            (unhyphenated.as_str(), ClientLinkError::UserId),
+            (
+                "b831381d-6324-4d53-ad4f-8cda48b3081",
+                ClientLinkError::UserId,
+            ),
+            (
+                "b831381d6324-4d53-ad4f-8cda48b30811",
+                ClientLinkError::UserId,
+            ),
+            (
+                "{b831381d-6324-4d53-ad4f-8cda48b30811}",
+                ClientLinkError::UserId,
+            ),
+            (
+                "not-a-uuid-at-all-see-reject-me-now",
+                ClientLinkError::UserId,
+            ),
+        ] {
+            let uri = format!("vless://{user}@203.0.113.10:443?{good}");
+            assert_eq!(
+                parse_client_link(&uri).err(),
+                Some(expected),
+                "user: {user}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_all_numeric_dotted_hosts_that_are_not_ipv4() {
+        let good = good_query();
+        for host in ["999.999.999.999", "1.2.3", "1.2.3.4.5", "256.1.1.1"] {
+            let uri = format!("vless://{USER_ID}@{host}:443?{good}");
+            assert_eq!(
+                parse_client_link(&uri).err(),
+                Some(ClientLinkError::Host),
+                "host: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_host_and_missing_or_empty_query() {
+        let good = good_query();
+        assert_eq!(
+            parse_client_link(&format!("vless://{USER_ID}@:443?{good}")).err(),
+            Some(ClientLinkError::Host)
+        );
+        assert_eq!(
+            parse_client_link(&format!("vless://{USER_ID}@203.0.113.10:443")).err(),
+            Some(ClientLinkError::Security)
+        );
+        assert_eq!(
+            parse_client_link(&format!("vless://{USER_ID}@203.0.113.10:443?")).err(),
+            Some(ClientLinkError::Security)
+        );
     }
 
     #[test]

@@ -15,6 +15,11 @@ Rust core exposes every hook that the Android phase needs.
   pure Rust. It never reads the Linux `/run/beam-client/status` file.
 - `DnsConfig::local_socket_protector` in `beam-tun` (Unix only). The engine
   calls it after `bind` and before `connect` on each fresh local-DNS socket.
+- `BeamClientConfig::socket_protector` in `beam-core`. The dial path calls it
+  on the unconnected upstream socket before `connect`. Done.
+- `beam_core::client::{parse_client_link, ParsedClientLink, ClientLinkError}`
+  in `beam-core`. Strict `vless://` parser mirroring
+  `identity::client_link`. Done.
 - This document and its link from `docs/CLIENT.md`.
 
 ## `VpnService` wiring map
@@ -22,14 +27,16 @@ Rust core exposes every hook that the Android phase needs.
 | Android side | Rust core side | State |
 |---|---|---|
 | `VpnService.Builder` TUN fd, after `detachFd` | `TunDevice` trait | Implement in the Android phase. `MemoryTun` covers tests. |
-| `VpnService.protect(fd)` on the upstream socket | `BeamClientConfig` dial path | Open. The dial path has no protector hook yet. |
+| `VpnService.protect(fd)` on the upstream socket | `BeamClientConfig::socket_protector` | Done. Runs before `connect` on the unconnected socket. |
 | `VpnService.protect(fd)` on the local-DNS socket | `DnsConfig::local_socket_protector` | Done. Runs after `bind` and before `connect`. |
+| `vless://` import in the UI | `beam_core::client::{parse_client_link, ParsedClientLink, ClientLinkError}` | Done. Strict parser mirroring `identity::client_link`. |
 | `ConnectivityManager` network callbacks | `TunEngineConfig::network_reset` | Done. Send a new generation on each switch. |
-| `vless://` import in the UI | `beam_core::identity::client_link` link format | Partial. The link renderer exists. No parser exists yet. |
 
-If the upstream protector hook is missing, the upstream socket can enter the
-tunnel routing loop. Add the hook in the Android phase before any field test.
-The local-DNS hook alone does not protect the upstream path.
+Wire both protectors in the Android phase before any field test: call
+`VpnService.protect(fd)` inside `BeamClientConfig::socket_protector` for
+every upstream socket and inside `DnsConfig::local_socket_protector` for every
+local-DNS socket. An unprotected upstream socket enters the tunnel routing
+loop; the local-DNS hook alone does not protect the upstream path.
 
 On each network switch, send a new `network_reset` generation. The engine then
 resets all TCP flows with `RST`, drops the XUDP mux, and clears local DNS
@@ -50,7 +57,10 @@ The mobile presets implement this design:
   stack idle timeout governs flow lifetime.
 
 Worst-case TCP buffer use is 128 flows times 128 KiB times two directions.
-That is 32 MiB, which fits the Android `VpnService` RAM budget.
+That 32 MiB is the TCP ring buffer ceiling (`128 x 128 KiB x 2`). Relay adds
+per-active-flow buffers on top: 64 KiB S2C plus up to 64 KiB C2S scratch,
+about 48 MiB total at full 128-flow concurrency. Size the Android
+`VpnService` RAM budget for the combined total.
 
 Push-notification alignment:
 
@@ -92,9 +102,11 @@ signatures. Existing Linux callers do not change behavior.
 
 Build the Rust core for `aarch64-linux-android` first. Add
 `armv7-linux-androideabi` and `x86_64-linux-android` only for emulator and
-legacy-device tests. Use the Android NDK toolchains. No JNI or UniFFI
-surface exists yet. Define that surface in the Android phase, after the
-upstream protector hook and the `vless://` parser land.
+legacy-device tests. Use the Android NDK toolchains. Cross-compile status:
+`cargo check -p beam-sys --target aarch64-linux-android` passes without the
+NDK; `beam-core` (`aws-lc-sys`) requires the Android NDK
+`CC_aarch64_linux_android` compiler. No JNI or UniFFI
+surface exists yet. Define that surface in the Android phase.
 
 ## Congestion control note
 
@@ -106,8 +118,6 @@ kernel BBR. Do not promise BBR-class upload performance on stock phones.
 
 ## Next steps
 
-1. Add the upstream `protect(fd)` hook to the `beam-core` dial path.
-2. Add a `vless://` link parser that mirrors `identity::client_link`.
-3. Implement `TunDevice` over the detached `VpnService` fd.
-4. Define the JNI or UniFFI surface for engine control and telemetry polling.
-5. Field-test Doze, app standby, and network switches against the hooks.
+1. Implement `TunDevice` over the detached `VpnService` fd.
+2. Define the JNI or UniFFI surface for engine control and telemetry polling.
+3. Field-test Doze, app standby, and network switches against the hooks.

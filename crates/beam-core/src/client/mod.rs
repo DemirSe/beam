@@ -215,6 +215,13 @@ pub(crate) async fn dial_vless(
     {
         tracing::debug!(error = %err, count, "failed to set upstream TCP_KEEPCNT");
     }
+    if config.keepalive_idle.is_some() != config.keepalive_interval.is_some() {
+        tracing::debug!(
+            idle = ?config.keepalive_idle,
+            interval = ?config.keepalive_interval,
+            "partial TCP keepalive config; keepalive stays disabled unless idle and interval are both set",
+        );
+    }
     if let (Some(idle), Some(interval)) = (config.keepalive_idle, config.keepalive_interval)
         && let Err(err) = beam_sys::set_tcp_keepalive(fd, idle, interval)
     {

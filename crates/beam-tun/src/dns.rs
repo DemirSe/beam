@@ -269,10 +269,6 @@ pub type LocalDnsRefresh = Arc<dyn Fn() -> Option<SocketAddr> + Send + Sync>;
 /// Unix only: other platforms always open local DNS directly.
 #[cfg(unix)]
 pub type LocalSocketProtector = Arc<dyn Fn(std::os::fd::RawFd) -> io::Result<()> + Send + Sync>;
-/// Placeholder protector type for non-Unix builds, where local DNS needs no
-/// protection. It is never constructed; it only keeps signatures uniform.
-#[cfg(not(unix))]
-pub type LocalSocketProtector = Arc<dyn Fn(u32) -> io::Result<()> + Send + Sync>;
 
 /// Configuration for the built-in [`DnsInterceptor`].
 #[derive(Clone)]
@@ -325,15 +321,15 @@ impl std::fmt::Debug for DnsConfig {
 
 impl DnsConfig {
     /// Returns the local-socket protector, if any (Unix only).
+    #[cfg(unix)]
     pub(crate) fn local_protector(&self) -> Option<LocalSocketProtector> {
-        #[cfg(unix)]
-        {
-            self.local_socket_protector.clone()
-        }
-        #[cfg(not(unix))]
-        {
-            None
-        }
+        self.local_socket_protector.clone()
+    }
+
+    /// Non-Unix builds have no socket protector; local DNS is always direct.
+    #[cfg(not(unix))]
+    pub(crate) fn local_protector(&self) -> Option<()> {
+        None
     }
 
     /// Returns the default local-only suffixes (`.lan`, `.local`, `.internal`).
@@ -1863,7 +1859,8 @@ async fn resolve_local_udp(
     query: &[u8],
     expected_tx_id: u16,
     query_timeout: Duration,
-    protector: Option<LocalSocketProtector>,
+    #[cfg(unix)] protector: Option<LocalSocketProtector>,
+    #[cfg(not(unix))] protector: Option<()>,
 ) -> io::Result<Vec<u8>> {
     let (pooled, generation) = pool.take(local_upstream, Instant::now());
     let sock = match pooled {
@@ -1881,7 +1878,7 @@ async fn resolve_local_udp(
                 protect(sock.as_raw_fd())?;
             }
             #[cfg(not(unix))]
-            let _ = protector.as_ref();
+            let _ = protector;
             sock.connect(local_upstream).await?;
             sock
         }

@@ -334,11 +334,17 @@ impl TunnelActivity {
 
     /// Returns the most recent [`DialFailure`] if it happened within `max_age`.
     pub fn recent_failure(&self, max_age: Duration) -> Option<DialFailure> {
+        // One `Acquire` load of the timestamp: the writer publishes stage and
+        // kind before its `Release` store, so a fresh timestamp is never
+        // paired with a stale stage or kind. Stage/kind follow with `Relaxed`
+        // loads under that `Acquire`, with no second timestamp load.
         let recorded = self.last_failure_ms_plus_one.load(Ordering::Acquire);
         if recorded == 0 {
             return None;
         }
-        let failure = self.last_failure()?;
+        let stage = DialFailureStage::from_code(self.last_failure_stage.load(Ordering::Relaxed))?;
+        let kind = DialFailureKind::from_code(self.last_failure_kind.load(Ordering::Relaxed))?;
+        let failure = DialFailure { stage, kind };
         let now_ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
         let age_ms = now_ms.saturating_sub(recorded - 1);
         let max_age_ms = u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX);
@@ -546,6 +552,13 @@ where
     S: NetStack,
 {
     let start = Instant::now();
+    if dns_counters.is_some() != config.dns.is_some() {
+        debug!(
+            has_dns_config = config.dns.is_some(),
+            has_dns_counters = dns_counters.is_some(),
+            "telemetry DNS counters and engine DNS config presence mismatch; the UI DNS section will be empty or stale",
+        );
+    }
     let stack_waker = stack.waker();
     let tcp_permits = Arc::new(Semaphore::new(config.max_tcp_connections.max(1)));
     let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(TUN_TX_CHANNEL_CAP);

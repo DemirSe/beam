@@ -23,7 +23,9 @@ pub mod stats;
 pub mod udp;
 
 pub use device::{MemoryTun, TunDevice};
-pub use dns::{DnsConfig, DnsInterceptor, DnsUpstream, LocalSocketProtector};
+#[cfg(unix)]
+pub use dns::LocalSocketProtector;
+pub use dns::{DnsConfig, DnsInterceptor, DnsUpstream};
 pub use engine::{
     DialFailure, DialFailureKind, DialFailureStage, EngineError, EngineTelemetry,
     TelemetrySnapshot, TunEngineConfig, TunnelActivity, run_tun_engine,
