@@ -11,7 +11,7 @@ use beam_core::address::{Address, NetLocation};
 use beam_core::client::{BeamClientConfig, ClientError, dial_tcp};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc, watch};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::device::TunDevice;
@@ -22,7 +22,7 @@ use crate::packet::{
 use crate::ratelimit::RateLimiter;
 use crate::router::{RouteDecision, RoutePolicy};
 use crate::stack::{AcceptedTcpStream, NetStack};
-use crate::stats::{DropCounters, DropSnapshot};
+use crate::stats::{DnsCounters, DnsSnapshot, DropCounters, DropSnapshot};
 use crate::udp::{UdpBridgeConfig, UdpNatBridge};
 
 const MAX_PACKET_BUF: usize = 65_536;
@@ -54,6 +54,16 @@ pub struct TunEngineConfig {
     pub route: RoutePolicy,
     /// Maximum concurrent proxied TCP connections.
     pub max_tcp_connections: usize,
+    /// Optional idle timeout for the *reads* of the established TCP relay loops.
+    ///
+    /// `None` removes only the relay read cap, so 15-minute FCM/MTalk push
+    /// sockets stay alive under `ProxyTcpStack::idle_timeout_ms` plus upstream
+    /// keepalive/`TCP_USER_TIMEOUT`. Relay writes always keep a bounded
+    /// deadline: `None` falls back to
+    /// [`BeamClientConfig::idle_timeout`](beam_core::client::BeamClientConfig::idle_timeout),
+    /// so a peer that stops draining can never wedge a relay task. `Some(dur)`
+    /// bounds reads and writes with `dur`, the classic per-direction cap.
+    pub tcp_relay_idle_timeout: Option<Duration>,
     /// UDP NAT bridge configuration.
     pub udp: UdpBridgeConfig,
     /// Optional built-in DNS interceptor (DoH / plain DNS + local suffix split).
@@ -311,21 +321,51 @@ impl TunnelActivity {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
 
+    /// Returns the most recent [`DialFailure`] regardless of age, or `None`
+    /// when no dial ever failed.
+    pub fn last_failure(&self) -> Option<DialFailure> {
+        // Load the timestamp first with `Acquire`: the writer publishes stage
+        // and kind before its `Release` store, so a fresh timestamp is never
+        // paired with a stale stage or kind.
+        if self.last_failure_ms_plus_one.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let stage = DialFailureStage::from_code(self.last_failure_stage.load(Ordering::Relaxed))?;
+        let kind = DialFailureKind::from_code(self.last_failure_kind.load(Ordering::Relaxed))?;
+        Some(DialFailure { stage, kind })
+    }
+
     /// Returns the most recent [`DialFailure`] if it happened within `max_age`.
     pub fn recent_failure(&self, max_age: Duration) -> Option<DialFailure> {
-        // Load the timestamp first with `Acquire`: the writer publishes stage and
-        // kind before its `Release` store, so a fresh timestamp is never paired
-        // with a stale stage or kind.
+        // One `Acquire` load of the timestamp: the writer publishes stage and
+        // kind before its `Release` store, so a fresh timestamp is never
+        // paired with a stale stage or kind. Stage/kind follow with `Relaxed`
+        // loads under that `Acquire`, with no second timestamp load.
         let recorded = self.last_failure_ms_plus_one.load(Ordering::Acquire);
         if recorded == 0 {
             return None;
         }
         let stage = DialFailureStage::from_code(self.last_failure_stage.load(Ordering::Relaxed))?;
         let kind = DialFailureKind::from_code(self.last_failure_kind.load(Ordering::Relaxed))?;
+        let failure = DialFailure { stage, kind };
         let now_ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
         let age_ms = now_ms.saturating_sub(recorded - 1);
         let max_age_ms = u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX);
-        (age_ms <= max_age_ms).then_some(DialFailure { stage, kind })
+        (age_ms <= max_age_ms).then_some(failure)
+    }
+
+    /// Returns how long ago the last dial succeeded, or `None` when no dial
+    /// ever succeeded.
+    pub fn last_success_age(&self) -> Option<Duration> {
+        let recorded = self.last_success_ms_plus_one.load(Ordering::Acquire);
+        if recorded == 0 {
+            return None;
+        }
+        Some(
+            self.origin
+                .elapsed()
+                .saturating_sub(Duration::from_millis(recorded - 1)),
+        )
     }
 
     /// Returns the consecutive failure streak when the last failure is no older
@@ -387,21 +427,144 @@ where
 /// Runs the TUN packet engine with an optional [`TunnelActivity`] tracker that
 /// records upstream dial RTTs on every successful `dial_tcp`.
 pub async fn run_tun_engine_with_activity<D, S>(
-    mut device: D,
-    mut stack: S,
+    device: D,
+    stack: S,
     config: TunEngineConfig,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     activity: Option<Arc<TunnelActivity>>,
 ) -> Result<(), EngineError>
 where
     D: TunDevice,
     S: NetStack,
 {
+    let drops = Arc::new(DropCounters::default());
+    run_engine_inner(device, stack, config, shutdown, activity, drops, None).await
+}
+
+/// Pure-Rust live health handle for Android UI and notification polling.
+///
+/// Clone the handle before [`run_tun_engine_with_telemetry`] and call
+/// [`EngineTelemetry::snapshot`] from any thread. It reads the same lock-free
+/// counters the engine updates, so polling never touches the Linux
+/// `/run/beam-client/status` file.
+#[derive(Clone, Debug)]
+pub struct EngineTelemetry {
+    /// Upstream dial liveness tracker shared with the engine relay tasks.
+    pub activity: Arc<TunnelActivity>,
+    /// Packet drop counters shared with the engine, stack, and UDP bridge.
+    pub drops: Arc<DropCounters>,
+    /// DNS outcome counters shared with the DNS interceptor when the engine
+    /// runs with DNS enabled. Build the handle with
+    /// [`EngineTelemetry::with_dns`] so the snapshot carries DNS health.
+    pub dns: Option<Arc<DnsCounters>>,
+}
+
+impl EngineTelemetry {
+    /// Creates a telemetry handle without DNS counters.
+    pub fn new() -> Self {
+        Self {
+            activity: Arc::new(TunnelActivity::new()),
+            drops: Arc::new(DropCounters::default()),
+            dns: None,
+        }
+    }
+
+    /// Creates a telemetry handle with DNS counters attached.
+    pub fn with_dns() -> Self {
+        Self {
+            activity: Arc::new(TunnelActivity::new()),
+            drops: Arc::new(DropCounters::default()),
+            dns: Some(Arc::new(DnsCounters::default())),
+        }
+    }
+
+    /// Takes a point-in-time health snapshot for UI display.
+    pub fn snapshot(&self) -> TelemetrySnapshot {
+        TelemetrySnapshot {
+            drops: self.drops.snapshot(),
+            dns: self.dns.as_ref().map(|counters| counters.snapshot()),
+            last_dial_success_age: self.activity.last_success_age(),
+            consecutive_dial_failures: self.activity.consecutive_failure_count(),
+            last_dial_failure: self.activity.last_failure(),
+        }
+    }
+}
+
+impl Default for EngineTelemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Point-in-time tunnel health for Android UI and notification display.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TelemetrySnapshot {
+    /// Packet drop counters.
+    pub drops: DropSnapshot,
+    /// DNS outcome counters, present whenever the handle was built with
+    /// [`EngineTelemetry::with_dns`]. The counters stay at zero when the engine
+    /// ran with `dns: None`.
+    pub dns: Option<DnsSnapshot>,
+    /// Age of the last successful upstream dial, if any dial succeeded.
+    pub last_dial_success_age: Option<Duration>,
+    /// Consecutive failed upstream dials since the last success.
+    pub consecutive_dial_failures: u64,
+    /// Most recent dial failure, if any dial ever failed.
+    pub last_dial_failure: Option<DialFailure>,
+}
+
+/// Runs the TUN packet engine with a shared [`EngineTelemetry`] handle.
+///
+/// Behaves exactly like [`run_tun_engine_with_activity`] with the handle's
+/// activity tracker attached, and additionally shares the handle's drop and
+/// DNS counters with the engine instead of allocating fresh ones, so
+/// [`EngineTelemetry::snapshot`] observes live values while the engine runs.
+pub async fn run_tun_engine_with_telemetry<D, S>(
+    device: D,
+    stack: S,
+    config: TunEngineConfig,
+    shutdown: watch::Receiver<bool>,
+    telemetry: EngineTelemetry,
+) -> Result<(), EngineError>
+where
+    D: TunDevice,
+    S: NetStack,
+{
+    run_engine_inner(
+        device,
+        stack,
+        config,
+        shutdown,
+        Some(Arc::clone(&telemetry.activity)),
+        Arc::clone(&telemetry.drops),
+        telemetry.dns.clone(),
+    )
+    .await
+}
+
+async fn run_engine_inner<D, S>(
+    mut device: D,
+    mut stack: S,
+    config: TunEngineConfig,
+    mut shutdown: watch::Receiver<bool>,
+    activity: Option<Arc<TunnelActivity>>,
+    drops: Arc<DropCounters>,
+    dns_counters: Option<Arc<DnsCounters>>,
+) -> Result<(), EngineError>
+where
+    D: TunDevice,
+    S: NetStack,
+{
     let start = Instant::now();
+    if dns_counters.is_some() && config.dns.is_none() {
+        debug!(
+            "telemetry DNS counters are attached but the engine runs without DNS; the UI DNS section stays at zero",
+        );
+    }
     let stack_waker = stack.waker();
     let tcp_permits = Arc::new(Semaphore::new(config.max_tcp_connections.max(1)));
     let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(TUN_TX_CHANNEL_CAP);
-    let drops = Arc::new(DropCounters::default());
+    stack.set_drop_counters(Arc::clone(&drops));
     if let Some(tracker) = activity.as_ref() {
         tracker.attach_drop_counters(Arc::clone(&drops));
     }
@@ -415,13 +578,25 @@ where
     let dns_interceptor = config
         .dns
         .as_ref()
-        .map(|dns_cfg| DnsInterceptor::new(config.client.clone(), dns_cfg.clone(), tun_tx.clone()));
+        .map(|dns_cfg| match dns_counters.as_ref() {
+            Some(counters) => DnsInterceptor::with_counters(
+                config.client.clone(),
+                dns_cfg.clone(),
+                tun_tx.clone(),
+                Arc::clone(counters),
+            ),
+            None => DnsInterceptor::new(config.client.clone(), dns_cfg.clone(), tun_tx.clone()),
+        });
     let mut network_reset = config.network_reset.clone();
 
     let mut recv_buf = vec![0u8; device.mtu().clamp(2048, MAX_PACKET_BUF)];
     let mut tx_batch: Vec<Vec<u8>> = Vec::with_capacity(64);
     let mut accepted: Vec<AcceptedTcpStream> = Vec::with_capacity(16);
     let mut next_udp_sweep_at: Option<Instant> = None;
+    // One pinned timer for the whole engine loop: resetting it is much cheaper
+    // than registering and dropping a fresh `sleep` on every iteration.
+    let mut timer_deadline: Option<Instant> = None;
+    let mut timer_sleep = std::pin::pin!(tokio::time::sleep_until(tokio::time::Instant::now()));
 
     info!(
         mtu = device.mtu(),
@@ -454,6 +629,7 @@ where
                 network_reset.clone(),
                 activity.clone(),
                 Arc::clone(&drops),
+                config.tcp_relay_idle_timeout,
             );
         }
 
@@ -475,6 +651,17 @@ where
             (Some(a), None) | (None, Some(a)) => Some(a.max(1)),
             (None, None) => None,
         };
+
+        let now = Instant::now();
+        if timer_deadline.is_some_and(|deadline| deadline <= now) {
+            timer_deadline = None;
+        }
+        if let Some(deadline) = rearm_deadline(timer_deadline, now, next_timer_ms) {
+            timer_sleep
+                .as_mut()
+                .reset(tokio::time::Instant::from_std(deadline));
+            timer_deadline = Some(deadline);
+        }
 
         tokio::select! {
             biased;
@@ -567,11 +754,12 @@ where
             }
             () = stack_waker.notified() => {}
             () = async {
-                match next_timer_ms {
-                    Some(ms) => sleep(Duration::from_millis(ms)).await,
+                match timer_deadline {
+                    Some(_) => (&mut timer_sleep).await,
                     None => std::future::pending::<()>().await,
                 }
             } => {
+                timer_deadline = None;
                 if next_udp_sweep_at.is_some_and(|deadline| Instant::now() >= deadline) {
                     udp_bridge.sweep_idle();
                     next_udp_sweep_at = None;
@@ -614,6 +802,29 @@ fn warn_relay_timeout(dst: SocketAddr, op: &'static str, idle: Duration) {
     }
 }
 
+/// Runs `fut` with a deadline when `Some`, or awaits it directly when `None`.
+///
+/// Only relay *reads* pass `None`, in the push-safe always-on mode: established
+/// FCM/MTalk flows wait on the socket with no redundant read cap, so
+/// `ProxyTcpStack`'s `idle_timeout_ms` plus upstream keepalive/
+/// `TCP_USER_TIMEOUT` govern flow lifetime instead of a second timer. Relay
+/// writes always pass `Some`, see [`spawn_tcp_relay`].
+async fn with_relay_idle<T>(
+    idle: Option<Duration>,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, ()> {
+    match idle {
+        Some(budget) => timeout(budget, fut).await.map_err(|_| ()),
+        None => Ok(fut.await),
+    }
+}
+
+/// Relay write deadline: always bounded, so `None` falls back to the client
+/// idle timeout.
+fn relay_write_idle(relay_idle: Option<Duration>, client_idle: Duration) -> Duration {
+    relay_idle.unwrap_or(client_idle)
+}
+
 fn spawn_tcp_relay(
     mut conn: AcceptedTcpStream,
     client_config: BeamClientConfig,
@@ -621,6 +832,7 @@ fn spawn_tcp_relay(
     mut network_reset: Option<watch::Receiver<u64>>,
     activity: Option<Arc<TunnelActivity>>,
     drops: Arc<DropCounters>,
+    relay_idle: Option<Duration>,
 ) {
     let Ok(permit) = permits.try_acquire_owned() else {
         debug!(dst = %conn.dst, "TCP connection limit reached; aborting with RST");
@@ -700,7 +912,10 @@ fn spawn_tcp_relay(
             }
         };
 
-        let idle = client_config.idle_timeout;
+        // Push-safe mode unbounds reads only. Writes keep a deadline in both
+        // modes, so a peer that stops draining can never wedge this task.
+        let read_idle = relay_idle;
+        let write_idle = relay_write_idle(relay_idle, client_config.idle_timeout);
         let (mut tun_r, mut tun_w) = conn.stream.into_split();
         let (mut up_r, mut up_w) = tokio::io::split(upstream);
 
@@ -709,7 +924,7 @@ fn spawn_tcp_relay(
             // write; stays empty (zero allocation) when no coalescing is needed.
             let mut scratch: Vec<u8> = Vec::new();
             loop {
-                let chunk = match timeout(idle, tun_r.recv_chunk()).await {
+                let chunk = match with_relay_idle(read_idle, tun_r.recv_chunk()).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => {
                         let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
@@ -721,14 +936,14 @@ fn spawn_tcp_relay(
                 // so multi-flow uploads write full TLS records with fewer syscalls.
                 let coalesced = coalesce_c2s(&chunk, &mut scratch, || tun_r.try_recv_chunk());
                 let out: &[u8] = if coalesced { &scratch } else { &chunk };
-                match timeout(idle, up_w.write_all(out)).await {
+                match with_relay_idle(Some(write_idle), up_w.write_all(out)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "write", &err);
                         break;
                     }
                     Err(_) => {
-                        warn_relay_timeout(conn.dst, "write", idle);
+                        warn_relay_timeout(conn.dst, "write", write_idle);
                         break;
                     }
                 }
@@ -743,14 +958,14 @@ fn spawn_tcp_relay(
                 if tun_r.has_queued() {
                     continue;
                 }
-                match timeout(idle, up_w.flush()).await {
+                match with_relay_idle(Some(write_idle), up_w.flush()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "flush", &err);
                         break;
                     }
                     Err(_) => {
-                        warn_relay_timeout(conn.dst, "flush", idle);
+                        warn_relay_timeout(conn.dst, "flush", write_idle);
                         break;
                     }
                 }
@@ -763,7 +978,7 @@ fn spawn_tcp_relay(
                 let read_res = tokio::select! {
                     biased;
                     () = tun_w.closed() => break,
-                    res = timeout(idle, up_r.read(&mut buf)) => res,
+                    res = async { with_relay_idle(read_idle, up_r.read(&mut buf)).await } => res,
                 };
                 let n = match read_res {
                     Ok(Ok(0)) => break,
@@ -773,18 +988,20 @@ fn spawn_tcp_relay(
                         break;
                     }
                     Err(_) => {
-                        warn_relay_timeout(conn.dst, "read", idle);
+                        if let Some(budget) = read_idle {
+                            warn_relay_timeout(conn.dst, "read", budget);
+                        }
                         break;
                     }
                 };
-                match timeout(idle, tun_w.send_chunk_pooled(&buf[..n])).await {
+                match with_relay_idle(Some(write_idle), tun_w.send_chunk_pooled(&buf[..n])).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "send_chunk", &err);
                         break;
                     }
                     Err(_) => {
-                        warn_relay_timeout(conn.dst, "send_chunk", idle);
+                        warn_relay_timeout(conn.dst, "send_chunk", write_idle);
                         break;
                     }
                 }
@@ -842,6 +1059,16 @@ fn failure_streak_is_stale(previous_ms_plus_one: u64, now_ms: u64, window: Durat
     }
     now_ms.saturating_sub(previous_ms_plus_one - 1)
         > u64::try_from(window.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Returns the absolute deadline the engine timer must be reset to, or `None`
+/// while the armed timer is already the earliest wakeup.
+fn rearm_deadline(armed: Option<Instant>, now: Instant, delay_ms: Option<u64>) -> Option<Instant> {
+    let deadline = now + Duration::from_millis(delay_ms?);
+    match armed {
+        Some(armed) if armed <= deadline => None,
+        _ => Some(deadline),
+    }
 }
 
 /// Updates the sticky UDP sweep deadline, shortening it whenever a more urgent
@@ -1042,6 +1269,26 @@ mod tests {
     }
 
     #[test]
+    fn rearm_deadline_keeps_the_armed_timer_and_only_resets_for_earlier_wakeups() {
+        let now = Instant::now();
+        assert_eq!(rearm_deadline(None, now, None), None, "no wakeup, no arm");
+
+        let armed = rearm_deadline(None, now, Some(5)).expect("armed");
+        assert_eq!(armed, now + Duration::from_millis(5));
+
+        // Time passing re-computes a later deadline: keep the armed timer.
+        assert_eq!(
+            rearm_deadline(Some(armed), now + Duration::from_millis(1), Some(5)),
+            None
+        );
+
+        // A shrinking deadline must re-arm to the earlier instant.
+        let sooner =
+            rearm_deadline(Some(armed), now + Duration::from_millis(1), Some(2)).expect("re-armed");
+        assert_eq!(sooner, now + Duration::from_millis(3));
+    }
+
+    #[test]
     fn tunnel_activity_tracks_recent_dial_rtt_and_expires() {
         let activity = TunnelActivity::new();
         assert_eq!(activity.recent_rtt(Duration::from_secs(10)), None);
@@ -1055,5 +1302,55 @@ mod tests {
         std::thread::sleep(Duration::from_millis(15));
         assert_eq!(activity.recent_rtt(Duration::from_millis(5)), None);
         assert_eq!(activity.recent_rtt(Duration::from_secs(10)), Some(17));
+    }
+
+    #[test]
+    fn relay_write_deadline_is_always_bounded() {
+        let client_idle = Duration::from_secs(300);
+        assert_eq!(relay_write_idle(None, client_idle), client_idle);
+        assert_eq!(
+            relay_write_idle(Some(Duration::from_secs(45)), client_idle),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_idle_none_never_times_out_an_idle_flow() {
+        // An idle wait longer than the classic 300 s relay cap still completes.
+        let slow = with_relay_idle(None, async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            7u32
+        })
+        .await;
+        assert_eq!(slow, Ok(7));
+
+        // With an explicit budget the same wait fails fast instead of hanging.
+        let capped = with_relay_idle(Some(Duration::from_millis(20)), async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        })
+        .await;
+        assert_eq!(capped, Err(()));
+    }
+
+    #[test]
+    fn telemetry_snapshot_reports_dial_health_and_drops() {
+        let telemetry = EngineTelemetry::with_dns();
+        assert!(telemetry.snapshot().last_dial_success_age.is_none());
+        assert!(telemetry.snapshot().last_dial_failure.is_none());
+
+        telemetry.activity.record_dial_success(9);
+        let snap = telemetry.snapshot();
+        assert!(snap.last_dial_success_age.is_some());
+        assert_eq!(snap.consecutive_dial_failures, 0);
+
+        telemetry.activity.record_dial_failure(test_failure());
+        let snap = telemetry.snapshot();
+        assert_eq!(snap.consecutive_dial_failures, 1);
+        assert_eq!(snap.last_dial_failure, Some(test_failure()));
+        assert!(snap.dns.is_some());
+        assert!(snap.drops.is_empty());
+
+        // Without DNS counters the snapshot carries no DNS section.
+        assert!(EngineTelemetry::new().snapshot().dns.is_none());
     }
 }

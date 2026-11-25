@@ -302,6 +302,10 @@ before sniffing with `method: default` and `no_drop: true`. H3 fails fast and
 the client falls back to HTTP/2; H3 is intentionally unavailable in this
 profile. The TCP/REALITY path is unchanged.
 
+The Android TUN prep design (the always-on profile, the telemetry API, and
+the `VpnService` wiring map) is in
+[`ANDROID-PREP.md`](ANDROID-PREP.md).
+
 The Windows profile is `$HOME/.config/beam/windows.json`. The installer is
 `$HOME/.config/beam/beam-install-windows.ps1`.
 
@@ -315,7 +319,8 @@ it can contain a provider profile ID or token.
 
 The client publishes `/run/beam-client/status` as `key=value` lines for
 `beam-tray`: `state`, `ifname`, `ts`, `pid`, `rtt_ms`, `reason`, `generation`,
-`bypass_ok`, `dial_failures`, and, when non-zero, `drops`. The tray ignores keys
+`bypass_ok`, `dial_failures`, and, when non-zero, `drops`. DNS outcome counters
+stay internal/API-level and are not published in the status file. The tray ignores keys
 it does not know, so this list can grow without breaking an older tray. A
 `reason` of `dial_failures` means authenticated upstream dials keep failing, so
 a bare TCP connect to the server no longer reports the link as connected. The
@@ -323,8 +328,24 @@ client reports this state while a new dial failure is no more than 20 s old, and
 only after three consecutive failures. A gap of more than 30 s between failures
 starts a new failure count.
 
+The tray turns these keys into a degraded warning. `health.rs` emits
+`state=connected`, `state=reconnecting` (with `reason=dial_failures` while
+fresh authenticated dial failures degrade the link), or
+`state=waiting_network`; it never emits `state=degraded`. The tray shows green
+`Beam: connected` (with RTT when reported) only for `state=connected` with
+`bypass_ok != 0`. It shows a degraded warning for `state=connected` with
+`bypass_ok=0` (`Beam: degraded (bypass missing)`), for `state=reconnecting`
+with `reason=dial_failures` (`Beam: degraded (dial failures)`, combined with
+the bypass text when both apply), and plain `Beam: reconnecting...` or
+`Beam: waiting for network...` otherwise. The `dial_failures` count is a
+lifetime counter, so the tray matches on `reason`, not on the count. The tray
+returns to green `Beam: connected` automatically once the status file reports
+healthy again.
+
 The `drops` value holds `key:value` pairs. The keys are `tun_tx_full`,
-`ip_parse`, `frag`, `route`, `tcp_limit`, `udp_sess_q`, `udp_pending`,
-`udp_payload`, and `udp_sess_tbl`. `tcp_limit` counts new TCP flows that the
-client resets when it reaches `max_tcp_connections`. These resets are not
-`route` drops.
+`ip_parse`, `frag`, `route`, `tcp_limit`, `tcp_rx_ovf`, `udp_mux_q`,
+`udp_sess_q`, `udp_pending`, `udp_payload`, and `udp_sess_tbl`. `tcp_limit`
+counts new TCP flows that the client resets when it reaches
+`max_tcp_connections`. These resets are not `route` drops. `tcp_rx_ovf` counts
+TCP packets dropped because the stack RX queue was full, and `udp_mux_q`
+counts UDP frames dropped by a full XUDP mux queue (outbound or inbound).

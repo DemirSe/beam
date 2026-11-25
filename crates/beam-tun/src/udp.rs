@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use beam_core::address::{Address, NetLocation};
-use beam_core::client::{BeamClientConfig, XudpClient, XudpClientConfig, XudpSession};
+use beam_core::client::{
+    BeamClientConfig, XudpClient, XudpClientConfig, XudpClientError, XudpSession,
+};
 use beam_core::xudp::MAX_PAYLOAD_LEN;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -43,6 +45,29 @@ impl Default for UdpBridgeConfig {
             max_sessions: DEFAULT_MAX_UDP_SESSIONS,
             idle_timeout: DEFAULT_UDP_IDLE_TIMEOUT,
         }
+    }
+}
+
+impl UdpBridgeConfig {
+    /// Low-RAM always-on profile for Android `VpnService`: 128 NAT sessions
+    /// with a 60 s idle expiry, so an idle phone holds no UDP timer wakeups.
+    pub fn mobile() -> Self {
+        Self {
+            max_sessions: 128,
+            idle_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+#[cfg(test)]
+mod mobile_tests {
+    use super::*;
+
+    #[test]
+    fn mobile_profile_bounds_sessions_and_expiry() {
+        let cfg = UdpBridgeConfig::mobile();
+        assert_eq!(cfg.max_sessions, 128);
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
     }
 }
 
@@ -228,17 +253,22 @@ impl UdpNatBridge {
         };
 
         let (tx, mut rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(PER_SESSION_SEND_QUEUE);
-        let _ = tx.try_send((dst, queued_payload(payload)));
+        if tx.try_send((dst, queued_payload(payload))).is_err() {
+            // The channel was just created with capacity, so this only happens
+            // if it is already closed; count it like any other queue drop.
+            self.drops.udp_session_queue_full.incr();
+        }
 
         let tun_tx = self.tun_tx.clone();
         let task_drops = Arc::clone(&self.drops);
-        let idle = self.bridge_config.idle_timeout;
         let last_active_ms = Arc::new(AtomicU64::new(now_ms));
         let task_active = Arc::clone(&last_active_ms);
         let start = self.start;
 
         let task = tokio::spawn(async move {
             let mut last_dst = dst;
+            // No idle timer here: `sweep_idle` expires the session and aborts
+            // this task, so per-datagram timer churn is not needed.
             loop {
                 tokio::select! {
                     maybe_out = rx.recv() => {
@@ -250,9 +280,15 @@ impl UdpNatBridge {
                         }
                         last_dst = target;
                         task_active.store(start.elapsed().as_millis() as u64, Ordering::Release);
-                        if let Err(err) = session.send_owned(socket_to_netloc(target), data).await {
-                            warn!(%target, error = %err, "xudp session send_to failed");
-                            break;
+                        // Never await the shared mux queue here: a full outbound
+                        // queue would stop this task from draining inbound replies.
+                        match session.try_send_owned(socket_to_netloc(target), data) {
+                            Ok(()) => {}
+                            Err(XudpClientError::OutboundQueueFull) => task_drops.udp_mux_q.incr(),
+                            Err(err) => {
+                                warn!(%target, error = %err, "xudp session send_to failed");
+                                break;
+                            }
                         }
                     }
                     maybe_reply = session.recv() => {
@@ -275,12 +311,11 @@ impl UdpNatBridge {
                         {
                             task_drops.tun_tx_full.incr();
                         }
-                    }
-                    () = tokio::time::sleep(idle) => {
-                        break;
+                        sync_mux_drops(&session, &task_drops);
                     }
                 }
             }
+            sync_mux_drops(&session, &task_drops);
             let _ = session.close().await;
         });
 
@@ -324,17 +359,25 @@ impl UdpNatBridge {
     /// XUDP reconnect backoff retry when datagrams are queued, or `None` when
     /// idle (allowing the TUN engine to sleep with zero idle wakeups).
     pub fn next_sweep_delay_ms(&self) -> Option<u64> {
-        let session_delay = if self.sessions.is_empty() {
-            None
-        } else {
-            let idle_ms = self.bridge_config.idle_timeout.as_millis() as u64;
-            Some(idle_ms.clamp(1_000, 10_000))
-        };
+        let now_ms = self.now_ms();
+        let idle_ms = self.bridge_config.idle_timeout.as_millis() as u64;
+        // Single pass: a finished session task is reaped by the next sweep,
+        // so it forces delay 0 instead of keeping its slot until idle
+        // timeout. Otherwise track the earliest real expiry.
+        let mut session_delay: Option<u64> = None;
+        for entry in self.sessions.values() {
+            if entry.task.is_finished() {
+                return Some(0);
+            }
+            let last = entry.last_active_ms.load(Ordering::Acquire);
+            let remaining = last.saturating_add(idle_ms).saturating_sub(now_ms);
+            session_delay = Some(session_delay.map_or(remaining, |min| min.min(remaining)));
+        }
         let backoff_delay = if !self.pending_initial.is_empty()
             && self.connecting.is_none()
             && self.mux.as_ref().is_none_or(|m| !m.is_open())
         {
-            Some(self.next_connect_allowed_ms.saturating_sub(self.now_ms()))
+            Some(self.next_connect_allowed_ms.saturating_sub(now_ms))
         } else {
             None
         };
@@ -394,6 +437,14 @@ fn queued_payload(payload: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Moves the mux-level reply drops observed for this session into `udp_mux_q`.
+fn sync_mux_drops(session: &XudpSession, drops: &DropCounters) {
+    let dropped = session.take_dropped_replies();
+    if dropped > 0 {
+        drops.udp_mux_q.add(dropped);
+    }
+}
+
 fn socket_to_netloc(addr: SocketAddr) -> NetLocation {
     let address = match addr.ip() {
         IpAddr::V4(v4) => Address::Ipv4(v4),
@@ -449,28 +500,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_sweep_delay_ms_none_when_idle_and_clamped_when_active() {
+    async fn next_sweep_delay_reaps_a_finished_session_task_at_once() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig {
+                max_sessions: 4,
+                idle_timeout: Duration::from_secs(60),
+            },
+            tun_tx,
+            Arc::new(Notify::new()),
+            dummy_drops(),
+        );
+
+        // A session task that already exited must not linger for 60s.
+        let task = tokio::spawn(async {});
+        for _ in 0..8 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            task.is_finished(),
+            "short-lived session task did not finish"
+        );
+        let (tx, _rx) = mpsc::channel(PER_SESSION_SEND_QUEUE);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 40_100);
+        bridge.sessions.insert(
+            src,
+            NatEntry {
+                tx,
+                last_active_ms: Arc::new(AtomicU64::new(bridge.now_ms())),
+                task,
+            },
+        );
+        assert_eq!(
+            bridge.next_sweep_delay_ms(),
+            Some(0),
+            "a finished session task must schedule an immediate sweep"
+        );
+        bridge.sweep_idle();
+        assert!(bridge.sessions.is_empty(), "the finished session is reaped");
+    }
+
+    #[tokio::test]
+    async fn next_sweep_delay_ms_tracks_the_earliest_session_expiry() {
         let (tun_tx, _tun_rx) = mpsc::channel(8);
         let waker = Arc::new(Notify::new());
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig {
+                max_sessions: 4,
+                idle_timeout: Duration::from_secs(60),
+            },
+            tun_tx,
+            Arc::clone(&waker),
+            dummy_drops(),
+        );
+        assert_eq!(
+            bridge.next_sweep_delay_ms(),
+            None,
+            "idle bridge must not wake"
+        );
 
-        for (idle_ms, expected_ms) in [(200, 1_000), (5_000, 5_000), (60_000, 10_000)] {
-            let mut bridge = UdpNatBridge::new(
-                dummy_client_config(),
-                UdpBridgeConfig {
-                    max_sessions: 4,
-                    idle_timeout: Duration::from_millis(idle_ms),
-                },
-                tun_tx.clone(),
-                Arc::clone(&waker),
-                dummy_drops(),
-            );
-            assert_eq!(bridge.next_sweep_delay_ms(), None);
+        // A fresh session must schedule its real 60s expiry, not a 10s clamp.
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 40_000);
+        // Pretend the bridge has been up for 70s so session ages are meaningful.
+        bridge.start = Instant::now() - Duration::from_secs(70);
+        let now_ms = bridge.now_ms();
+        let _rx = insert_fake_entry(&mut bridge, src, now_ms);
+        let delay = bridge
+            .next_sweep_delay_ms()
+            .expect("an active session schedules a sweep");
+        assert!(
+            (59_000..=60_000).contains(&delay),
+            "expected about 60000ms (unclamped), got {delay}ms"
+        );
 
-            let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 40_000);
-            let now_ms = bridge.now_ms();
-            let _rx = insert_fake_entry(&mut bridge, src, now_ms);
-            assert_eq!(bridge.next_sweep_delay_ms(), Some(expected_ms));
-        }
+        // An older session shortens the delay to its own expiry.
+        let older = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 40_001);
+        let _rx_older = insert_fake_entry(&mut bridge, older, now_ms.saturating_sub(5_000));
+        let delay = bridge
+            .next_sweep_delay_ms()
+            .expect("the earliest expiry wins");
+        assert!(
+            (54_000..=55_000).contains(&delay),
+            "expected about 55000ms, got {delay}ms"
+        );
+
+        // A session that is already past its idle timeout reports zero delay so
+        // the sweep runs on the next engine iteration.
+        let expired = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 40_002);
+        let _rx_expired = insert_fake_entry(&mut bridge, expired, 0);
+        assert_eq!(bridge.next_sweep_delay_ms(), Some(0));
     }
 
     #[tokio::test]

@@ -195,6 +195,7 @@ async fn main() {
             intercept_dns: false,
         },
         max_tcp_connections: 32,
+        tcp_relay_idle_timeout: None,
         udp: UdpBridgeConfig::default(),
         dns: None,
         network_reset: None,

@@ -9,11 +9,14 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use beam_core::address::{Address, NetLocation};
-use beam_core::client::{BeamClientConfig, BeamTcpStream, XudpClient, XudpClientConfig, dial_tcp};
+use beam_core::client::{
+    BeamClientConfig, BeamTcpStream, SocketProtector, XudpClient, XudpClientConfig, dial_tcp,
+};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,7 +24,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant as TokioInstant, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::packet::build_ip_udp_packet_patched;
 use crate::ratelimit::RateLimiter;
@@ -54,6 +57,17 @@ const MAX_LOCAL_UDP_POOL_SIZE: usize = 4;
 const LOCAL_UDP_POOL_IDLE_TTL: Duration = Duration::from_secs(30);
 /// Stale replies discarded while waiting for the reply to the current query.
 const MAX_LOCAL_UDP_STALE_REPLIES: usize = 8;
+/// Bound on the cache-miss bypass route install await: a hung `ip` command
+/// can neither stall the DNS reply nor exhaust `MAX_INFLIGHT_DNS_QUERIES`.
+const BYPASS_ROUTE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Max concurrent bypass route installs shared by the cache-miss and
+/// cache-hit paths (each may fork `ip`). A hung `ip` call holds its permit
+/// only until `BYPASS_ROUTE_TIMEOUT`, so hung installs cannot grow blocking
+/// tasks unboundedly.
+const MAX_BYPASS_REFIRE_INFLIGHT: usize = 4;
+/// Max cache-hit bypass re-fires per [`BYPASS_REFIRE_WINDOW`].
+const MAX_BYPASS_REFIRE_PER_WINDOW: u32 = 4;
+const BYPASS_REFIRE_WINDOW: Duration = Duration::from_secs(5);
 const DNS_XUDP_REPLY_QUEUE: usize = 8;
 const MAX_DNS_NAME_LEN: usize = 255;
 const MAX_DNS_LABELS: usize = 128;
@@ -67,6 +81,12 @@ static DNS_UPSTREAM_LOG: LazyLock<RateLimiter> =
 /// At most 2 concurrency-limit SERVFAIL warnings per 30 s window.
 static DNS_BUSY_LOG: LazyLock<RateLimiter> =
     LazyLock::new(|| RateLimiter::new(2, Duration::from_secs(30)));
+/// At most 2 bypass-route timeout warnings per 30 s window.
+static DNS_BYPASS_LOG: LazyLock<RateLimiter> =
+    LazyLock::new(|| RateLimiter::new(2, Duration::from_secs(30)));
+/// At most 1 cache/pool mutex-poison error per 30 s window.
+static DNS_POISON_LOG: LazyLock<RateLimiter> =
+    LazyLock::new(|| RateLimiter::new(1, Duration::from_secs(30)));
 
 const EDNS0_OPT_RR: [u8; 11] = [
     0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -227,7 +247,17 @@ fn split_host_port(authority: &str, default_port: u16) -> Result<(&str, u16), St
 }
 
 /// Callback invoked when a `bypass_domains` query resolves to one or more IPs.
-pub type BypassIpCallback = Arc<dyn Fn(&[IpAddr]) + Send + Sync>;
+///
+/// On cache misses the interceptor `.await`s the returned handle **before**
+/// sending the DNS reply to the TUN device (bounded by a 500 ms timeout), so
+/// the dynamic `/32`/`/128` bypass route is installed first and the follow-up
+/// TCP SYN takes the physical gateway instead of re-entering the tunnel
+/// (first-packet race). On cache hits the re-fire is best-effort and
+/// rate-limited (at most 2 concurrent installs, 4 per 5 s); the cached reply
+/// is sent immediately without waiting. The callback itself must dispatch
+/// blocking route installation to Tokio's blocking pool and return
+/// immediately without blocking a worker thread.
+pub type BypassIpCallback = Arc<dyn Fn(Vec<IpAddr>) -> tokio::task::JoinHandle<()> + Send + Sync>;
 
 /// Optional callback invoked on network transitions to refresh the local DNS server.
 pub type LocalDnsRefresh = Arc<dyn Fn() -> Option<SocketAddr> + Send + Sync>;
@@ -243,6 +273,11 @@ pub struct DnsConfig {
     /// Optional callback invoked on network transitions to re-detect the
     /// host's local DNS server when `local_upstream` was auto-detected.
     pub refresh_local_upstream: Option<LocalDnsRefresh>,
+    /// Optional [`SocketProtector`] hook (`VpnService.protect(fd)`), the same
+    /// type the upstream dial path takes, called after `bind` and before
+    /// `connect` on every freshly bound local-DNS socket. A reused pooled socket
+    /// skips the hook. Omitted from `Debug` like the other callbacks.
+    pub local_socket_protector: Option<SocketProtector>,
     /// Local-only suffixes (e.g. `["lan", "local", "internal"]`).
     pub local_suffixes: Vec<String>,
     /// Additional user-configured bypass domain suffixes.
@@ -277,6 +312,11 @@ impl std::fmt::Debug for DnsConfig {
 }
 
 impl DnsConfig {
+    /// Returns the local-socket protector, if any.
+    pub(crate) fn local_protector(&self) -> Option<SocketProtector> {
+        self.local_socket_protector.clone()
+    }
+
     /// Returns the default local-only suffixes (`.lan`, `.local`, `.internal`).
     pub fn default_local_suffixes() -> Vec<String> {
         vec!["lan".to_owned(), "local".to_owned(), "internal".to_owned()]
@@ -288,6 +328,7 @@ impl DnsConfig {
             upstream,
             local_upstream,
             refresh_local_upstream: None,
+            local_socket_protector: None,
             local_suffixes: Self::default_local_suffixes(),
             bypass_domains: Vec::new(),
             cache_size: DEFAULT_CACHE_SIZE,
@@ -716,12 +757,24 @@ pub fn matches_domain_suffix(qname: &str, suffix: &str) -> bool {
     q.len() > s.len() && q.ends_with(&s) && q.as_bytes()[q.len() - s.len() - 1] == b'.'
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CacheKey {
-    qname: String,
+/// Non-name part of a [`DnsCache`] key: the `qname` lives in the outer
+/// `HashMap<String, _>` so lookups borrow it as `&str` with zero allocation,
+/// while this `Copy` remainder keys the small inner map by value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CacheRest {
     qtype: u16,
     qclass: u16,
     dnssec_ok: bool,
+}
+
+impl CacheRest {
+    fn of(query: &DnsQuery) -> Self {
+        Self {
+            qtype: query.qtype,
+            qclass: query.qclass,
+            dnssec_ok: query.dnssec_ok,
+        }
+    }
 }
 
 struct CacheEntry {
@@ -734,10 +787,15 @@ struct CacheEntry {
 }
 
 /// Bounded LRU + TTL DNS response cache.
+///
+/// Two-level index: the outer map is keyed by `qname`, so [`DnsCache::get`]
+/// borrows the query name as `&str` with zero allocation on the hot hit path;
+/// only [`DnsCache::insert`] (the miss path) clones the name it must store.
 pub struct DnsCache {
     max_entries: usize,
     seq: u64,
-    entries: HashMap<CacheKey, CacheEntry>,
+    len: usize,
+    entries: HashMap<String, HashMap<CacheRest, CacheEntry>>,
 }
 
 impl DnsCache {
@@ -747,8 +805,19 @@ impl DnsCache {
         Self {
             max_entries: cap,
             seq: 0,
+            len: 0,
             entries: HashMap::with_capacity(cap.min(256)),
         }
+    }
+
+    /// Asserts in debug builds that `len` mirrors the inner maps exactly.
+    /// A release build compiles this to nothing.
+    fn debug_check_len(&self) {
+        debug_assert_eq!(
+            self.len,
+            self.entries.values().map(HashMap::len).sum::<usize>(),
+            "DnsCache.len must mirror its inner entries"
+        );
     }
 
     /// Looks up a cached response.
@@ -759,21 +828,22 @@ impl DnsCache {
         if self.max_entries == 0 {
             return None;
         }
-        let key = CacheKey {
-            qname: query.qname.clone(),
-            qtype: query.qtype,
-            qclass: query.qclass,
-            dnssec_ok: query.dnssec_ok,
-        };
-        let expired = self
-            .entries
-            .get(&key)
-            .is_some_and(|entry| now >= entry.expires_at);
-        if expired {
-            self.entries.remove(&key);
+        // Zero-allocation borrowed lookup: `String: Borrow<str>` for the outer
+        // map, `Copy` key by value for the inner map.
+        let rest = CacheRest::of(query);
+        // Single outer+inner lookup: one `qname` hash on every path.
+        let inner = self.entries.get_mut(query.qname.as_str())?;
+        let entry = inner.get_mut(&rest)?;
+        if now >= entry.expires_at {
+            inner.remove(&rest);
+            self.len = self.len.saturating_sub(1);
+            let became_empty = inner.is_empty();
+            if became_empty {
+                self.entries.remove(query.qname.as_str());
+            }
+            self.debug_check_len();
             return None;
         }
-        let entry = self.entries.get_mut(&key)?;
         self.seq = self.seq.wrapping_add(1);
         entry.last_used = self.seq;
         Some(Arc::clone(&entry.wire))
@@ -792,48 +862,95 @@ impl DnsCache {
         if self.max_entries == 0 || wire.len() < 12 || wire.len() > MAX_DOH_RESPONSE_BYTES {
             return;
         }
-        let key = CacheKey {
-            qname: query.qname.clone(),
-            qtype: query.qtype,
-            qclass: query.qclass,
-            dnssec_ok: query.dnssec_ok,
-        };
-        if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
-            self.entries.retain(|_, v| now < v.expires_at);
-            if self.entries.len() >= self.max_entries
-                && let Some(oldest_key) = self
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, v)| v.last_used)
-                    .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&oldest_key);
+        let rest = CacheRest::of(query);
+        let exists = self
+            .entries
+            .get(query.qname.as_str())
+            .is_some_and(|inner| inner.contains_key(&rest));
+        if !exists && self.len >= self.max_entries {
+            self.entries.retain(|_, inner| {
+                inner.retain(|_, v| now < v.expires_at);
+                !inner.is_empty()
+            });
+            self.len = self.entries.values().map(HashMap::len).sum();
+            if self.len >= self.max_entries {
+                let mut oldest: Option<(&String, CacheRest)> = None;
+                let mut oldest_used = u64::MAX;
+                for (name, inner) in &self.entries {
+                    for (r, entry) in inner {
+                        if entry.last_used < oldest_used {
+                            oldest_used = entry.last_used;
+                            oldest = Some((name, *r));
+                        }
+                    }
+                }
+                if let Some((name, rest)) = oldest {
+                    // One clone of the winning name, after the scan.
+                    let name = name.to_owned();
+                    if let Some(inner) = self.entries.get_mut(name.as_str()) {
+                        inner.remove(&rest);
+                        self.len = self.len.saturating_sub(1);
+                        if inner.is_empty() {
+                            self.entries.remove(name.as_str());
+                        }
+                    }
+                }
             }
         }
         self.seq = self.seq.wrapping_add(1);
-        self.entries.insert(
-            key,
-            CacheEntry {
-                wire,
-                expires_at: now + Duration::from_secs(u64::from(ttl_secs)),
-                last_used: self.seq,
-                is_local,
-            },
-        );
+        let entry = CacheEntry {
+            wire,
+            expires_at: now + Duration::from_secs(u64::from(ttl_secs)),
+            last_used: self.seq,
+            is_local,
+        };
+        // Update a known name through `get_mut`: only the first entry of a name
+        // allocates an owned key, and a new qtype under a known name allocates
+        // nothing at all.
+        if let Some(inner) = self.entries.get_mut(query.qname.as_str()) {
+            if inner.insert(rest, entry).is_none() {
+                self.len += 1;
+            }
+        } else {
+            self.entries
+                .insert(query.qname.clone(), HashMap::from([(rest, entry)]));
+            self.len += 1;
+        }
+        self.debug_check_len();
     }
 
     /// Evicts local-network DNS entries (called on network/gateway switches).
     pub fn clear_local(&mut self) {
-        self.entries.retain(|_, v| !v.is_local);
+        self.entries.retain(|_, inner| {
+            inner.retain(|_, v| !v.is_local);
+            !inner.is_empty()
+        });
+        self.len = self.entries.values().map(HashMap::len).sum();
+        self.debug_check_len();
     }
 
     /// Clears all cached entries.
     pub fn clear_all(&mut self) {
         self.entries.clear();
+        self.len = 0;
+        self.debug_check_len();
     }
 }
 
 type DohTlsStream = tokio_rustls::client::TlsStream<BeamTcpStream>;
+
+/// Logs a rate-limited `error!` when a DNS cache/pool mutex is poisoned.
+///
+/// Poisoning means another thread panicked while holding the lock; the
+/// interceptor keeps serving (dropping the pooled state) instead of stalling.
+fn log_pool_poisoned(what: &str) {
+    if let Some(suppressed) = DNS_POISON_LOG.allow() {
+        error!(
+            pool = what,
+            suppressed, "DNS cache/pool mutex poisoned; continuing without the cached state"
+        );
+    }
+}
 
 struct PooledDohConn<S> {
     stream: S,
@@ -847,7 +964,19 @@ struct PooledDohConn<S> {
 /// immediately on network transitions. A monotonic generation counter prevents
 /// connections dialed before a network transition from being returned to the
 /// pool after `clear()`.
+///
+/// Concurrency is bounded by `slots` (`MAX_DOH_POOL_SIZE` permits): each
+/// query holds one slot across `take -> (dial if empty) -> request I/O ->
+/// put`, so a cold burst performs at most `MAX_DOH_POOL_SIZE` concurrent
+/// REALITY handshakes, up to that many queries run I/O in parallel, and a
+/// waiter that acquires a freed slot immediately reuses the warm connection
+/// the previous holder `put()` before releasing its permit.
 struct DohPool<S = DohTlsStream> {
+    state: Mutex<DohPoolState<S>>,
+    slots: Semaphore,
+}
+
+struct DohPoolState<S> {
     idle: Vec<PooledDohConn<S>>,
     generation: u64,
 }
@@ -855,20 +984,33 @@ struct DohPool<S = DohTlsStream> {
 impl<S> Default for DohPool<S> {
     fn default() -> Self {
         Self {
-            idle: Vec::new(),
-            generation: 0,
+            state: Mutex::new(DohPoolState {
+                idle: Vec::new(),
+                generation: 0,
+            }),
+            slots: Semaphore::new(MAX_DOH_POOL_SIZE),
         }
     }
 }
 
 impl<S> DohPool<S> {
     fn generation(&self) -> u64 {
-        self.generation
+        match self.state.lock() {
+            Ok(state) => state.generation,
+            Err(_) => {
+                log_pool_poisoned("doh_pool");
+                0
+            }
+        }
     }
 
-    fn take(&mut self, now: Instant) -> (Option<S>, u64) {
-        let generation = self.generation;
-        while let Some(entry) = self.idle.pop() {
+    fn take(&self, now: Instant) -> (Option<S>, u64) {
+        let Ok(mut state) = self.state.lock() else {
+            log_pool_poisoned("doh_pool");
+            return (None, 0);
+        };
+        let generation = state.generation;
+        while let Some(entry) = state.idle.pop() {
             if now.saturating_duration_since(entry.last_used) < DOH_POOL_IDLE_TTL {
                 return (Some(entry.stream), generation);
             }
@@ -876,23 +1018,33 @@ impl<S> DohPool<S> {
         (None, generation)
     }
 
-    fn put(&mut self, stream: S, expected_generation: u64, now: Instant) {
-        if self.generation != expected_generation {
+    fn put(&self, stream: S, expected_generation: u64, now: Instant) {
+        let Ok(mut state) = self.state.lock() else {
+            log_pool_poisoned("doh_pool");
+            return;
+        };
+        if state.generation != expected_generation {
             return;
         }
-        self.idle
+        state
+            .idle
             .retain(|entry| now.saturating_duration_since(entry.last_used) < DOH_POOL_IDLE_TTL);
-        if self.idle.len() < MAX_DOH_POOL_SIZE {
-            self.idle.push(PooledDohConn {
+        if state.idle.len() < MAX_DOH_POOL_SIZE {
+            state.idle.push(PooledDohConn {
                 stream,
                 last_used: now,
             });
         }
     }
 
-    fn clear(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.idle.clear();
+    fn clear(&self) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.generation = state.generation.wrapping_add(1);
+                state.idle.clear();
+            }
+            Err(_) => log_pool_poisoned("doh_pool"),
+        }
     }
 }
 
@@ -905,7 +1057,17 @@ struct PooledTcpDnsConn<S> {
 ///
 /// Mirrors [`DohPool`]: zero background timers; expired entries are discarded
 /// passively on borrow/return or cleared immediately on network transitions.
+/// Concurrency is bounded by `slots` (`MAX_TCP_DNS_POOL_SIZE` permits) held
+/// across `take -> (dial if empty) -> request I/O -> put`, so a cold burst
+/// performs at most pool-capacity concurrent REALITY handshakes, queries run
+/// I/O in parallel, and waiters reuse warm connections `put()` before the
+/// permit is released.
 struct TcpDnsPool<S = BeamTcpStream> {
+    state: Mutex<TcpDnsPoolState<S>>,
+    slots: Semaphore,
+}
+
+struct TcpDnsPoolState<S> {
     idle: Vec<PooledTcpDnsConn<S>>,
     generation: u64,
 }
@@ -913,20 +1075,33 @@ struct TcpDnsPool<S = BeamTcpStream> {
 impl<S> Default for TcpDnsPool<S> {
     fn default() -> Self {
         Self {
-            idle: Vec::new(),
-            generation: 0,
+            state: Mutex::new(TcpDnsPoolState {
+                idle: Vec::new(),
+                generation: 0,
+            }),
+            slots: Semaphore::new(MAX_TCP_DNS_POOL_SIZE),
         }
     }
 }
 
 impl<S> TcpDnsPool<S> {
     fn generation(&self) -> u64 {
-        self.generation
+        match self.state.lock() {
+            Ok(state) => state.generation,
+            Err(_) => {
+                log_pool_poisoned("tcp_dns_pool");
+                0
+            }
+        }
     }
 
-    fn take(&mut self, now: Instant) -> (Option<S>, u64) {
-        let generation = self.generation;
-        while let Some(entry) = self.idle.pop() {
+    fn take(&self, now: Instant) -> (Option<S>, u64) {
+        let Ok(mut state) = self.state.lock() else {
+            log_pool_poisoned("tcp_dns_pool");
+            return (None, 0);
+        };
+        let generation = state.generation;
+        while let Some(entry) = state.idle.pop() {
             if now.saturating_duration_since(entry.last_used) < TCP_DNS_POOL_IDLE_TTL {
                 return (Some(entry.stream), generation);
             }
@@ -934,28 +1109,38 @@ impl<S> TcpDnsPool<S> {
         (None, generation)
     }
 
-    fn put(&mut self, stream: S, expected_gen: u64, now: Instant) {
-        if self.generation != expected_gen {
+    fn put(&self, stream: S, expected_gen: u64, now: Instant) {
+        let Ok(mut state) = self.state.lock() else {
+            log_pool_poisoned("tcp_dns_pool");
+            return;
+        };
+        if state.generation != expected_gen {
             return;
         }
-        self.idle
+        state
+            .idle
             .retain(|entry| now.saturating_duration_since(entry.last_used) < TCP_DNS_POOL_IDLE_TTL);
-        if self.idle.len() < MAX_TCP_DNS_POOL_SIZE {
-            self.idle.push(PooledTcpDnsConn {
+        if state.idle.len() < MAX_TCP_DNS_POOL_SIZE {
+            state.idle.push(PooledTcpDnsConn {
                 stream,
                 last_used: now,
             });
         }
     }
 
-    fn clear(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.idle.clear();
+    fn clear(&self) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.generation = state.generation.wrapping_add(1);
+                state.idle.clear();
+            }
+            Err(_) => log_pool_poisoned("tcp_dns_pool"),
+        }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.idle.len()
+        self.state.lock().map(|s| s.idle.len()).unwrap_or(0)
     }
 }
 
@@ -998,6 +1183,7 @@ struct LocalUdpPool {
 impl LocalUdpPool {
     fn take(&self, key: SocketAddr, now: Instant) -> (Option<UdpSocket>, u64) {
         let Ok(mut state) = self.state.lock() else {
+            log_pool_poisoned("local_udp_pool");
             return (None, 0);
         };
         let generation = state.generation;
@@ -1014,6 +1200,7 @@ impl LocalUdpPool {
 
     fn put(&self, sock: UdpSocket, key: SocketAddr, expected_generation: u64, now: Instant) {
         let Ok(mut state) = self.state.lock() else {
+            log_pool_poisoned("local_udp_pool");
             return;
         };
         if state.generation != expected_generation {
@@ -1032,9 +1219,12 @@ impl LocalUdpPool {
     }
 
     fn clear(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.generation = state.generation.wrapping_add(1);
-            state.idle.clear();
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.generation = state.generation.wrapping_add(1);
+                state.idle.clear();
+            }
+            Err(_) => log_pool_poisoned("local_udp_pool"),
         }
     }
 
@@ -1086,6 +1276,7 @@ impl<C: MuxHealth> UdpDnsMuxPool<C> {
         let _connect_guard = self.connect_lock.lock().await;
         let generation = {
             let Ok(mut guard) = self.slot.lock() else {
+                log_pool_poisoned("udp_mux_pool");
                 return Err(io::Error::other("DNS XUDP mux slot poisoned"));
             };
             if let Some(existing) = guard.mux.as_ref() {
@@ -1107,20 +1298,27 @@ impl<C: MuxHealth> UdpDnsMuxPool<C> {
     }
 
     fn invalidate(&self, stale: &Arc<C>) {
-        if let Ok(mut guard) = self.slot.lock()
-            && guard
-                .mux
-                .as_ref()
-                .is_some_and(|cur| Arc::ptr_eq(cur, stale))
-        {
-            guard.mux = None;
+        match self.slot.lock() {
+            Ok(mut guard) => {
+                if guard
+                    .mux
+                    .as_ref()
+                    .is_some_and(|cur| Arc::ptr_eq(cur, stale))
+                {
+                    guard.mux = None;
+                }
+            }
+            Err(_) => log_pool_poisoned("udp_mux_pool"),
         }
     }
 
     fn clear(&self) {
-        if let Ok(mut guard) = self.slot.lock() {
-            guard.generation = guard.generation.wrapping_add(1);
-            guard.mux = None;
+        match self.slot.lock() {
+            Ok(mut guard) => {
+                guard.generation = guard.generation.wrapping_add(1);
+                guard.mux = None;
+            }
+            Err(_) => log_pool_poisoned("udp_mux_pool"),
         }
     }
 }
@@ -1135,15 +1333,26 @@ fn dns_xudp_config() -> XudpClientConfig {
 
 /// Non-blocking DNS interceptor embedded in `beam-tun`'s engine loop.
 pub struct DnsInterceptor {
-    client_config: BeamClientConfig,
-    dns_config: DnsConfig,
+    // `Arc`-shared so a cache miss clones two pointers instead of copying up
+    // to 512 `String`s (`local_suffixes` + `bypass_domains`) and the whole
+    // `BeamClientConfig` on every miss.
+    client_config: Arc<BeamClientConfig>,
+    dns_config: Arc<DnsConfig>,
+    /// Pre-formatted static DoH request prefix (`None` for non-DoH upstreams).
+    /// Embeds the secret DoH path, so [`DohPrefix`] cannot be printed.
+    doh_prefix: Option<DohPrefix>,
     local_upstream: Arc<Mutex<Option<SocketAddr>>>,
     tls_config: Arc<ClientConfig>,
-    doh_pool: Arc<Mutex<DohPool>>,
-    tcp_pool: Arc<Mutex<TcpDnsPool>>,
+    doh_pool: Arc<DohPool>,
+    tcp_pool: Arc<TcpDnsPool>,
     udp_mux_pool: Arc<UdpDnsMuxPool>,
     cache: Arc<Mutex<DnsCache>>,
     inflight: Arc<Semaphore>,
+    /// Bounds concurrent `on_bypass_ips` route installs shared by the
+    /// cache-miss path and cache-hit re-fires (each may fork `ip`).
+    bypass_permits: Arc<Semaphore>,
+    /// Rate-budget for cache-hit `on_bypass_ips` re-fires (fork-storm guard).
+    bypass_refire_limit: Arc<RateLimiter>,
     tun_tx: mpsc::Sender<Vec<u8>>,
     local_udp_pool: Arc<LocalUdpPool>,
     counters: Arc<DnsCounters>,
@@ -1156,7 +1365,34 @@ impl DnsInterceptor {
         dns_config: DnsConfig,
         tun_tx: mpsc::Sender<Vec<u8>>,
     ) -> Self {
-        let interceptor = Self::with_pool(client_config, dns_config, tun_tx);
+        let interceptor = Self::with_pool(
+            client_config,
+            dns_config,
+            tun_tx,
+            Arc::new(DnsCounters::default()),
+        );
+        info!(
+            upstream = %interceptor.dns_config.upstream,
+            upstream_kind = interceptor.dns_config.upstream.kind(),
+            local_upstream = ?interceptor.dns_config.local_upstream,
+            cache_size = interceptor.dns_config.cache_size,
+            ipv4_only = interceptor.dns_config.ipv4_only,
+            local_suffixes = interceptor.dns_config.local_suffixes.len(),
+            bypass_domains = interceptor.dns_config.bypass_domains.len(),
+            "DNS interceptor configured"
+        );
+        interceptor
+    }
+
+    /// Creates a [`DnsInterceptor`] that shares `counters` instead of owning
+    /// fresh ones, so external telemetry can poll live DNS health.
+    pub fn with_counters(
+        client_config: BeamClientConfig,
+        dns_config: DnsConfig,
+        tun_tx: mpsc::Sender<Vec<u8>>,
+        counters: Arc<DnsCounters>,
+    ) -> Self {
+        let interceptor = Self::with_pool(client_config, dns_config, tun_tx, counters);
         info!(
             upstream = %interceptor.dns_config.upstream,
             upstream_kind = interceptor.dns_config.upstream.kind(),
@@ -1174,6 +1410,7 @@ impl DnsInterceptor {
         client_config: BeamClientConfig,
         dns_config: DnsConfig,
         tun_tx: mpsc::Sender<Vec<u8>>,
+        counters: Arc<DnsCounters>,
     ) -> Self {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1185,22 +1422,40 @@ impl DnsInterceptor {
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
         );
+        let doh_prefix = match &dns_config.upstream {
+            DnsUpstream::Doh { host, port, path } => {
+                let host_header = format_http_host_header(host, *port);
+                Some(build_doh_request_prefix(path, &host_header))
+            }
+            _ => None,
+        };
         let cache = Arc::new(Mutex::new(DnsCache::new(dns_config.cache_size)));
         let local_upstream = Arc::new(Mutex::new(dns_config.local_upstream));
         Self {
-            client_config,
-            dns_config,
+            client_config: Arc::new(client_config),
+            dns_config: Arc::new(dns_config),
+            doh_prefix,
             local_upstream,
             tls_config,
-            doh_pool: Arc::new(Mutex::new(DohPool::default())),
-            tcp_pool: Arc::new(Mutex::new(TcpDnsPool::default())),
+            doh_pool: Arc::new(DohPool::default()),
+            tcp_pool: Arc::new(TcpDnsPool::default()),
             udp_mux_pool: Arc::new(UdpDnsMuxPool::new()),
             cache,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_DNS_QUERIES)),
+            bypass_permits: Arc::new(Semaphore::new(MAX_BYPASS_REFIRE_INFLIGHT)),
+            bypass_refire_limit: Arc::new(RateLimiter::new(
+                MAX_BYPASS_REFIRE_PER_WINDOW,
+                BYPASS_REFIRE_WINDOW,
+            )),
             tun_tx,
             local_udp_pool: Arc::new(LocalUdpPool::default()),
-            counters: Arc::new(DnsCounters::default()),
+            counters,
         }
+    }
+
+    /// Returns the shared DNS outcome counters for telemetry snapshots.
+    pub fn counters(&self) -> &Arc<DnsCounters> {
+        &self.counters
     }
 
     /// Returns a snapshot of the DNS outcome counters for diagnostics.
@@ -1211,21 +1466,19 @@ impl DnsInterceptor {
     /// Clears local-only cache entries, drops pooled DoH/TCP/UDP connections,
     /// and refreshes auto-detected local DNS upstream on network transitions.
     pub fn on_network_change(&self) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.clear_local();
+        match self.cache.lock() {
+            Ok(mut cache) => cache.clear_local(),
+            Err(_) => log_pool_poisoned("dns_cache"),
         }
-        if let Ok(mut pool) = self.doh_pool.lock() {
-            pool.clear();
-        }
-        if let Ok(mut pool) = self.tcp_pool.lock() {
-            pool.clear();
-        }
+        self.doh_pool.clear();
+        self.tcp_pool.clear();
         self.local_udp_pool.clear();
         self.udp_mux_pool.clear();
         if let Some(refresher) = self.dns_config.refresh_local_upstream.as_ref() {
             let refreshed = refresher();
-            if let Ok(mut guard) = self.local_upstream.lock() {
-                *guard = refreshed;
+            match self.local_upstream.lock() {
+                Ok(mut guard) => *guard = refreshed,
+                Err(_) => log_pool_poisoned("local_upstream"),
             }
         }
     }
@@ -1233,10 +1486,17 @@ impl DnsInterceptor {
     /// Handles one intercepted UDP/53 query packet without blocking the TUN loop.
     pub fn handle_query(&self, src: SocketAddr, dst: SocketAddr, wire: &[u8]) {
         let Some(query) = parse_dns_query(wire) else {
+            self.counters.dropped_malformed.incr();
             return;
         };
 
-        let current_local = self.local_upstream.lock().ok().and_then(|g| *g);
+        let current_local = match self.local_upstream.lock() {
+            Ok(guard) => *guard,
+            Err(_) => {
+                log_pool_poisoned("local_upstream");
+                None
+            }
+        };
         let is_local = self
             .dns_config
             .local_suffixes
@@ -1281,13 +1541,51 @@ impl DnsInterceptor {
 
         // Fast path: synchronous cache hit (0 ms latency). The hit shares the
         // cached wire buffer and patches only the 2-byte `tx_id` (#168).
-        let cached = self
-            .cache
-            .lock()
-            .ok()
-            .and_then(|mut cache| cache.get(&query, Instant::now()));
+        let cached = match self.cache.lock() {
+            Ok(mut cache) => cache.get(&query, Instant::now()),
+            Err(_) => {
+                log_pool_poisoned("dns_cache");
+                None
+            }
+        };
         if let Some(cached) = cached {
             self.counters.hits.incr();
+            // Re-fire `on_bypass_ips` on bypass-domain cache hits so a
+            // previously failed route install (e.g. no gateway at first
+            // lookup) recovers without waiting for TTL expiry. The spawn
+            // keeps the TUN loop non-blocking; the reply below is sent
+            // immediately from the already-cached answer.
+            if is_bypass_domain {
+                let (_, refire_ips) = parse_dns_response_meta(&cached);
+                // Best-effort re-fire: the shared `bypass_permits` semaphore
+                // bounds concurrent installs across the miss and hit paths,
+                // and `MAX_BYPASS_REFIRE_PER_WINDOW` per window stops a flood
+                // of cached bypass queries from fork-storming `ip`. The
+                // cached reply below is sent immediately without waiting.
+                // The install await is bounded by `BYPASS_ROUTE_TIMEOUT` so
+                // a hung `ip` cannot permanently pin a permit.
+                if !refire_ips.is_empty()
+                    && let Some(cb) = self.dns_config.on_bypass_ips.clone()
+                    && let Ok(permit) = self.bypass_permits.clone().try_acquire_owned()
+                    && self.bypass_refire_limit.allow().is_some()
+                {
+                    let qname = query.qname.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let handle = cb(refire_ips);
+                        if !matches!(timeout(BYPASS_ROUTE_TIMEOUT, handle).await, Ok(Ok(())))
+                            && let Some(suppressed) = DNS_BYPASS_LOG.allow()
+                        {
+                            warn!(
+                                qname = %qname,
+                                stage = "bypass_refire_timeout",
+                                suppressed,
+                                "cache-hit bypass route install did not finish cleanly"
+                            );
+                        }
+                    });
+                }
+            }
             if cached.len() <= udp_dns_response_limit(wire) {
                 send_udp_reply(
                     &self.tun_tx,
@@ -1326,8 +1624,10 @@ impl DnsInterceptor {
         self.counters.misses.incr();
 
         let wire_owned = wire.to_vec();
-        let client_cfg = self.client_config.clone();
-        let dns_cfg = self.dns_config.clone();
+        // Two `Arc` clones: no `String` or `BeamClientConfig` copies per miss.
+        let client_cfg = Arc::clone(&self.client_config);
+        let dns_cfg = Arc::clone(&self.dns_config);
+        let doh_prefix = self.doh_prefix.clone();
         let tls_cfg = Arc::clone(&self.tls_config);
         let doh_pool = Arc::clone(&self.doh_pool);
         let tcp_pool = Arc::clone(&self.tcp_pool);
@@ -1336,6 +1636,7 @@ impl DnsInterceptor {
         let cache = Arc::clone(&self.cache);
         let counters = Arc::clone(&self.counters);
         let tun_tx = self.tun_tx.clone();
+        let bypass_permits = Arc::clone(&self.bypass_permits);
         let upstream_kind = if use_local {
             "local_udp"
         } else {
@@ -1353,6 +1654,7 @@ impl DnsInterceptor {
                             &wire_owned,
                             query.tx_id,
                             dns_cfg.query_timeout,
+                            dns_cfg.local_protector(),
                         )
                         .await
                     }
@@ -1368,6 +1670,7 @@ impl DnsInterceptor {
                     &udp_mux_pool,
                     &wire_owned,
                     dns_cfg.query_timeout,
+                    doh_prefix.as_deref(),
                 )
                 .await
             };
@@ -1400,22 +1703,55 @@ impl DnsInterceptor {
                         resp[0] = id[0];
                         resp[1] = id[1];
                         let (maybe_ttl, ips) = parse_dns_response_meta(&resp);
+                        // Install the dynamic bypass route BEFORE the reply is
+                        // sent so the follow-up SYN cannot race the route into
+                        // the tunnel. The callback runs the blocking `ip`
+                        // install on the blocking pool; awaiting its handle
+                        // yields the worker thread instead of blocking it.
+                        // The shared `bypass_permits` semaphore bounds hung
+                        // `ip` calls across the miss and hit paths so they
+                        // cannot grow blocking tasks unboundedly; the await is
+                        // bounded by `BYPASS_ROUTE_TIMEOUT` so a hung install
+                        // cannot permanently pin a permit.
                         if is_bypass_domain
                             && !ips.is_empty()
                             && let Some(cb) = dns_cfg.on_bypass_ips.as_ref()
                         {
-                            cb(&ips);
+                            if let Ok(_bypass_permit) = bypass_permits.clone().try_acquire_owned() {
+                                let ip_count = ips.len();
+                                let handle = cb(ips);
+                                if !matches!(
+                                    timeout(BYPASS_ROUTE_TIMEOUT, handle).await,
+                                    Ok(Ok(()))
+                                ) && let Some(suppressed) = DNS_BYPASS_LOG.allow()
+                                {
+                                    warn!(
+                                        ip_count,
+                                        stage = "bypass_route_timeout",
+                                        suppressed,
+                                        "bypass route install did not finish cleanly; replying without waiting"
+                                    );
+                                }
+                            } else if let Some(suppressed) = DNS_BYPASS_LOG.allow() {
+                                warn!(
+                                    ip_count = ips.len(),
+                                    stage = "bypass_route_saturated",
+                                    suppressed,
+                                    "bypass route install skipped because all permits are busy"
+                                );
+                            }
                         }
-                        if let Some(ttl) = maybe_ttl
-                            && let Ok(mut guard) = cache.lock()
-                        {
-                            guard.insert(
-                                &query,
-                                Arc::from(resp.as_slice()),
-                                ttl,
-                                use_local,
-                                Instant::now(),
-                            );
+                        if let Some(ttl) = maybe_ttl {
+                            match cache.lock() {
+                                Ok(mut guard) => guard.insert(
+                                    &query,
+                                    Arc::from(resp.as_slice()),
+                                    ttl,
+                                    use_local,
+                                    Instant::now(),
+                                ),
+                                Err(_) => log_pool_poisoned("dns_cache"),
+                            }
                         }
                         fit_response_for_udp(&wire_owned, resp)
                     }
@@ -1507,6 +1843,7 @@ async fn resolve_local_udp(
     query: &[u8],
     expected_tx_id: u16,
     query_timeout: Duration,
+    protector: Option<SocketProtector>,
 ) -> io::Result<Vec<u8>> {
     let (pooled, generation) = pool.take(local_upstream, Instant::now());
     let sock = match pooled {
@@ -1517,6 +1854,11 @@ async fn resolve_local_udp(
                 SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
             };
             let sock = UdpSocket::bind(bind_addr).await?;
+            // The Android protector runs here: after `bind`, before `connect`,
+            // so a protector error fails the query before any packet is sent.
+            if let Some(protect) = protector.as_ref() {
+                protect(sock.as_raw_fd())?;
+            }
             sock.connect(local_upstream).await?;
             sock
         }
@@ -1577,16 +1919,20 @@ async fn resolve_tunneled(
     client_cfg: &BeamClientConfig,
     upstream: &DnsUpstream,
     tls_cfg: &Arc<ClientConfig>,
-    doh_pool: &Arc<Mutex<DohPool>>,
-    tcp_pool: &Arc<Mutex<TcpDnsPool>>,
+    doh_pool: &Arc<DohPool>,
+    tcp_pool: &Arc<TcpDnsPool>,
     udp_mux_pool: &Arc<UdpDnsMuxPool>,
     query: &[u8],
     query_timeout: Duration,
+    doh_prefix: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
     timeout(query_timeout, async {
         match upstream {
             DnsUpstream::Doh { host, port, path } => {
-                resolve_doh_over_beam(client_cfg, tls_cfg, doh_pool, host, *port, path, query).await
+                resolve_doh_over_beam(
+                    client_cfg, tls_cfg, doh_pool, host, *port, path, doh_prefix, query,
+                )
+                .await
             }
             DnsUpstream::PlainTcp(addr) => {
                 resolve_tcp_over_beam(client_cfg, tcp_pool, *addr, query).await
@@ -1624,52 +1970,75 @@ async fn send_tcp_dns_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
     Ok(resp)
 }
 
-async fn resolve_tcp_over_beam(
-    client_cfg: &BeamClientConfig,
-    tcp_pool: &Arc<Mutex<TcpDnsPool>>,
-    addr: SocketAddr,
-    query: &[u8],
-) -> io::Result<Vec<u8>> {
-    // Fast path: reuse an idle DNS-over-TCP connection (1 RTT).
-    let (pooled, pool_gen) = tcp_pool
-        .lock()
-        .ok()
-        .map(|mut pool| pool.take(Instant::now()))
-        .unwrap_or((None, 0));
-    if let Some(mut stream) = pooled {
-        match send_tcp_dns_request(&mut stream, query).await {
-            Ok(resp) => {
-                if let Ok(mut pool) = tcp_pool.lock() {
-                    pool.put(stream, pool_gen, Instant::now());
-                }
-                return Ok(resp);
-            }
-            Err(err) => {
-                debug!(error = %err, "pooled TCP DNS connection stale; retrying with fresh dial");
-            }
-        }
-    }
-
-    let dest = NetLocation {
+/// Builds the tunneled destination for a plain-TCP DNS upstream address.
+fn tcp_dns_dest(addr: SocketAddr) -> NetLocation {
+    NetLocation {
         address: match addr.ip() {
             IpAddr::V4(ip) => Address::Ipv4(ip),
             IpAddr::V6(ip) => Address::Ipv6(ip),
         },
         port: addr.port(),
-    };
-    // Sample the current pool generation right before dialing a fresh
-    // connection (after any stale-pooled attempt above), so a post-reset dial
-    // is pooled under the current generation while a transition during dial
-    // still drops it.
-    let pool_gen = tcp_pool.lock().ok().map(|pool| pool.generation());
-    let mut stream = dial_tcp(client_cfg, dest)
-        .await
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    let resp = send_tcp_dns_request(&mut stream, query).await?;
-    if let (Some(gen_id), Ok(mut pool)) = (pool_gen, tcp_pool.lock()) {
-        pool.put(stream, gen_id, Instant::now());
     }
-    Ok(resp)
+}
+
+async fn resolve_tcp_over_beam(
+    client_cfg: &BeamClientConfig,
+    tcp_pool: &Arc<TcpDnsPool>,
+    addr: SocketAddr,
+    query: &[u8],
+) -> io::Result<Vec<u8>> {
+    // Bounded slot held across `take -> (dial if empty) -> request I/O ->
+    // put`: at most `MAX_TCP_DNS_POOL_SIZE` concurrent REALITY handshakes,
+    // up to that many queries run I/O in parallel, and `put()` happens
+    // before the permit is released so waiters reuse warm connections.
+    let _slot = tcp_pool
+        .slots
+        .acquire()
+        .await
+        .map_err(|_| io::Error::other("DNS TCP pool closed"))?;
+    let dest = tcp_dns_dest(addr);
+    let (pooled, pool_gen) = tcp_pool.take(Instant::now());
+    let (mut stream, stream_gen, from_pool) = match pooled {
+        Some(stream) => (stream, pool_gen, true),
+        None => {
+            let fresh_gen = tcp_pool.generation();
+            let stream = dial_tcp(client_cfg, dest.clone())
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            (stream, fresh_gen, false)
+        }
+    };
+    match send_tcp_dns_request(&mut stream, query).await {
+        Ok(resp) => {
+            tcp_pool.put(stream, stream_gen, Instant::now());
+            Ok(resp)
+        }
+        Err(err) if from_pool => {
+            debug!(error = %err, "pooled TCP DNS connection stale; taking once more before fresh dial");
+            // Stale-pool retry: take once more so a warm connection
+            // returned concurrently is reused instead of dialing.
+            let (pooled2, gen2) = tcp_pool.take(Instant::now());
+            if let Some(mut retry) = pooled2 {
+                match send_tcp_dns_request(&mut retry, query).await {
+                    Ok(resp) => {
+                        tcp_pool.put(retry, gen2, Instant::now());
+                        return Ok(resp);
+                    }
+                    Err(retry_err) => {
+                        debug!(error = %retry_err, "retry pooled TCP DNS connection stale; dialing fresh");
+                    }
+                }
+            }
+            let fresh_gen = tcp_pool.generation();
+            let mut fresh = dial_tcp(client_cfg, dest)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let resp = send_tcp_dns_request(&mut fresh, query).await?;
+            tcp_pool.put(fresh, fresh_gen, Instant::now());
+            Ok(resp)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn run_udp_dns_query(
@@ -1751,59 +2120,104 @@ async fn resolve_udp_over_beam(
     }
 }
 
+/// Trailing half of a DoH HTTP/1.1 request after the `Content-Length` value.
+const DOH_REQUEST_SUFFIX: &[u8] = b"\r\nConnection: keep-alive\r\n\r\n";
+
+/// Decimal digits that `Content-Length` can need at most (`u64::MAX` has 20).
+const MAX_CONTENT_LENGTH_DIGITS: usize = 20;
+
+/// Pre-formatted leading half of a DoH HTTP/1.1 request, up to (but not
+/// including) the `Content-Length` value.
+///
+/// The bytes embed the secret DoH `path`, which is why this type has a manual
+/// [`Debug`] impl: printing it, directly or through a containing struct, can
+/// never leak the path.
+#[derive(Clone)]
+struct DohPrefix(Arc<[u8]>);
+
+impl std::fmt::Debug for DohPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"<redacted>\"")
+    }
+}
+
+impl std::ops::Deref for DohPrefix {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Builds the static leading half of a DoH HTTP/1.1 request, up to (but not
+/// including) the `Content-Length` value. Pre-formatted once per interceptor
+/// so a cache miss never re-allocates the header prefix.
+///
+/// The bytes embed the secret DoH `path`: never log them, and never expose
+/// them via `Debug`/`Display` ([`DnsUpstream`] redacts the path everywhere).
+fn build_doh_request_prefix(path: &str, host_header: &str) -> DohPrefix {
+    let mut prefix = Vec::with_capacity(path.len() + host_header.len() + 128);
+    prefix.extend_from_slice(b"POST ");
+    prefix.extend_from_slice(path.as_bytes());
+    prefix.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    prefix.extend_from_slice(host_header.as_bytes());
+    prefix.extend_from_slice(
+        b"\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: ",
+    );
+    DohPrefix(Arc::from(prefix))
+}
+
+/// Formats `len` as decimal ASCII into `buf` without allocating; returns the
+/// used tail. `buf` must hold at least 20 bytes (`u64::MAX` is 20 digits), so
+/// the indexing below can never run out of bounds for any `usize` value.
+fn decimal_len_bytes(len: usize, buf: &mut [u8; 20]) -> &[u8] {
+    let mut idx = buf.len();
+    if len == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+        return &buf[idx..];
+    }
+    let mut n = len;
+    while n > 0 {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    &buf[idx..]
+}
+
+/// Assembles one DoH HTTP/1.1 request into a single buffer so the caller can
+/// send it with one write (one TLS record) instead of four.
+fn build_doh_request(prefix: &[u8], query: &[u8]) -> Vec<u8> {
+    let mut request = Vec::with_capacity(
+        prefix.len() + DOH_REQUEST_SUFFIX.len() + MAX_CONTENT_LENGTH_DIGITS + query.len(),
+    );
+    request.extend_from_slice(prefix);
+    let mut len_buf = [0u8; MAX_CONTENT_LENGTH_DIGITS];
+    request.extend_from_slice(decimal_len_bytes(query.len(), &mut len_buf));
+    request.extend_from_slice(DOH_REQUEST_SUFFIX);
+    request.extend_from_slice(query);
+    request
+}
+
 async fn send_doh_http_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
-    host_header: &str,
-    path: &str,
+    prefix: &[u8],
     query: &[u8],
 ) -> io::Result<(Vec<u8>, bool)> {
-    let req = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: {host_header}\r\n\
-         Content-Type: application/dns-message\r\n\
-         Accept: application/dns-message\r\n\
-         Content-Length: {}\r\n\
-         Connection: keep-alive\r\n\r\n",
-        query.len()
-    );
-    stream.write_all(req.as_bytes()).await?;
-    stream.write_all(query).await?;
+    let request = build_doh_request(prefix, query);
+    stream.write_all(&request).await?;
     stream.flush().await?;
     read_doh_http_response_keepalive(stream).await
 }
 
-async fn resolve_doh_over_beam(
+/// Dials a fresh REALITY stream and completes the TLS handshake for a DoH upstream.
+async fn dial_doh_stream(
     client_cfg: &BeamClientConfig,
     tls_cfg: &Arc<ClientConfig>,
-    doh_pool: &Arc<Mutex<DohPool>>,
     host: &str,
     port: u16,
-    path: &str,
-    query: &[u8],
-) -> io::Result<Vec<u8>> {
-    let host_header = format_http_host_header(host, port);
-
-    // Fast path: reuse an idle HTTP/1.1 keep-alive DoH connection (1 RTT).
-    let (pooled, pooled_gen) = doh_pool
-        .lock()
-        .ok()
-        .map(|mut pool| pool.take(Instant::now()))
-        .unwrap_or((None, 0));
-    if let Some(mut tls) = pooled {
-        match send_doh_http_request(&mut tls, &host_header, path, query).await {
-            Ok((body, reusable)) => {
-                if reusable && let Ok(mut pool) = doh_pool.lock() {
-                    pool.put(tls, pooled_gen, Instant::now());
-                }
-                return Ok(body);
-            }
-            Err(err) => {
-                debug!(error = %err, "pooled DoH connection stale; retrying with fresh dial");
-            }
-        }
-    }
-
-    let dial_gen = doh_pool.lock().ok().map(|pool| pool.generation());
+) -> io::Result<DohTlsStream> {
     let address = if let Ok(ip) = host.parse::<IpAddr>() {
         match ip {
             IpAddr::V4(v4) => Address::Ipv4(v4),
@@ -1820,13 +2234,85 @@ async fn resolve_doh_over_beam(
     let server_name = ServerName::try_from(host.to_owned())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid DoH TLS server name"))?;
     let connector = TlsConnector::from(Arc::clone(tls_cfg));
-    let mut tls = connector.connect(server_name, beam_stream).await?;
+    connector.connect(server_name, beam_stream).await
+}
 
-    let (body, reusable) = send_doh_http_request(&mut tls, &host_header, path, query).await?;
-    if reusable && let (Some(gen_id), Ok(mut pool)) = (dial_gen, doh_pool.lock()) {
-        pool.put(tls, gen_id, Instant::now());
+#[allow(clippy::too_many_arguments)]
+async fn resolve_doh_over_beam(
+    client_cfg: &BeamClientConfig,
+    tls_cfg: &Arc<ClientConfig>,
+    doh_pool: &Arc<DohPool>,
+    host: &str,
+    port: u16,
+    path: &str,
+    prefix: Option<&[u8]>,
+    query: &[u8],
+) -> io::Result<Vec<u8>> {
+    // Fast path: reuse the interceptor-wide pre-formatted header prefix, so a
+    // cache miss performs zero header allocations. The fallback rebuilds the
+    // prefix only when none was supplied (e.g. direct unit-test use).
+    let owned_prefix: DohPrefix;
+    let prefix: &[u8] = match prefix {
+        Some(cached) => cached,
+        None => {
+            owned_prefix = build_doh_request_prefix(path, &format_http_host_header(host, port));
+            &owned_prefix
+        }
+    };
+
+    // Bounded slot held across `take -> (dial if empty) -> request I/O ->
+    // put`: at most `MAX_DOH_POOL_SIZE` concurrent REALITY+TLS handshakes,
+    // up to that many queries run I/O in parallel, and `put()` happens
+    // before the permit is released so waiters reuse warm connections.
+    let _slot = doh_pool
+        .slots
+        .acquire()
+        .await
+        .map_err(|_| io::Error::other("DNS DoH pool closed"))?;
+    let (pooled, pooled_gen) = doh_pool.take(Instant::now());
+    let (mut tls, dial_gen, from_pool) = match pooled {
+        Some(tls) => (tls, pooled_gen, true),
+        None => {
+            let fresh_gen = doh_pool.generation();
+            let tls = dial_doh_stream(client_cfg, tls_cfg, host, port).await?;
+            (tls, fresh_gen, false)
+        }
+    };
+    match send_doh_http_request(&mut tls, prefix, query).await {
+        Ok((body, reusable)) => {
+            if reusable {
+                doh_pool.put(tls, dial_gen, Instant::now());
+            }
+            Ok(body)
+        }
+        Err(err) if from_pool => {
+            debug!(error = %err, "pooled DoH connection stale; taking once more before fresh dial");
+            // Stale-pool retry: take once more so a warm connection
+            // returned concurrently is reused instead of dialing.
+            let (pooled2, gen2) = doh_pool.take(Instant::now());
+            if let Some(mut retry) = pooled2 {
+                match send_doh_http_request(&mut retry, prefix, query).await {
+                    Ok((body, reusable)) => {
+                        if reusable {
+                            doh_pool.put(retry, gen2, Instant::now());
+                        }
+                        return Ok(body);
+                    }
+                    Err(retry_err) => {
+                        debug!(error = %retry_err, "retry pooled DoH connection stale; dialing fresh");
+                    }
+                }
+            }
+            let fresh_gen = doh_pool.generation();
+            let mut fresh = dial_doh_stream(client_cfg, tls_cfg, host, port).await?;
+            let (body, reusable) = send_doh_http_request(&mut fresh, prefix, query).await?;
+            if reusable {
+                doh_pool.put(fresh, fresh_gen, Instant::now());
+            }
+            Ok(body)
+        }
+        Err(err) => Err(err),
     }
-    Ok(body)
 }
 
 /// Formats an RFC 9110 §7.2 `Host` header value, bracketing IPv6 literals.
@@ -2201,6 +2687,23 @@ mod tests {
 
         // Expired after TTL.
         assert!(cache.get(&q1, t0 + Duration::from_secs(31)).is_none());
+    }
+
+    #[test]
+    fn cache_never_exceeds_max_entries_for_unique_names() {
+        const MAX: usize = 64;
+        let t0 = Instant::now();
+        let mut cache = DnsCache::new(MAX);
+        for idx in 0..(4 * MAX) {
+            let name = format!("host{idx}.example");
+            let wire = build_query(0x1234, &name, 1);
+            let query = parse_dns_query(&wire).expect("query");
+            let resp = build_a_response(&wire, Ipv4Addr::new(9, 9, 9, 9), 30);
+            cache.insert(&query, Arc::from(resp), 30, false, t0);
+            let total: usize = cache.entries.values().map(HashMap::len).sum();
+            assert!(total <= MAX, "{total} entries cached for a {MAX} bound");
+        }
+        assert_eq!(cache.len, MAX, "the cache must fill up to its bound");
     }
 
     #[test]
@@ -2711,7 +3214,7 @@ mod tests {
 
         let pool = LocalUdpPool::default();
         let q1 = build_query(0x9001, "nas.lan", 1);
-        resolve_local_udp(&pool, local_addr, &q1, 0x9001, Duration::from_secs(2))
+        resolve_local_udp(&pool, local_addr, &q1, 0x9001, Duration::from_secs(2), None)
             .await
             .expect("first resolve");
         assert_eq!(
@@ -2721,7 +3224,7 @@ mod tests {
         );
 
         let q2 = build_query(0x9002, "nas.lan", 1);
-        resolve_local_udp(&pool, local_addr, &q2, 0x9002, Duration::from_secs(2))
+        resolve_local_udp(&pool, local_addr, &q2, 0x9002, Duration::from_secs(2), None)
             .await
             .expect("second resolve");
         let used = peers.lock().expect("lock").clone();
@@ -2748,12 +3251,77 @@ mod tests {
         // A `tx_id` mismatch must drop the socket instead of pooling it.
         let q3 = build_query(0x9003, "nas.lan", 1);
         assert!(
-            resolve_local_udp(&pool, local_addr, &q3, 0xffff, Duration::from_secs(2))
+            resolve_local_udp(&pool, local_addr, &q3, 0xffff, Duration::from_secs(2), None)
                 .await
                 .is_err()
         );
         assert_eq!(pool.len(), 0, "mismatched replies must not poison the pool");
         server.await.expect("server done");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_socket_protector_runs_after_bind_before_connect() {
+        let local_dns = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let local_addr = local_dns.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = local_dns.recv_from(&mut buf).await.expect("recv");
+            let resp = build_a_response(&buf[..n], Ipv4Addr::new(192, 168, 1, 7), 60);
+            local_dns.send_to(&resp, peer).await.expect("send");
+        });
+
+        // Success path: the protector sees the bound socket's fd exactly once.
+        let seen: Arc<Mutex<Vec<std::os::fd::RawFd>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = Arc::clone(&seen);
+        let protector: SocketProtector = Arc::new(move |fd| {
+            // The fd must already name a socket when the protector runs.
+            let link = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                .map_err(|err| io::Error::new(err.kind(), "protector cannot inspect fd"))?;
+            if !link.to_string_lossy().starts_with("socket:") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "protector got a non-socket fd",
+                ));
+            }
+            seen_cb.lock().expect("lock").push(fd);
+            Ok(())
+        });
+        let pool = LocalUdpPool::default();
+        let query = build_query(0xa001, "nas.lan", 1);
+        let reply = resolve_local_udp(
+            &pool,
+            local_addr,
+            &query,
+            0xa001,
+            Duration::from_secs(2),
+            Some(protector),
+        )
+        .await
+        .expect("protected resolve succeeds");
+        assert_eq!(u16::from_be_bytes([reply[0], reply[1]]), 0xa001);
+        assert_eq!(seen.lock().expect("lock").len(), 1);
+        server.await.expect("server done");
+
+        // Error path: a fresh socket fails before `connect`, so no packet can
+        // leave and the refused socket never reaches the pool.
+        let failing: SocketProtector =
+            Arc::new(|_| Err(io::Error::other("VpnService.protect denied")));
+        let pool = LocalUdpPool::default();
+        let err = resolve_local_udp(
+            &pool,
+            local_addr,
+            &query,
+            0xa001,
+            Duration::from_secs(2),
+            Some(failing),
+        )
+        .await
+        .expect_err("a protector error must fail the resolve");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(pool.len(), 0, "a refused socket must not be pooled");
     }
 
     #[tokio::test]
@@ -2819,9 +3387,16 @@ mod tests {
 
         let pool = LocalUdpPool::default();
         let query = build_query(0x7002, "nas.lan", 1);
-        let reply = resolve_local_udp(&pool, local_addr, &query, 0x7002, Duration::from_secs(2))
-            .await
-            .expect("the stale reply must be skipped, not failed on");
+        let reply = resolve_local_udp(
+            &pool,
+            local_addr,
+            &query,
+            0x7002,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .expect("the stale reply must be skipped, not failed on");
         assert_eq!(u16::from_be_bytes([reply[0], reply[1]]), 0x7002);
         assert_eq!(
             pool.len(),
@@ -2849,9 +3424,16 @@ mod tests {
         });
         let pool = LocalUdpPool::default();
         assert!(
-            resolve_local_udp(&pool, local_addr, &query, 0x7002, Duration::from_secs(2))
-                .await
-                .is_err(),
+            resolve_local_udp(
+                &pool,
+                local_addr,
+                &query,
+                0x7002,
+                Duration::from_secs(2),
+                None
+            )
+            .await
+            .is_err(),
             "a stale-reply flood must give up instead of looping forever"
         );
         flood.await.expect("flood done");
@@ -2929,13 +3511,14 @@ mod tests {
             }
         });
 
-        let (got1, reusable1) = send_doh_http_request(&mut client, "1.1.1.1", "/dns-query", &q1)
+        let prefix = build_doh_request_prefix("/dns-query", "1.1.1.1");
+        let (got1, reusable1) = send_doh_http_request(&mut client, &prefix, &q1)
             .await
             .expect("req1");
         assert_eq!(got1, r1);
         assert!(reusable1, "keep-alive response must be marked reusable");
 
-        let (got2, reusable2) = send_doh_http_request(&mut client, "1.1.1.1", "/dns-query", &q2)
+        let (got2, reusable2) = send_doh_http_request(&mut client, &prefix, &q2)
             .await
             .expect("req2");
         assert_eq!(got2, r2);
@@ -2947,7 +3530,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_dns_pool_reuses_expires_bounds_and_clears() {
         let t0 = Instant::now();
-        let mut pool: TcpDnsPool<u32> = TcpDnsPool::default();
+        let pool: TcpDnsPool<u32> = TcpDnsPool::default();
 
         // LIFO reuse within idle TTL.
         let (_, g0) = pool.take(t0);
@@ -3403,7 +3986,7 @@ mod tests {
 
     #[test]
     fn doh_pool_generation_rejects_stale_put_after_clear() {
-        let mut pool: DohPool<u32> = DohPool::default();
+        let pool: DohPool<u32> = DohPool::default();
         let now = Instant::now();
         let gen0 = pool.generation();
         pool.put(1, gen0, now);
@@ -3424,5 +4007,497 @@ mod tests {
         let gen1 = pool.generation();
         pool.put(2, gen1, now);
         assert_eq!(pool.take(now).0, Some(2));
+    }
+
+    #[test]
+    fn malformed_queries_count_as_dropped_malformed() {
+        let (tun_tx, mut tun_rx) = mpsc::channel(8);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            dummy_reality,
+            [2u8; 16],
+        );
+        let dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            None,
+        );
+        let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_123);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+
+        // Truncated header, QR=1 response bit, and QDCOUNT=0 are all rejected.
+        let mut qr_set = build_query(0x0001, "evil.example", 1);
+        qr_set[2] |= 0x80;
+        let mut no_question = build_query(0x0002, "evil.example", 1);
+        no_question[4] = 0;
+        no_question[5] = 0;
+        for bad in [&[0u8; 5][..], &qr_set, &no_question] {
+            interceptor.handle_query(src, dst, bad);
+        }
+        assert_eq!(interceptor.stats().dropped_malformed, 3);
+        assert!(
+            tun_rx.try_recv().is_err(),
+            "malformed queries send no reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn bypass_domain_cache_hit_refires_on_bypass_ips() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (tun_tx, mut tun_rx) = mpsc::channel(8);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            dummy_reality,
+            [2u8; 16],
+        );
+        let refires = Arc::new(AtomicUsize::new(0));
+        let refires_cb = Arc::clone(&refires);
+        let mut dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            None,
+        );
+        dns_cfg.bypass_domains = vec!["bypass.test".to_owned()];
+        dns_cfg.on_bypass_ips = Some(Arc::new(move |ips: Vec<IpAddr>| {
+            let refires_inner = Arc::clone(&refires_cb);
+            tokio::task::spawn_blocking(move || {
+                refires_inner.fetch_add(ips.len(), Ordering::SeqCst);
+            })
+        }));
+        let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+
+        // Seed the cache as a first (miss) lookup would have.
+        let seed_wire = build_query(0x1111, "host.bypass.test", 1);
+        let seed_query = parse_dns_query(&seed_wire).expect("seed query");
+        let seed_resp = build_a_response(&seed_wire, Ipv4Addr::new(203, 0, 113, 7), 60);
+        interceptor.cache.lock().expect("cache").insert(
+            &seed_query,
+            Arc::from(seed_resp),
+            60,
+            false,
+            Instant::now(),
+        );
+
+        // A cache hit must reply immediately AND re-fire the bypass callback.
+        let mut hit_wire = seed_wire.clone();
+        hit_wire[0..2].copy_from_slice(&0x2222u16.to_be_bytes());
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_123);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        interceptor.handle_query(src, dst, &hit_wire);
+        let pkt = tokio::time::timeout(Duration::from_secs(2), tun_rx.recv())
+            .await
+            .expect("reply arrives")
+            .expect("packet");
+        let udp = crate::packet::parse_udp(crate::packet::parse_ip(&pkt).expect("ip").payload)
+            .expect("udp");
+        assert_eq!(u16::from_be_bytes([udp.payload[0], udp.payload[1]]), 0x2222);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(refires.load(Ordering::SeqCst), 1);
+        assert_eq!(interceptor.stats().hits, 1);
+    }
+
+    #[tokio::test]
+    async fn bypass_domain_miss_installs_route_before_reply() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Fake local DNS server answering one A query off the TUN.
+        let server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind fake dns");
+        let server_addr = server.local_addr().expect("server addr");
+        let srv = tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_LOCAL_UDP_RECV_BYTES];
+            loop {
+                let Ok((n, peer)) = server.recv_from(&mut buf).await else {
+                    return;
+                };
+                if n < 12 {
+                    continue;
+                }
+                let resp = build_a_response(&buf[..n], Ipv4Addr::new(203, 0, 113, 9), 60);
+                let _ = server.send_to(&resp, peer).await;
+            }
+        });
+
+        let (tun_tx, mut tun_rx) = mpsc::channel(8);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            dummy_reality,
+            [2u8; 16],
+        );
+        let installed = Arc::new(AtomicBool::new(false));
+        let installed_cb = Arc::clone(&installed);
+        let mut dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            Some(server_addr),
+        );
+        dns_cfg.bypass_domains = vec!["bypass.test".to_owned()];
+        // A slow blocking install: if the reply were sent before the await,
+        // it would arrive while `installed` is still false.
+        dns_cfg.on_bypass_ips = Some(Arc::new(move |_ips: Vec<IpAddr>| {
+            let installed_inner = Arc::clone(&installed_cb);
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                installed_inner.store(true, Ordering::SeqCst);
+            })
+        }));
+        let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+
+        let wire = build_query(0x3333, "host.bypass.test", 1);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_123);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        interceptor.handle_query(src, dst, &wire);
+        let pkt = tokio::time::timeout(Duration::from_secs(5), tun_rx.recv())
+            .await
+            .expect("reply arrives")
+            .expect("packet");
+        let udp = crate::packet::parse_udp(crate::packet::parse_ip(&pkt).expect("ip").payload)
+            .expect("udp");
+        assert_eq!(u16::from_be_bytes([udp.payload[0], udp.payload[1]]), 0x3333);
+        assert!(
+            installed.load(Ordering::SeqCst),
+            "bypass route install must finish before the DNS reply is sent"
+        );
+        srv.abort();
+    }
+
+    /// Mirrors the bounded-slot block of `resolve_tcp_over_beam` /
+    /// `resolve_doh_over_beam`: one `slots` permit held across
+    /// `take -> (dial if empty) -> request I/O -> put`, with `put()` before
+    /// the permit is released so waiters reuse warm connections.
+    async fn bounded_exchange(
+        pool: &TcpDnsPool<tokio::io::DuplexStream>,
+        query: Vec<u8>,
+        server_delay: Duration,
+        dials: &std::sync::atomic::AtomicUsize,
+    ) -> Vec<u8> {
+        let _slot = pool.slots.acquire().await.expect("slot");
+        let (pooled, pooled_gen) = pool.take(Instant::now());
+        let (mut stream, exch_gen) = match pooled {
+            Some(stream) => (stream, pooled_gen),
+            None => {
+                dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let dial_gen = pool.generation();
+                let (client, mut server) = tokio::io::duplex(4096);
+                // Persistent fake upstream: serves sequential queries on this
+                // connection so pooled reuse succeeds, like a real keep-alive.
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 2];
+                        if server.read_exact(&mut len_buf).await.is_err() {
+                            return;
+                        }
+                        let qlen = usize::from(u16::from_be_bytes(len_buf));
+                        if qlen == 0 || qlen > MAX_DNS_QUERY_BYTES {
+                            return;
+                        }
+                        let mut qbuf = vec![0u8; qlen];
+                        if server.read_exact(&mut qbuf).await.is_err() {
+                            return;
+                        }
+                        let resp = build_a_response(&qbuf, Ipv4Addr::new(9, 9, 9, 9), 60);
+                        tokio::time::sleep(server_delay).await;
+                        let rlen = u16::try_from(resp.len()).expect("resp len");
+                        if server.write_all(&rlen.to_be_bytes()).await.is_err() {
+                            return;
+                        }
+                        if server.write_all(&resp).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                (client, dial_gen)
+            }
+        };
+        let resp = send_tcp_dns_request(&mut stream, &query)
+            .await
+            .expect("exchange");
+        pool.put(stream, exch_gen, Instant::now());
+        // `_slot` drops after `put()`, so the next waiter reuses the warm conn.
+        resp
+    }
+
+    #[tokio::test]
+    async fn bounded_slots_limit_dials_and_overlap_io() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // (ii) Concurrent queries overlap their I/O in parallel: two 200 ms
+        // exchanges must finish in well under the 400 ms serial bound.
+        let pool = Arc::new(TcpDnsPool::<tokio::io::DuplexStream>::default());
+        let dials = Arc::new(AtomicUsize::new(0));
+        let q1 = build_query(0xAAAA, "one.example", 1);
+        let q2 = build_query(0xBBBB, "two.example", 1);
+        let start = TokioInstant::now();
+        let (r1, r2) = tokio::join!(
+            bounded_exchange(&pool, q1.clone(), Duration::from_millis(200), &dials),
+            bounded_exchange(&pool, q2.clone(), Duration::from_millis(200), &dials),
+        );
+        assert_eq!(r1, build_a_response(&q1, Ipv4Addr::new(9, 9, 9, 9), 60));
+        assert_eq!(r2, build_a_response(&q2, Ipv4Addr::new(9, 9, 9, 9), 60));
+        assert!(
+            start.elapsed() < Duration::from_millis(350),
+            "concurrent exchanges must overlap I/O (took {:?})",
+            start.elapsed()
+        );
+
+        // (i) A 16-query cold burst opens at most pool-capacity connections:
+        // the first `MAX_TCP_DNS_POOL_SIZE` dials serve the burst while
+        // later waiters reuse the returned warm connections.
+        let pool2 = Arc::new(TcpDnsPool::<tokio::io::DuplexStream>::default());
+        let dials2 = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for i in 0..16u16 {
+            let pool = Arc::clone(&pool2);
+            let dials = Arc::clone(&dials2);
+            let q = build_query(0xC000 + i, &format!("burst{i}.example"), 1);
+            handles.push(tokio::spawn(async move {
+                let expected = build_a_response(&q, Ipv4Addr::new(9, 9, 9, 9), 60);
+                let got = bounded_exchange(&pool, q, Duration::from_millis(50), &dials).await;
+                assert_eq!(got, expected);
+            }));
+        }
+        for h in handles {
+            h.await.expect("burst task");
+        }
+        let total_dials = dials2.load(Ordering::SeqCst);
+        assert!(
+            total_dials <= MAX_TCP_DNS_POOL_SIZE,
+            "16-query cold burst must reuse warm conns: {total_dials} dials, bound is {MAX_TCP_DNS_POOL_SIZE}"
+        );
+        assert!(pool2.len() <= MAX_TCP_DNS_POOL_SIZE);
+    }
+
+    #[tokio::test]
+    async fn bypass_miss_replies_despite_hung_route_install() {
+        // A hung `on_bypass_ips` install must not stall the DNS reply: the
+        // miss path awaits it for at most `BYPASS_ROUTE_TIMEOUT` (500 ms).
+        let server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind fake dns");
+        let server_addr = server.local_addr().expect("server addr");
+        let srv = tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_LOCAL_UDP_RECV_BYTES];
+            loop {
+                let Ok((n, peer)) = server.recv_from(&mut buf).await else {
+                    return;
+                };
+                if n < 12 {
+                    continue;
+                }
+                let resp = build_a_response(&buf[..n], Ipv4Addr::new(203, 0, 113, 9), 60);
+                let _ = server.send_to(&resp, peer).await;
+            }
+        });
+
+        let (tun_tx, mut tun_rx) = mpsc::channel(8);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            dummy_reality,
+            [2u8; 16],
+        );
+        let mut dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            Some(server_addr),
+        );
+        dns_cfg.bypass_domains = vec!["bypass.test".to_owned()];
+        dns_cfg.on_bypass_ips = Some(Arc::new(|_ips: Vec<IpAddr>| {
+            tokio::spawn(async move {
+                std::future::pending::<()>().await;
+            })
+        }));
+        let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+
+        let wire = build_query(0x4444, "host.bypass.test", 1);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_123);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        let start = TokioInstant::now();
+        interceptor.handle_query(src, dst, &wire);
+        let pkt = timeout(Duration::from_secs(5), tun_rx.recv())
+            .await
+            .expect("a hung route install must not stall the reply")
+            .expect("packet");
+        let elapsed = start.elapsed();
+        let udp = crate::packet::parse_udp(crate::packet::parse_ip(&pkt).expect("ip").payload)
+            .expect("udp");
+        assert_eq!(u16::from_be_bytes([udp.payload[0], udp.payload[1]]), 0x4444);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "reply must arrive near the 500 ms bound, took {elapsed:?}"
+        );
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn bypass_cache_hit_refire_stays_bounded_under_flood() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (tun_tx, _tun_rx) = mpsc::channel(64);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            dummy_reality,
+            [2u8; 16],
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cb = Arc::clone(&calls);
+        let mut dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            None,
+        );
+        dns_cfg.bypass_domains = vec!["bypass.test".to_owned()];
+        dns_cfg.on_bypass_ips = Some(Arc::new(move |ips: Vec<IpAddr>| {
+            calls_cb.fetch_add(ips.len(), Ordering::SeqCst);
+            tokio::spawn(async {})
+        }));
+        let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+
+        let seed_wire = build_query(0x1111, "host.bypass.test", 1);
+        let seed_query = parse_dns_query(&seed_wire).expect("seed query");
+        let seed_resp = build_a_response(&seed_wire, Ipv4Addr::new(203, 0, 113, 7), 60);
+        interceptor.cache.lock().expect("cache").insert(
+            &seed_query,
+            Arc::from(seed_resp),
+            60,
+            false,
+            Instant::now(),
+        );
+
+        // Flood 50 cache hits synchronously: no await points, so spawned
+        // re-fires cannot release permits mid-flood.
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_123);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        for i in 0..50u16 {
+            let mut hit_wire = seed_wire.clone();
+            hit_wire[0..2].copy_from_slice(&i.to_be_bytes());
+            interceptor.handle_query(src, dst, &hit_wire);
+        }
+        assert_eq!(interceptor.stats().hits, 50);
+        // Let the spawned re-fires run to completion.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let fired = calls.load(Ordering::SeqCst);
+        assert!(
+            fired <= MAX_BYPASS_REFIRE_INFLIGHT,
+            "50 cache hits must not fork-storm: {fired} installs, bound is {MAX_BYPASS_REFIRE_INFLIGHT}"
+        );
+    }
+
+    #[test]
+    fn borrowed_cache_lookup_has_hit_miss_eviction_parity() {
+        let mut cache = DnsCache::new(2);
+        let t0 = Instant::now();
+        let q_a = parse_dns_query(&build_query(0x1111, "parity.example", 1)).expect("q");
+        let q_aaaa = parse_dns_query(&build_query(0x2222, "parity.example", 28)).expect("q");
+        let q_c = parse_dns_query(&build_query(0x3333, "other.example", 1)).expect("q");
+        cache.insert(
+            &q_a,
+            Arc::from(build_a_response(
+                &build_query(0x1111, "parity.example", 1),
+                Ipv4Addr::new(1, 1, 1, 1),
+                30,
+            )),
+            30,
+            false,
+            t0,
+        );
+        cache.insert(
+            &q_aaaa,
+            Arc::from(build_a_response(
+                &build_query(0x2222, "parity.example", 28),
+                Ipv4Addr::new(1, 1, 1, 1),
+                30,
+            )),
+            30,
+            false,
+            t0,
+        );
+        // Same name but different type/class/DO bit are distinct entries.
+        assert!(cache.get(&q_a, t0).is_some());
+        assert!(cache.get(&q_aaaa, t0).is_some());
+        let mut q_other_class = q_a.clone();
+        q_other_class.qclass = 3;
+        assert!(cache.get(&q_other_class, t0).is_none());
+        let mut q_other_name = q_a.clone();
+        q_other_name.qname = "elsewhere.example".to_owned();
+        assert!(cache.get(&q_other_name, t0).is_none());
+        // Misses insert nothing; `q_a` was refreshed first, so inserting a
+        // third name evicts the older `q_a` entry.
+        cache.insert(
+            &q_c,
+            Arc::from(build_a_response(
+                &build_query(0x3333, "other.example", 1),
+                Ipv4Addr::new(3, 3, 3, 3),
+                30,
+            )),
+            30,
+            false,
+            t0,
+        );
+        assert!(cache.get(&q_a, t0).is_none());
+        assert!(cache.get(&q_aaaa, t0).is_some());
+        assert!(cache.get(&q_c, t0).is_some());
+        // Expired entries miss and are removed.
+        assert!(cache.get(&q_c, t0 + Duration::from_secs(31)).is_none());
+    }
+
+    #[test]
+    fn doh_prefixed_request_matches_legacy_format_byte_for_byte() {
+        for (host, port, path) in [
+            ("dns.nextdns.io", 443, "/abc123"),
+            ("1.1.1.1", 8443, "/dns-query"),
+            ("2606:4700:4700::1111", 443, "/dns-query"),
+        ] {
+            let host_header = format_http_host_header(host, port);
+            let prefix = build_doh_request_prefix(path, &host_header);
+            for len in [0usize, 12, 33, 512, 1232] {
+                let query = vec![0xABu8; len];
+                let mut expected = format!(
+                    "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {len}\r\nConnection: keep-alive\r\n\r\n"
+                )
+                .into_bytes();
+                expected.extend_from_slice(&query);
+                let assembled = build_doh_request(&prefix, &query);
+                assert_eq!(assembled, expected, "host={host} port={port} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn doh_prefix_debug_redacts_the_secret_path() {
+        let prefix = build_doh_request_prefix("/secret-path-abc123", "dns.example");
+        assert_eq!(format!("{prefix:?}"), "\"<redacted>\"");
+        assert!(
+            prefix
+                .windows(b"/secret-path-abc123".len())
+                .any(|w| w == b"/secret-path-abc123"),
+            "the raw bytes must still hold the path for the request itself"
+        );
     }
 }

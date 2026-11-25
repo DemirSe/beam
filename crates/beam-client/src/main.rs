@@ -179,20 +179,21 @@ async fn run_client(mut cfg: config::ValidatedConfig) -> Result<(), Box<dyn std:
         &cfg.bypass_cidrs,
     )?));
 
-    // Wire dynamic bypass route installation for resolved `bypass.domains` IPs
-    // (dispatched to blocking pool so DNS tasks never block Tokio worker threads).
+    // Wire dynamic bypass route installation for resolved `bypass.domains` IPs.
+    // The interceptor `.await`s the returned handle before sending the DNS
+    // reply, so the blocking `ip` install runs on the blocking pool without
+    // stalling the TUN loop or a Tokio worker thread (first-packet race).
     if let Some(dns_cfg) = cfg.engine.dns.as_mut() {
         let routes_cb = Arc::clone(&routes);
-        dns_cfg.on_bypass_ips = Some(Arc::new(move |ips: &[IpAddr]| {
-            let owned: Vec<IpAddr> = ips.to_vec();
+        dns_cfg.on_bypass_ips = Some(Arc::new(move |ips: Vec<IpAddr>| {
             let routes_bg = Arc::clone(&routes_cb);
             tokio::task::spawn_blocking(move || {
                 if let Ok(mut guard) = routes_bg.lock() {
-                    for ip in owned {
+                    for ip in ips {
                         guard.install_dynamic_bypass_ip(ip);
                     }
                 }
-            });
+            })
         }));
     }
 

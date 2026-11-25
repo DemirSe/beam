@@ -449,6 +449,117 @@ mod tests {
     }
 
     #[test]
+    fn drop_private_toggle_routes_lan_through_tunnel_or_drops() {
+        use crate::packet::TCP_SYN;
+
+        let lan_v4 = Ipv4Addr::new(192, 168, 1, 10);
+        let pub_v4 = Ipv4Addr::new(1, 1, 1, 1);
+        let src_v4 = Ipv4Addr::new(172, 19, 0, 1);
+        let ula_v6: Ipv6Addr = "fd00::42".parse().expect("ula");
+        let pub_v6: Ipv6Addr = "2606:4700:4700::1111".parse().expect("global v6");
+        let src_v6: Ipv6Addr = "fd00:be:a::1".parse().expect("tun v6");
+
+        for drop_private in [true, false] {
+            let policy = RoutePolicy {
+                drop_private_destinations: drop_private,
+                ..RoutePolicy::default()
+            };
+            // Public traffic always tunnels in both modes.
+            let pub_udp =
+                build_ipv4_udp_packet(src_v4, 40000, pub_v4, 8080, b"x").expect("public udp");
+            assert_eq!(
+                policy.classify(&parse_ip(&pub_udp).expect("ip")),
+                RouteDecision::ProxyUdp,
+                "public UDP must tunnel with drop_private={drop_private}"
+            );
+            let pub_tcp = crate::packet::build_ip_tcp_packet_slices(
+                IpAddr::V4(src_v4),
+                40001,
+                IpAddr::V4(pub_v4),
+                8080,
+                100,
+                0,
+                TCP_SYN,
+                65535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("public tcp");
+            assert_eq!(
+                policy.classify(&parse_ip(&pub_tcp).expect("ip")),
+                RouteDecision::ProxyTcp,
+                "public TCP must tunnel with drop_private={drop_private}"
+            );
+
+            // Private/LAN traffic drops by default but tunnels when opted out.
+            let lan_udp =
+                build_ipv4_udp_packet(src_v4, 40002, lan_v4, 8080, b"x").expect("lan udp");
+            let lan_tcp = crate::packet::build_ip_tcp_packet_slices(
+                IpAddr::V4(src_v4),
+                40003,
+                IpAddr::V4(lan_v4),
+                8080,
+                100,
+                0,
+                TCP_SYN,
+                65535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("lan tcp");
+            let ula_udp = crate::packet::build_ip_udp_packet(
+                IpAddr::V6(src_v6),
+                40004,
+                IpAddr::V6(ula_v6),
+                8080,
+                b"x",
+            )
+            .expect("ula udp");
+            let expected = if drop_private {
+                RouteDecision::Drop
+            } else {
+                RouteDecision::ProxyUdp
+            };
+            assert_eq!(
+                policy.classify(&parse_ip(&lan_udp).expect("ip")),
+                expected,
+                "LAN UDP with drop_private={drop_private}"
+            );
+            assert_eq!(
+                policy.classify(&parse_ip(&lan_tcp).expect("ip")),
+                if drop_private {
+                    RouteDecision::Drop
+                } else {
+                    RouteDecision::ProxyTcp
+                },
+                "LAN TCP with drop_private={drop_private}"
+            );
+            assert_eq!(
+                policy.classify(&parse_ip(&ula_udp).expect("ip")),
+                expected,
+                "ULA UDP with drop_private={drop_private}"
+            );
+
+            // The global IPv6 twin of the ULA case is unaffected by the toggle.
+            let pub_udp6 = crate::packet::build_ip_udp_packet(
+                IpAddr::V6(src_v6),
+                40005,
+                IpAddr::V6(pub_v6),
+                8080,
+                b"x",
+            )
+            .expect("public udp6");
+            assert_eq!(
+                policy.classify(&parse_ip(&pub_udp6).expect("ip")),
+                RouteDecision::ProxyUdp,
+                "global IPv6 UDP must tunnel with drop_private={drop_private}"
+            );
+        }
+    }
+
+    #[test]
     fn reject_ipv6_emits_rst_for_tcp_and_icmp_for_udp() {
         let policy = RoutePolicy {
             reject_ipv6: true,

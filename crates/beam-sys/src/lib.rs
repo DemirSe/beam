@@ -1,49 +1,51 @@
 #![allow(unsafe_code)]
 
-//! Isolated Linux syscall layer for beam.
+//! Isolated Linux and Android syscall layer for beam.
 //!
-//! Every `unsafe` block in this crate must carry a safety comment that
-//! explains the invariants the caller must uphold.
+//! Android shares the Linux kernel ABI, so most modules build for both
+//! targets. `tun` and `netlink` stay Linux-only. Every `unsafe` block in this
+//! crate must carry a safety comment that explains the invariants the caller
+//! must uphold.
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("beam-sys only supports Linux targets; beam is a Linux-only server");
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+compile_error!("beam-sys supports only Linux and Android targets; both share the Linux kernel ABI");
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod eventfd;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod fd;
 #[cfg(target_os = "linux")]
 pub mod netlink;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod poll;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod socket;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod splice;
 #[cfg(target_os = "linux")]
 pub mod tun;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use eventfd::EventFd;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use fd::{set_cloexec, set_nonblocking};
 #[cfg(target_os = "linux")]
 pub use netlink::NetlinkRouteWatcher;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use poll::{PollEvents, PollFd, poll};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use socket::{
     AcceptError, get_ipv6_v6only, get_tcp_maxseg, set_reuse_addr, set_tcp_keepalive,
-    set_tcp_maxseg, set_tcp_nodelay, set_tcp_user_timeout, set_udp_recv_buffer,
+    set_tcp_keepcnt, set_tcp_maxseg, set_tcp_nodelay, set_tcp_user_timeout, set_udp_recv_buffer,
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use splice::{SpliceFlags, pipe, splice};
 #[cfg(target_os = "linux")]
 pub use tun::{LinuxTun, MAX_IFNAME_LEN, validate_ifname};
@@ -52,7 +54,7 @@ pub use tun::{LinuxTun, MAX_IFNAME_LEN, validate_ifname};
 ///
 /// The kernel rounds the request up to a whole number of pages and caps it at
 /// `/proc/sys/fs/pipe-max-size`. Returns the size actually granted.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn set_pipe_size(fd: RawFd, size: usize) -> io::Result<usize> {
     let size = libc::c_int::try_from(size).map_err(|_| {
         io::Error::new(
@@ -79,7 +81,7 @@ pub fn set_pipe_size(fd: RawFd, size: usize) -> io::Result<usize> {
 }
 
 /// Returns the current kernel buffer capacity of a pipe in bytes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn get_pipe_size(fd: RawFd) -> io::Result<usize> {
     // SAFETY: `F_GETPIPE_SZ` takes no pointer arguments and queries the
     // kernel's current capacity for `fd`, returning -1 on error.
@@ -93,7 +95,7 @@ pub fn get_pipe_size(fd: RawFd) -> io::Result<usize> {
 
 /// Queries the kernel page size via `sysconf(_SC_PAGESIZE)`, returning `None`
 /// if the query fails or returns a non-positive value.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn query_page_size() -> Option<u64> {
     // SAFETY: `sysconf(_SC_PAGESIZE)` takes no pointer arguments and returns
@@ -104,14 +106,14 @@ pub fn query_page_size() -> Option<u64> {
 
 /// Returns the kernel page size used by pipe and splice accounting, falling
 /// back to 4 KiB if `sysconf(_SC_PAGESIZE)` fails.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn page_size() -> u64 {
     query_page_size().unwrap_or(4096)
 }
 
 /// Reads the per-user soft limit on pipe pages.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn pipe_user_pages_soft() -> Option<u64> {
     std::fs::read_to_string("/proc/sys/fs/pipe-user-pages-soft")
@@ -122,20 +124,20 @@ pub fn pipe_user_pages_soft() -> Option<u64> {
 }
 
 /// Reads the host TCP listen backlog ceiling (`net.core.somaxconn`).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn tcp_somaxconn() -> Option<u32> {
     let raw = std::fs::read_to_string("/proc/sys/net/core/somaxconn").ok()?;
     parse_positive_u32(&raw)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn parse_positive_u32(raw: &str) -> Option<u32> {
     raw.trim().parse::<u32>().ok().filter(|&value| value > 0)
 }
 
 /// Returns the soft `RLIMIT_NOFILE` limit. `None` means unlimited.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn open_file_limit() -> io::Result<Option<u64>> {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     // SAFETY: `getrlimit` initializes the provided `rlimit` structure on
@@ -151,7 +153,7 @@ pub fn open_file_limit() -> io::Result<Option<u64>> {
 }
 
 /// Duplicates a descriptor with close-on-exec set.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn try_clone_fd(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: `F_DUPFD_CLOEXEC` only reads the integer descriptor and returns a
     // new descriptor owned by the caller. It does not dereference a pointer.
@@ -168,7 +170,7 @@ pub fn try_clone_fd(fd: RawFd) -> io::Result<OwnedFd> {
 /// The read half stays usable, which is what a relay needs after its source
 /// reaches EOF. `ENOTCONN` is treated as success because a socket whose peer is
 /// already gone has nothing left to shut down.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn shutdown_write(fd: RawFd) -> io::Result<()> {
     // SAFETY: `shutdown` only reads the descriptor and the `how` argument. The
     // kernel validates the descriptor; no user pointer is dereferenced and
@@ -189,14 +191,14 @@ pub fn shutdown_write(fd: RawFd) -> io::Result<()> {
 ///
 /// Both clocks are monotonic and unaffected by NTP or wall-clock jumps, so
 /// their difference advances only across system suspend/resume transitions.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn boottime_offset() -> io::Result<Duration> {
     let boottime = read_clock(libc::CLOCK_BOOTTIME)?;
     let monotonic = read_clock(libc::CLOCK_MONOTONIC)?;
     Ok(boottime.saturating_sub(monotonic))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_clock(clock_id: libc::clockid_t) -> io::Result<Duration> {
     let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
     // SAFETY: `clock_gettime` initializes `ts` on success and does not retain
@@ -225,7 +227,7 @@ fn read_clock(clock_id: libc::clockid_t) -> io::Result<Duration> {
     Ok(Duration::new(secs, nanos))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     use super::*;
     use std::fs::File;

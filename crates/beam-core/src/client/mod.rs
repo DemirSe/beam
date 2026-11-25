@@ -5,6 +5,7 @@
 //! - [`dial_tcp`]: Vision-framed TCP streams with raw Direct handoff.
 //! - [`XudpClient`]: multiplexed UDP sessions over VLESS `Command::Mux`.
 
+pub mod link;
 pub mod xudp;
 
 use std::fmt;
@@ -12,6 +13,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -28,13 +30,23 @@ use crate::tls::stream::{RawTlsHandoff, TlsStream, TlsStreamError};
 use crate::vision::VisionStream;
 use crate::vless::{Addons, Command, RequestHeader, ResponseHeader, VLESS_VERSION, VlessError};
 
+pub use link::{ClientLinkError, ParsedClientLink, parse_client_link};
 pub use xudp::{XudpClient, XudpClientConfig, XudpClientError, XudpReply, XudpSession};
+
+/// Binds a socket descriptor to the VPN transport before it connects.
+///
+/// Android VPN services must protect every outgoing socket, or its traffic
+/// loops back into the tunnel. The hook receives the raw descriptor of the
+/// unconnected socket, so it can run `VpnService.protect` through JNI. Other
+/// targets leave [`BeamClientConfig::socket_protector`] as `None`.
+pub type SocketProtector = Arc<dyn Fn(RawFd) -> io::Result<()> + Send + Sync>;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const UPSTREAM_TCP_MSS: u16 = 1400;
-const UPSTREAM_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_KEEPALIVE_COUNT: u32 = 4;
 const UPSTREAM_TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Handshake stage names, shared by [`ClientError::Timeout`] and
@@ -61,6 +73,15 @@ pub struct BeamClientConfig {
     pub handshake_timeout: Duration,
     /// Idle timeout for established streams and XUDP sessions.
     pub idle_timeout: Duration,
+    /// Hook that protects the socket before it connects. `None` dials directly.
+    pub socket_protector: Option<SocketProtector>,
+    /// TCP keepalive idle time, or `None` to leave keepalive disabled.
+    pub keepalive_idle: Option<Duration>,
+    /// TCP keepalive probe interval, or `None` to leave keepalive disabled.
+    pub keepalive_interval: Option<Duration>,
+    /// Unanswered keepalive probes before the kernel drops the connection.
+    /// `None` keeps the kernel default.
+    pub keepalive_count: Option<u32>,
 }
 
 impl BeamClientConfig {
@@ -72,6 +93,10 @@ impl BeamClientConfig {
             user_id,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            socket_protector: None,
+            keepalive_idle: Some(DEFAULT_KEEPALIVE_IDLE),
+            keepalive_interval: Some(DEFAULT_KEEPALIVE_INTERVAL),
+            keepalive_count: Some(DEFAULT_KEEPALIVE_COUNT),
         }
     }
 }
@@ -84,6 +109,13 @@ impl fmt::Debug for BeamClientConfig {
             .field("user_id", &"<redacted>")
             .field("handshake_timeout", &self.handshake_timeout)
             .field("idle_timeout", &self.idle_timeout)
+            .field(
+                "socket_protector",
+                &self.socket_protector.as_ref().map(|_| "<socket_protector>"),
+            )
+            .field("keepalive_idle", &self.keepalive_idle)
+            .field("keepalive_interval", &self.keepalive_interval)
+            .field("keepalive_count", &self.keepalive_count)
             .finish()
     }
 }
@@ -156,6 +188,14 @@ pub(crate) async fn dial_vless(
     if let Err(err) = beam_sys::set_tcp_maxseg(tcp_socket.as_raw_fd(), UPSTREAM_TCP_MSS) {
         tracing::debug!(error = %err, mss = UPSTREAM_TCP_MSS, "failed to set upstream TCP_MAXSEG");
     }
+    // The protector must run before `connect`, or the connect leaves the VPN
+    // through the tunnel it is meant to serve.
+    if let Some(protector) = &config.socket_protector {
+        protector(tcp_socket.as_raw_fd()).map_err(|err| ClientError::Io {
+            stage: STAGE_TCP_CONNECT,
+            source: err,
+        })?;
+    }
 
     let socket = timeout_at(deadline, tcp_socket.connect(config.server_addr))
         .await
@@ -170,8 +210,20 @@ pub(crate) async fn dial_vless(
         tracing::debug!(error = %err, "failed to set upstream TCP_NODELAY");
     }
     let fd = socket.as_raw_fd();
-    if let Err(err) =
-        beam_sys::set_tcp_keepalive(fd, UPSTREAM_KEEPALIVE_IDLE, UPSTREAM_KEEPALIVE_INTERVAL)
+    if let Some(count) = config.keepalive_count
+        && let Err(err) = beam_sys::set_tcp_keepcnt(fd, count)
+    {
+        tracing::debug!(error = %err, count, "failed to set upstream TCP_KEEPCNT");
+    }
+    if config.keepalive_idle.is_some() != config.keepalive_interval.is_some() {
+        tracing::debug!(
+            idle = ?config.keepalive_idle,
+            interval = ?config.keepalive_interval,
+            "partial TCP keepalive config; keepalive stays disabled unless idle and interval are both set",
+        );
+    }
+    if let (Some(idle), Some(interval)) = (config.keepalive_idle, config.keepalive_interval)
+        && let Err(err) = beam_sys::set_tcp_keepalive(fd, idle, interval)
     {
         tracing::debug!(error = %err, "failed to set upstream TCP keepalive");
     }
@@ -385,7 +437,128 @@ fn vision_seed() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::vision_seed;
+    use super::{
+        Addons, BeamClientConfig, Command, DEFAULT_KEEPALIVE_COUNT, DEFAULT_KEEPALIVE_IDLE,
+        DEFAULT_KEEPALIVE_INTERVAL, dial_vless, vision_seed,
+    };
+    use std::io;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::os::fd::AsRawFd;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+
+    use crate::reality::RealityClientConfig;
+
+    const USER_ID: [u8; 16] = [0xaa; 16];
+
+    fn config(server_addr: SocketAddr) -> BeamClientConfig {
+        let reality = RealityClientConfig::new([0x37; 32], "0123456789abcdef", "whatsapp.net")
+            .expect("test reality config");
+        let mut config = BeamClientConfig::new(server_addr, reality, USER_ID);
+        config.handshake_timeout = Duration::from_secs(2);
+        config
+    }
+
+    async fn loopback_listener() -> TcpListener {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback listener")
+    }
+
+    #[tokio::test]
+    async fn socket_protector_runs_before_connect_with_a_valid_fd() {
+        let listener = loopback_listener().await;
+        let server_addr = listener.local_addr().expect("listener address");
+
+        let events = Arc::new(Mutex::new(Vec::<(&'static str, i32)>::new()));
+        let accept_events = Arc::clone(&events);
+        let accept_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept protected dial");
+            accept_events
+                .lock()
+                .expect("events lock")
+                .push(("accept", socket.as_raw_fd()));
+            // Closing right away makes the REALITY handshake fail fast.
+        });
+
+        let protect_events = Arc::clone(&events);
+        let mut client = config(server_addr);
+        client.socket_protector = Some(Arc::new(move |fd| {
+            assert!(
+                fd > 2,
+                "protector must see a live socket descriptor, got {fd}"
+            );
+            protect_events
+                .lock()
+                .expect("events lock")
+                .push(("protect", fd));
+            Ok(())
+        }));
+
+        let _ = dial_vless(&client, Command::Tcp, Addons::vision(), None).await;
+        accept_task.await.expect("accept task join");
+
+        let events = events.lock().expect("events lock").clone();
+        // A correct implementation records `protect` synchronously before it
+        // calls `connect`, and no accept can precede the connect call.
+        assert_eq!(events.len(), 2, "unexpected events: {events:?}");
+        assert_eq!(events[0].0, "protect", "unexpected events: {events:?}");
+        assert_eq!(events[1].0, "accept", "unexpected events: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn protector_failure_aborts_before_connect() {
+        let listener = loopback_listener().await;
+        let server_addr = listener.local_addr().expect("listener address");
+
+        let mut client = config(server_addr);
+        client.socket_protector = Some(Arc::new(|_fd| {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "blocked"))
+        }));
+
+        let error = dial_vless(&client, Command::Tcp, Addons::vision(), None)
+            .await
+            .err()
+            .expect("a failing protector must abort the dial");
+        match error {
+            super::ClientError::Io { stage, source } => {
+                assert_eq!(stage, super::STAGE_TCP_CONNECT);
+                assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // The protector failed before `connect`, so nothing reached the listener.
+        assert!(
+            timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "the dial must not connect after a failed protector"
+        );
+    }
+
+    #[test]
+    fn default_config_enables_keepalive_and_has_no_protector() {
+        let client = config(SocketAddr::from((Ipv4Addr::LOCALHOST, 443)));
+        assert!(client.socket_protector.is_none());
+        assert_eq!(client.keepalive_idle, Some(DEFAULT_KEEPALIVE_IDLE));
+        assert_eq!(client.keepalive_interval, Some(DEFAULT_KEEPALIVE_INTERVAL));
+        assert_eq!(client.keepalive_count, Some(DEFAULT_KEEPALIVE_COUNT));
+    }
+
+    #[test]
+    fn debug_prints_the_protector_without_its_closure() {
+        let mut client = config(SocketAddr::from((Ipv4Addr::LOCALHOST, 443)));
+        assert!(format!("{client:?}").contains("socket_protector: None"));
+        client.socket_protector = Some(Arc::new(|_fd| Ok(())));
+        let rendered = format!("{client:?}");
+        assert!(
+            rendered.contains("socket_protector: Some(\"<socket_protector>\")"),
+            "{rendered}"
+        );
+    }
 
     #[test]
     fn vision_seed_is_not_constant_across_connections() {

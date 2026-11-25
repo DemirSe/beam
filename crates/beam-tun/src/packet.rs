@@ -609,19 +609,37 @@ pub fn build_icmp_port_unreachable(original: &IpPacketView<'_>) -> Option<Vec<u8
     }
 }
 
-fn sum_bytes(data: &[u8]) -> u32 {
-    let mut sum = 0u32;
-    let (chunks, remainder) = data.as_chunks::<2>();
+/// Sums `data` as big-endian 16-bit words for the internet checksum.
+///
+/// The result equals the plain word sum modulo 65535, which is what the checksum
+/// fold consumes. Reads two 32-bit words per 64-bit chunk into two `u64`
+/// accumulators; one holds 16 GB of maximum-valued words before it could
+/// overflow, far above any packet or the usual callers.
+///
+/// Public because the `packet_checksum` benchmark compares it with a scalar
+/// reference for the same bytes; hidden so it stays out of the public docs.
+#[doc(hidden)]
+pub fn sum_bytes(data: &[u8]) -> u64 {
+    let (chunks, remainder) = data.as_chunks::<8>();
+    let mut high = 0u64;
+    let mut low = 0u64;
     for chunk in chunks {
-        sum += u32::from(u16::from_be_bytes(*chunk));
+        let word = u64::from_be_bytes(*chunk);
+        high += word >> 32;
+        low += word & 0xffff_ffff;
     }
-    if let Some(&last) = remainder.first() {
-        sum += u32::from(u16::from_be_bytes([last, 0]));
+    let (pairs, last) = remainder.as_chunks::<2>();
+    let mut sum = high + low;
+    for pair in pairs {
+        sum += u64::from(u16::from_be_bytes(*pair));
+    }
+    if let Some(&odd_byte) = last.first() {
+        sum += u64::from(odd_byte) << 8;
     }
     sum
 }
 
-fn fold_checksum(mut sum: u32) -> u16 {
+fn fold_checksum(mut sum: u64) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
@@ -646,16 +664,16 @@ fn apply_payload_patch(udp: &mut [u8], patch: Option<(usize, [u8; 2])>) -> Optio
 
 fn l4_ipv4_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, segment: &[u8]) -> u16 {
     let mut sum = sum_bytes(&src.octets()) + sum_bytes(&dst.octets());
-    sum += u32::from(proto);
-    sum += segment.len() as u32;
+    sum += u64::from(proto);
+    sum += segment.len() as u64;
     sum += sum_bytes(segment);
     fold_checksum(sum)
 }
 
 fn l4_ipv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, segment: &[u8]) -> u16 {
     let mut sum = sum_bytes(&src.octets()) + sum_bytes(&dst.octets());
-    sum += segment.len() as u32;
-    sum += u32::from(proto);
+    sum += segment.len() as u64;
+    sum += u64::from(proto);
     sum += sum_bytes(segment);
     fold_checksum(sum)
 }
@@ -877,5 +895,53 @@ mod tests {
         }
         let deep = build_ipv6_with_headers(src, dst, IPV6_NEXT_DEST_OPTS, &deep_body);
         assert!(parse_ipv6(&deep).is_none());
+    }
+
+    /// Byte-pair reference implementation that the checksum fold of the
+    /// unrolled [`sum_bytes`] must reproduce bit for bit.
+    fn scalar_sum_bytes(data: &[u8]) -> u64 {
+        let mut sum = 0u64;
+        let mut idx = 0;
+        while idx + 1 < data.len() {
+            sum += u64::from(u16::from_be_bytes([data[idx], data[idx + 1]]));
+            idx += 2;
+        }
+        if idx < data.len() {
+            sum += u64::from(data[idx]) << 8;
+        }
+        sum
+    }
+
+    fn scalar_checksum(data: &[u8]) -> u16 {
+        let mut sum = scalar_sum_bytes(data) as u32;
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn sum_bytes_is_bit_exact_with_the_scalar_reference() {
+        let mut buf = vec![0u8; 1500 + 8];
+        let mut state = 0x1234_5678u32;
+        for byte in buf.iter_mut() {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *byte = (state >> 16) as u8;
+        }
+        for offset in 0..8 {
+            for len in 0..=1500 {
+                let data = &buf[offset..offset + len];
+                assert_eq!(
+                    sum_bytes(data) % 65_535,
+                    scalar_sum_bytes(data) % 65_535,
+                    "word sum diverges at offset {offset} len {len}"
+                );
+                assert_eq!(
+                    internet_checksum(data),
+                    scalar_checksum(data),
+                    "checksum mismatch at offset {offset} len {len}"
+                );
+            }
+        }
     }
 }

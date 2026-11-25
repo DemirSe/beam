@@ -75,3 +75,10 @@ path = "fuzz_targets/tun_packet.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "client_link"
+path = "fuzz_targets/client_link.rs"
+test = false
+doc = false
+bench = false

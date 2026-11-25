@@ -421,6 +421,9 @@ impl ClientFileConfig {
             client,
             route,
             max_tcp_connections: self.limits.max_tcp_connections,
+            // Same as `client.idle_timeout`, so Linux write and read deadlines
+            // stay as they were; read timeouts are exactly the classic cap.
+            tcp_relay_idle_timeout: Some(Duration::from_millis(self.limits.idle_timeout_ms)),
             udp: UdpBridgeConfig {
                 max_sessions: self.limits.max_udp_sessions,
                 idle_timeout: Duration::from_millis(self.limits.idle_timeout_ms.min(60_000)),
@@ -609,6 +612,21 @@ mod tests {
         assert_eq!(cfg.tun_name, "beamtun0");
         assert_eq!(cfg.mtu, 1500);
         assert!(cfg.engine.route.reject_quic);
+    }
+
+    #[test]
+    fn tun_drop_private_destinations_propagates_to_route_policy() {
+        // The example omits the key, so the default stays `true` (drop).
+        let cfg = ClientFileConfig::parse_and_validate(EXAMPLE).expect("example config valid");
+        assert!(cfg.engine.route.drop_private_destinations);
+
+        // Explicit `false` routes private/LAN traffic through the tunnel.
+        let raw = EXAMPLE.replace(
+            "reject_ipv6 = false",
+            "reject_ipv6 = false\ndrop_private_destinations = false",
+        );
+        let cfg = ClientFileConfig::parse_and_validate(&raw).expect("drop_private=false valid");
+        assert!(!cfg.engine.route.drop_private_destinations);
     }
 
     #[test]

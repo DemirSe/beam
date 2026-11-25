@@ -11,6 +11,8 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc};
 
+use crate::stats::DropCounters;
+
 const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
 const DEFAULT_TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
@@ -106,6 +108,43 @@ impl Default for TcpStackConfig {
     }
 }
 
+impl TcpStackConfig {
+    /// Low-RAM always-on profile for Android `VpnService`.
+    ///
+    /// Worst case is 128 flows times 128 KiB times two directions, which is
+    /// 32 MiB. The 30-minute idle timeout keeps 15-minute FCM/MTalk push
+    /// sockets alive with zero relay wakeups while idle.
+    pub fn mobile() -> Self {
+        Self {
+            mtu: 1500,
+            max_connections: 128,
+            socket_buffer_bytes: 128 * 1024,
+            handshake_timeout_ms: 10_000,
+            idle_timeout_ms: 1_800_000,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mobile_tests {
+    use super::*;
+
+    #[test]
+    fn mobile_profile_fits_android_ram_and_keeps_push_sockets_alive() {
+        let cfg = TcpStackConfig::mobile();
+        // Worst case counts both directions per flow.
+        let worst_case = cfg.max_connections as u64 * cfg.socket_buffer_bytes as u64 * 2;
+        assert!(
+            worst_case <= 32 * 1024 * 1024,
+            "mobile buffer budget {worst_case} bytes exceeds 32 MiB"
+        );
+        assert!(
+            cfg.idle_timeout_ms >= 1_800_000,
+            "mobile idle timeout must cover 15-minute push sockets"
+        );
+    }
+}
+
 /// Per-flow dirty notification callback used by [`NetStack`] implementations
 /// to avoid O(N) scans across idle connections on wakeup.
 pub(crate) trait FlowWaker: Send + Sync {
@@ -157,6 +196,11 @@ pub trait NetStack: Send + 'static {
     /// and closing relay channels) on network/gateway transitions so local
     /// applications reconnect immediately instead of hanging on dead sockets.
     fn reset_all(&mut self, _tx_out: &mut Vec<Vec<u8>>) {}
+
+    /// Attaches the engine drop counters so the stack can report silent drops
+    /// (for example an overflowing receive queue). Implementations that cannot
+    /// drop silently keep the default no-op.
+    fn set_drop_counters(&mut self, _drops: Arc<DropCounters>) {}
 }
 
 /// Async TCP stream bridged to a [`NetStack`] socket.
@@ -204,6 +248,36 @@ impl TunTcpReader {
     /// Returns `true` if another chunk is already buffered in the channel.
     pub fn has_queued(&self) -> bool {
         !self.from_stack.is_empty()
+    }
+}
+
+/// Releases the in-flight accounting of chunks that were queued for a relay but
+/// will never be read, so dropping a relay cannot leave the advertised TCP
+/// receive window shrunken for the rest of the flow.
+///
+/// Both call sites are terminal drops of the reader half. After `close()` and
+/// draining, the counter is swapped to zero: even a Tokio `Permit` reserved
+/// before `close()` cannot leave permanently charged bytes.
+fn release_queued_in_flight(
+    from_stack: &mut mpsc::Receiver<Vec<u8>>,
+    in_flight_relay: Option<&Arc<AtomicUsize>>,
+) -> bool {
+    let Some(counter) = in_flight_relay else {
+        return false;
+    };
+    // Close before draining so a concurrent send cannot succeed after the drain
+    // and leave bytes charged for a chunk that nobody will ever read.
+    from_stack.close();
+    while from_stack.try_recv().is_ok() {}
+    let freed = counter.swap(0, Ordering::AcqRel);
+    freed > 0
+}
+
+impl Drop for TunTcpReader {
+    fn drop(&mut self) {
+        if release_queued_in_flight(&mut self.from_stack, self.in_flight_relay.as_ref()) {
+            wake_stack(&self.waker, self.flow_waker.as_ref());
+        }
     }
 }
 
@@ -438,8 +512,86 @@ impl AsyncWrite for TunTcpStream {
 
 impl Drop for TunTcpStream {
     fn drop(&mut self) {
-        if self.to_stack.take().is_some() {
+        let mut woken = self.to_stack.take().is_some();
+        if release_queued_in_flight(&mut self.from_stack, self.in_flight_relay.as_ref()) {
+            woken = true;
+        }
+        if woken {
             wake_stack(&self.waker, self.flow_waker.as_ref());
         }
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_the_relay_reader_never_loses_in_flight_bytes() {
+        // Terminal drops swap the counter to zero, so even a Tokio `Permit`
+        // reserved before `close()` cannot leave permanently charged bytes.
+        // The racing thread below charges and releases bytes with a net
+        // change of zero, so any lost release leaves a non-zero residue.
+        for round in 0..500 {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+            let counter = Arc::new(AtomicUsize::new(0));
+            for _ in 0..4 {
+                counter.fetch_add(512, Ordering::AcqRel);
+                assert!(tx.try_send(vec![0u8; 512]).is_ok(), "round {round}");
+            }
+            let stream = TunTcpStream::new_with_accounting(
+                rx,
+                tx.clone(),
+                Arc::new(Notify::new()),
+                None,
+                Some(Arc::clone(&counter)),
+                None,
+                RelayBufPool::new(),
+            );
+            let (reader, _writer) = stream.into_split();
+
+            let racer_counter = Arc::clone(&counter);
+            let racer = std::thread::spawn(move || {
+                for _ in 0..64 {
+                    racer_counter.fetch_add(1, Ordering::AcqRel);
+                    racer_counter.fetch_sub(1, Ordering::AcqRel);
+                    std::thread::yield_now();
+                }
+            });
+
+            // Wait for any concurrent reader-side activity to finish before
+            // the terminal drop (in production only the dropped reader ever
+            // subtracts from `in_flight_relay`).
+            racer.join().expect("racer thread");
+            drop(reader);
+
+            assert_eq!(
+                counter.load(Ordering::Acquire),
+                0,
+                "round {round}: queued bytes must be fully released"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_drop_zeroes_reserved_permit_residue() {
+        // Simulates a `try_reserve` permit taken before `close()`: the counter
+        // holds charged bytes with no chunk left in the channel. A terminal
+        // drop must still swap to zero.
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let counter = Arc::new(AtomicUsize::new(0));
+        counter.fetch_add(1024, Ordering::AcqRel);
+        let stream = TunTcpStream::new_with_accounting(
+            rx,
+            _tx,
+            Arc::new(Notify::new()),
+            None,
+            Some(Arc::clone(&counter)),
+            None,
+            RelayBufPool::new(),
+        );
+        let (reader, _writer) = stream.into_split();
+        drop(reader);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 }

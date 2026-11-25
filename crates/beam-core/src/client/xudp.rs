@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -85,6 +86,10 @@ pub enum XudpClientError {
         max: usize,
     },
 
+    /// The bounded outbound mux queue is full; the frame was not queued.
+    #[error("XUDP mux outbound queue is full")]
+    OutboundQueueFull,
+
     /// Frame encoding failed.
     #[error("XUDP frame error: {0}")]
     Frame(#[from] crate::xudp::XudpError),
@@ -101,9 +106,17 @@ pub struct XudpReply {
 
 struct SessionTable {
     next_id: u16,
-    sessions: HashMap<u16, mpsc::Sender<XudpReply>>,
+    sessions: HashMap<u16, SessionEntry>,
     max_sessions: usize,
     closed: bool,
+}
+
+/// One registered session: its reply queue and the drops the mux reader charged
+/// to it, so `dropped_replies` is exact per session and needs no table lock.
+struct SessionEntry {
+    tx: mpsc::Sender<XudpReply>,
+    dropped_replies: Arc<AtomicU64>,
+    live: Arc<AtomicBool>,
 }
 
 impl SessionTable {
@@ -116,13 +129,25 @@ impl SessionTable {
         }
     }
 
-    fn allocate(&mut self, tx: mpsc::Sender<XudpReply>) -> Result<u16, XudpClientError> {
+    /// Returns the reply queue and drop counter of `id` for the mux reader.
+    fn reply_target(&self, id: u16) -> Option<(mpsc::Sender<XudpReply>, Arc<AtomicU64>)> {
+        self.sessions
+            .get(&id)
+            .map(|e| (e.tx.clone(), Arc::clone(&e.dropped_replies)))
+    }
+
+    fn allocate(
+        &mut self,
+        tx: mpsc::Sender<XudpReply>,
+    ) -> Result<(u16, Arc<AtomicU64>, Arc<AtomicBool>), XudpClientError> {
         if self.closed {
             return Err(XudpClientError::Closed);
         }
         if self.sessions.len() >= self.max_sessions {
             return Err(XudpClientError::SessionLimit);
         }
+        let dropped_replies = Arc::new(AtomicU64::new(0));
+        let live = Arc::new(AtomicBool::new(true));
         for _ in 0..u16::MAX {
             let id = self.next_id;
             self.next_id = self.next_id.wrapping_add(1);
@@ -130,20 +155,48 @@ impl SessionTable {
                 self.next_id = 1;
             }
             if id != 0 && !self.sessions.contains_key(&id) {
-                self.sessions.insert(id, tx);
-                return Ok(id);
+                self.sessions.insert(
+                    id,
+                    SessionEntry {
+                        tx,
+                        dropped_replies: Arc::clone(&dropped_replies),
+                        live: Arc::clone(&live),
+                    },
+                );
+                return Ok((id, dropped_replies, live));
             }
         }
         Err(XudpClientError::SessionLimit)
     }
 
     fn remove(&mut self, id: u16) {
-        self.sessions.remove(&id);
+        if let Some(entry) = self.sessions.remove(&id) {
+            entry.live.store(false, Ordering::Release);
+        }
+    }
+
+    /// Removes `id` only when `live` still belongs to the registered session.
+    ///
+    /// A session's `Drop` runs after `close()` already removed it; without this
+    /// identity check that late removal could clear a *reused* id and silently
+    /// kill a fresh session. Returns whether an entry was removed.
+    fn remove_if_same(&mut self, id: u16, live: &Arc<AtomicBool>) -> bool {
+        let same = self
+            .sessions
+            .get(&id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.live, live));
+        if !same {
+            return false;
+        }
+        self.remove(id);
+        true
     }
 
     fn close_all(&mut self) {
         self.closed = true;
-        self.sessions.clear();
+        for (_, entry) in self.sessions.drain() {
+            entry.live.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -309,14 +362,21 @@ impl XudpClient {
                             match frame.status {
                                 SessionStatus::Keep => {
                                     if !frame.payload.is_empty() {
-                                        let tx = reader_table.lock().ok().and_then(|t| {
-                                            t.sessions.get(&frame.session_id).cloned()
-                                        });
-                                        if let Some(tx) = tx {
-                                            let _ = tx.try_send(XudpReply {
+                                        let target = reader_table
+                                            .lock()
+                                            .ok()
+                                            .and_then(|t| t.reply_target(frame.session_id));
+                                        if let Some((tx, dropped_replies)) = target {
+                                            match tx.try_send(XudpReply {
                                                 source: frame.destination,
                                                 payload: frame.payload.to_vec(),
-                                            });
+                                            }) {
+                                                Ok(()) => {}
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    dropped_replies.fetch_add(1, Ordering::Relaxed);
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                            }
                                         }
                                     }
                                 }
@@ -374,7 +434,7 @@ impl XudpClient {
             .ok_or(XudpClientError::Closed)?
             .clone();
         let (reply_tx, reply_rx) = mpsc::channel(self.reply_queue);
-        let session_id = {
+        let (session_id, dropped_replies, live) = {
             let mut guard = self.table.lock().map_err(|_| XudpClientError::Closed)?;
             guard.allocate(reply_tx)?
         };
@@ -385,6 +445,8 @@ impl XudpClient {
             table: Arc::clone(&self.table),
             outbound_tx,
             reply_rx,
+            dropped_replies,
+            live,
         })
     }
 
@@ -434,6 +496,10 @@ pub struct XudpSession {
     table: Arc<Mutex<SessionTable>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
     reply_rx: mpsc::Receiver<XudpReply>,
+    /// Replies the mux reader dropped for this session; only this session bumps it.
+    dropped_replies: Arc<AtomicU64>,
+    /// Cleared by the mux when the session is removed, so liveness needs no lock.
+    live: Arc<AtomicBool>,
 }
 
 impl XudpSession {
@@ -468,6 +534,27 @@ impl XudpSession {
         destination: NetLocation,
         payload: Vec<u8>,
     ) -> Result<(), XudpClientError> {
+        let frame = self.encode_owned(destination, payload)?;
+        self.outbound_tx
+            .send(frame)
+            .await
+            .map_err(|_| XudpClientError::Closed)?;
+        self.sent_new = true;
+        Ok(())
+    }
+
+    /// Non-blocking form of [`Self::send_owned`].
+    ///
+    /// Returns [`XudpClientError::OutboundQueueFull`] instead of waiting for the
+    /// mux writer, so a caller that drains inbound replies and sends outbound
+    /// datagrams in the same loop never blocks the reply path on the 256-frame
+    /// outbound queue. The queue slot is reserved before the frame is encoded,
+    /// so a full queue costs no payload allocation or copy.
+    pub fn try_send_owned(
+        &mut self,
+        destination: NetLocation,
+        payload: Vec<u8>,
+    ) -> Result<(), XudpClientError> {
         if !self.is_live() {
             return Err(XudpClientError::Closed);
         }
@@ -477,6 +564,44 @@ impl XudpSession {
                 max: MAX_PAYLOAD_LEN,
             });
         }
+        let permit = match self.outbound_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                return Err(XudpClientError::OutboundQueueFull);
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => return Err(XudpClientError::Closed),
+        };
+        // A dropped permit returns the reserved slot to the queue.
+        let frame = self.encode_frame_owned(destination, payload)?;
+        permit.send(frame);
+        self.sent_new = true;
+        Ok(())
+    }
+
+    /// Encodes one owned payload into a mux frame without queueing it.
+    fn encode_owned(
+        &self,
+        destination: NetLocation,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, XudpClientError> {
+        if !self.is_live() {
+            return Err(XudpClientError::Closed);
+        }
+        if payload.is_empty() || payload.len() > MAX_PAYLOAD_LEN {
+            return Err(XudpClientError::InvalidPayloadLength {
+                length: payload.len(),
+                max: MAX_PAYLOAD_LEN,
+            });
+        }
+        self.encode_frame_owned(destination, payload)
+    }
+
+    /// Prepends the frame header to an already validated owned payload.
+    fn encode_frame_owned(
+        &self,
+        destination: NetLocation,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, XudpClientError> {
         let status = if self.sent_new {
             SessionStatus::Keep
         } else {
@@ -499,12 +624,13 @@ impl XudpSession {
         frame.resize(body_len + header.len(), 0);
         frame.copy_within(0..body_len, header.len());
         frame[..header.len()].copy_from_slice(&header);
-        self.outbound_tx
-            .send(frame)
-            .await
-            .map_err(|_| XudpClientError::Closed)?;
-        self.sent_new = true;
-        Ok(())
+        Ok(frame)
+    }
+
+    /// Returns and clears the number of inbound replies the mux dropped for this
+    /// session because its reply queue was full.
+    pub fn take_dropped_replies(&self) -> u64 {
+        self.dropped_replies.swap(0, Ordering::Relaxed)
     }
 
     /// Allocates a datagram buffer with [`FRAME_HEADER_RESERVE`] bytes of
@@ -515,10 +641,7 @@ impl XudpSession {
 
     /// Returns `true` while this session is still registered on a live mux.
     fn is_live(&self) -> bool {
-        self.table
-            .lock()
-            .map(|t| !t.closed && t.sessions.contains_key(&self.session_id))
-            .unwrap_or(false)
+        self.live.load(Ordering::Acquire)
     }
 
     async fn send_inner(
@@ -573,7 +696,8 @@ impl XudpSession {
 
     fn send_end_best_effort(&mut self) {
         if let Ok(mut guard) = self.table.lock() {
-            guard.remove(self.session_id);
+            // Never removes a session that reused this id after `close()`.
+            guard.remove_if_same(self.session_id, &self.live);
         }
         if self.sent_new {
             let spec = FrameSpec {
@@ -680,7 +804,7 @@ mod tests {
     ) {
         let table = Arc::new(Mutex::new(SessionTable::new(4)));
         let (reply_tx, reply_rx) = mpsc::channel(4);
-        let session_id = table
+        let (session_id, dropped_replies, live) = table
             .lock()
             .expect("session table")
             .allocate(reply_tx)
@@ -694,6 +818,8 @@ mod tests {
                 table: Arc::clone(&table),
                 outbound_tx,
                 reply_rx,
+                dropped_replies,
+                live,
             },
             outbound_rx,
             table,
@@ -803,6 +929,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_replies_flow_while_the_outbound_queue_is_full() {
+        let table = Arc::new(Mutex::new(SessionTable::new(4)));
+        let (reply_tx, reply_rx) = mpsc::channel(4);
+        reply_tx
+            .try_send(XudpReply {
+                source: None,
+                payload: b"pong".to_vec(),
+            })
+            .expect("queue reply");
+        let (session_id, dropped_replies, live) = table
+            .lock()
+            .expect("session table")
+            .allocate(reply_tx)
+            .expect("allocate session");
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        outbound_tx.try_send(vec![0u8]).expect("prefill queue");
+        let mut session = XudpSession {
+            session_id,
+            default_dest: test_dest(false),
+            sent_new: false,
+            table,
+            outbound_tx,
+            reply_rx,
+            dropped_replies,
+            live,
+        };
+
+        // The full mux queue must fail fast instead of stalling the caller, so
+        // the same task can keep draining inbound replies.
+        let err = session
+            .try_send_owned(test_dest(false), alloc_owned(b"ping"))
+            .expect_err("full outbound queue");
+        assert!(
+            matches!(err, XudpClientError::OutboundQueueFull),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !session.sent_new,
+            "a refused frame must not mark the session as opened"
+        );
+        assert!(outbound_rx.try_recv().is_ok());
+        assert!(outbound_rx.try_recv().is_err(), "nothing extra was queued");
+
+        let reply = session.recv().await.expect("inbound reply must arrive");
+        assert_eq!(reply.payload, b"pong");
+
+        // With room in the queue the same non-blocking send succeeds.
+        session
+            .try_send_owned(test_dest(true), alloc_owned(b"ping"))
+            .expect("queued after draining");
+        assert!(session.sent_new);
+        assert!(outbound_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn take_dropped_replies_is_per_session_and_clears() {
+        let (session, _rx, table) = new_test_session();
+        let (other_reply_tx, _other_reply_rx) = mpsc::channel(4);
+        let (other_id, other_dropped, _other_live) = table
+            .lock()
+            .expect("table")
+            .allocate(other_reply_tx)
+            .expect("allocate second session");
+        assert_ne!(other_id, session.session_id);
+
+        assert_eq!(session.take_dropped_replies(), 0);
+        {
+            let guard = table.lock().expect("table");
+            let (tx, dropped) = guard.reply_target(session.session_id).expect("session");
+            drop(tx);
+            dropped.fetch_add(2, Ordering::Relaxed);
+        }
+        // Another session's drops must not be attributed to this one.
+        other_dropped.fetch_add(5, Ordering::Relaxed);
+
+        assert_eq!(session.take_dropped_replies(), 2);
+        assert_eq!(
+            session.take_dropped_replies(),
+            0,
+            "the count is consumed by the reader"
+        );
+        assert_eq!(other_dropped.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
     async fn send_owned_rejects_empty_oversize_and_closed_sessions() {
         let (mut session, mut rx, table) = new_test_session();
         let dest = test_dest(false);
@@ -845,6 +1056,58 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn close_then_drop_keeps_a_reused_id() {
+        let (session, _outbound, table) = new_test_session();
+        let stale_id = session.session_id;
+        let stale_live = Arc::clone(&session.live);
+
+        // `close()` removes the id; its `Drop` repeats the removal afterwards.
+        session.close().await.expect("close");
+
+        // The mux hands the same numeric id to a fresh session.
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        let reused_live = {
+            let mut guard = table.lock().expect("table");
+            guard.next_id = stale_id;
+            let (id, _dropped, live) = guard.allocate(reply_tx).expect("reused session");
+            assert_eq!(id, stale_id, "the test must reuse the same id");
+            live
+        };
+
+        // A stale handle, as a late `Drop` would hold, must not touch it.
+        assert!(
+            !table
+                .lock()
+                .expect("table")
+                .remove_if_same(stale_id, &stale_live),
+            "a stale live handle must not remove the reused session"
+        );
+        assert!(
+            reused_live.load(Ordering::Acquire),
+            "the reused session must stay live"
+        );
+        assert!(
+            table
+                .lock()
+                .expect("table")
+                .remove_if_same(stale_id, &reused_live),
+            "the owning handle must still remove its own session"
+        );
+        assert!(!reused_live.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn session_liveness_flips_without_reading_the_table() {
+        let (session, _rx, table) = new_test_session();
+        assert!(session.is_live());
+        table.lock().expect("table").remove(session.session_id);
+        assert!(
+            !session.is_live(),
+            "removal must clear the live flag, not the table entry only"
+        );
     }
 
     #[tokio::test]
