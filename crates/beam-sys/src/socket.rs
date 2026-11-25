@@ -57,6 +57,27 @@ pub fn set_tcp_keepalive(fd: RawFd, idle: Duration, interval: Duration) -> io::R
     setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)
 }
 
+/// Sets `TCP_KEEPCNT`, the number of unanswered keepalive probes after which
+/// the kernel drops the connection.
+///
+/// The count is applied only as a tuning hint: keepalive stays disabled until
+/// [`set_tcp_keepalive`] enables `SO_KEEPALIVE`. A zero count is rejected.
+pub fn set_tcp_keepcnt(fd: RawFd, count: u32) -> io::Result<()> {
+    let count = libc::c_int::try_from(count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TCP keepalive count does not fit in c_int",
+        )
+    })?;
+    if count <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TCP keepalive count must be positive",
+        ));
+    }
+    setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, count)
+}
+
 /// Sets `TCP_USER_TIMEOUT` on `fd`.
 ///
 /// The timeout is expressed in milliseconds as a positive `c_int`. Zero
@@ -219,7 +240,7 @@ fn setsockopt_int(
 mod tests {
     use super::{
         AcceptError, get_ipv6_v6only, get_tcp_maxseg, getsockopt_int, set_reuse_addr,
-        set_tcp_keepalive, set_tcp_maxseg, set_tcp_nodelay, set_tcp_user_timeout,
+        set_tcp_keepalive, set_tcp_keepcnt, set_tcp_maxseg, set_tcp_nodelay, set_tcp_user_timeout,
         set_udp_recv_buffer,
     };
     use std::io;
@@ -298,6 +319,19 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn keepcnt_round_trips_and_rejects_zero() {
+        let (client, _server) = loopback_pair();
+
+        set_tcp_keepcnt(client.as_raw_fd(), 4).unwrap();
+        let observed =
+            getsockopt_int(client.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_KEEPCNT).unwrap();
+        assert_eq!(observed, 4);
+
+        let error = set_tcp_keepcnt(client.as_raw_fd(), 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
