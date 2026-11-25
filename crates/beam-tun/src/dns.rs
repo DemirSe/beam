@@ -743,12 +743,24 @@ pub fn matches_domain_suffix(qname: &str, suffix: &str) -> bool {
     q.len() > s.len() && q.ends_with(&s) && q.as_bytes()[q.len() - s.len() - 1] == b'.'
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CacheKey {
-    qname: String,
+/// Non-name part of a [`DnsCache`] key: the `qname` lives in the outer
+/// `HashMap<String, _>` so lookups borrow it as `&str` with zero allocation,
+/// while this `Copy` remainder keys the small inner map by value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CacheRest {
     qtype: u16,
     qclass: u16,
     dnssec_ok: bool,
+}
+
+impl CacheRest {
+    fn of(query: &DnsQuery) -> Self {
+        Self {
+            qtype: query.qtype,
+            qclass: query.qclass,
+            dnssec_ok: query.dnssec_ok,
+        }
+    }
 }
 
 struct CacheEntry {
@@ -761,10 +773,15 @@ struct CacheEntry {
 }
 
 /// Bounded LRU + TTL DNS response cache.
+///
+/// Two-level index: the outer map is keyed by `qname`, so [`DnsCache::get`]
+/// borrows the query name as `&str` with zero allocation on the hot hit path;
+/// only [`DnsCache::insert`] (the miss path) clones the name it must store.
 pub struct DnsCache {
     max_entries: usize,
     seq: u64,
-    entries: HashMap<CacheKey, CacheEntry>,
+    len: usize,
+    entries: HashMap<String, HashMap<CacheRest, CacheEntry>>,
 }
 
 impl DnsCache {
@@ -774,6 +791,7 @@ impl DnsCache {
         Self {
             max_entries: cap,
             seq: 0,
+            len: 0,
             entries: HashMap::with_capacity(cap.min(256)),
         }
     }
@@ -786,21 +804,25 @@ impl DnsCache {
         if self.max_entries == 0 {
             return None;
         }
-        let key = CacheKey {
-            qname: query.qname.clone(),
-            qtype: query.qtype,
-            qclass: query.qclass,
-            dnssec_ok: query.dnssec_ok,
-        };
+        // Zero-allocation borrowed lookup: `String: Borrow<str>` for the outer
+        // map, `Copy` key by value for the inner map.
+        let rest = CacheRest::of(query);
         let expired = self
             .entries
-            .get(&key)
+            .get(query.qname.as_str())
+            .and_then(|inner| inner.get(&rest))
             .is_some_and(|entry| now >= entry.expires_at);
         if expired {
-            self.entries.remove(&key);
+            if let Some(inner) = self.entries.get_mut(query.qname.as_str()) {
+                inner.remove(&rest);
+                self.len = self.len.saturating_sub(1);
+                if inner.is_empty() {
+                    self.entries.remove(query.qname.as_str());
+                }
+            }
             return None;
         }
-        let entry = self.entries.get_mut(&key)?;
+        let entry = self.entries.get_mut(query.qname.as_str())?.get_mut(&rest)?;
         self.seq = self.seq.wrapping_add(1);
         entry.last_used = self.seq;
         Some(Arc::clone(&entry.wire))
@@ -819,27 +841,46 @@ impl DnsCache {
         if self.max_entries == 0 || wire.len() < 12 || wire.len() > MAX_DOH_RESPONSE_BYTES {
             return;
         }
-        let key = CacheKey {
-            qname: query.qname.clone(),
-            qtype: query.qtype,
-            qclass: query.qclass,
-            dnssec_ok: query.dnssec_ok,
-        };
-        if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
-            self.entries.retain(|_, v| now < v.expires_at);
-            if self.entries.len() >= self.max_entries
-                && let Some(oldest_key) = self
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, v)| v.last_used)
-                    .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&oldest_key);
+        let rest = CacheRest::of(query);
+        let exists = self
+            .entries
+            .get(query.qname.as_str())
+            .is_some_and(|inner| inner.contains_key(&rest));
+        if !exists && self.len >= self.max_entries {
+            self.entries.retain(|_, inner| {
+                inner.retain(|_, v| now < v.expires_at);
+                !inner.is_empty()
+            });
+            self.len = self.entries.values().map(HashMap::len).sum();
+            if self.len >= self.max_entries {
+                let mut oldest_name: Option<String> = None;
+                let mut oldest_rest = rest;
+                let mut oldest_used = u64::MAX;
+                for (name, inner) in &self.entries {
+                    for (r, entry) in inner {
+                        if entry.last_used < oldest_used {
+                            oldest_used = entry.last_used;
+                            oldest_name = Some(name.clone());
+                            oldest_rest = *r;
+                        }
+                    }
+                }
+                if let Some(name) = oldest_name
+                    && let Some(inner) = self.entries.get_mut(name.as_str())
+                {
+                    inner.remove(&oldest_rest);
+                    self.len = self.len.saturating_sub(1);
+                    if inner.is_empty() {
+                        self.entries.remove(name.as_str());
+                    }
+                }
             }
         }
         self.seq = self.seq.wrapping_add(1);
-        self.entries.insert(
-            key,
+        let inner = self.entries.entry(query.qname.clone()).or_default();
+        let is_new = !inner.contains_key(&rest);
+        inner.insert(
+            rest,
             CacheEntry {
                 wire,
                 expires_at: now + Duration::from_secs(u64::from(ttl_secs)),
@@ -847,16 +888,24 @@ impl DnsCache {
                 is_local,
             },
         );
+        if is_new {
+            self.len += 1;
+        }
     }
 
     /// Evicts local-network DNS entries (called on network/gateway switches).
     pub fn clear_local(&mut self) {
-        self.entries.retain(|_, v| !v.is_local);
+        self.entries.retain(|_, inner| {
+            inner.retain(|_, v| !v.is_local);
+            !inner.is_empty()
+        });
+        self.len = self.entries.values().map(HashMap::len).sum();
     }
 
     /// Clears all cached entries.
     pub fn clear_all(&mut self) {
         self.entries.clear();
+        self.len = 0;
     }
 }
 
@@ -1256,8 +1305,15 @@ fn dns_xudp_config() -> XudpClientConfig {
 
 /// Non-blocking DNS interceptor embedded in `beam-tun`'s engine loop.
 pub struct DnsInterceptor {
-    client_config: BeamClientConfig,
-    dns_config: DnsConfig,
+    // `Arc`-shared so a cache miss clones two pointers instead of copying up
+    // to 512 `String`s (`local_suffixes` + `bypass_domains`) and the whole
+    // `BeamClientConfig` on every miss.
+    client_config: Arc<BeamClientConfig>,
+    dns_config: Arc<DnsConfig>,
+    /// Pre-formatted static DoH request prefix (`None` for non-DoH upstreams).
+    /// Embeds the secret DoH path: never log it or expose it via
+    /// `Debug`/`Display` (this type implements neither).
+    doh_prefix: Option<Arc<[u8]>>,
     local_upstream: Arc<Mutex<Option<SocketAddr>>>,
     tls_config: Arc<ClientConfig>,
     doh_pool: Arc<DohPool>,
@@ -1311,11 +1367,19 @@ impl DnsInterceptor {
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
         );
+        let doh_prefix = match &dns_config.upstream {
+            DnsUpstream::Doh { host, port, path } => {
+                let host_header = format_http_host_header(host, *port);
+                Some(build_doh_request_prefix(path, &host_header))
+            }
+            _ => None,
+        };
         let cache = Arc::new(Mutex::new(DnsCache::new(dns_config.cache_size)));
         let local_upstream = Arc::new(Mutex::new(dns_config.local_upstream));
         Self {
-            client_config,
-            dns_config,
+            client_config: Arc::new(client_config),
+            dns_config: Arc::new(dns_config),
+            doh_prefix,
             local_upstream,
             tls_config,
             doh_pool: Arc::new(DohPool::default()),
@@ -1500,8 +1564,10 @@ impl DnsInterceptor {
         self.counters.misses.incr();
 
         let wire_owned = wire.to_vec();
-        let client_cfg = self.client_config.clone();
-        let dns_cfg = self.dns_config.clone();
+        // Two `Arc` clones: no `String` or `BeamClientConfig` copies per miss.
+        let client_cfg = Arc::clone(&self.client_config);
+        let dns_cfg = Arc::clone(&self.dns_config);
+        let doh_prefix = self.doh_prefix.clone();
         let tls_cfg = Arc::clone(&self.tls_config);
         let doh_pool = Arc::clone(&self.doh_pool);
         let tcp_pool = Arc::clone(&self.tcp_pool);
@@ -1543,6 +1609,7 @@ impl DnsInterceptor {
                     &udp_mux_pool,
                     &wire_owned,
                     dns_cfg.query_timeout,
+                    doh_prefix.as_deref(),
                 )
                 .await
             };
@@ -1790,11 +1857,15 @@ async fn resolve_tunneled(
     udp_mux_pool: &Arc<UdpDnsMuxPool>,
     query: &[u8],
     query_timeout: Duration,
+    doh_prefix: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
     timeout(query_timeout, async {
         match upstream {
             DnsUpstream::Doh { host, port, path } => {
-                resolve_doh_over_beam(client_cfg, tls_cfg, doh_pool, host, *port, path, query).await
+                resolve_doh_over_beam(
+                    client_cfg, tls_cfg, doh_pool, host, *port, path, doh_prefix, query,
+                )
+                .await
             }
             DnsUpstream::PlainTcp(addr) => {
                 resolve_tcp_over_beam(client_cfg, tcp_pool, *addr, query).await
@@ -1982,22 +2053,59 @@ async fn resolve_udp_over_beam(
     }
 }
 
+/// Trailing half of a DoH HTTP/1.1 request after the `Content-Length` value.
+const DOH_REQUEST_SUFFIX: &[u8] = b"\r\nConnection: keep-alive\r\n\r\n";
+
+/// Builds the static leading half of a DoH HTTP/1.1 request, up to (but not
+/// including) the `Content-Length` value. Pre-formatted once per interceptor
+/// so a cache miss never re-allocates the header prefix.
+///
+/// The bytes embed the secret DoH `path`: never log them, and never expose
+/// them via `Debug`/`Display` ([`DnsUpstream`] redacts the path everywhere).
+fn build_doh_request_prefix(path: &str, host_header: &str) -> Arc<[u8]> {
+    let mut prefix = Vec::with_capacity(path.len() + host_header.len() + 128);
+    prefix.extend_from_slice(b"POST ");
+    prefix.extend_from_slice(path.as_bytes());
+    prefix.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    prefix.extend_from_slice(host_header.as_bytes());
+    prefix.extend_from_slice(
+        b"\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: ",
+    );
+    Arc::from(prefix)
+}
+
+/// Formats `len` as decimal ASCII into `buf` without allocating; returns the
+/// used tail. `buf` must hold at least 20 bytes (`u64::MAX` is 20 digits), so
+/// the indexing below can never run out of bounds for any `usize` value.
+fn decimal_len_bytes(len: usize, buf: &mut [u8; 20]) -> &[u8] {
+    let mut idx = buf.len();
+    if len == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+        return &buf[idx..];
+    }
+    let mut n = len;
+    while n > 0 {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    &buf[idx..]
+}
+
 async fn send_doh_http_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
-    host_header: &str,
-    path: &str,
+    prefix: &[u8],
     query: &[u8],
 ) -> io::Result<(Vec<u8>, bool)> {
-    let req = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: {host_header}\r\n\
-         Content-Type: application/dns-message\r\n\
-         Accept: application/dns-message\r\n\
-         Content-Length: {}\r\n\
-         Connection: keep-alive\r\n\r\n",
-        query.len()
-    );
-    stream.write_all(req.as_bytes()).await?;
+    // The static header prefix is pre-formatted per interceptor; only the
+    // decimal `Content-Length` (stack buffer, no allocation) varies per query.
+    stream.write_all(prefix).await?;
+    let mut len_buf = [0u8; 20];
+    stream
+        .write_all(decimal_len_bytes(query.len(), &mut len_buf))
+        .await?;
+    stream.write_all(DOH_REQUEST_SUFFIX).await?;
     stream.write_all(query).await?;
     stream.flush().await?;
     read_doh_http_response_keepalive(stream).await
@@ -2029,6 +2137,7 @@ async fn dial_doh_stream(
     connector.connect(server_name, beam_stream).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_doh_over_beam(
     client_cfg: &BeamClientConfig,
     tls_cfg: &Arc<ClientConfig>,
@@ -2036,9 +2145,20 @@ async fn resolve_doh_over_beam(
     host: &str,
     port: u16,
     path: &str,
+    prefix: Option<&[u8]>,
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let host_header = format_http_host_header(host, port);
+    // Fast path: reuse the interceptor-wide pre-formatted header prefix, so a
+    // cache miss performs zero header allocations. The fallback rebuilds the
+    // prefix only when none was supplied (e.g. direct unit-test use).
+    let owned_prefix: Arc<[u8]>;
+    let prefix: &[u8] = match prefix {
+        Some(cached) => cached,
+        None => {
+            owned_prefix = build_doh_request_prefix(path, &format_http_host_header(host, port));
+            &owned_prefix
+        }
+    };
 
     // Bounded slot held across `take -> (dial if empty) -> request I/O ->
     // put`: at most `MAX_DOH_POOL_SIZE` concurrent REALITY+TLS handshakes,
@@ -2058,7 +2178,7 @@ async fn resolve_doh_over_beam(
             (tls, fresh_gen, false)
         }
     };
-    match send_doh_http_request(&mut tls, &host_header, path, query).await {
+    match send_doh_http_request(&mut tls, prefix, query).await {
         Ok((body, reusable)) => {
             if reusable {
                 doh_pool.put(tls, dial_gen, Instant::now());
@@ -2071,7 +2191,7 @@ async fn resolve_doh_over_beam(
             // returned concurrently is reused instead of dialing.
             let (pooled2, gen2) = doh_pool.take(Instant::now());
             if let Some(mut retry) = pooled2 {
-                match send_doh_http_request(&mut retry, &host_header, path, query).await {
+                match send_doh_http_request(&mut retry, prefix, query).await {
                     Ok((body, reusable)) => {
                         if reusable {
                             doh_pool.put(retry, gen2, Instant::now());
@@ -2085,8 +2205,7 @@ async fn resolve_doh_over_beam(
             }
             let fresh_gen = doh_pool.generation();
             let mut fresh = dial_doh_stream(client_cfg, tls_cfg, host, port).await?;
-            let (body, reusable) =
-                send_doh_http_request(&mut fresh, &host_header, path, query).await?;
+            let (body, reusable) = send_doh_http_request(&mut fresh, prefix, query).await?;
             if reusable {
                 doh_pool.put(fresh, fresh_gen, Instant::now());
             }
@@ -3196,13 +3315,14 @@ mod tests {
             }
         });
 
-        let (got1, reusable1) = send_doh_http_request(&mut client, "1.1.1.1", "/dns-query", &q1)
+        let prefix = build_doh_request_prefix("/dns-query", "1.1.1.1");
+        let (got1, reusable1) = send_doh_http_request(&mut client, &prefix, &q1)
             .await
             .expect("req1");
         assert_eq!(got1, r1);
         assert!(reusable1, "keep-alive response must be marked reusable");
 
-        let (got2, reusable2) = send_doh_http_request(&mut client, "1.1.1.1", "/dns-query", &q2)
+        let (got2, reusable2) = send_doh_http_request(&mut client, &prefix, &q2)
             .await
             .expect("req2");
         assert_eq!(got2, r2);
@@ -4091,5 +4211,90 @@ mod tests {
             fired <= MAX_BYPASS_REFIRE_INFLIGHT,
             "50 cache hits must not fork-storm: {fired} installs, bound is {MAX_BYPASS_REFIRE_INFLIGHT}"
         );
+    }
+
+    #[test]
+    fn borrowed_cache_lookup_has_hit_miss_eviction_parity() {
+        let mut cache = DnsCache::new(2);
+        let t0 = Instant::now();
+        let q_a = parse_dns_query(&build_query(0x1111, "parity.example", 1)).expect("q");
+        let q_aaaa = parse_dns_query(&build_query(0x2222, "parity.example", 28)).expect("q");
+        let q_c = parse_dns_query(&build_query(0x3333, "other.example", 1)).expect("q");
+        cache.insert(
+            &q_a,
+            Arc::from(build_a_response(
+                &build_query(0x1111, "parity.example", 1),
+                Ipv4Addr::new(1, 1, 1, 1),
+                30,
+            )),
+            30,
+            false,
+            t0,
+        );
+        cache.insert(
+            &q_aaaa,
+            Arc::from(build_a_response(
+                &build_query(0x2222, "parity.example", 28),
+                Ipv4Addr::new(1, 1, 1, 1),
+                30,
+            )),
+            30,
+            false,
+            t0,
+        );
+        // Same name but different type/class/DO bit are distinct entries.
+        assert!(cache.get(&q_a, t0).is_some());
+        assert!(cache.get(&q_aaaa, t0).is_some());
+        let mut q_other_class = q_a.clone();
+        q_other_class.qclass = 3;
+        assert!(cache.get(&q_other_class, t0).is_none());
+        let mut q_other_name = q_a.clone();
+        q_other_name.qname = "elsewhere.example".to_owned();
+        assert!(cache.get(&q_other_name, t0).is_none());
+        // Misses insert nothing; `q_a` was refreshed first, so inserting a
+        // third name evicts the older `q_a` entry.
+        cache.insert(
+            &q_c,
+            Arc::from(build_a_response(
+                &build_query(0x3333, "other.example", 1),
+                Ipv4Addr::new(3, 3, 3, 3),
+                30,
+            )),
+            30,
+            false,
+            t0,
+        );
+        assert!(cache.get(&q_a, t0).is_none());
+        assert!(cache.get(&q_aaaa, t0).is_some());
+        assert!(cache.get(&q_c, t0).is_some());
+        // Expired entries miss and are removed.
+        assert!(cache.get(&q_c, t0 + Duration::from_secs(31)).is_none());
+    }
+
+    #[test]
+    fn doh_prefixed_request_matches_legacy_format_byte_for_byte() {
+        for (host, port, path) in [
+            ("dns.nextdns.io", 443, "/abc123"),
+            ("1.1.1.1", 8443, "/dns-query"),
+            ("2606:4700:4700::1111", 443, "/dns-query"),
+        ] {
+            let host_header = format_http_host_header(host, port);
+            let prefix = build_doh_request_prefix(path, &host_header);
+            for len in [0usize, 12, 33, 512, 1232] {
+                let query = vec![0xABu8; len];
+                let mut expected = format!(
+                    "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {len}\r\nConnection: keep-alive\r\n\r\n"
+                )
+                .into_bytes();
+                expected.extend_from_slice(&query);
+                let mut assembled = Vec::with_capacity(prefix.len() + 8 + len);
+                assembled.extend_from_slice(&prefix);
+                let mut len_buf = [0u8; 20];
+                assembled.extend_from_slice(decimal_len_bytes(len, &mut len_buf));
+                assembled.extend_from_slice(DOH_REQUEST_SUFFIX);
+                assembled.extend_from_slice(&query);
+                assert_eq!(assembled, expected, "host={host} port={port} len={len}");
+            }
+        }
     }
 }
