@@ -135,6 +135,8 @@ pub struct DnsCounters {
     pub loop_guard: Counter,
     /// Replies dropped because the `tun_tx` channel was full.
     pub tun_tx_dropped: Counter,
+    /// Queries rejected because `parse_dns_query` returned `None`.
+    pub dropped_malformed: Counter,
 }
 
 /// Immutable snapshot of [`DnsCounters`].
@@ -148,6 +150,7 @@ pub struct DnsSnapshot {
     pub timeout: u64,
     pub loop_guard: u64,
     pub tun_tx_dropped: u64,
+    pub dropped_malformed: u64,
 }
 
 impl DnsCounters {
@@ -162,6 +165,7 @@ impl DnsCounters {
             timeout: self.timeout.get(),
             loop_guard: self.loop_guard.get(),
             tun_tx_dropped: self.tun_tx_dropped.get(),
+            dropped_malformed: self.dropped_malformed.get(),
         }
     }
 }
@@ -170,7 +174,7 @@ impl DnsSnapshot {
     /// Compact `key:value` form for the `beam-client` status file.
     pub fn as_status_value(&self) -> String {
         format!(
-            "hits:{},misses:{},sf_busy:{},sf_upstream:{},sf_mismatch:{},timeout:{},loop:{},tun_tx_dropped:{}",
+            "hits:{},misses:{},sf_busy:{},sf_upstream:{},sf_mismatch:{},timeout:{},loop:{},tun_tx_dropped:{},malformed:{}",
             self.hits,
             self.misses,
             self.servfail_concurrency,
@@ -178,7 +182,8 @@ impl DnsSnapshot {
             self.servfail_mismatch,
             self.timeout,
             self.loop_guard,
-            self.tun_tx_dropped
+            self.tun_tx_dropped,
+            self.dropped_malformed
         )
     }
 }
@@ -212,8 +217,11 @@ mod tests {
         let dns = DnsCounters::default();
         dns.hits.incr();
         dns.timeout.add(3);
+        dns.dropped_malformed.incr();
         assert_eq!(dns.snapshot().hits, 1);
         assert_eq!(dns.snapshot().timeout, 3);
+        assert_eq!(dns.snapshot().dropped_malformed, 1);
         assert!(dns.snapshot().as_status_value().contains("timeout:3"));
+        assert!(dns.snapshot().as_status_value().contains("malformed:1"));
     }
 }

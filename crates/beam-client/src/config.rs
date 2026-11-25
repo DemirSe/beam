@@ -612,6 +612,21 @@ mod tests {
     }
 
     #[test]
+    fn tun_drop_private_destinations_propagates_to_route_policy() {
+        // The example omits the key, so the default stays `true` (drop).
+        let cfg = ClientFileConfig::parse_and_validate(EXAMPLE).expect("example config valid");
+        assert!(cfg.engine.route.drop_private_destinations);
+
+        // Explicit `false` routes private/LAN traffic through the tunnel.
+        let raw = EXAMPLE.replace(
+            "reject_ipv6 = false",
+            "reject_ipv6 = false\ndrop_private_destinations = false",
+        );
+        let cfg = ClientFileConfig::parse_and_validate(&raw).expect("drop_private=false valid");
+        assert!(!cfg.engine.route.drop_private_destinations);
+    }
+
+    #[test]
     fn rejects_unknown_field() {
         let bad = format!("{EXAMPLE}\nunknown_key = 1\n");
         assert!(ClientFileConfig::parse_and_validate(&bad).is_err());

@@ -323,6 +323,12 @@ client reports this state while a new dial failure is no more than 20 s old, and
 only after three consecutive failures. A gap of more than 30 s between failures
 starts a new failure count.
 
+The tray turns these keys into a degraded warning: `state=connected` with
+`bypass_ok=0` shows `Beam: degraded (bypass missing)`, and `state=degraded`
+shows `Beam: degraded (dial failures)` when `reason=dial_failures` (or a
+non-zero `dial_failures` count). The tray returns to green `Beam: connected`
+automatically once the status file reports healthy again.
+
 The `drops` value holds `key:value` pairs. The keys are `tun_tx_full`,
 `ip_parse`, `frag`, `route`, `tcp_limit`, `udp_sess_q`, `udp_pending`,
 `udp_payload`, and `udp_sess_tbl`. `tcp_limit` counts new TCP flows that the

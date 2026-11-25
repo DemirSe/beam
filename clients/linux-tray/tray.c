@@ -1,8 +1,11 @@
 /*
  * beam-tray: minimal Linux tray for the beam client.
  *
- * The tray is deliberately small: it reports whether sbtun0 is present and
- * calls the fixed-command root helper to bring the tunnel up or down.
+ * The tray is deliberately small: it reports whether beamtun0 (native) or
+ * sbtun0 (legacy) is present and calls the fixed-command root helper to
+ * bring the tunnel up or down. It also surfaces the beam-client status file
+ * (`/run/beam-client/status`), including degraded states when bypass routes
+ * are missing or authenticated dials keep failing.
  * DNS switching lives in beam-helper, not in the GUI.
  */
 
@@ -146,7 +149,9 @@ static int tunnel_present(void)
     return native_tunnel_present() || if_nametoindex(TUN_IFACE_LEGACY) != 0;
 }
 
-static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
+static int read_client_status(char *state_out, size_t state_cap, long *rtt_out,
+                              int *bypass_ok_out, char *reason_out, size_t reason_cap,
+                              long *dial_failures_out)
 {
     FILE *fp;
     /* Wide enough for the longest status line (`drops=...`) without splitting it
@@ -158,6 +163,11 @@ static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
 
     state_out[0] = '\0';
     *rtt_out = -1;
+    /* Unknown/absent keys mean healthy so older status files keep working. */
+    *bypass_ok_out = 1;
+    if (reason_cap > 0)
+        reason_out[0] = '\0';
+    *dial_failures_out = 0;
 
     fp = fopen(STATUS_FILE, "r");
     if (!fp)
@@ -193,6 +203,26 @@ static int read_client_status(char *state_out, size_t state_cap, long *rtt_out)
             if (errno == 0 && end != line + 4 && *end == '\0' && val > 0 &&
                 (long long)(pid_t)val == val)
                 pid = (pid_t)val;
+        } else if (strncmp(line, "bypass_ok=", 10) == 0) {
+            char *end = NULL;
+            errno = 0;
+            long val = strtol(line + 10, &end, 10);
+            if (errno == 0 && end != line + 10 && *end == '\0' && (val == 0 || val == 1))
+                *bypass_ok_out = (int)val;
+        } else if (strncmp(line, "reason=", 7) == 0) {
+            size_t copy_len = strlen(line + 7);
+            if (reason_cap > 0) {
+                if (copy_len >= reason_cap)
+                    copy_len = reason_cap - 1;
+                memcpy(reason_out, line + 7, copy_len);
+                reason_out[copy_len] = '\0';
+            }
+        } else if (strncmp(line, "dial_failures=", 14) == 0) {
+            char *end = NULL;
+            errno = 0;
+            long val = strtol(line + 14, &end, 10);
+            if (errno == 0 && end != line + 14 && *end == '\0' && val >= 0)
+                *dial_failures_out = val;
         }
     }
     fclose(fp);
@@ -213,8 +243,11 @@ static void update_ui(void)
     int connected = native_up || if_nametoindex(TUN_IFACE_LEGACY) != 0;
     int cooling = time(NULL) < g_cooldown_until;
     char state[32];
+    char reason[32];
     char label[96];
     long rtt_ms = -1;
+    long dial_failures = 0;
+    int bypass_ok = 1;
     const char *icon = connected ? "network-vpn-symbolic" : "network-vpn-disconnected-symbolic";
     const char *desc = connected ? "Interface up" : "Disconnected";
 
@@ -226,8 +259,23 @@ static void update_ui(void)
 
     if (g_helper_failed) {
         set_status_label("Beam: error");
-    } else if (native_up && read_client_status(state, sizeof(state), &rtt_ms)) {
-        if (strcmp(state, "connected") == 0) {
+    } else if (native_up && read_client_status(state, sizeof(state), &rtt_ms,
+                                              &bypass_ok, reason, sizeof(reason),
+                                              &dial_failures)) {
+        if (strcmp(state, "connected") == 0 && !bypass_ok) {
+            snprintf(label, sizeof(label), "Beam: degraded (bypass missing)");
+            icon = "network-vpn-acquiring-symbolic";
+            desc = "Degraded: bypass routes missing";
+        } else if (strcmp(state, "degraded") == 0) {
+            if (strcmp(reason, "dial_failures") == 0 || dial_failures > 0)
+                snprintf(label, sizeof(label), "Beam: degraded (dial failures)");
+            else if (reason[0] != '\0')
+                snprintf(label, sizeof(label), "Beam: degraded (%s)", reason);
+            else
+                snprintf(label, sizeof(label), "Beam: degraded");
+            icon = "network-vpn-acquiring-symbolic";
+            desc = "Degraded";
+        } else if (strcmp(state, "connected") == 0) {
             if (rtt_ms >= 0)
                 snprintf(label, sizeof(label), "Beam: connected (%ld ms)", rtt_ms);
             else
