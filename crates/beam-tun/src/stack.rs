@@ -11,6 +11,8 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc};
 
+use crate::stats::DropCounters;
+
 const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
 const DEFAULT_TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
@@ -157,6 +159,11 @@ pub trait NetStack: Send + 'static {
     /// and closing relay channels) on network/gateway transitions so local
     /// applications reconnect immediately instead of hanging on dead sockets.
     fn reset_all(&mut self, _tx_out: &mut Vec<Vec<u8>>) {}
+
+    /// Attaches the engine drop counters so the stack can report silent drops
+    /// (for example an overflowing receive queue). Implementations that cannot
+    /// drop silently keep the default no-op.
+    fn set_drop_counters(&mut self, _drops: Arc<DropCounters>) {}
 }
 
 /// Async TCP stream bridged to a [`NetStack`] socket.
@@ -204,6 +211,37 @@ impl TunTcpReader {
     /// Returns `true` if another chunk is already buffered in the channel.
     pub fn has_queued(&self) -> bool {
         !self.from_stack.is_empty()
+    }
+}
+
+/// Releases the in-flight accounting of chunks that were queued for a relay but
+/// will never be read, so dropping a relay cannot leave the advertised TCP
+/// receive window shrunken for the rest of the flow.
+fn release_queued_in_flight(
+    from_stack: &mut mpsc::Receiver<Vec<u8>>,
+    in_flight_relay: Option<&Arc<AtomicUsize>>,
+) -> bool {
+    let Some(counter) = in_flight_relay else {
+        return false;
+    };
+    let mut freed = 0usize;
+    while let Ok(chunk) = from_stack.try_recv() {
+        freed = freed.saturating_add(chunk.len());
+    }
+    if freed == 0 {
+        return false;
+    }
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+        Some(cur.saturating_sub(freed))
+    });
+    true
+}
+
+impl Drop for TunTcpReader {
+    fn drop(&mut self) {
+        if release_queued_in_flight(&mut self.from_stack, self.in_flight_relay.as_ref()) {
+            wake_stack(&self.waker, self.flow_waker.as_ref());
+        }
     }
 }
 
@@ -438,7 +476,11 @@ impl AsyncWrite for TunTcpStream {
 
 impl Drop for TunTcpStream {
     fn drop(&mut self) {
-        if self.to_stack.take().is_some() {
+        let mut woken = self.to_stack.take().is_some();
+        if release_queued_in_flight(&mut self.from_stack, self.in_flight_relay.as_ref()) {
+            woken = true;
+        }
+        if woken {
             wake_stack(&self.waker, self.flow_waker.as_ref());
         }
     }

@@ -4,7 +4,8 @@
 //! lock-free counters classify each silent drop by reason (#165).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use beam_core::address::{Address, NetLocation};
@@ -12,10 +13,11 @@ use beam_core::client::BeamClientConfig;
 use beam_core::reality::RealityClientConfig;
 use beam_tun::device::{MemoryTun, TunDevice};
 use beam_tun::{
-    BypassCidrs, ExcludeIps, IpNet, ProxyTcpStack, RoutePolicy, TcpStackConfig, TunEngineConfig,
-    TunnelActivity, UdpBridgeConfig, run_tun_engine_with_activity,
+    AcceptedTcpStream, BypassCidrs, DropCounters, ExcludeIps, IpNet, NetStack, ProxyTcpStack,
+    RoutePolicy, TcpStackConfig, TunEngineConfig, TunnelActivity, UdpBridgeConfig,
+    run_tun_engine_with_activity,
 };
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::time::timeout;
 
 /// Sends one raw packet into the virtual host side of the TUN pair.
@@ -237,6 +239,85 @@ async fn open_tcp_flow(host_tun: &mut MemoryTun, src_port: u16, iss: u32) {
         ),
     )
     .await;
+}
+
+#[tokio::test]
+async fn engine_shares_its_drop_counters_with_the_tcp_stack() {
+    /// Stack that keeps the counters the engine attaches.
+    struct CounterProbeStack {
+        attached: Arc<AtomicBool>,
+        shared: Arc<Mutex<Option<Arc<DropCounters>>>>,
+        waker: Arc<Notify>,
+    }
+
+    impl NetStack for CounterProbeStack {
+        fn push_ip_tcp(&mut self, _packet: &[u8]) {}
+
+        fn poll(
+            &mut self,
+            _now_ms: i64,
+            _tx_out: &mut Vec<Vec<u8>>,
+            _accepted: &mut Vec<AcceptedTcpStream>,
+        ) {
+        }
+
+        fn poll_delay_ms(&mut self, _now_ms: i64) -> Option<u64> {
+            Some(1_000)
+        }
+
+        fn waker(&self) -> Arc<Notify> {
+            Arc::clone(&self.waker)
+        }
+
+        fn set_drop_counters(&mut self, drops: Arc<DropCounters>) {
+            if let Ok(mut slot) = self.shared.lock() {
+                *slot = Some(drops);
+            }
+            self.attached.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let (engine_tun, _host_tun) = MemoryTun::pair(1500, 8);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let activity = Arc::new(TunnelActivity::new());
+    let shared: Arc<Mutex<Option<Arc<DropCounters>>>> = Arc::new(Mutex::new(None));
+    let attached = Arc::new(AtomicBool::new(false));
+    let engine_task = tokio::spawn(run_tun_engine_with_activity(
+        engine_tun,
+        CounterProbeStack {
+            attached: Arc::clone(&attached),
+            shared: Arc::clone(&shared),
+            waker: Arc::new(Notify::new()),
+        },
+        engine_config(),
+        shutdown_rx,
+        Some(Arc::clone(&activity)),
+    ));
+
+    timeout(Duration::from_secs(5), async {
+        while !attached.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the engine must attach drop counters to the stack");
+
+    // The stack and the activity tracker must share one counter set, so a stack
+    // level drop is visible in the status snapshot.
+    let counters = {
+        let guard = shared.lock().expect("shared counters");
+        Arc::clone(guard.as_ref().expect("counters attached"))
+    };
+    counters.tcp_rx_overflow.incr();
+    counters.udp_mux_q.add(2);
+    let snapshot = activity.drop_snapshot();
+    assert_eq!(snapshot.tcp_rx_overflow, 1);
+    assert_eq!(snapshot.udp_mux_q, 2);
+    assert!(snapshot.as_status_value().contains("tcp_rx_ovf:1"));
+    assert!(snapshot.as_status_value().contains("udp_mux_q:2"));
+
+    let _ = shutdown_tx.send(true);
+    engine_task.await.expect("engine task").expect("engine ok");
 }
 
 #[tokio::test]

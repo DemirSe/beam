@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -85,6 +86,10 @@ pub enum XudpClientError {
         max: usize,
     },
 
+    /// The bounded outbound mux queue is full; the frame was not queued.
+    #[error("XUDP mux outbound queue is full")]
+    OutboundQueueFull,
+
     /// Frame encoding failed.
     #[error("XUDP frame error: {0}")]
     Frame(#[from] crate::xudp::XudpError),
@@ -104,6 +109,8 @@ struct SessionTable {
     sessions: HashMap<u16, mpsc::Sender<XudpReply>>,
     max_sessions: usize,
     closed: bool,
+    /// Replies the mux reader dropped because a session reply queue was full.
+    dropped_replies: Arc<AtomicU64>,
 }
 
 impl SessionTable {
@@ -113,7 +120,13 @@ impl SessionTable {
             sessions: HashMap::new(),
             max_sessions: max_sessions.max(1),
             closed: false,
+            dropped_replies: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Counts one inbound reply dropped by a full session reply queue.
+    fn note_dropped_reply(&self) {
+        self.dropped_replies.fetch_add(1, Ordering::Relaxed);
     }
 
     fn allocate(&mut self, tx: mpsc::Sender<XudpReply>) -> Result<u16, XudpClientError> {
@@ -313,10 +326,18 @@ impl XudpClient {
                                             t.sessions.get(&frame.session_id).cloned()
                                         });
                                         if let Some(tx) = tx {
-                                            let _ = tx.try_send(XudpReply {
+                                            match tx.try_send(XudpReply {
                                                 source: frame.destination,
                                                 payload: frame.payload.to_vec(),
-                                            });
+                                            }) {
+                                                Ok(()) => {}
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    if let Ok(t) = reader_table.lock() {
+                                                        t.note_dropped_reply();
+                                                    }
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                            }
                                         }
                                     }
                                 }
@@ -468,6 +489,43 @@ impl XudpSession {
         destination: NetLocation,
         payload: Vec<u8>,
     ) -> Result<(), XudpClientError> {
+        let frame = self.encode_owned(destination, payload)?;
+        self.outbound_tx
+            .send(frame)
+            .await
+            .map_err(|_| XudpClientError::Closed)?;
+        self.sent_new = true;
+        Ok(())
+    }
+
+    /// Non-blocking form of [`Self::send_owned`].
+    ///
+    /// Returns [`XudpClientError::OutboundQueueFull`] instead of waiting for the
+    /// mux writer, so a caller that drains inbound replies and sends outbound
+    /// datagrams in the same loop never blocks the reply path on the 256-frame
+    /// outbound queue.
+    pub fn try_send_owned(
+        &mut self,
+        destination: NetLocation,
+        payload: Vec<u8>,
+    ) -> Result<(), XudpClientError> {
+        let frame = self.encode_owned(destination, payload)?;
+        match self.outbound_tx.try_send(frame) {
+            Ok(()) => {
+                self.sent_new = true;
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(XudpClientError::OutboundQueueFull),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(XudpClientError::Closed),
+        }
+    }
+
+    /// Encodes one owned payload into a mux frame without queueing it.
+    fn encode_owned(
+        &self,
+        destination: NetLocation,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, XudpClientError> {
         if !self.is_live() {
             return Err(XudpClientError::Closed);
         }
@@ -499,12 +557,16 @@ impl XudpSession {
         frame.resize(body_len + header.len(), 0);
         frame.copy_within(0..body_len, header.len());
         frame[..header.len()].copy_from_slice(&header);
-        self.outbound_tx
-            .send(frame)
-            .await
-            .map_err(|_| XudpClientError::Closed)?;
-        self.sent_new = true;
-        Ok(())
+        Ok(frame)
+    }
+
+    /// Returns and clears the number of inbound replies the mux dropped for this
+    /// session because its reply queue was full.
+    pub fn take_dropped_replies(&self) -> u64 {
+        self.table
+            .lock()
+            .map(|t| t.dropped_replies.swap(0, Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Allocates a datagram buffer with [`FRAME_HEADER_RESERVE`] bytes of
@@ -800,6 +862,76 @@ mod tests {
         buf.extend_from_slice(payload);
         assert!(buf.capacity() >= payload.len() + FRAME_HEADER_RESERVE);
         buf
+    }
+
+    #[tokio::test]
+    async fn inbound_replies_flow_while_the_outbound_queue_is_full() {
+        let table = Arc::new(Mutex::new(SessionTable::new(4)));
+        let (reply_tx, reply_rx) = mpsc::channel(4);
+        reply_tx
+            .try_send(XudpReply {
+                source: None,
+                payload: b"pong".to_vec(),
+            })
+            .expect("queue reply");
+        let session_id = table
+            .lock()
+            .expect("session table")
+            .allocate(reply_tx)
+            .expect("allocate session");
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        outbound_tx.try_send(vec![0u8]).expect("prefill queue");
+        let mut session = XudpSession {
+            session_id,
+            default_dest: test_dest(false),
+            sent_new: false,
+            table,
+            outbound_tx,
+            reply_rx,
+        };
+
+        // The full mux queue must fail fast instead of stalling the caller, so
+        // the same task can keep draining inbound replies.
+        let err = session
+            .try_send_owned(test_dest(false), alloc_owned(b"ping"))
+            .expect_err("full outbound queue");
+        assert!(
+            matches!(err, XudpClientError::OutboundQueueFull),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !session.sent_new,
+            "a refused frame must not mark the session as opened"
+        );
+        assert!(outbound_rx.try_recv().is_ok());
+        assert!(outbound_rx.try_recv().is_err(), "nothing extra was queued");
+
+        let reply = session.recv().await.expect("inbound reply must arrive");
+        assert_eq!(reply.payload, b"pong");
+
+        // With room in the queue the same non-blocking send succeeds.
+        session
+            .try_send_owned(test_dest(true), alloc_owned(b"ping"))
+            .expect("queued after draining");
+        assert!(session.sent_new);
+        assert!(outbound_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn take_dropped_replies_reports_and_clears_mux_reply_drops() {
+        let (session, _rx, table) = new_test_session();
+        assert_eq!(session.take_dropped_replies(), 0);
+        {
+            let guard = table.lock().expect("table");
+            guard.note_dropped_reply();
+            guard.note_dropped_reply();
+        }
+        assert_eq!(session.take_dropped_replies(), 2);
+        assert_eq!(
+            session.take_dropped_replies(),
+            0,
+            "the count is consumed by the reader"
+        );
     }
 
     #[tokio::test]

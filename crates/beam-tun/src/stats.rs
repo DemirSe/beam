@@ -42,6 +42,10 @@ pub struct DropCounters {
     pub route: Counter,
     /// New TCP flow aborted with RST because `max_tcp_connections` was reached.
     pub tcp_limit: Counter,
+    /// TCP packet dropped because the stack RX queue was full.
+    pub tcp_rx_overflow: Counter,
+    /// UDP frame dropped by a full XUDP mux queue (outbound or inbound).
+    pub udp_mux_q: Counter,
     /// Per-session UDP send queue full.
     pub udp_session_queue_full: Counter,
     /// Pre-connect UDP queue full or cleared.
@@ -60,6 +64,8 @@ pub struct DropSnapshot {
     pub fragment: u64,
     pub route: u64,
     pub tcp_limit: u64,
+    pub tcp_rx_overflow: u64,
+    pub udp_mux_q: u64,
     pub udp_session_queue_full: u64,
     pub udp_pending_full: u64,
     pub udp_payload_invalid: u64,
@@ -75,6 +81,8 @@ impl DropCounters {
             fragment: self.fragment.get(),
             route: self.route.get(),
             tcp_limit: self.tcp_limit.get(),
+            tcp_rx_overflow: self.tcp_rx_overflow.get(),
+            udp_mux_q: self.udp_mux_q.get(),
             udp_session_queue_full: self.udp_session_queue_full.get(),
             udp_pending_full: self.udp_pending_full.get(),
             udp_payload_invalid: self.udp_payload_invalid.get(),
@@ -92,12 +100,14 @@ impl DropSnapshot {
     /// Compact `key:value` form for the `beam-client` status file.
     pub fn as_status_value(&self) -> String {
         format!(
-            "tun_tx_full:{},ip_parse:{},frag:{},route:{},tcp_limit:{},udp_sess_q:{},udp_pending:{},udp_payload:{},udp_sess_tbl:{}",
+            "tun_tx_full:{},ip_parse:{},frag:{},route:{},tcp_limit:{},tcp_rx_ovf:{},udp_mux_q:{},udp_sess_q:{},udp_pending:{},udp_payload:{},udp_sess_tbl:{}",
             self.tun_tx_full,
             self.ip_parse,
             self.fragment,
             self.route,
             self.tcp_limit,
+            self.tcp_rx_overflow,
+            self.udp_mux_q,
             self.udp_session_queue_full,
             self.udp_pending_full,
             self.udp_payload_invalid,
@@ -184,14 +194,20 @@ mod tests {
         counters.tun_tx_full.incr();
         counters.route.add(2);
         counters.tcp_limit.incr();
+        counters.tcp_rx_overflow.add(3);
+        counters.udp_mux_q.add(4);
         let snap = counters.snapshot();
         assert_eq!(snap.tun_tx_full, 1);
         assert_eq!(snap.route, 2);
         assert_eq!(snap.tcp_limit, 1);
+        assert_eq!(snap.tcp_rx_overflow, 3);
+        assert_eq!(snap.udp_mux_q, 4);
         assert!(!snap.is_empty());
         assert!(snap.as_status_value().starts_with("tun_tx_full:1,"));
         assert!(snap.as_status_value().contains("route:2"));
         assert!(snap.as_status_value().contains("tcp_limit:1"));
+        assert!(snap.as_status_value().contains("tcp_rx_ovf:3"));
+        assert!(snap.as_status_value().contains("udp_mux_q:4"));
 
         let dns = DnsCounters::default();
         dns.hits.incr();

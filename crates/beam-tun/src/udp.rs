@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use beam_core::address::{Address, NetLocation};
-use beam_core::client::{BeamClientConfig, XudpClient, XudpClientConfig, XudpSession};
+use beam_core::client::{
+    BeamClientConfig, XudpClient, XudpClientConfig, XudpClientError, XudpSession,
+};
 use beam_core::xudp::MAX_PAYLOAD_LEN;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -228,7 +230,11 @@ impl UdpNatBridge {
         };
 
         let (tx, mut rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(PER_SESSION_SEND_QUEUE);
-        let _ = tx.try_send((dst, queued_payload(payload)));
+        if tx.try_send((dst, queued_payload(payload))).is_err() {
+            // The channel was just created with capacity, so this only happens
+            // if it is already closed; count it like any other queue drop.
+            self.drops.udp_session_queue_full.incr();
+        }
 
         let tun_tx = self.tun_tx.clone();
         let task_drops = Arc::clone(&self.drops);
@@ -250,9 +256,15 @@ impl UdpNatBridge {
                         }
                         last_dst = target;
                         task_active.store(start.elapsed().as_millis() as u64, Ordering::Release);
-                        if let Err(err) = session.send_owned(socket_to_netloc(target), data).await {
-                            warn!(%target, error = %err, "xudp session send_to failed");
-                            break;
+                        // Never await the shared mux queue here: a full outbound
+                        // queue would stop this task from draining inbound replies.
+                        match session.try_send_owned(socket_to_netloc(target), data) {
+                            Ok(()) => {}
+                            Err(XudpClientError::OutboundQueueFull) => task_drops.udp_mux_q.incr(),
+                            Err(err) => {
+                                warn!(%target, error = %err, "xudp session send_to failed");
+                                break;
+                            }
                         }
                     }
                     maybe_reply = session.recv() => {
@@ -275,12 +287,14 @@ impl UdpNatBridge {
                         {
                             task_drops.tun_tx_full.incr();
                         }
+                        sync_mux_drops(&session, &task_drops);
                     }
                     () = tokio::time::sleep(idle) => {
                         break;
                     }
                 }
             }
+            sync_mux_drops(&session, &task_drops);
             let _ = session.close().await;
         });
 
@@ -392,6 +406,14 @@ fn queued_payload(payload: &[u8]) -> Vec<u8> {
     let mut buf = XudpSession::alloc_payload(payload.len());
     buf.extend_from_slice(payload);
     buf
+}
+
+/// Moves the mux-level reply drops observed for this session into `udp_mux_q`.
+fn sync_mux_drops(session: &XudpSession, drops: &DropCounters) {
+    let dropped = session.take_dropped_replies();
+    if dropped > 0 {
+        drops.udp_mux_q.add(dropped);
+    }
 }
 
 fn socket_to_netloc(addr: SocketAddr) -> NetLocation {

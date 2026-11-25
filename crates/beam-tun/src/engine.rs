@@ -402,6 +402,7 @@ where
     let tcp_permits = Arc::new(Semaphore::new(config.max_tcp_connections.max(1)));
     let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(TUN_TX_CHANNEL_CAP);
     let drops = Arc::new(DropCounters::default());
+    stack.set_drop_counters(Arc::clone(&drops));
     if let Some(tracker) = activity.as_ref() {
         tracker.attach_drop_counters(Arc::clone(&drops));
     }
