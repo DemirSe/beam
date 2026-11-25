@@ -5,7 +5,6 @@ import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import java.security.KeyStore
 import java.security.KeyStoreException
-import java.security.SecureRandom
 import java.security.UnrecoverableKeyException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -48,11 +47,13 @@ internal object ProfileCrypto {
     }
 
     fun encrypt(plain: ByteArray): ByteArray {
-        val iv = ByteArray(IV_BYTES).also { SecureRandom().nextBytes(it) }
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, key(), GCMParameterSpec(GCM_TAG_BITS, iv))
-        val ct = cipher.doFinal(plain)
-        return iv + ct
+        // Android Keystore enforces randomized encryption by default and
+        // rejects a caller-provided encryption IV, so ask the cipher for one.
+        cipher.init(Cipher.ENCRYPT_MODE, key())
+        val iv = cipher.iv
+        check(iv.size == IV_BYTES) { "unexpected IV length" }
+        return iv + cipher.doFinal(plain)
     }
 
     fun decrypt(blob: ByteArray): ByteArray {
