@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -259,6 +261,19 @@ pub type BypassIpCallback = Arc<dyn Fn(Vec<IpAddr>) -> tokio::task::JoinHandle<(
 /// Optional callback invoked on network transitions to refresh the local DNS server.
 pub type LocalDnsRefresh = Arc<dyn Fn() -> Option<SocketAddr> + Send + Sync>;
 
+/// Android `VpnService.protect(fd)` hook for the local-DNS socket.
+///
+/// The engine calls it with the bound socket's raw fd after `bind` and before
+/// `connect`, so the protector keeps local queries outside the tunnel. A
+/// protector error fails the query before any packet leaves the socket.
+/// Unix only: other platforms always open local DNS directly.
+#[cfg(unix)]
+pub type LocalSocketProtector = Arc<dyn Fn(std::os::fd::RawFd) -> io::Result<()> + Send + Sync>;
+/// Placeholder protector type for non-Unix builds, where local DNS needs no
+/// protection. It is never constructed; it only keeps signatures uniform.
+#[cfg(not(unix))]
+pub type LocalSocketProtector = Arc<dyn Fn(u32) -> io::Result<()> + Send + Sync>;
+
 /// Configuration for the built-in [`DnsInterceptor`].
 #[derive(Clone)]
 pub struct DnsConfig {
@@ -270,6 +285,11 @@ pub struct DnsConfig {
     /// Optional callback invoked on network transitions to re-detect the
     /// host's local DNS server when `local_upstream` was auto-detected.
     pub refresh_local_upstream: Option<LocalDnsRefresh>,
+    /// Optional `VpnService.protect(fd)` hook, called after `bind` and before
+    /// `connect` on every freshly bound local-DNS socket. A reused pooled
+    /// socket skips the hook. Omitted from `Debug` like the other callbacks.
+    #[cfg(unix)]
+    pub local_socket_protector: Option<LocalSocketProtector>,
     /// Local-only suffixes (e.g. `["lan", "local", "internal"]`).
     pub local_suffixes: Vec<String>,
     /// Additional user-configured bypass domain suffixes.
@@ -304,6 +324,18 @@ impl std::fmt::Debug for DnsConfig {
 }
 
 impl DnsConfig {
+    /// Returns the local-socket protector, if any (Unix only).
+    pub(crate) fn local_protector(&self) -> Option<LocalSocketProtector> {
+        #[cfg(unix)]
+        {
+            self.local_socket_protector.clone()
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     /// Returns the default local-only suffixes (`.lan`, `.local`, `.internal`).
     pub fn default_local_suffixes() -> Vec<String> {
         vec!["lan".to_owned(), "local".to_owned(), "internal".to_owned()]
@@ -315,6 +347,8 @@ impl DnsConfig {
             upstream,
             local_upstream,
             refresh_local_upstream: None,
+            #[cfg(unix)]
+            local_socket_protector: None,
             local_suffixes: Self::default_local_suffixes(),
             bypass_domains: Vec::new(),
             cache_size: DEFAULT_CACHE_SIZE,
@@ -1351,7 +1385,34 @@ impl DnsInterceptor {
         dns_config: DnsConfig,
         tun_tx: mpsc::Sender<Vec<u8>>,
     ) -> Self {
-        let interceptor = Self::with_pool(client_config, dns_config, tun_tx);
+        let interceptor = Self::with_pool(
+            client_config,
+            dns_config,
+            tun_tx,
+            Arc::new(DnsCounters::default()),
+        );
+        info!(
+            upstream = %interceptor.dns_config.upstream,
+            upstream_kind = interceptor.dns_config.upstream.kind(),
+            local_upstream = ?interceptor.dns_config.local_upstream,
+            cache_size = interceptor.dns_config.cache_size,
+            ipv4_only = interceptor.dns_config.ipv4_only,
+            local_suffixes = interceptor.dns_config.local_suffixes.len(),
+            bypass_domains = interceptor.dns_config.bypass_domains.len(),
+            "DNS interceptor configured"
+        );
+        interceptor
+    }
+
+    /// Creates a [`DnsInterceptor`] that shares `counters` instead of owning
+    /// fresh ones, so external telemetry can poll live DNS health.
+    pub fn with_counters(
+        client_config: BeamClientConfig,
+        dns_config: DnsConfig,
+        tun_tx: mpsc::Sender<Vec<u8>>,
+        counters: Arc<DnsCounters>,
+    ) -> Self {
+        let interceptor = Self::with_pool(client_config, dns_config, tun_tx, counters);
         info!(
             upstream = %interceptor.dns_config.upstream,
             upstream_kind = interceptor.dns_config.upstream.kind(),
@@ -1369,6 +1430,7 @@ impl DnsInterceptor {
         client_config: BeamClientConfig,
         dns_config: DnsConfig,
         tun_tx: mpsc::Sender<Vec<u8>>,
+        counters: Arc<DnsCounters>,
     ) -> Self {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1407,8 +1469,13 @@ impl DnsInterceptor {
             )),
             tun_tx,
             local_udp_pool: Arc::new(LocalUdpPool::default()),
-            counters: Arc::new(DnsCounters::default()),
+            counters,
         }
+    }
+
+    /// Returns the shared DNS outcome counters for telemetry snapshots.
+    pub fn counters(&self) -> &Arc<DnsCounters> {
+        &self.counters
     }
 
     /// Returns a snapshot of the DNS outcome counters for diagnostics.
@@ -1607,6 +1674,7 @@ impl DnsInterceptor {
                             &wire_owned,
                             query.tx_id,
                             dns_cfg.query_timeout,
+                            dns_cfg.local_protector(),
                         )
                         .await
                     }
@@ -1795,6 +1863,7 @@ async fn resolve_local_udp(
     query: &[u8],
     expected_tx_id: u16,
     query_timeout: Duration,
+    protector: Option<LocalSocketProtector>,
 ) -> io::Result<Vec<u8>> {
     let (pooled, generation) = pool.take(local_upstream, Instant::now());
     let sock = match pooled {
@@ -1805,6 +1874,14 @@ async fn resolve_local_udp(
                 SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
             };
             let sock = UdpSocket::bind(bind_addr).await?;
+            // The Android protector runs here: after `bind`, before `connect`,
+            // so a protector error fails the query before any packet is sent.
+            #[cfg(unix)]
+            if let Some(protect) = protector.as_ref() {
+                protect(sock.as_raw_fd())?;
+            }
+            #[cfg(not(unix))]
+            let _ = protector.as_ref();
             sock.connect(local_upstream).await?;
             sock
         }
@@ -3160,7 +3237,7 @@ mod tests {
 
         let pool = LocalUdpPool::default();
         let q1 = build_query(0x9001, "nas.lan", 1);
-        resolve_local_udp(&pool, local_addr, &q1, 0x9001, Duration::from_secs(2))
+        resolve_local_udp(&pool, local_addr, &q1, 0x9001, Duration::from_secs(2), None)
             .await
             .expect("first resolve");
         assert_eq!(
@@ -3170,7 +3247,7 @@ mod tests {
         );
 
         let q2 = build_query(0x9002, "nas.lan", 1);
-        resolve_local_udp(&pool, local_addr, &q2, 0x9002, Duration::from_secs(2))
+        resolve_local_udp(&pool, local_addr, &q2, 0x9002, Duration::from_secs(2), None)
             .await
             .expect("second resolve");
         let used = peers.lock().expect("lock").clone();
@@ -3197,12 +3274,77 @@ mod tests {
         // A `tx_id` mismatch must drop the socket instead of pooling it.
         let q3 = build_query(0x9003, "nas.lan", 1);
         assert!(
-            resolve_local_udp(&pool, local_addr, &q3, 0xffff, Duration::from_secs(2))
+            resolve_local_udp(&pool, local_addr, &q3, 0xffff, Duration::from_secs(2), None)
                 .await
                 .is_err()
         );
         assert_eq!(pool.len(), 0, "mismatched replies must not poison the pool");
         server.await.expect("server done");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_socket_protector_runs_after_bind_before_connect() {
+        let local_dns = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let local_addr = local_dns.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = local_dns.recv_from(&mut buf).await.expect("recv");
+            let resp = build_a_response(&buf[..n], Ipv4Addr::new(192, 168, 1, 7), 60);
+            local_dns.send_to(&resp, peer).await.expect("send");
+        });
+
+        // Success path: the protector sees the bound socket's fd exactly once.
+        let seen: Arc<Mutex<Vec<std::os::fd::RawFd>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = Arc::clone(&seen);
+        let protector: LocalSocketProtector = Arc::new(move |fd| {
+            // The fd must already name a socket when the protector runs.
+            let link = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                .map_err(|err| io::Error::new(err.kind(), "protector cannot inspect fd"))?;
+            if !link.to_string_lossy().starts_with("socket:") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "protector got a non-socket fd",
+                ));
+            }
+            seen_cb.lock().expect("lock").push(fd);
+            Ok(())
+        });
+        let pool = LocalUdpPool::default();
+        let query = build_query(0xa001, "nas.lan", 1);
+        let reply = resolve_local_udp(
+            &pool,
+            local_addr,
+            &query,
+            0xa001,
+            Duration::from_secs(2),
+            Some(protector),
+        )
+        .await
+        .expect("protected resolve succeeds");
+        assert_eq!(u16::from_be_bytes([reply[0], reply[1]]), 0xa001);
+        assert_eq!(seen.lock().expect("lock").len(), 1);
+        server.await.expect("server done");
+
+        // Error path: a fresh socket fails before `connect`, so no packet can
+        // leave and the refused socket never reaches the pool.
+        let failing: LocalSocketProtector =
+            Arc::new(|_| Err(io::Error::other("VpnService.protect denied")));
+        let pool = LocalUdpPool::default();
+        let err = resolve_local_udp(
+            &pool,
+            local_addr,
+            &query,
+            0xa001,
+            Duration::from_secs(2),
+            Some(failing),
+        )
+        .await
+        .expect_err("a protector error must fail the resolve");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(pool.len(), 0, "a refused socket must not be pooled");
     }
 
     #[tokio::test]
@@ -3268,9 +3410,16 @@ mod tests {
 
         let pool = LocalUdpPool::default();
         let query = build_query(0x7002, "nas.lan", 1);
-        let reply = resolve_local_udp(&pool, local_addr, &query, 0x7002, Duration::from_secs(2))
-            .await
-            .expect("the stale reply must be skipped, not failed on");
+        let reply = resolve_local_udp(
+            &pool,
+            local_addr,
+            &query,
+            0x7002,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .expect("the stale reply must be skipped, not failed on");
         assert_eq!(u16::from_be_bytes([reply[0], reply[1]]), 0x7002);
         assert_eq!(
             pool.len(),
@@ -3298,9 +3447,16 @@ mod tests {
         });
         let pool = LocalUdpPool::default();
         assert!(
-            resolve_local_udp(&pool, local_addr, &query, 0x7002, Duration::from_secs(2))
-                .await
-                .is_err(),
+            resolve_local_udp(
+                &pool,
+                local_addr,
+                &query,
+                0x7002,
+                Duration::from_secs(2),
+                None
+            )
+            .await
+            .is_err(),
             "a stale-reply flood must give up instead of looping forever"
         );
         flood.await.expect("flood done");

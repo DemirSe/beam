@@ -421,6 +421,7 @@ impl ClientFileConfig {
             client,
             route,
             max_tcp_connections: self.limits.max_tcp_connections,
+            tcp_relay_idle_timeout: None,
             udp: UdpBridgeConfig {
                 max_sessions: self.limits.max_udp_sessions,
                 idle_timeout: Duration::from_millis(self.limits.idle_timeout_ms.min(60_000)),

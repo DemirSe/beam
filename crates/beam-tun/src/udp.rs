@@ -48,6 +48,29 @@ impl Default for UdpBridgeConfig {
     }
 }
 
+impl UdpBridgeConfig {
+    /// Low-RAM always-on profile for Android `VpnService`: 128 NAT sessions
+    /// with a 60 s idle expiry, so an idle phone holds no UDP timer wakeups.
+    pub fn mobile() -> Self {
+        Self {
+            max_sessions: 128,
+            idle_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+#[cfg(test)]
+mod mobile_tests {
+    use super::*;
+
+    #[test]
+    fn mobile_profile_bounds_sessions_and_expiry() {
+        let cfg = UdpBridgeConfig::mobile();
+        assert_eq!(cfg.max_sessions, 128);
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
+    }
+}
+
 struct NatEntry {
     tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     last_active_ms: Arc<AtomicU64>,

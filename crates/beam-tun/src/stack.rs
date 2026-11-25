@@ -108,6 +108,43 @@ impl Default for TcpStackConfig {
     }
 }
 
+impl TcpStackConfig {
+    /// Low-RAM always-on profile for Android `VpnService`.
+    ///
+    /// Worst case is 128 flows times 128 KiB times two directions, which is
+    /// 32 MiB. The 30-minute idle timeout keeps 15-minute FCM/MTalk push
+    /// sockets alive with zero relay wakeups while idle.
+    pub fn mobile() -> Self {
+        Self {
+            mtu: 1500,
+            max_connections: 128,
+            socket_buffer_bytes: 128 * 1024,
+            handshake_timeout_ms: 10_000,
+            idle_timeout_ms: 1_800_000,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mobile_tests {
+    use super::*;
+
+    #[test]
+    fn mobile_profile_fits_android_ram_and_keeps_push_sockets_alive() {
+        let cfg = TcpStackConfig::mobile();
+        // Worst case counts both directions per flow.
+        let worst_case = cfg.max_connections as u64 * cfg.socket_buffer_bytes as u64 * 2;
+        assert!(
+            worst_case <= 32 * 1024 * 1024,
+            "mobile buffer budget {worst_case} bytes exceeds 32 MiB"
+        );
+        assert!(
+            cfg.idle_timeout_ms >= 1_800_000,
+            "mobile idle timeout must cover 15-minute push sockets"
+        );
+    }
+}
+
 /// Per-flow dirty notification callback used by [`NetStack`] implementations
 /// to avoid O(N) scans across idle connections on wakeup.
 pub(crate) trait FlowWaker: Send + Sync {

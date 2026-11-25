@@ -23,10 +23,11 @@ pub mod stats;
 pub mod udp;
 
 pub use device::{MemoryTun, TunDevice};
-pub use dns::{DnsConfig, DnsInterceptor, DnsUpstream};
+pub use dns::{DnsConfig, DnsInterceptor, DnsUpstream, LocalSocketProtector};
 pub use engine::{
-    DialFailure, DialFailureKind, DialFailureStage, EngineError, TunEngineConfig, TunnelActivity,
-    run_tun_engine, run_tun_engine_with_activity,
+    DialFailure, DialFailureKind, DialFailureStage, EngineError, EngineTelemetry,
+    TelemetrySnapshot, TunEngineConfig, TunnelActivity, run_tun_engine,
+    run_tun_engine_with_activity, run_tun_engine_with_telemetry,
 };
 pub use proxy_tcp::ProxyTcpStack;
 pub use ratelimit::RateLimiter;
