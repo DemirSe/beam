@@ -98,6 +98,36 @@ impl LinuxTun {
         })
     }
 
+    /// Wraps a TUN descriptor that another layer created and detached.
+    ///
+    /// `raw_fd` is the descriptor Android's
+    /// `ParcelFileDescriptor.detachFd()` returns. Ownership transfers to this
+    /// [`LinuxTun`] at the call, so the caller must never use, duplicate, or
+    /// close `raw_fd` again. Every error path closes it, so a failed start
+    /// cannot leak the descriptor.
+    ///
+    /// The descriptor must already be attached to a TUN interface, because a
+    /// detached `VpnService` fd cannot be re-configured with `TUNSETIFF`.
+    pub fn from_detached_fd(raw_fd: RawFd, name: &str) -> io::Result<Self> {
+        if raw_fd < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "detached TUN file descriptor must not be negative",
+            ));
+        }
+        // SAFETY: `detachFd()` handed over the only owner of `raw_fd`, so this
+        // call takes exclusive ownership. `OwnedFd` closes the descriptor on
+        // every early return below, which keeps the transfer leak-free.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        validate_ifname(name)?;
+        crate::fd::set_nonblocking(fd.as_raw_fd())?;
+        crate::fd::set_cloexec(fd.as_raw_fd())?;
+        Ok(Self {
+            fd,
+            name: name.to_owned(),
+        })
+    }
+
     /// Returns the kernel-assigned interface name.
     pub fn name(&self) -> &str {
         &self.name
@@ -202,5 +232,78 @@ mod tests {
         assert!(validate_ifname("0123456789abcdef").is_err()); // 16 bytes
         assert!(validate_ifname("tun/0").is_err());
         assert!(validate_ifname("tun 0").is_err());
+    }
+
+    mod detached_fd {
+        use super::*;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        /// Returns a detached raw fd plus its live peer, like `detachFd()`.
+        fn detached_socket() -> (RawFd, UnixStream) {
+            let (stream, peer) = UnixStream::pair().expect("socketpair");
+            (stream.into_raw_fd(), peer)
+        }
+
+        fn is_open(fd: RawFd) -> bool {
+            // SAFETY: `F_GETFD` takes no variadic argument and does not
+            // dereference a user pointer. The kernel reports `EBADF` for a
+            // closed descriptor.
+            (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
+        }
+
+        fn get_flags(fd: RawFd, command: libc::c_int) -> libc::c_int {
+            // SAFETY: `F_GETFL` and `F_GETFD` take no variadic argument and do
+            // not dereference a user pointer. `fd` is a valid descriptor in
+            // these tests.
+            unsafe { libc::fcntl(fd, command) }
+        }
+
+        #[test]
+        fn rejects_negative_fd() {
+            let Err(error) = LinuxTun::from_detached_fd(-1, "tun0") else {
+                panic!("a negative descriptor must be rejected");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        #[test]
+        fn invalid_name_closes_the_detached_fd() {
+            for name in ["", "0123456789abcdef", "tun\0", "tun/0"] {
+                let (raw, _peer) = detached_socket();
+                let Err(error) = LinuxTun::from_detached_fd(raw, name) else {
+                    panic!("an invalid interface name {name:?} must be rejected");
+                };
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name:?}");
+                assert!(!is_open(raw), "{name:?} must close the descriptor");
+            }
+        }
+
+        #[test]
+        fn valid_detached_fd_is_nonblocking_cloexec_and_owned() {
+            let (raw, peer) = detached_socket();
+            // Clear both flags first, so the assertions prove that
+            // `from_detached_fd` sets them instead of inheriting them.
+            // SAFETY: `F_SETFD`/`F_SETFL` consume their `c_int` argument by
+            // value and `raw` is a valid owned descriptor here.
+            unsafe {
+                assert!(libc::fcntl(raw, libc::F_SETFD, 0) >= 0);
+                let flags = libc::fcntl(raw, libc::F_GETFL);
+                assert!(flags >= 0);
+                assert!(libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK) >= 0);
+            }
+            assert_eq!(get_flags(raw, libc::F_GETFL) & libc::O_NONBLOCK, 0);
+            assert_eq!(get_flags(raw, libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+
+            let tun = LinuxTun::from_detached_fd(raw, "beamtun0").expect("valid detached fd");
+
+            assert_eq!(tun.name(), "beamtun0");
+            assert_ne!(get_flags(raw, libc::F_GETFL) & libc::O_NONBLOCK, 0);
+            assert_ne!(get_flags(raw, libc::F_GETFD) & libc::FD_CLOEXEC, 0);
+
+            drop(tun);
+            assert!(!is_open(raw), "dropping the TUN must close its descriptor");
+            drop(peer);
+        }
     }
 }

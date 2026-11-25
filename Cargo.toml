@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/beam", "crates/beam-client", "crates/beam-core", "crates/beam-sys", "crates/beam-tun"]
+members = ["crates/beam", "crates/beam-android", "crates/beam-client", "crates/beam-core", "crates/beam-sys", "crates/beam-tun"]
 exclude = ["fuzz"]
 
 [workspace.package]

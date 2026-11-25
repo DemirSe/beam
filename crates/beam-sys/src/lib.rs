@@ -3,7 +3,7 @@
 //! Isolated Linux and Android syscall layer for beam.
 //!
 //! Android shares the Linux kernel ABI, so most modules build for both
-//! targets. `tun` and `netlink` stay Linux-only. Every `unsafe` block in this
+//! targets. `netlink` stays Linux-only. Every `unsafe` block in this
 //! crate must carry a safety comment that explains the invariants the caller
 //! must uphold.
 
@@ -29,7 +29,7 @@ pub mod poll;
 pub mod socket;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod splice;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod tun;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -47,7 +47,7 @@ pub use socket::{
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use splice::{SpliceFlags, pipe, splice};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use tun::{LinuxTun, MAX_IFNAME_LEN, validate_ifname};
 
 /// Resizes the kernel buffer of a pipe.
