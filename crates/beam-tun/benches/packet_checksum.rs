@@ -37,18 +37,35 @@ fn measure(scalar: &mut dyn FnMut() -> u64, unrolled: &mut dyn FnMut() -> u64) -
     let rounds = ROUNDS / TRIALS;
     let mut best_scalar = f64::MAX;
     let mut best_unrolled = f64::MAX;
-    for _ in 0..TRIALS {
-        let start = Instant::now();
-        for _ in 0..rounds {
-            black_box(scalar());
-        }
-        best_scalar = best_scalar.min(start.elapsed().as_secs_f64() * 1e9 / rounds as f64);
+    for trial in 0..TRIALS {
+        // Alternate order on even/odd trials so neither variant always gets
+        // the first-block cache/frequency advantage.
+        let scalar_first = trial % 2 == 0;
+        if scalar_first {
+            let start = Instant::now();
+            for _ in 0..rounds {
+                black_box(scalar());
+            }
+            best_scalar = best_scalar.min(start.elapsed().as_secs_f64() * 1e9 / rounds as f64);
 
-        let start = Instant::now();
-        for _ in 0..rounds {
-            black_box(unrolled());
+            let start = Instant::now();
+            for _ in 0..rounds {
+                black_box(unrolled());
+            }
+            best_unrolled = best_unrolled.min(start.elapsed().as_secs_f64() * 1e9 / rounds as f64);
+        } else {
+            let start = Instant::now();
+            for _ in 0..rounds {
+                black_box(unrolled());
+            }
+            best_unrolled = best_unrolled.min(start.elapsed().as_secs_f64() * 1e9 / rounds as f64);
+
+            let start = Instant::now();
+            for _ in 0..rounds {
+                black_box(scalar());
+            }
+            best_scalar = best_scalar.min(start.elapsed().as_secs_f64() * 1e9 / rounds as f64);
         }
-        best_unrolled = best_unrolled.min(start.elapsed().as_secs_f64() * 1e9 / rounds as f64);
     }
     (best_scalar, best_unrolled)
 }

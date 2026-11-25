@@ -817,23 +817,19 @@ impl DnsCache {
         // Zero-allocation borrowed lookup: `String: Borrow<str>` for the outer
         // map, `Copy` key by value for the inner map.
         let rest = CacheRest::of(query);
-        let expired = self
-            .entries
-            .get(query.qname.as_str())
-            .and_then(|inner| inner.get(&rest))
-            .is_some_and(|entry| now >= entry.expires_at);
-        if expired {
-            if let Some(inner) = self.entries.get_mut(query.qname.as_str()) {
-                inner.remove(&rest);
-                self.len = self.len.saturating_sub(1);
-                if inner.is_empty() {
-                    self.entries.remove(query.qname.as_str());
-                }
+        // Single outer+inner lookup: one `qname` hash on every path.
+        let inner = self.entries.get_mut(query.qname.as_str())?;
+        let entry = inner.get_mut(&rest)?;
+        if now >= entry.expires_at {
+            inner.remove(&rest);
+            self.len = self.len.saturating_sub(1);
+            let became_empty = inner.is_empty();
+            if became_empty {
+                self.entries.remove(query.qname.as_str());
             }
             self.debug_check_len();
             return None;
         }
-        let entry = self.entries.get_mut(query.qname.as_str())?.get_mut(&rest)?;
         self.seq = self.seq.wrapping_add(1);
         entry.last_used = self.seq;
         Some(Arc::clone(&entry.wire))

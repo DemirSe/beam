@@ -338,21 +338,18 @@ impl UdpNatBridge {
     pub fn next_sweep_delay_ms(&self) -> Option<u64> {
         let now_ms = self.now_ms();
         let idle_ms = self.bridge_config.idle_timeout.as_millis() as u64;
-        // A finished session task is reaped by the next sweep, so it must not
-        // keep its slot (or an idle wakeup) until `idle_timeout` elapses.
-        if self.sessions.values().any(|entry| entry.task.is_finished()) {
-            return Some(0);
+        // Single pass: a finished session task is reaped by the next sweep,
+        // so it forces delay 0 instead of keeping its slot until idle
+        // timeout. Otherwise track the earliest real expiry.
+        let mut session_delay: Option<u64> = None;
+        for entry in self.sessions.values() {
+            if entry.task.is_finished() {
+                return Some(0);
+            }
+            let last = entry.last_active_ms.load(Ordering::Acquire);
+            let remaining = last.saturating_add(idle_ms).saturating_sub(now_ms);
+            session_delay = Some(session_delay.map_or(remaining, |min| min.min(remaining)));
         }
-        // The earliest real expiry, so the sweep runs exactly when a session
-        // times out instead of on a coarse fixed clamp.
-        let session_delay = self
-            .sessions
-            .values()
-            .map(|entry| {
-                let last = entry.last_active_ms.load(Ordering::Acquire);
-                last.saturating_add(idle_ms).saturating_sub(now_ms)
-            })
-            .min();
         let backoff_delay = if !self.pending_initial.is_empty()
             && self.connecting.is_none()
             && self.mux.as_ref().is_none_or(|m| !m.is_open())
