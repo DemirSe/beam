@@ -148,6 +148,7 @@ jobs:
             -noaudio -no-boot-anim
           script: |
             cd clients/android && (./gradlew -Pbeam.includeX86_64=true connectedDebugAndroidTest || { echo '=== instrumentation results ==='; find app/build/outputs/androidTest-results -name '*.xml' -print -exec cat {} +; exit 1; })
+            adb install -r clients/android/app/build/outputs/apk/debug/app-debug.apk
             adb shell am start -W -n com.beam.android/.ui.MainActivity
             sleep 10
             adb shell pidof com.beam.android || { echo "error: com.beam.android died after launch"; adb logcat -d -t 200; exit 1; }
