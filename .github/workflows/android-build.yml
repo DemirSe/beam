@@ -41,6 +41,8 @@ jobs:
           java-version: '17'
 
       - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: Install NDK r27c + SDK 35
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION"
@@ -81,14 +83,21 @@ jobs:
 
       - name: Enable KVM and verify /dev/kvm
         run: |
-          set -euo pipefail
+          set -uo pipefail
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          test -c /dev/kvm
-          test -r /dev/kvm -a -w /dev/kvm
-          ls -l /dev/kvm
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules || echo "warn: udevadm reload failed"
+          sudo udevadm trigger --name-match=kvm || echo "warn: udevadm trigger failed"
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "KVM_AVAILABLE=1" >> "$GITHUB_ENV"
+            ls -l /dev/kvm
+          else
+            echo "KVM_AVAILABLE=0" >> "$GITHUB_ENV"
+            echo "::warning::/dev/kvm is unavailable; the emulator will use software emulation"
+            ls -ld /dev/kvm /sys/class/misc/kvm 2>&1 || true
+            grep -c -E 'vmx|svm' /proc/cpuinfo || true
+          fi
 
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
@@ -100,6 +109,8 @@ jobs:
           java-version: '17'
 
       - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: Install NDK r27c + SDK 35
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION"
@@ -130,7 +141,9 @@ jobs:
           arch: x86_64
           target: default
           disable-animations: true
+          emulator-boot-timeout: 1800
           emulator-options: >-
+            ${{ env.KVM_AVAILABLE == '0' && '-accel off' || '' }}
             -no-snapshot-save -no-window -gpu swiftshader_indirect
             -noaudio -no-boot-anim
           script: |
