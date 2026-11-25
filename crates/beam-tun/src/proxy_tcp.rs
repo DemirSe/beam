@@ -32,8 +32,12 @@ const INITIAL_RTO_MS: i64 = 200;
 const MAX_RTO_MS: i64 = 4_000;
 /// Data retransmit ceiling: 200 ms doubling to the 4 s cap, 20 retransmits
 /// cover about 66 s, so a brief network flap or handover does not RST a flow
-/// that is still being used. Zero-window persist probes have no such ceiling.
+/// that is still being used.
 const MAX_RETRIES: u8 = 20;
+/// Zero-window persist probe ceiling: 225 probes at the 4 s cap cover about
+/// 15 min, so a peer that answers every probe with `window = 0` cannot pin a
+/// TCP slot forever.
+const MAX_PERSIST_PROBES: u16 = 225;
 const CLOSING_TIMEOUT_MS: i64 = 5_000;
 
 type FlowKey = (IpAddr, u16, IpAddr, u16);
@@ -122,6 +126,9 @@ struct TcpConn {
     peer_wscale: u8,
     our_wscale: u8,
     // Receive state (peer -> proxy)
+    /// ISN from the SYN that created this flow, so a late duplicate SYN can be
+    /// told apart from a new connection reusing the same 4-tuple.
+    rcv_isn: u32,
     rcv_nxt: u32,
     rcv_coalesce: Vec<u8>,
     pending_to_relay: VecDeque<Vec<u8>>,
@@ -153,6 +160,9 @@ struct TcpConn {
     /// Zero-window persist timer when `snd_wnd == 0` and `tx_buf` has unsent bytes.
     persist_ms: i64,
     persist_deadline_ms: Option<i64>,
+    /// Zero-window probes sent since `snd_wnd` was last open, capped by
+    /// [`MAX_PERSIST_PROBES`]. Kept separate from `retries`.
+    persist_probes: u16,
     retries: u8,
     state_deadline_ms: Option<i64>,
     last_activity_ms: i64,
@@ -214,6 +224,9 @@ impl TcpConn {
 
     /// Emits a TCP segment slicing `tx_buf[offset..offset+len]` directly via
     /// `VecDeque::as_slices()` with zero intermediate payload allocation.
+    ///
+    /// Returns the number of bytes actually sent (`0` when the range does not
+    /// fit in `tx_buf`), so the caller never advances `snd_nxt` past sent bytes.
     fn emit_tx_segment(
         &mut self,
         offset: usize,
@@ -221,7 +234,14 @@ impl TcpConn {
         flags: u8,
         seq: u32,
         tx_out: &mut Vec<Vec<u8>>,
-    ) {
+    ) -> usize {
+        if len == 0
+            || !offset
+                .checked_add(len)
+                .is_some_and(|end| end <= self.tx_buf.len())
+        {
+            return 0;
+        }
         let (s1, s2) = self.tx_buf.as_slices();
         let (part_a, part_b) = if offset < s1.len() {
             let a_len = (s1.len() - offset).min(len);
@@ -259,7 +279,9 @@ impl TcpConn {
             part_b,
         ) {
             tx_out.push(pkt);
+            return len;
         }
+        0
     }
 
     fn send_syn_ack(&mut self, now_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
@@ -335,6 +357,13 @@ impl TcpConn {
         if (seg.flags & TCP_SYN) != 0 && (seg.flags & TCP_ACK) == 0 {
             if self.state == TcpState::SynReceived {
                 self.send_syn_ack(now_ms, tx_out);
+            } else if self.state.is_synchronized() && seg.seq == self.rcv_isn {
+                // RFC 5961: a SYN that repeats the ISN of the live connection is
+                // a late or reordered duplicate, not a new connection. Challenge
+                // it with an ACK and keep the flow instead of resetting it.
+                if let Some(pkt) = self.build_packet_slices(TCP_ACK, &[], &[], &[], self.snd_nxt) {
+                    tx_out.push(pkt);
+                }
             }
             return;
         }
@@ -447,6 +476,7 @@ impl TcpConn {
             if self.snd_wnd > 0 {
                 self.persist_deadline_ms = None;
                 self.persist_ms = INITIAL_RTO_MS;
+                self.persist_probes = 0;
             }
         }
 
@@ -685,8 +715,11 @@ impl TcpConn {
                 TCP_ACK
             };
             let seq = self.snd_nxt;
-            self.emit_tx_segment(in_flight, seg_len, flags, seq, tx_out);
-            self.snd_nxt = self.snd_nxt.wrapping_add(seg_len as u32);
+            let sent = self.emit_tx_segment(in_flight, seg_len, flags, seq, tx_out);
+            if sent == 0 {
+                break;
+            }
+            self.snd_nxt = self.snd_nxt.wrapping_add(sent as u32);
             self.need_ack = false;
             if self.rto_deadline_ms.is_none() {
                 self.rto_deadline_ms = Some(now_ms + self.rto_ms);
@@ -760,13 +793,19 @@ impl TcpConn {
             return;
         }
 
-        // Zero-window persist probe. Probes are bounded by `MAX_RTO_MS` spacing
-        // and repeat until the peer opens its window, the flow closes, or the
-        // idle timeout reclaims it. They never touch the data retransmit counter,
-        // so a long zero-window stall cannot exhaust the data RTO budget.
+        // Zero-window persist probe. Probes are spaced by at most `MAX_RTO_MS`
+        // and never touch the data retransmit counter, so a long zero-window
+        // stall cannot exhaust the data RTO budget. They stop after
+        // `MAX_PERSIST_PROBES` so a peer that keeps answering with `window = 0`
+        // cannot pin the socket forever.
         if let Some(persist_at) = self.persist_deadline_ms
             && now_ms >= persist_at
         {
+            if self.persist_probes >= MAX_PERSIST_PROBES {
+                self.send_rst(self.snd_nxt, tx_out);
+                return;
+            }
+            self.persist_probes += 1;
             self.persist_ms = (self.persist_ms * 2).min(MAX_RTO_MS);
             self.persist_deadline_ms = Some(now_ms + self.persist_ms);
             // Send a zero-window probe ACK (`seq = snd_una - 1`) to elicit a
@@ -924,6 +963,7 @@ impl ProxyTcpStack {
             mss,
             peer_wscale: negotiated_peer_wscale,
             our_wscale,
+            rcv_isn: seg.seq,
             rcv_nxt: seg.seq.wrapping_add(1),
             rcv_coalesce: Vec::new(),
             pending_to_relay: VecDeque::new(),
@@ -950,6 +990,7 @@ impl ProxyTcpStack {
             rto_deadline_ms: None,
             persist_ms: INITIAL_RTO_MS,
             persist_deadline_ms: None,
+            persist_probes: 0,
             retries: 0,
             state_deadline_ms: Some(now_ms.saturating_add(handshake_timeout_ms(config))),
             last_activity_ms: now_ms,
@@ -1010,15 +1051,17 @@ impl NetStack for ProxyTcpStack {
             let flow: FlowKey = (ip.src_ip, seg.src_port, ip.dst_ip, seg.dst_port);
             let pure_syn = (seg.flags & TCP_SYN) != 0 && (seg.flags & TCP_ACK) == 0;
 
-            // A pure SYN for a 4-tuple that is already synchronized is a new
-            // connection attempt (the local peer restarted and its old socket is
-            // gone). Reset the stale flow and accept the new SYN immediately
-            // instead of silently dropping the handshake.
+            // A pure SYN for a 4-tuple that is already synchronized and carries
+            // a different ISN than the live flow is a new connection attempt: the
+            // local peer restarted and its old socket is gone. Reset the stale
+            // flow and accept the new SYN instead of dropping the handshake.
+            // This assumes a local TUN peer, which keeps one socket per 4-tuple,
+            // so a repeated ISN can only be a duplicate of the original SYN.
             if pure_syn
                 && self
                     .conns
                     .get(&flow)
-                    .is_some_and(|conn| conn.state.is_synchronized())
+                    .is_some_and(|conn| conn.state.is_synchronized() && seg.seq != conn.rcv_isn)
                 && let Some(mut stale) = self.conns.remove(&flow)
             {
                 stale.send_rst(stale.snd_nxt, tx_out);
@@ -1641,6 +1684,76 @@ mod tests {
     }
 
     #[test]
+    fn zero_window_persist_probes_are_capped_when_the_peer_keeps_zeroing() {
+        let cfg = TcpStackConfig {
+            idle_timeout_ms: 3_600_000,
+            ..TcpStackConfig::default()
+        };
+        let mut stack = ProxyTcpStack::new(cfg);
+        let (srv_nxt, acc) = handshake(&mut stack, 300);
+        let (_reader, _writer) = acc.stream.into_split();
+
+        stack.push_ip_tcp(&make_seg(301, srv_nxt, TCP_ACK, 0, &[], &[]));
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+        stack.poll(30, &mut tx, &mut accepted);
+
+        let conn = stack.conns.values_mut().next().expect("conn");
+        conn.tx_buf.extend(b"blocked-by-zero-window");
+        conn.dirty_handle.as_ref().expect("dirty handle").wake();
+        tx.clear();
+        stack.poll(40, &mut tx, &mut accepted);
+        assert!(tx.is_empty(), "must not transmit into zero window");
+
+        // The peer answers every probe with another zero-window ACK, so the idle
+        // timeout never fires and only the probe cap can reclaim the flow.
+        let mut now = 40;
+        let mut peer_seq = 302u32;
+        for probe in 1..=MAX_PERSIST_PROBES {
+            now += MAX_RTO_MS;
+            let snd_una = stack.conns.values().next().expect("conn").snd_una;
+            peer_seq = peer_seq.wrapping_add(1);
+            stack.push_ip_tcp(&make_seg(peer_seq, snd_una, TCP_ACK, 0, &[], &[]));
+            tx.clear();
+            stack.poll(now, &mut tx, &mut accepted);
+            assert_eq!(tx.len(), 1, "probe {probe} must be emitted");
+            let seg = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+            assert_eq!(seg.flags, TCP_ACK, "probe {probe} must not reset");
+            assert_eq!(seg.seq, snd_una.wrapping_sub(1));
+            let conn = stack.conns.values().next().expect("flow stays open");
+            assert_eq!(conn.persist_probes, probe);
+            assert_eq!(
+                conn.retries, 0,
+                "persist probes must not consume the data retransmit budget"
+            );
+        }
+
+        // The probe budget is exhausted: the next expiry resets the flow.
+        now += MAX_RTO_MS;
+        peer_seq = peer_seq.wrapping_add(1);
+        stack.push_ip_tcp(&make_seg(
+            peer_seq,
+            stack.conns.values().next().expect("c").snd_una,
+            TCP_ACK,
+            0,
+            &[],
+            &[],
+        ));
+        tx.clear();
+        stack.poll(now, &mut tx, &mut accepted);
+        assert!(
+            stack.conns.is_empty(),
+            "an exhausted persist budget must reset the flow"
+        );
+        assert!(
+            tx.iter().any(|pkt| parse_ip(pkt)
+                .and_then(|ip| parse_tcp(ip.payload))
+                .is_some_and(|seg| (seg.flags & TCP_RST) != 0)),
+            "expected a TCP RST after the persist probe budget"
+        );
+    }
+
+    #[test]
     fn data_rto_survives_twenty_retransmits_before_resetting() {
         let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
         let (_srv_nxt, acc) = handshake(&mut stack, 400);
@@ -1726,6 +1839,57 @@ mod tests {
         ));
         stack.poll(40, &mut tx, &mut accepted);
         assert_eq!(accepted.len(), 1, "new flow must be accepted immediately");
+    }
+
+    #[tokio::test]
+    async fn late_duplicate_syn_keeps_flow_while_a_new_isn_replaces_it() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let client_isn = 700u32;
+        let (srv_nxt, acc) = handshake(&mut stack, client_isn);
+        let (mut reader, _writer) = acc.stream.into_split();
+        let opts = [2, 4, 0x05, 0xb4, 1, 3, 3, 6];
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+
+        // Reordered duplicate of the original SYN (same ISN): challenge ACK only.
+        stack.push_ip_tcp(&make_seg(client_isn, 0, TCP_SYN, 65_535, &opts, &[]));
+        stack.poll(30, &mut tx, &mut accepted);
+        assert_eq!(tx.len(), 1, "a duplicate SYN must get exactly one ACK");
+        let challenge = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_eq!(challenge.flags, TCP_ACK, "duplicate SYN must not be reset");
+        assert_eq!(stack.conns.len(), 1, "the live flow must survive");
+        let conn = stack.conns.values().next().expect("conn");
+        assert_eq!(conn.state, TcpState::Established);
+        assert_eq!(conn.rcv_isn, client_isn);
+        assert_eq!(conn.rcv_nxt, client_isn.wrapping_add(1));
+
+        // The kept flow still carries data.
+        tx.clear();
+        stack.push_ip_tcp(&make_seg(
+            client_isn.wrapping_add(1),
+            srv_nxt,
+            TCP_ACK,
+            1024,
+            &[],
+            b"still-alive",
+        ));
+        stack.poll(40, &mut tx, &mut accepted);
+        assert_eq!(reader.recv_chunk().await.expect("data"), b"still-alive");
+
+        // A different ISN means a new connection on the same 4-tuple: RST + SYN|ACK.
+        let new_isn = 9_000u32;
+        tx.clear();
+        stack.push_ip_tcp(&make_seg(new_isn, 0, TCP_SYN, 65_535, &opts, &[]));
+        stack.poll(50, &mut tx, &mut accepted);
+        assert_eq!(tx.len(), 2, "expected RST then SYN|ACK");
+        let rst = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_ne!(rst.flags & TCP_RST, 0, "the stale flow must be reset");
+        let syn_ack = parse_tcp(parse_ip(&tx[1]).expect("ip").payload).expect("tcp");
+        assert_eq!(syn_ack.flags, TCP_SYN | TCP_ACK);
+        let conn = stack.conns.values().next().expect("conn");
+        assert_eq!(conn.state, TcpState::SynReceived);
+        assert_eq!(conn.rcv_isn, new_isn);
+        assert!(reader.recv_chunk().await.is_none(), "old relay must close");
     }
 
     fn small_buffer_stack() -> ProxyTcpStack {

@@ -224,6 +224,9 @@ fn release_queued_in_flight(
     let Some(counter) = in_flight_relay else {
         return false;
     };
+    // Close before draining so a concurrent send cannot succeed after the drain
+    // and leave bytes charged for a chunk that nobody will ever read.
+    from_stack.close();
     let mut freed = 0usize;
     while let Ok(chunk) = from_stack.try_recv() {
         freed = freed.saturating_add(chunk.len());
@@ -231,6 +234,10 @@ fn release_queued_in_flight(
     if freed == 0 {
         return false;
     }
+    // `try_update` is a retrying CAS loop (the old `fetch_update` name is
+    // deprecated), so a concurrent `fetch_add` from the stack only forces a
+    // retry and can never drop the `freed` bytes. The accounting test below
+    // covers that race.
     let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
         Some(cur.saturating_sub(freed))
     });
@@ -482,6 +489,54 @@ impl Drop for TunTcpStream {
         }
         if woken {
             wake_stack(&self.waker, self.flow_waker.as_ref());
+        }
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_the_relay_reader_never_loses_in_flight_bytes() {
+        // `release_queued_in_flight` races the stack's `fetch_add` when a relay
+        // dies. The racing thread below charges and releases bytes with a net
+        // change of zero, so any lost release leaves a non-zero residue.
+        for round in 0..500 {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+            let counter = Arc::new(AtomicUsize::new(0));
+            for _ in 0..4 {
+                counter.fetch_add(512, Ordering::AcqRel);
+                assert!(tx.try_send(vec![0u8; 512]).is_ok(), "round {round}");
+            }
+            let stream = TunTcpStream::new_with_accounting(
+                rx,
+                tx.clone(),
+                Arc::new(Notify::new()),
+                None,
+                Some(Arc::clone(&counter)),
+                None,
+                RelayBufPool::new(),
+            );
+            let (reader, _writer) = stream.into_split();
+
+            let racer_counter = Arc::clone(&counter);
+            let racer = std::thread::spawn(move || {
+                for _ in 0..64 {
+                    racer_counter.fetch_add(1, Ordering::AcqRel);
+                    racer_counter.fetch_sub(1, Ordering::AcqRel);
+                    std::thread::yield_now();
+                }
+            });
+
+            drop(reader);
+            racer.join().expect("racer thread");
+
+            assert_eq!(
+                counter.load(Ordering::Acquire),
+                0,
+                "round {round}: queued bytes must be fully released"
+            );
         }
     }
 }

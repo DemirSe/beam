@@ -106,10 +106,15 @@ pub struct XudpReply {
 
 struct SessionTable {
     next_id: u16,
-    sessions: HashMap<u16, mpsc::Sender<XudpReply>>,
+    sessions: HashMap<u16, SessionEntry>,
     max_sessions: usize,
     closed: bool,
-    /// Replies the mux reader dropped because a session reply queue was full.
+}
+
+/// One registered session: its reply queue and the drops the mux reader charged
+/// to it, so `dropped_replies` is exact per session and needs no table lock.
+struct SessionEntry {
+    tx: mpsc::Sender<XudpReply>,
     dropped_replies: Arc<AtomicU64>,
 }
 
@@ -120,22 +125,27 @@ impl SessionTable {
             sessions: HashMap::new(),
             max_sessions: max_sessions.max(1),
             closed: false,
-            dropped_replies: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Counts one inbound reply dropped by a full session reply queue.
-    fn note_dropped_reply(&self) {
-        self.dropped_replies.fetch_add(1, Ordering::Relaxed);
+    /// Returns the reply queue and drop counter of `id` for the mux reader.
+    fn reply_target(&self, id: u16) -> Option<(mpsc::Sender<XudpReply>, Arc<AtomicU64>)> {
+        self.sessions
+            .get(&id)
+            .map(|e| (e.tx.clone(), Arc::clone(&e.dropped_replies)))
     }
 
-    fn allocate(&mut self, tx: mpsc::Sender<XudpReply>) -> Result<u16, XudpClientError> {
+    fn allocate(
+        &mut self,
+        tx: mpsc::Sender<XudpReply>,
+    ) -> Result<(u16, Arc<AtomicU64>), XudpClientError> {
         if self.closed {
             return Err(XudpClientError::Closed);
         }
         if self.sessions.len() >= self.max_sessions {
             return Err(XudpClientError::SessionLimit);
         }
+        let dropped_replies = Arc::new(AtomicU64::new(0));
         for _ in 0..u16::MAX {
             let id = self.next_id;
             self.next_id = self.next_id.wrapping_add(1);
@@ -143,8 +153,14 @@ impl SessionTable {
                 self.next_id = 1;
             }
             if id != 0 && !self.sessions.contains_key(&id) {
-                self.sessions.insert(id, tx);
-                return Ok(id);
+                self.sessions.insert(
+                    id,
+                    SessionEntry {
+                        tx,
+                        dropped_replies: Arc::clone(&dropped_replies),
+                    },
+                );
+                return Ok((id, dropped_replies));
             }
         }
         Err(XudpClientError::SessionLimit)
@@ -322,19 +338,18 @@ impl XudpClient {
                             match frame.status {
                                 SessionStatus::Keep => {
                                     if !frame.payload.is_empty() {
-                                        let tx = reader_table.lock().ok().and_then(|t| {
-                                            t.sessions.get(&frame.session_id).cloned()
-                                        });
-                                        if let Some(tx) = tx {
+                                        let target = reader_table
+                                            .lock()
+                                            .ok()
+                                            .and_then(|t| t.reply_target(frame.session_id));
+                                        if let Some((tx, dropped_replies)) = target {
                                             match tx.try_send(XudpReply {
                                                 source: frame.destination,
                                                 payload: frame.payload.to_vec(),
                                             }) {
                                                 Ok(()) => {}
                                                 Err(mpsc::error::TrySendError::Full(_)) => {
-                                                    if let Ok(t) = reader_table.lock() {
-                                                        t.note_dropped_reply();
-                                                    }
+                                                    dropped_replies.fetch_add(1, Ordering::Relaxed);
                                                 }
                                                 Err(mpsc::error::TrySendError::Closed(_)) => {}
                                             }
@@ -395,7 +410,7 @@ impl XudpClient {
             .ok_or(XudpClientError::Closed)?
             .clone();
         let (reply_tx, reply_rx) = mpsc::channel(self.reply_queue);
-        let session_id = {
+        let (session_id, dropped_replies) = {
             let mut guard = self.table.lock().map_err(|_| XudpClientError::Closed)?;
             guard.allocate(reply_tx)?
         };
@@ -406,6 +421,7 @@ impl XudpClient {
             table: Arc::clone(&self.table),
             outbound_tx,
             reply_rx,
+            dropped_replies,
         })
     }
 
@@ -455,6 +471,8 @@ pub struct XudpSession {
     table: Arc<Mutex<SessionTable>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
     reply_rx: mpsc::Receiver<XudpReply>,
+    /// Replies the mux reader dropped for this session; only this session bumps it.
+    dropped_replies: Arc<AtomicU64>,
 }
 
 impl XudpSession {
@@ -503,21 +521,34 @@ impl XudpSession {
     /// Returns [`XudpClientError::OutboundQueueFull`] instead of waiting for the
     /// mux writer, so a caller that drains inbound replies and sends outbound
     /// datagrams in the same loop never blocks the reply path on the 256-frame
-    /// outbound queue.
+    /// outbound queue. The queue slot is reserved before the frame is encoded,
+    /// so a full queue costs no payload allocation or copy.
     pub fn try_send_owned(
         &mut self,
         destination: NetLocation,
         payload: Vec<u8>,
     ) -> Result<(), XudpClientError> {
-        let frame = self.encode_owned(destination, payload)?;
-        match self.outbound_tx.try_send(frame) {
-            Ok(()) => {
-                self.sent_new = true;
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => Err(XudpClientError::OutboundQueueFull),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(XudpClientError::Closed),
+        if !self.is_live() {
+            return Err(XudpClientError::Closed);
         }
+        if payload.is_empty() || payload.len() > MAX_PAYLOAD_LEN {
+            return Err(XudpClientError::InvalidPayloadLength {
+                length: payload.len(),
+                max: MAX_PAYLOAD_LEN,
+            });
+        }
+        let permit = match self.outbound_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                return Err(XudpClientError::OutboundQueueFull);
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => return Err(XudpClientError::Closed),
+        };
+        // A dropped permit returns the reserved slot to the queue.
+        let frame = self.encode_frame_owned(destination, payload)?;
+        permit.send(frame);
+        self.sent_new = true;
+        Ok(())
     }
 
     /// Encodes one owned payload into a mux frame without queueing it.
@@ -535,6 +566,15 @@ impl XudpSession {
                 max: MAX_PAYLOAD_LEN,
             });
         }
+        self.encode_frame_owned(destination, payload)
+    }
+
+    /// Prepends the frame header to an already validated owned payload.
+    fn encode_frame_owned(
+        &self,
+        destination: NetLocation,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, XudpClientError> {
         let status = if self.sent_new {
             SessionStatus::Keep
         } else {
@@ -563,10 +603,7 @@ impl XudpSession {
     /// Returns and clears the number of inbound replies the mux dropped for this
     /// session because its reply queue was full.
     pub fn take_dropped_replies(&self) -> u64 {
-        self.table
-            .lock()
-            .map(|t| t.dropped_replies.swap(0, Ordering::Relaxed))
-            .unwrap_or(0)
+        self.dropped_replies.swap(0, Ordering::Relaxed)
     }
 
     /// Allocates a datagram buffer with [`FRAME_HEADER_RESERVE`] bytes of
@@ -742,7 +779,7 @@ mod tests {
     ) {
         let table = Arc::new(Mutex::new(SessionTable::new(4)));
         let (reply_tx, reply_rx) = mpsc::channel(4);
-        let session_id = table
+        let (session_id, dropped_replies) = table
             .lock()
             .expect("session table")
             .allocate(reply_tx)
@@ -756,6 +793,7 @@ mod tests {
                 table: Arc::clone(&table),
                 outbound_tx,
                 reply_rx,
+                dropped_replies,
             },
             outbound_rx,
             table,
@@ -874,7 +912,7 @@ mod tests {
                 payload: b"pong".to_vec(),
             })
             .expect("queue reply");
-        let session_id = table
+        let (session_id, dropped_replies) = table
             .lock()
             .expect("session table")
             .allocate(reply_tx)
@@ -888,6 +926,7 @@ mod tests {
             table,
             outbound_tx,
             reply_rx,
+            dropped_replies,
         };
 
         // The full mux queue must fail fast instead of stalling the caller, so
@@ -918,20 +957,33 @@ mod tests {
     }
 
     #[test]
-    fn take_dropped_replies_reports_and_clears_mux_reply_drops() {
+    fn take_dropped_replies_is_per_session_and_clears() {
         let (session, _rx, table) = new_test_session();
+        let (other_reply_tx, _other_reply_rx) = mpsc::channel(4);
+        let (other_id, other_dropped) = table
+            .lock()
+            .expect("table")
+            .allocate(other_reply_tx)
+            .expect("allocate second session");
+        assert_ne!(other_id, session.session_id);
+
         assert_eq!(session.take_dropped_replies(), 0);
         {
             let guard = table.lock().expect("table");
-            guard.note_dropped_reply();
-            guard.note_dropped_reply();
+            let (tx, dropped) = guard.reply_target(session.session_id).expect("session");
+            drop(tx);
+            dropped.fetch_add(2, Ordering::Relaxed);
         }
+        // Another session's drops must not be attributed to this one.
+        other_dropped.fetch_add(5, Ordering::Relaxed);
+
         assert_eq!(session.take_dropped_replies(), 2);
         assert_eq!(
             session.take_dropped_replies(),
             0,
             "the count is consumed by the reader"
         );
+        assert_eq!(other_dropped.load(Ordering::Relaxed), 5);
     }
 
     #[tokio::test]
