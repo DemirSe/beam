@@ -617,7 +617,8 @@ pub fn build_icmp_port_unreachable(original: &IpPacketView<'_>) -> Option<Vec<u8
 /// overflow, far above any packet or the usual callers.
 ///
 /// Public because the `packet_checksum` benchmark compares it with a scalar
-/// reference for the same bytes.
+/// reference for the same bytes; hidden so it stays out of the public docs.
+#[doc(hidden)]
 pub fn sum_bytes(data: &[u8]) -> u64 {
     let (chunks, remainder) = data.as_chunks::<8>();
     let mut high = 0u64;

@@ -338,6 +338,11 @@ impl UdpNatBridge {
     pub fn next_sweep_delay_ms(&self) -> Option<u64> {
         let now_ms = self.now_ms();
         let idle_ms = self.bridge_config.idle_timeout.as_millis() as u64;
+        // A finished session task is reaped by the next sweep, so it must not
+        // keep its slot (or an idle wakeup) until `idle_timeout` elapses.
+        if self.sessions.values().any(|entry| entry.task.is_finished()) {
+            return Some(0);
+        }
         // The earliest real expiry, so the sweep runs exactly when a session
         // times out instead of on a coarse fixed clamp.
         let session_delay = self
@@ -472,6 +477,51 @@ mod tests {
             },
         );
         rx
+    }
+
+    #[tokio::test]
+    async fn next_sweep_delay_reaps_a_finished_session_task_at_once() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig {
+                max_sessions: 4,
+                idle_timeout: Duration::from_secs(60),
+            },
+            tun_tx,
+            Arc::new(Notify::new()),
+            dummy_drops(),
+        );
+
+        // A session task that already exited must not linger for 60s.
+        let task = tokio::spawn(async {});
+        for _ in 0..8 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            task.is_finished(),
+            "short-lived session task did not finish"
+        );
+        let (tx, _rx) = mpsc::channel(PER_SESSION_SEND_QUEUE);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 40_100);
+        bridge.sessions.insert(
+            src,
+            NatEntry {
+                tx,
+                last_active_ms: Arc::new(AtomicU64::new(bridge.now_ms())),
+                task,
+            },
+        );
+        assert_eq!(
+            bridge.next_sweep_delay_ms(),
+            Some(0),
+            "a finished session task must schedule an immediate sweep"
+        );
+        bridge.sweep_idle();
+        assert!(bridge.sessions.is_empty(), "the finished session is reaped");
     }
 
     #[tokio::test]

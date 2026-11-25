@@ -796,6 +796,16 @@ impl DnsCache {
         }
     }
 
+    /// Asserts in debug builds that `len` mirrors the inner maps exactly.
+    /// A release build compiles this to nothing.
+    fn debug_check_len(&self) {
+        debug_assert_eq!(
+            self.len,
+            self.entries.values().map(HashMap::len).sum::<usize>(),
+            "DnsCache.len must mirror its inner entries"
+        );
+    }
+
     /// Looks up a cached response.
     ///
     /// The returned buffer still carries the original responder's `tx_id`; the
@@ -820,6 +830,7 @@ impl DnsCache {
                     self.entries.remove(query.qname.as_str());
                 }
             }
+            self.debug_check_len();
             return None;
         }
         let entry = self.entries.get_mut(query.qname.as_str())?.get_mut(&rest)?;
@@ -853,44 +864,49 @@ impl DnsCache {
             });
             self.len = self.entries.values().map(HashMap::len).sum();
             if self.len >= self.max_entries {
-                let mut oldest_name: Option<String> = None;
-                let mut oldest_rest = rest;
+                let mut oldest: Option<(&String, CacheRest)> = None;
                 let mut oldest_used = u64::MAX;
                 for (name, inner) in &self.entries {
                     for (r, entry) in inner {
                         if entry.last_used < oldest_used {
                             oldest_used = entry.last_used;
-                            oldest_name = Some(name.clone());
-                            oldest_rest = *r;
+                            oldest = Some((name, *r));
                         }
                     }
                 }
-                if let Some(name) = oldest_name
-                    && let Some(inner) = self.entries.get_mut(name.as_str())
-                {
-                    inner.remove(&oldest_rest);
-                    self.len = self.len.saturating_sub(1);
-                    if inner.is_empty() {
-                        self.entries.remove(name.as_str());
+                if let Some((name, rest)) = oldest {
+                    // One clone of the winning name, after the scan.
+                    let name = name.to_owned();
+                    if let Some(inner) = self.entries.get_mut(name.as_str()) {
+                        inner.remove(&rest);
+                        self.len = self.len.saturating_sub(1);
+                        if inner.is_empty() {
+                            self.entries.remove(name.as_str());
+                        }
                     }
                 }
             }
         }
         self.seq = self.seq.wrapping_add(1);
-        let inner = self.entries.entry(query.qname.clone()).or_default();
-        let is_new = !inner.contains_key(&rest);
-        inner.insert(
-            rest,
-            CacheEntry {
-                wire,
-                expires_at: now + Duration::from_secs(u64::from(ttl_secs)),
-                last_used: self.seq,
-                is_local,
-            },
-        );
-        if is_new {
+        let entry = CacheEntry {
+            wire,
+            expires_at: now + Duration::from_secs(u64::from(ttl_secs)),
+            last_used: self.seq,
+            is_local,
+        };
+        // Update a known name through `get_mut`: only the first entry of a name
+        // allocates an owned key, and a new qtype under a known name allocates
+        // nothing at all.
+        if let Some(inner) = self.entries.get_mut(query.qname.as_str()) {
+            if inner.insert(rest, entry).is_none() {
+                self.len += 1;
+            }
+        } else {
+            self.entries
+                .insert(query.qname.clone(), HashMap::from([(rest, entry)]));
             self.len += 1;
         }
+        self.debug_check_len();
     }
 
     /// Evicts local-network DNS entries (called on network/gateway switches).
@@ -900,12 +916,14 @@ impl DnsCache {
             !inner.is_empty()
         });
         self.len = self.entries.values().map(HashMap::len).sum();
+        self.debug_check_len();
     }
 
     /// Clears all cached entries.
     pub fn clear_all(&mut self) {
         self.entries.clear();
         self.len = 0;
+        self.debug_check_len();
     }
 }
 
@@ -1311,9 +1329,8 @@ pub struct DnsInterceptor {
     client_config: Arc<BeamClientConfig>,
     dns_config: Arc<DnsConfig>,
     /// Pre-formatted static DoH request prefix (`None` for non-DoH upstreams).
-    /// Embeds the secret DoH path: never log it or expose it via
-    /// `Debug`/`Display` (this type implements neither).
-    doh_prefix: Option<Arc<[u8]>>,
+    /// Embeds the secret DoH path, so [`DohPrefix`] cannot be printed.
+    doh_prefix: Option<DohPrefix>,
     local_upstream: Arc<Mutex<Option<SocketAddr>>>,
     tls_config: Arc<ClientConfig>,
     doh_pool: Arc<DohPool>,
@@ -2056,13 +2073,39 @@ async fn resolve_udp_over_beam(
 /// Trailing half of a DoH HTTP/1.1 request after the `Content-Length` value.
 const DOH_REQUEST_SUFFIX: &[u8] = b"\r\nConnection: keep-alive\r\n\r\n";
 
+/// Decimal digits that `Content-Length` can need at most (`u64::MAX` has 20).
+const MAX_CONTENT_LENGTH_DIGITS: usize = 20;
+
+/// Pre-formatted leading half of a DoH HTTP/1.1 request, up to (but not
+/// including) the `Content-Length` value.
+///
+/// The bytes embed the secret DoH `path`, which is why this type has a manual
+/// [`Debug`] impl: printing it, directly or through a containing struct, can
+/// never leak the path.
+#[derive(Clone)]
+struct DohPrefix(Arc<[u8]>);
+
+impl std::fmt::Debug for DohPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"<redacted>\"")
+    }
+}
+
+impl std::ops::Deref for DohPrefix {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Builds the static leading half of a DoH HTTP/1.1 request, up to (but not
 /// including) the `Content-Length` value. Pre-formatted once per interceptor
 /// so a cache miss never re-allocates the header prefix.
 ///
 /// The bytes embed the secret DoH `path`: never log them, and never expose
 /// them via `Debug`/`Display` ([`DnsUpstream`] redacts the path everywhere).
-fn build_doh_request_prefix(path: &str, host_header: &str) -> Arc<[u8]> {
+fn build_doh_request_prefix(path: &str, host_header: &str) -> DohPrefix {
     let mut prefix = Vec::with_capacity(path.len() + host_header.len() + 128);
     prefix.extend_from_slice(b"POST ");
     prefix.extend_from_slice(path.as_bytes());
@@ -2071,7 +2114,7 @@ fn build_doh_request_prefix(path: &str, host_header: &str) -> Arc<[u8]> {
     prefix.extend_from_slice(
         b"\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: ",
     );
-    Arc::from(prefix)
+    DohPrefix(Arc::from(prefix))
 }
 
 /// Formats `len` as decimal ASCII into `buf` without allocating; returns the
@@ -2093,20 +2136,27 @@ fn decimal_len_bytes(len: usize, buf: &mut [u8; 20]) -> &[u8] {
     &buf[idx..]
 }
 
+/// Assembles one DoH HTTP/1.1 request into a single buffer so the caller can
+/// send it with one write (one TLS record) instead of four.
+fn build_doh_request(prefix: &[u8], query: &[u8]) -> Vec<u8> {
+    let mut request = Vec::with_capacity(
+        prefix.len() + DOH_REQUEST_SUFFIX.len() + MAX_CONTENT_LENGTH_DIGITS + query.len(),
+    );
+    request.extend_from_slice(prefix);
+    let mut len_buf = [0u8; MAX_CONTENT_LENGTH_DIGITS];
+    request.extend_from_slice(decimal_len_bytes(query.len(), &mut len_buf));
+    request.extend_from_slice(DOH_REQUEST_SUFFIX);
+    request.extend_from_slice(query);
+    request
+}
+
 async fn send_doh_http_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
     prefix: &[u8],
     query: &[u8],
 ) -> io::Result<(Vec<u8>, bool)> {
-    // The static header prefix is pre-formatted per interceptor; only the
-    // decimal `Content-Length` (stack buffer, no allocation) varies per query.
-    stream.write_all(prefix).await?;
-    let mut len_buf = [0u8; 20];
-    stream
-        .write_all(decimal_len_bytes(query.len(), &mut len_buf))
-        .await?;
-    stream.write_all(DOH_REQUEST_SUFFIX).await?;
-    stream.write_all(query).await?;
+    let request = build_doh_request(prefix, query);
+    stream.write_all(&request).await?;
     stream.flush().await?;
     read_doh_http_response_keepalive(stream).await
 }
@@ -2151,7 +2201,7 @@ async fn resolve_doh_over_beam(
     // Fast path: reuse the interceptor-wide pre-formatted header prefix, so a
     // cache miss performs zero header allocations. The fallback rebuilds the
     // prefix only when none was supplied (e.g. direct unit-test use).
-    let owned_prefix: Arc<[u8]>;
+    let owned_prefix: DohPrefix;
     let prefix: &[u8] = match prefix {
         Some(cached) => cached,
         None => {
@@ -2587,6 +2637,23 @@ mod tests {
 
         // Expired after TTL.
         assert!(cache.get(&q1, t0 + Duration::from_secs(31)).is_none());
+    }
+
+    #[test]
+    fn cache_never_exceeds_max_entries_for_unique_names() {
+        const MAX: usize = 64;
+        let t0 = Instant::now();
+        let mut cache = DnsCache::new(MAX);
+        for idx in 0..(4 * MAX) {
+            let name = format!("host{idx}.example");
+            let wire = build_query(0x1234, &name, 1);
+            let query = parse_dns_query(&wire).expect("query");
+            let resp = build_a_response(&wire, Ipv4Addr::new(9, 9, 9, 9), 30);
+            cache.insert(&query, Arc::from(resp), 30, false, t0);
+            let total: usize = cache.entries.values().map(HashMap::len).sum();
+            assert!(total <= MAX, "{total} entries cached for a {MAX} bound");
+        }
+        assert_eq!(cache.len, MAX, "the cache must fill up to its bound");
     }
 
     #[test]
@@ -4287,14 +4354,21 @@ mod tests {
                 )
                 .into_bytes();
                 expected.extend_from_slice(&query);
-                let mut assembled = Vec::with_capacity(prefix.len() + 8 + len);
-                assembled.extend_from_slice(&prefix);
-                let mut len_buf = [0u8; 20];
-                assembled.extend_from_slice(decimal_len_bytes(len, &mut len_buf));
-                assembled.extend_from_slice(DOH_REQUEST_SUFFIX);
-                assembled.extend_from_slice(&query);
+                let assembled = build_doh_request(&prefix, &query);
                 assert_eq!(assembled, expected, "host={host} port={port} len={len}");
             }
         }
+    }
+
+    #[test]
+    fn doh_prefix_debug_redacts_the_secret_path() {
+        let prefix = build_doh_request_prefix("/secret-path-abc123", "dns.example");
+        assert_eq!(format!("{prefix:?}"), "\"<redacted>\"");
+        assert!(
+            prefix
+                .windows(b"/secret-path-abc123".len())
+                .any(|w| w == b"/secret-path-abc123"),
+            "the raw bytes must still hold the path for the request itself"
+        );
     }
 }

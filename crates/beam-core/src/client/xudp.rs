@@ -175,6 +175,23 @@ impl SessionTable {
         }
     }
 
+    /// Removes `id` only when `live` still belongs to the registered session.
+    ///
+    /// A session's `Drop` runs after `close()` already removed it; without this
+    /// identity check that late removal could clear a *reused* id and silently
+    /// kill a fresh session. Returns whether an entry was removed.
+    fn remove_if_same(&mut self, id: u16, live: &Arc<AtomicBool>) -> bool {
+        let same = self
+            .sessions
+            .get(&id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.live, live));
+        if !same {
+            return false;
+        }
+        self.remove(id);
+        true
+    }
+
     fn close_all(&mut self) {
         self.closed = true;
         for (_, entry) in self.sessions.drain() {
@@ -679,7 +696,8 @@ impl XudpSession {
 
     fn send_end_best_effort(&mut self) {
         if let Ok(mut guard) = self.table.lock() {
-            guard.remove(self.session_id);
+            // Never removes a session that reused this id after `close()`.
+            guard.remove_if_same(self.session_id, &self.live);
         }
         if self.sent_new {
             let spec = FrameSpec {
@@ -1038,6 +1056,47 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn close_then_drop_keeps_a_reused_id() {
+        let (session, _outbound, table) = new_test_session();
+        let stale_id = session.session_id;
+        let stale_live = Arc::clone(&session.live);
+
+        // `close()` removes the id; its `Drop` repeats the removal afterwards.
+        session.close().await.expect("close");
+
+        // The mux hands the same numeric id to a fresh session.
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        let reused_live = {
+            let mut guard = table.lock().expect("table");
+            guard.next_id = stale_id;
+            let (id, _dropped, live) = guard.allocate(reply_tx).expect("reused session");
+            assert_eq!(id, stale_id, "the test must reuse the same id");
+            live
+        };
+
+        // A stale handle, as a late `Drop` would hold, must not touch it.
+        assert!(
+            !table
+                .lock()
+                .expect("table")
+                .remove_if_same(stale_id, &stale_live),
+            "a stale live handle must not remove the reused session"
+        );
+        assert!(
+            reused_live.load(Ordering::Acquire),
+            "the reused session must stay live"
+        );
+        assert!(
+            table
+                .lock()
+                .expect("table")
+                .remove_if_same(stale_id, &reused_live),
+            "the owning handle must still remove its own session"
+        );
+        assert!(!reused_live.load(Ordering::Acquire));
     }
 
     #[test]

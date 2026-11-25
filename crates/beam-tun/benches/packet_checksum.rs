@@ -28,18 +28,29 @@ fn scalar_sum_bytes(data: &[u8]) -> u64 {
     sum
 }
 
-fn measure(run: &mut dyn FnMut() -> u64) -> f64 {
-    // Interleaved short trials keep frequency drift from favouring one side.
-    black_box(run());
-    let mut best = f64::MAX;
+/// Runs both variants in the same trial loop, so each round samples both
+/// implementations under the same cache and frequency conditions. Returns the
+/// best (scalar, unrolled) ns/segment pair.
+fn measure(scalar: &mut dyn FnMut() -> u64, unrolled: &mut dyn FnMut() -> u64) -> (f64, f64) {
+    black_box(scalar());
+    black_box(unrolled());
+    let rounds = ROUNDS / TRIALS;
+    let mut best_scalar = f64::MAX;
+    let mut best_unrolled = f64::MAX;
     for _ in 0..TRIALS {
         let start = Instant::now();
-        for _ in 0..(ROUNDS / TRIALS) {
-            black_box(run());
+        for _ in 0..rounds {
+            black_box(scalar());
         }
-        best = best.min(start.elapsed().as_secs_f64() * 1e9 / (ROUNDS / TRIALS) as f64);
+        best_scalar = best_scalar.min(start.elapsed().as_secs_f64() * 1e9 / rounds as f64);
+
+        let start = Instant::now();
+        for _ in 0..rounds {
+            black_box(unrolled());
+        }
+        best_unrolled = best_unrolled.min(start.elapsed().as_secs_f64() * 1e9 / rounds as f64);
     }
-    best
+    (best_scalar, best_unrolled)
 }
 
 fn main() {
@@ -52,8 +63,7 @@ fn main() {
 
     let mut scalar = || scalar_sum_bytes(black_box(&segment));
     let mut unrolled = || sum_bytes(black_box(&segment));
-    let scalar_ns = measure(&mut scalar);
-    let unrolled_ns = measure(&mut unrolled);
+    let (scalar_ns, unrolled_ns) = measure(&mut scalar, &mut unrolled);
     assert_eq!(
         scalar_sum_bytes(&segment) % 65_535,
         sum_bytes(&segment) % 65_535,
