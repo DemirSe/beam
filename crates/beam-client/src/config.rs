@@ -421,8 +421,9 @@ impl ClientFileConfig {
             client,
             route,
             max_tcp_connections: self.limits.max_tcp_connections,
-            // `None` leaves `tcp_stack.idle_timeout_ms` as the sole TCP idle bound.
-            tcp_relay_idle_timeout: None,
+            // Same as `client.idle_timeout`, so Linux write and read deadlines
+            // stay as they were; read timeouts are exactly the classic cap.
+            tcp_relay_idle_timeout: Some(Duration::from_millis(self.limits.idle_timeout_ms)),
             udp: UdpBridgeConfig {
                 max_sessions: self.limits.max_udp_sessions,
                 idle_timeout: Duration::from_millis(self.limits.idle_timeout_ms.min(60_000)),

@@ -54,12 +54,15 @@ pub struct TunEngineConfig {
     pub route: RoutePolicy,
     /// Maximum concurrent proxied TCP connections.
     pub max_tcp_connections: usize,
-    /// Optional per-direction idle timeout for the established TCP relay loops.
+    /// Optional idle timeout for the *reads* of the established TCP relay loops.
     ///
-    /// `None` (the default) imposes no relay timeout, so 15-minute FCM/MTalk
-    /// push sockets stay alive under `ProxyTcpStack::idle_timeout_ms` plus
-    /// upstream keepalive/`TCP_USER_TIMEOUT`. `Some(dur)` keeps the classic
-    /// per-direction read/write cap for metered or short-lived profiles.
+    /// `None` removes only the relay read cap, so 15-minute FCM/MTalk push
+    /// sockets stay alive under `ProxyTcpStack::idle_timeout_ms` plus upstream
+    /// keepalive/`TCP_USER_TIMEOUT`. Relay writes always keep a bounded
+    /// deadline: `None` falls back to
+    /// [`BeamClientConfig::idle_timeout`](beam_core::client::BeamClientConfig::idle_timeout),
+    /// so a peer that stops draining can never wedge a relay task. `Some(dur)`
+    /// bounds reads and writes with `dur`, the classic per-direction cap.
     pub tcp_relay_idle_timeout: Option<Duration>,
     /// UDP NAT bridge configuration.
     pub udp: UdpBridgeConfig,
@@ -498,8 +501,9 @@ impl Default for EngineTelemetry {
 pub struct TelemetrySnapshot {
     /// Packet drop counters.
     pub drops: DropSnapshot,
-    /// DNS outcome counters, present when the handle was built with
-    /// [`EngineTelemetry::with_dns`] and the engine ran with DNS enabled.
+    /// DNS outcome counters, present whenever the handle was built with
+    /// [`EngineTelemetry::with_dns`]. The counters stay at zero when the engine
+    /// ran with `dns: None`.
     pub dns: Option<DnsSnapshot>,
     /// Age of the last successful upstream dial, if any dial succeeded.
     pub last_dial_success_age: Option<Duration>,
@@ -552,11 +556,9 @@ where
     S: NetStack,
 {
     let start = Instant::now();
-    if dns_counters.is_some() != config.dns.is_some() {
+    if dns_counters.is_some() && config.dns.is_none() {
         debug!(
-            has_dns_config = config.dns.is_some(),
-            has_dns_counters = dns_counters.is_some(),
-            "telemetry DNS counters and engine DNS config presence mismatch; the UI DNS section will be empty or stale",
+            "telemetry DNS counters are attached but the engine runs without DNS; the UI DNS section stays at zero",
         );
     }
     let stack_waker = stack.waker();
@@ -800,13 +802,13 @@ fn warn_relay_timeout(dst: SocketAddr, op: &'static str, idle: Duration) {
     }
 }
 
-/// Runs `fut` with an idle timeout when `Some`, or awaits it directly when
-/// `None`.
+/// Runs `fut` with a deadline when `Some`, or awaits it directly when `None`.
 ///
-/// `None` is the push-safe always-on mode: established FCM/MTalk flows wait on
-/// the socket with no redundant relay read cap, so `ProxyTcpStack`'s
-/// `idle_timeout_ms` plus upstream keepalive/`TCP_USER_TIMEOUT` govern flow
-/// lifetime instead of a second timer.
+/// Only relay *reads* pass `None`, in the push-safe always-on mode: established
+/// FCM/MTalk flows wait on the socket with no redundant read cap, so
+/// `ProxyTcpStack`'s `idle_timeout_ms` plus upstream keepalive/
+/// `TCP_USER_TIMEOUT` govern flow lifetime instead of a second timer. Relay
+/// writes always pass `Some`, see [`spawn_tcp_relay`].
 async fn with_relay_idle<T>(
     idle: Option<Duration>,
     fut: impl std::future::Future<Output = T>,
@@ -815,6 +817,12 @@ async fn with_relay_idle<T>(
         Some(budget) => timeout(budget, fut).await.map_err(|_| ()),
         None => Ok(fut.await),
     }
+}
+
+/// Relay write deadline: always bounded, so `None` falls back to the client
+/// idle timeout.
+fn relay_write_idle(relay_idle: Option<Duration>, client_idle: Duration) -> Duration {
+    relay_idle.unwrap_or(client_idle)
 }
 
 fn spawn_tcp_relay(
@@ -904,7 +912,10 @@ fn spawn_tcp_relay(
             }
         };
 
-        let idle = relay_idle;
+        // Push-safe mode unbounds reads only. Writes keep a deadline in both
+        // modes, so a peer that stops draining can never wedge this task.
+        let read_idle = relay_idle;
+        let write_idle = relay_write_idle(relay_idle, client_config.idle_timeout);
         let (mut tun_r, mut tun_w) = conn.stream.into_split();
         let (mut up_r, mut up_w) = tokio::io::split(upstream);
 
@@ -913,7 +924,7 @@ fn spawn_tcp_relay(
             // write; stays empty (zero allocation) when no coalescing is needed.
             let mut scratch: Vec<u8> = Vec::new();
             loop {
-                let chunk = match with_relay_idle(idle, tun_r.recv_chunk()).await {
+                let chunk = match with_relay_idle(read_idle, tun_r.recv_chunk()).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => {
                         let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
@@ -925,16 +936,14 @@ fn spawn_tcp_relay(
                 // so multi-flow uploads write full TLS records with fewer syscalls.
                 let coalesced = coalesce_c2s(&chunk, &mut scratch, || tun_r.try_recv_chunk());
                 let out: &[u8] = if coalesced { &scratch } else { &chunk };
-                match with_relay_idle(idle, up_w.write_all(out)).await {
+                match with_relay_idle(Some(write_idle), up_w.write_all(out)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "write", &err);
                         break;
                     }
                     Err(_) => {
-                        if let Some(budget) = idle {
-                            warn_relay_timeout(conn.dst, "write", budget);
-                        }
+                        warn_relay_timeout(conn.dst, "write", write_idle);
                         break;
                     }
                 }
@@ -949,16 +958,14 @@ fn spawn_tcp_relay(
                 if tun_r.has_queued() {
                     continue;
                 }
-                match with_relay_idle(idle, up_w.flush()).await {
+                match with_relay_idle(Some(write_idle), up_w.flush()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "flush", &err);
                         break;
                     }
                     Err(_) => {
-                        if let Some(budget) = idle {
-                            warn_relay_timeout(conn.dst, "flush", budget);
-                        }
+                        warn_relay_timeout(conn.dst, "flush", write_idle);
                         break;
                     }
                 }
@@ -971,7 +978,7 @@ fn spawn_tcp_relay(
                 let read_res = tokio::select! {
                     biased;
                     () = tun_w.closed() => break,
-                    res = async { with_relay_idle(idle, up_r.read(&mut buf)).await } => res,
+                    res = async { with_relay_idle(read_idle, up_r.read(&mut buf)).await } => res,
                 };
                 let n = match read_res {
                     Ok(Ok(0)) => break,
@@ -981,22 +988,20 @@ fn spawn_tcp_relay(
                         break;
                     }
                     Err(_) => {
-                        if let Some(budget) = idle {
+                        if let Some(budget) = read_idle {
                             warn_relay_timeout(conn.dst, "read", budget);
                         }
                         break;
                     }
                 };
-                match with_relay_idle(idle, tun_w.send_chunk_pooled(&buf[..n])).await {
+                match with_relay_idle(Some(write_idle), tun_w.send_chunk_pooled(&buf[..n])).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "send_chunk", &err);
                         break;
                     }
                     Err(_) => {
-                        if let Some(budget) = idle {
-                            warn_relay_timeout(conn.dst, "send_chunk", budget);
-                        }
+                        warn_relay_timeout(conn.dst, "send_chunk", write_idle);
                         break;
                     }
                 }
@@ -1297,6 +1302,16 @@ mod tests {
         std::thread::sleep(Duration::from_millis(15));
         assert_eq!(activity.recent_rtt(Duration::from_millis(5)), None);
         assert_eq!(activity.recent_rtt(Duration::from_secs(10)), Some(17));
+    }
+
+    #[test]
+    fn relay_write_deadline_is_always_bounded() {
+        let client_idle = Duration::from_secs(300);
+        assert_eq!(relay_write_idle(None, client_idle), client_idle);
+        assert_eq!(
+            relay_write_idle(Some(Duration::from_secs(45)), client_idle),
+            Duration::from_secs(45)
+        );
     }
 
     #[tokio::test]

@@ -358,8 +358,9 @@ fn parse_port(text: &str) -> Result<u16, ClientLinkError> {
 
 /// Accepts an IPv4 address or a hostname.
 ///
-/// All-numeric dotted forms (e.g. `999.999.999.999`, `1.2.3`) must parse as
-/// [`Ipv4Addr`]; they are never accepted as hostnames, so a mistyped numeric
+/// A dotted string made only of digits must parse as an [`Ipv4Addr`].
+/// Decimal dotted-numeric forms that are not IPv4 addresses (e.g.
+/// `999.999.999.999` or `1.2.3`) are therefore rejected, so a mistyped numeric
 /// address cannot route as a DNS name.
 fn validate_host(host: &str) -> Result<(), ClientLinkError> {
     if host.is_empty() {

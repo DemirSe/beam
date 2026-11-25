@@ -9,12 +9,16 @@ Rust core exposes every hook that the Android phase needs.
 - `TcpStackConfig::mobile` and `UdpBridgeConfig::mobile` in `beam-tun`. These
   presets bound RAM use and keep push sockets alive.
 - `TunEngineConfig::tcp_relay_idle_timeout` in `beam-tun`. `None` removes the
-  redundant relay read cap. `Some` keeps the classic per-direction cap.
+  redundant relay *read* cap only; relay writes always keep a deadline. `Some`
+  keeps the classic per-direction cap on reads and writes.
 - `EngineTelemetry`, `TelemetrySnapshot`, and
   `run_tun_engine_with_telemetry` in `beam-tun`. The Android UI polls these in
   pure Rust. It never reads the Linux `/run/beam-client/status` file.
-- `DnsConfig::local_socket_protector` in `beam-tun` (Unix only). The engine
-  calls it after `bind` and before `connect` on each fresh local-DNS socket.
+- `DnsConfig::local_socket_protector` in `beam-tun`. It takes
+  `beam_core::client::SocketProtector`, the same hook type as
+  `BeamClientConfig::socket_protector`, so one JNI callback covers both. The
+  engine calls it after `bind` and before `connect` on each fresh local-DNS
+  socket.
 - `BeamClientConfig::socket_protector` in `beam-core`. The dial path calls it
   on the unconnected upstream socket before `connect`. Done.
 - `beam_core::client::{parse_client_link, ParsedClientLink, ClientLinkError}`
@@ -53,8 +57,11 @@ The mobile presets implement this design:
 - `TcpStackConfig::mobile`: MTU 1500, 128 connections, 128 KiB per-direction
   socket buffers, 10 s handshake timeout, 1800 s idle timeout.
 - `UdpBridgeConfig::mobile`: 128 NAT sessions, 60 s idle expiry.
-- `tcp_relay_idle_timeout: None`: no per-direction relay cap. The 1800 s
-  stack idle timeout governs flow lifetime.
+- `tcp_relay_idle_timeout: None`: no relay read cap. The 1800 s stack idle
+  timeout governs flow lifetime. Relay writes still time out after
+  `BeamClientConfig::idle_timeout`, so a peer that stops draining is bounded.
+  The Linux `beam-client` profile keeps `Some(idle_timeout_ms)` and therefore
+  keeps its exact previous read and write caps.
 
 Worst-case TCP buffer use is 128 flows times 128 KiB times two directions.
 That 32 MiB is the TCP ring buffer ceiling (`128 x 128 KiB x 2`). Relay adds
@@ -69,8 +76,9 @@ Push-notification alignment:
 - Upstream TCP keepalive starts after 30 s idle and probes every 10 s.
   `TCP_USER_TIMEOUT` is 30 s. Dead peers therefore fail fast while live push
   sockets stay open.
-- `None` relay timeout is required for this alignment. A 300 s relay cap
-  would kill a healthy 15-minute push socket from the middle.
+- `None` relay read timeout is required for this alignment. A 300 s read cap
+  would kill a healthy 15-minute push socket from the middle. The write
+  deadline stays in force and no live push socket reaches it.
 
 ## Flap backoff compared with short-outage retry
 

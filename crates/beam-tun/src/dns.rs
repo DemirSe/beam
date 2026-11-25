@@ -9,13 +9,14 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use beam_core::address::{Address, NetLocation};
-use beam_core::client::{BeamClientConfig, BeamTcpStream, XudpClient, XudpClientConfig, dial_tcp};
+use beam_core::client::{
+    BeamClientConfig, BeamTcpStream, SocketProtector, XudpClient, XudpClientConfig, dial_tcp,
+};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -261,15 +262,6 @@ pub type BypassIpCallback = Arc<dyn Fn(Vec<IpAddr>) -> tokio::task::JoinHandle<(
 /// Optional callback invoked on network transitions to refresh the local DNS server.
 pub type LocalDnsRefresh = Arc<dyn Fn() -> Option<SocketAddr> + Send + Sync>;
 
-/// Android `VpnService.protect(fd)` hook for the local-DNS socket.
-///
-/// The engine calls it with the bound socket's raw fd after `bind` and before
-/// `connect`, so the protector keeps local queries outside the tunnel. A
-/// protector error fails the query before any packet leaves the socket.
-/// Unix only: other platforms always open local DNS directly.
-#[cfg(unix)]
-pub type LocalSocketProtector = Arc<dyn Fn(std::os::fd::RawFd) -> io::Result<()> + Send + Sync>;
-
 /// Configuration for the built-in [`DnsInterceptor`].
 #[derive(Clone)]
 pub struct DnsConfig {
@@ -281,11 +273,11 @@ pub struct DnsConfig {
     /// Optional callback invoked on network transitions to re-detect the
     /// host's local DNS server when `local_upstream` was auto-detected.
     pub refresh_local_upstream: Option<LocalDnsRefresh>,
-    /// Optional `VpnService.protect(fd)` hook, called after `bind` and before
-    /// `connect` on every freshly bound local-DNS socket. A reused pooled
-    /// socket skips the hook. Omitted from `Debug` like the other callbacks.
-    #[cfg(unix)]
-    pub local_socket_protector: Option<LocalSocketProtector>,
+    /// Optional [`SocketProtector`] hook (`VpnService.protect(fd)`), the same
+    /// type the upstream dial path takes, called after `bind` and before
+    /// `connect` on every freshly bound local-DNS socket. A reused pooled socket
+    /// skips the hook. Omitted from `Debug` like the other callbacks.
+    pub local_socket_protector: Option<SocketProtector>,
     /// Local-only suffixes (e.g. `["lan", "local", "internal"]`).
     pub local_suffixes: Vec<String>,
     /// Additional user-configured bypass domain suffixes.
@@ -320,16 +312,9 @@ impl std::fmt::Debug for DnsConfig {
 }
 
 impl DnsConfig {
-    /// Returns the local-socket protector, if any (Unix only).
-    #[cfg(unix)]
-    pub(crate) fn local_protector(&self) -> Option<LocalSocketProtector> {
+    /// Returns the local-socket protector, if any.
+    pub(crate) fn local_protector(&self) -> Option<SocketProtector> {
         self.local_socket_protector.clone()
-    }
-
-    /// Non-Unix builds have no socket protector; local DNS is always direct.
-    #[cfg(not(unix))]
-    pub(crate) fn local_protector(&self) -> Option<()> {
-        None
     }
 
     /// Returns the default local-only suffixes (`.lan`, `.local`, `.internal`).
@@ -343,7 +328,6 @@ impl DnsConfig {
             upstream,
             local_upstream,
             refresh_local_upstream: None,
-            #[cfg(unix)]
             local_socket_protector: None,
             local_suffixes: Self::default_local_suffixes(),
             bypass_domains: Vec::new(),
@@ -1859,8 +1843,7 @@ async fn resolve_local_udp(
     query: &[u8],
     expected_tx_id: u16,
     query_timeout: Duration,
-    #[cfg(unix)] protector: Option<LocalSocketProtector>,
-    #[cfg(not(unix))] protector: Option<()>,
+    protector: Option<SocketProtector>,
 ) -> io::Result<Vec<u8>> {
     let (pooled, generation) = pool.take(local_upstream, Instant::now());
     let sock = match pooled {
@@ -1873,12 +1856,9 @@ async fn resolve_local_udp(
             let sock = UdpSocket::bind(bind_addr).await?;
             // The Android protector runs here: after `bind`, before `connect`,
             // so a protector error fails the query before any packet is sent.
-            #[cfg(unix)]
             if let Some(protect) = protector.as_ref() {
                 protect(sock.as_raw_fd())?;
             }
-            #[cfg(not(unix))]
-            let _ = protector;
             sock.connect(local_upstream).await?;
             sock
         }
@@ -3296,7 +3276,7 @@ mod tests {
         // Success path: the protector sees the bound socket's fd exactly once.
         let seen: Arc<Mutex<Vec<std::os::fd::RawFd>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_cb = Arc::clone(&seen);
-        let protector: LocalSocketProtector = Arc::new(move |fd| {
+        let protector: SocketProtector = Arc::new(move |fd| {
             // The fd must already name a socket when the protector runs.
             let link = std::fs::read_link(format!("/proc/self/fd/{fd}"))
                 .map_err(|err| io::Error::new(err.kind(), "protector cannot inspect fd"))?;
@@ -3327,7 +3307,7 @@ mod tests {
 
         // Error path: a fresh socket fails before `connect`, so no packet can
         // leave and the refused socket never reaches the pool.
-        let failing: LocalSocketProtector =
+        let failing: SocketProtector =
             Arc::new(|_| Err(io::Error::other("VpnService.protect denied")));
         let pool = LocalUdpPool::default();
         let err = resolve_local_udp(

@@ -22,9 +22,8 @@ pub mod stack;
 pub mod stats;
 pub mod udp;
 
+pub use beam_core::client::SocketProtector;
 pub use device::{MemoryTun, TunDevice};
-#[cfg(unix)]
-pub use dns::LocalSocketProtector;
 pub use dns::{DnsConfig, DnsInterceptor, DnsUpstream};
 pub use engine::{
     DialFailure, DialFailureKind, DialFailureStage, EngineError, EngineTelemetry,
