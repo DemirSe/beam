@@ -355,7 +355,11 @@ impl TcpConn {
         }
 
         if (seg.flags & TCP_SYN) != 0 && (seg.flags & TCP_ACK) == 0 {
-            if self.state == TcpState::SynReceived {
+            // A pure SYN repeating the flow's ISN is a duplicate of the
+            // original SYN: re-send SYN|ACK. A pure SYN with a different ISN
+            // is a new connection attempt and is replaced in `poll` before it
+            // can reach here.
+            if self.state == TcpState::SynReceived && seg.seq == self.rcv_isn {
                 self.send_syn_ack(now_ms, tx_out);
             } else if self.state.is_synchronized() && seg.seq == self.rcv_isn {
                 // RFC 5961: a SYN that repeats the ISN of the live connection is
@@ -1051,17 +1055,19 @@ impl NetStack for ProxyTcpStack {
             let flow: FlowKey = (ip.src_ip, seg.src_port, ip.dst_ip, seg.dst_port);
             let pure_syn = (seg.flags & TCP_SYN) != 0 && (seg.flags & TCP_ACK) == 0;
 
-            // A pure SYN for a 4-tuple that is already synchronized and carries
-            // a different ISN than the live flow is a new connection attempt: the
-            // local peer restarted and its old socket is gone. Reset the stale
-            // flow and accept the new SYN instead of dropping the handshake.
-            // This assumes a local TUN peer, which keeps one socket per 4-tuple,
-            // so a repeated ISN can only be a duplicate of the original SYN.
+            // A pure SYN for a 4-tuple that is already tracked (`SynReceived`
+            // or synchronized) and carries a different ISN than the live flow
+            // is a new connection attempt: the local peer restarted and its
+            // old socket is gone. Reset the stale flow and accept the new SYN
+            // instead of dropping the handshake. This assumes a local TUN
+            // peer, which keeps one socket per 4-tuple, so a repeated ISN can
+            // only be a duplicate of the original SYN (which re-sends
+            // SYN|ACK via `on_segment`).
             if pure_syn
-                && self
-                    .conns
-                    .get(&flow)
-                    .is_some_and(|conn| conn.state.is_synchronized() && seg.seq != conn.rcv_isn)
+                && self.conns.get(&flow).is_some_and(|conn| {
+                    (conn.state.is_synchronized() || conn.state == TcpState::SynReceived)
+                        && seg.seq != conn.rcv_isn
+                })
                 && let Some(mut stale) = self.conns.remove(&flow)
             {
                 stale.send_rst(stale.snd_nxt, tx_out);

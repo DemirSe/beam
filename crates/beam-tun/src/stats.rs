@@ -171,7 +171,8 @@ impl DnsCounters {
 }
 
 impl DnsSnapshot {
-    /// Compact `key:value` form for the `beam-client` status file.
+    /// Compact `key:value` API helper for diagnostics. DNS outcome counters
+    /// stay internal/API-level and are not currently written to the status file.
     pub fn as_status_value(&self) -> String {
         format!(
             "hits:{},misses:{},sf_busy:{},sf_upstream:{},sf_mismatch:{},timeout:{},loop:{},tun_tx_dropped:{},malformed:{}",

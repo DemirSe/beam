@@ -57,8 +57,11 @@ const MAX_LOCAL_UDP_STALE_REPLIES: usize = 8;
 /// Bound on the cache-miss bypass route install await: a hung `ip` command
 /// can neither stall the DNS reply nor exhaust `MAX_INFLIGHT_DNS_QUERIES`.
 const BYPASS_ROUTE_TIMEOUT: Duration = Duration::from_millis(500);
-/// Max concurrent cache-hit bypass route re-fires (each may fork `ip`).
-const MAX_BYPASS_REFIRE_INFLIGHT: usize = 2;
+/// Max concurrent bypass route installs shared by the cache-miss and
+/// cache-hit paths (each may fork `ip`). A hung `ip` call holds its permit
+/// only until `BYPASS_ROUTE_TIMEOUT`, so hung installs cannot grow blocking
+/// tasks unboundedly.
+const MAX_BYPASS_REFIRE_INFLIGHT: usize = 4;
 /// Max cache-hit bypass re-fires per [`BYPASS_REFIRE_WINDOW`].
 const MAX_BYPASS_REFIRE_PER_WINDOW: u32 = 4;
 const BYPASS_REFIRE_WINDOW: Duration = Duration::from_secs(5);
@@ -884,12 +887,16 @@ struct PooledDohConn<S> {
 /// immediately on network transitions. A monotonic generation counter prevents
 /// connections dialed before a network transition from being returned to the
 /// pool after `clear()`.
+///
+/// Concurrency is bounded by `slots` (`MAX_DOH_POOL_SIZE` permits): each
+/// query holds one slot across `take -> (dial if empty) -> request I/O ->
+/// put`, so a cold burst performs at most `MAX_DOH_POOL_SIZE` concurrent
+/// REALITY handshakes, up to that many queries run I/O in parallel, and a
+/// waiter that acquires a freed slot immediately reuses the warm connection
+/// the previous holder `put()` before releasing its permit.
 struct DohPool<S = DohTlsStream> {
     state: Mutex<DohPoolState<S>>,
-    /// Serializes concurrent dials so a burst of cache misses on a cold or
-    /// stale pool performs at most one REALITY handshake (same pattern as
-    /// [`UdpDnsMuxPool`]).
-    connect_lock: tokio::sync::Mutex<()>,
+    slots: Semaphore,
 }
 
 struct DohPoolState<S> {
@@ -904,7 +911,7 @@ impl<S> Default for DohPool<S> {
                 idle: Vec::new(),
                 generation: 0,
             }),
-            connect_lock: tokio::sync::Mutex::new(()),
+            slots: Semaphore::new(MAX_DOH_POOL_SIZE),
         }
     }
 }
@@ -972,13 +979,15 @@ struct PooledTcpDnsConn<S> {
 /// Passive, bounded keep-alive pool for RFC 1035 DNS-over-TCP connections.
 ///
 /// Mirrors [`DohPool`]: zero background timers; expired entries are discarded
-/// passively on borrow/return or cleared immediately on network transitions;
-/// `connect_lock` singleflights concurrent dials (see [`UdpDnsMuxPool`]).
+/// passively on borrow/return or cleared immediately on network transitions.
+/// Concurrency is bounded by `slots` (`MAX_TCP_DNS_POOL_SIZE` permits) held
+/// across `take -> (dial if empty) -> request I/O -> put`, so a cold burst
+/// performs at most pool-capacity concurrent REALITY handshakes, queries run
+/// I/O in parallel, and waiters reuse warm connections `put()` before the
+/// permit is released.
 struct TcpDnsPool<S = BeamTcpStream> {
     state: Mutex<TcpDnsPoolState<S>>,
-    /// Serializes concurrent dials so a burst of cache misses on a cold or
-    /// stale pool performs at most one REALITY handshake.
-    connect_lock: tokio::sync::Mutex<()>,
+    slots: Semaphore,
 }
 
 struct TcpDnsPoolState<S> {
@@ -993,7 +1002,7 @@ impl<S> Default for TcpDnsPool<S> {
                 idle: Vec::new(),
                 generation: 0,
             }),
-            connect_lock: tokio::sync::Mutex::new(()),
+            slots: Semaphore::new(MAX_TCP_DNS_POOL_SIZE),
         }
     }
 }
@@ -1256,8 +1265,9 @@ pub struct DnsInterceptor {
     udp_mux_pool: Arc<UdpDnsMuxPool>,
     cache: Arc<Mutex<DnsCache>>,
     inflight: Arc<Semaphore>,
-    /// Bounds concurrent cache-hit `on_bypass_ips` re-fires (each may fork `ip`).
-    bypass_refire_permits: Arc<Semaphore>,
+    /// Bounds concurrent `on_bypass_ips` route installs shared by the
+    /// cache-miss path and cache-hit re-fires (each may fork `ip`).
+    bypass_permits: Arc<Semaphore>,
     /// Rate-budget for cache-hit `on_bypass_ips` re-fires (fork-storm guard).
     bypass_refire_limit: Arc<RateLimiter>,
     tun_tx: mpsc::Sender<Vec<u8>>,
@@ -1313,7 +1323,7 @@ impl DnsInterceptor {
             udp_mux_pool: Arc::new(UdpDnsMuxPool::new()),
             cache,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_DNS_QUERIES)),
-            bypass_refire_permits: Arc::new(Semaphore::new(MAX_BYPASS_REFIRE_INFLIGHT)),
+            bypass_permits: Arc::new(Semaphore::new(MAX_BYPASS_REFIRE_INFLIGHT)),
             bypass_refire_limit: Arc::new(RateLimiter::new(
                 MAX_BYPASS_REFIRE_PER_WINDOW,
                 BYPASS_REFIRE_WINDOW,
@@ -1423,20 +1433,32 @@ impl DnsInterceptor {
             // immediately from the already-cached answer.
             if is_bypass_domain {
                 let (_, refire_ips) = parse_dns_response_meta(&cached);
-                // Best-effort re-fire: at most `MAX_BYPASS_REFIRE_INFLIGHT`
-                // concurrent installs and `MAX_BYPASS_REFIRE_PER_WINDOW` per
-                // window, so a flood of cached bypass queries cannot spawn
-                // unbounded tasks or fork-storm `ip`. The cached reply below
-                // is sent immediately without waiting for the install.
+                // Best-effort re-fire: the shared `bypass_permits` semaphore
+                // bounds concurrent installs across the miss and hit paths,
+                // and `MAX_BYPASS_REFIRE_PER_WINDOW` per window stops a flood
+                // of cached bypass queries from fork-storming `ip`. The
+                // cached reply below is sent immediately without waiting.
+                // The install await is bounded by `BYPASS_ROUTE_TIMEOUT` so
+                // a hung `ip` cannot permanently pin a permit.
                 if !refire_ips.is_empty()
                     && let Some(cb) = self.dns_config.on_bypass_ips.clone()
-                    && let Ok(permit) = self.bypass_refire_permits.clone().try_acquire_owned()
+                    && let Ok(permit) = self.bypass_permits.clone().try_acquire_owned()
                     && self.bypass_refire_limit.allow().is_some()
                 {
+                    let qname = query.qname.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
                         let handle = cb(refire_ips);
-                        let _ = handle.await;
+                        if !matches!(timeout(BYPASS_ROUTE_TIMEOUT, handle).await, Ok(Ok(())))
+                            && let Some(suppressed) = DNS_BYPASS_LOG.allow()
+                        {
+                            warn!(
+                                qname = %qname,
+                                stage = "bypass_refire_timeout",
+                                suppressed,
+                                "cache-hit bypass route install did not finish cleanly"
+                            );
+                        }
                     });
                 }
             }
@@ -1488,6 +1510,7 @@ impl DnsInterceptor {
         let cache = Arc::clone(&self.cache);
         let counters = Arc::clone(&self.counters);
         let tun_tx = self.tun_tx.clone();
+        let bypass_permits = Arc::clone(&self.bypass_permits);
         let upstream_kind = if use_local {
             "local_udp"
         } else {
@@ -1557,22 +1580,25 @@ impl DnsInterceptor {
                         // the tunnel. The callback runs the blocking `ip`
                         // install on the blocking pool; awaiting its handle
                         // yields the worker thread instead of blocking it.
+                        // The shared `bypass_permits` semaphore bounds hung
+                        // `ip` calls across the miss and hit paths so they
+                        // cannot grow blocking tasks unboundedly; the await is
+                        // bounded by `BYPASS_ROUTE_TIMEOUT` so a hung install
+                        // cannot permanently pin a permit.
                         if is_bypass_domain
                             && !ips.is_empty()
                             && let Some(cb) = dns_cfg.on_bypass_ips.as_ref()
+                            && let Ok(_bypass_permit) = bypass_permits.clone().try_acquire_owned()
                         {
                             let handle = cb(ips);
-                            // Bound the route install so a hung `ip` fork can
-                            // neither stall this reply nor exhaust
-                            // `MAX_INFLIGHT_DNS_QUERIES` permits.
-                            if timeout(BYPASS_ROUTE_TIMEOUT, handle).await.is_err()
+                            if !matches!(timeout(BYPASS_ROUTE_TIMEOUT, handle).await, Ok(Ok(())))
                                 && let Some(suppressed) = DNS_BYPASS_LOG.allow()
                             {
                                 warn!(
                                     qname = %query.qname,
                                     stage = "bypass_route_timeout",
                                     suppressed,
-                                    "bypass route install did not finish in time; replying without waiting"
+                                    "bypass route install did not finish cleanly; replying without waiting"
                                 );
                             }
                         }
@@ -1812,60 +1838,52 @@ async fn resolve_tcp_over_beam(
     addr: SocketAddr,
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
-    // Fast path: reuse an idle DNS-over-TCP connection (1 RTT).
-    let (pooled, pool_gen) = tcp_pool.take(Instant::now());
-    if let Some(mut stream) = pooled {
-        match send_tcp_dns_request(&mut stream, query).await {
-            Ok(resp) => {
-                tcp_pool.put(stream, pool_gen, Instant::now());
-                return Ok(resp);
-            }
-            Err(err) => {
-                debug!(error = %err, "pooled TCP DNS connection stale; retrying with fresh dial");
-            }
-        }
-    }
-
-    // Singleflight cold-start dial: the pool check and the fresh dial happen
-    // under `connect_lock`, but the guard is dropped before any request I/O
-    // so concurrent cache misses execute their DNS exchanges in parallel
-    // instead of serializing behind the lock.
+    // Bounded slot held across `take -> (dial if empty) -> request I/O ->
+    // put`: at most `MAX_TCP_DNS_POOL_SIZE` concurrent REALITY handshakes,
+    // up to that many queries run I/O in parallel, and `put()` happens
+    // before the permit is released so waiters reuse warm connections.
+    let _slot = tcp_pool
+        .slots
+        .acquire()
+        .await
+        .map_err(|_| io::Error::other("DNS TCP pool closed"))?;
     let dest = tcp_dns_dest(addr);
-    let (stream, pool_gen, from_pool) = {
-        let _connect_guard = tcp_pool.connect_lock.lock().await;
-        let (pooled, pool_gen2) = tcp_pool.take(Instant::now());
-        match pooled {
-            Some(stream) => (stream, pool_gen2, true),
-            None => {
-                // Sample the current pool generation right before dialing a
-                // fresh connection, so a transition during the dial still
-                // drops the stream instead of pooling it.
-                let fresh_gen = tcp_pool.generation();
-                let stream = dial_tcp(client_cfg, dest.clone())
-                    .await
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-                (stream, fresh_gen, false)
-            }
+    let (pooled, pool_gen) = tcp_pool.take(Instant::now());
+    let (mut stream, stream_gen, from_pool) = match pooled {
+        Some(stream) => (stream, pool_gen, true),
+        None => {
+            let fresh_gen = tcp_pool.generation();
+            let stream = dial_tcp(client_cfg, dest.clone())
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            (stream, fresh_gen, false)
         }
-    }; // `_connect_guard` is dropped here, before request I/O.
-
-    let mut stream = stream;
+    };
     match send_tcp_dns_request(&mut stream, query).await {
         Ok(resp) => {
-            tcp_pool.put(stream, pool_gen, Instant::now());
+            tcp_pool.put(stream, stream_gen, Instant::now());
             Ok(resp)
         }
         Err(err) if from_pool => {
-            debug!(error = %err, "pooled TCP DNS connection stale after singleflight wait; dialing fresh");
-            let (fresh, fresh_gen) = {
-                let _connect_guard = tcp_pool.connect_lock.lock().await;
-                let fresh_gen = tcp_pool.generation();
-                let stream = dial_tcp(client_cfg, dest)
-                    .await
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-                (stream, fresh_gen)
-            };
-            let mut fresh = fresh;
+            debug!(error = %err, "pooled TCP DNS connection stale; taking once more before fresh dial");
+            // Stale-pool retry: take once more so a warm connection
+            // returned concurrently is reused instead of dialing.
+            let (pooled2, gen2) = tcp_pool.take(Instant::now());
+            if let Some(mut retry) = pooled2 {
+                match send_tcp_dns_request(&mut retry, query).await {
+                    Ok(resp) => {
+                        tcp_pool.put(retry, gen2, Instant::now());
+                        return Ok(resp);
+                    }
+                    Err(retry_err) => {
+                        debug!(error = %retry_err, "retry pooled TCP DNS connection stale; dialing fresh");
+                    }
+                }
+            }
+            let fresh_gen = tcp_pool.generation();
+            let mut fresh = dial_tcp(client_cfg, dest)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
             let resp = send_tcp_dns_request(&mut fresh, query).await?;
             tcp_pool.put(fresh, fresh_gen, Instant::now());
             Ok(resp)
@@ -2011,40 +2029,24 @@ async fn resolve_doh_over_beam(
 ) -> io::Result<Vec<u8>> {
     let host_header = format_http_host_header(host, port);
 
-    // Fast path: reuse an idle HTTP/1.1 keep-alive DoH connection (1 RTT).
+    // Bounded slot held across `take -> (dial if empty) -> request I/O ->
+    // put`: at most `MAX_DOH_POOL_SIZE` concurrent REALITY+TLS handshakes,
+    // up to that many queries run I/O in parallel, and `put()` happens
+    // before the permit is released so waiters reuse warm connections.
+    let _slot = doh_pool
+        .slots
+        .acquire()
+        .await
+        .map_err(|_| io::Error::other("DNS DoH pool closed"))?;
     let (pooled, pooled_gen) = doh_pool.take(Instant::now());
-    if let Some(mut tls) = pooled {
-        match send_doh_http_request(&mut tls, &host_header, path, query).await {
-            Ok((body, reusable)) => {
-                if reusable {
-                    doh_pool.put(tls, pooled_gen, Instant::now());
-                }
-                return Ok(body);
-            }
-            Err(err) => {
-                debug!(error = %err, "pooled DoH connection stale; retrying with fresh dial");
-            }
+    let (mut tls, dial_gen, from_pool) = match pooled {
+        Some(tls) => (tls, pooled_gen, true),
+        None => {
+            let fresh_gen = doh_pool.generation();
+            let tls = dial_doh_stream(client_cfg, tls_cfg, host, port).await?;
+            (tls, fresh_gen, false)
         }
-    }
-
-    // Singleflight cold-start dial: the pool check, the fresh REALITY dial,
-    // and the TLS handshake happen under `connect_lock`, but the guard is
-    // dropped before the HTTP request/response I/O so concurrent cache
-    // misses execute their DNS exchanges in parallel instead of serializing
-    // behind the lock.
-    let (mut tls, dial_gen, from_pool) = {
-        let _connect_guard = doh_pool.connect_lock.lock().await;
-        let (pooled, pool_gen2) = doh_pool.take(Instant::now());
-        match pooled {
-            Some(tls) => (tls, pool_gen2, true),
-            None => {
-                let fresh_gen = doh_pool.generation();
-                let tls = dial_doh_stream(client_cfg, tls_cfg, host, port).await?;
-                (tls, fresh_gen, false)
-            }
-        }
-    }; // `_connect_guard` is dropped here, before request I/O.
-
+    };
     match send_doh_http_request(&mut tls, &host_header, path, query).await {
         Ok((body, reusable)) => {
             if reusable {
@@ -2053,13 +2055,25 @@ async fn resolve_doh_over_beam(
             Ok(body)
         }
         Err(err) if from_pool => {
-            debug!(error = %err, "pooled DoH connection stale after singleflight wait; dialing fresh");
-            let (mut fresh, fresh_gen) = {
-                let _connect_guard = doh_pool.connect_lock.lock().await;
-                let fresh_gen = doh_pool.generation();
-                let tls = dial_doh_stream(client_cfg, tls_cfg, host, port).await?;
-                (tls, fresh_gen)
-            };
+            debug!(error = %err, "pooled DoH connection stale; taking once more before fresh dial");
+            // Stale-pool retry: take once more so a warm connection
+            // returned concurrently is reused instead of dialing.
+            let (pooled2, gen2) = doh_pool.take(Instant::now());
+            if let Some(mut retry) = pooled2 {
+                match send_doh_http_request(&mut retry, &host_header, path, query).await {
+                    Ok((body, reusable)) => {
+                        if reusable {
+                            doh_pool.put(retry, gen2, Instant::now());
+                        }
+                        return Ok(body);
+                    }
+                    Err(retry_err) => {
+                        debug!(error = %retry_err, "retry pooled DoH connection stale; dialing fresh");
+                    }
+                }
+            }
+            let fresh_gen = doh_pool.generation();
+            let mut fresh = dial_doh_stream(client_cfg, tls_cfg, host, port).await?;
             let (body, reusable) =
                 send_doh_http_request(&mut fresh, &host_header, path, query).await?;
             if reusable {
@@ -3838,70 +3852,109 @@ mod tests {
         srv.abort();
     }
 
-    /// Mirrors the cold-start block of `resolve_tcp_over_beam` /
-    /// `resolve_doh_over_beam`: pool check + dial under `connect_lock`,
-    /// request I/O after the guard is dropped.
-    async fn cold_start_exchange(
+    /// Mirrors the bounded-slot block of `resolve_tcp_over_beam` /
+    /// `resolve_doh_over_beam`: one `slots` permit held across
+    /// `take -> (dial if empty) -> request I/O -> put`, with `put()` before
+    /// the permit is released so waiters reuse warm connections.
+    async fn bounded_exchange(
         pool: &TcpDnsPool<tokio::io::DuplexStream>,
         query: Vec<u8>,
         server_delay: Duration,
+        dials: &std::sync::atomic::AtomicUsize,
     ) -> Vec<u8> {
-        let (stream, exch_gen) = {
-            let _guard = pool.connect_lock.lock().await;
-            let (pooled, pool_gen) = pool.take(Instant::now());
-            match pooled {
-                Some(stream) => (stream, pool_gen),
-                None => {
-                    let dial_gen = pool.generation();
-                    let (client, mut server) = tokio::io::duplex(2048);
-                    let resp = build_a_response(&query, Ipv4Addr::new(9, 9, 9, 9), 60);
-                    tokio::spawn(async move {
+        let _slot = pool.slots.acquire().await.expect("slot");
+        let (pooled, pooled_gen) = pool.take(Instant::now());
+        let (mut stream, exch_gen) = match pooled {
+            Some(stream) => (stream, pooled_gen),
+            None => {
+                dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let dial_gen = pool.generation();
+                let (client, mut server) = tokio::io::duplex(4096);
+                // Persistent fake upstream: serves sequential queries on this
+                // connection so pooled reuse succeeds, like a real keep-alive.
+                tokio::spawn(async move {
+                    loop {
                         let mut len_buf = [0u8; 2];
                         if server.read_exact(&mut len_buf).await.is_err() {
                             return;
                         }
                         let qlen = usize::from(u16::from_be_bytes(len_buf));
+                        if qlen == 0 || qlen > MAX_DNS_QUERY_BYTES {
+                            return;
+                        }
                         let mut qbuf = vec![0u8; qlen];
                         if server.read_exact(&mut qbuf).await.is_err() {
                             return;
                         }
+                        let resp = build_a_response(&qbuf, Ipv4Addr::new(9, 9, 9, 9), 60);
                         tokio::time::sleep(server_delay).await;
                         let rlen = u16::try_from(resp.len()).expect("resp len");
-                        let _ = server.write_all(&rlen.to_be_bytes()).await;
-                        let _ = server.write_all(&resp).await;
-                    });
-                    (client, dial_gen)
-                }
+                        if server.write_all(&rlen.to_be_bytes()).await.is_err() {
+                            return;
+                        }
+                        if server.write_all(&resp).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                (client, dial_gen)
             }
-        }; // `connect_lock` released before request I/O.
-        let mut stream = stream;
+        };
         let resp = send_tcp_dns_request(&mut stream, &query)
             .await
             .expect("exchange");
         pool.put(stream, exch_gen, Instant::now());
+        // `_slot` drops after `put()`, so the next waiter reuses the warm conn.
         resp
     }
 
     #[tokio::test]
-    async fn connect_lock_released_before_request_io() {
-        // Two concurrent cold-start exchanges through the real `TcpDnsPool`
-        // and its real `connect_lock` must overlap their 200 ms request I/O
-        // instead of serializing behind the lock (>= 400 ms serial).
+    async fn bounded_slots_limit_dials_and_overlap_io() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // (ii) Concurrent queries overlap their I/O in parallel: two 200 ms
+        // exchanges must finish in well under the 400 ms serial bound.
         let pool = Arc::new(TcpDnsPool::<tokio::io::DuplexStream>::default());
+        let dials = Arc::new(AtomicUsize::new(0));
         let q1 = build_query(0xAAAA, "one.example", 1);
         let q2 = build_query(0xBBBB, "two.example", 1);
         let start = TokioInstant::now();
         let (r1, r2) = tokio::join!(
-            cold_start_exchange(&pool, q1.clone(), Duration::from_millis(200)),
-            cold_start_exchange(&pool, q2.clone(), Duration::from_millis(200)),
+            bounded_exchange(&pool, q1.clone(), Duration::from_millis(200), &dials),
+            bounded_exchange(&pool, q2.clone(), Duration::from_millis(200), &dials),
         );
-        let elapsed = start.elapsed();
         assert_eq!(r1, build_a_response(&q1, Ipv4Addr::new(9, 9, 9, 9), 60));
         assert_eq!(r2, build_a_response(&q2, Ipv4Addr::new(9, 9, 9, 9), 60));
         assert!(
-            elapsed < Duration::from_millis(350),
-            "concurrent exchanges must overlap (took {elapsed:?}); holding connect_lock across I/O would serialize them to >= 400 ms"
+            start.elapsed() < Duration::from_millis(350),
+            "concurrent exchanges must overlap I/O (took {:?})",
+            start.elapsed()
         );
+
+        // (i) A 16-query cold burst opens at most pool-capacity connections:
+        // the first `MAX_TCP_DNS_POOL_SIZE` dials serve the burst while
+        // later waiters reuse the returned warm connections.
+        let pool2 = Arc::new(TcpDnsPool::<tokio::io::DuplexStream>::default());
+        let dials2 = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for i in 0..16u16 {
+            let pool = Arc::clone(&pool2);
+            let dials = Arc::clone(&dials2);
+            let q = build_query(0xC000 + i, &format!("burst{i}.example"), 1);
+            handles.push(tokio::spawn(async move {
+                let expected = build_a_response(&q, Ipv4Addr::new(9, 9, 9, 9), 60);
+                let got = bounded_exchange(&pool, q, Duration::from_millis(50), &dials).await;
+                assert_eq!(got, expected);
+            }));
+        }
+        for h in handles {
+            h.await.expect("burst task");
+        }
+        let total_dials = dials2.load(Ordering::SeqCst);
+        assert!(
+            total_dials <= MAX_TCP_DNS_POOL_SIZE,
+            "16-query cold burst must reuse warm conns: {total_dials} dials, bound is {MAX_TCP_DNS_POOL_SIZE}"
+        );
+        assert!(pool2.len() <= MAX_TCP_DNS_POOL_SIZE);
     }
 
     #[tokio::test]

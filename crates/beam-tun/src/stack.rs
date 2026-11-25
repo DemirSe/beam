@@ -217,6 +217,10 @@ impl TunTcpReader {
 /// Releases the in-flight accounting of chunks that were queued for a relay but
 /// will never be read, so dropping a relay cannot leave the advertised TCP
 /// receive window shrunken for the rest of the flow.
+///
+/// Both call sites are terminal drops of the reader half. After `close()` and
+/// draining, the counter is swapped to zero: even a Tokio `Permit` reserved
+/// before `close()` cannot leave permanently charged bytes.
 fn release_queued_in_flight(
     from_stack: &mut mpsc::Receiver<Vec<u8>>,
     in_flight_relay: Option<&Arc<AtomicUsize>>,
@@ -227,21 +231,9 @@ fn release_queued_in_flight(
     // Close before draining so a concurrent send cannot succeed after the drain
     // and leave bytes charged for a chunk that nobody will ever read.
     from_stack.close();
-    let mut freed = 0usize;
-    while let Ok(chunk) = from_stack.try_recv() {
-        freed = freed.saturating_add(chunk.len());
-    }
-    if freed == 0 {
-        return false;
-    }
-    // `try_update` is a retrying CAS loop (the old `fetch_update` name is
-    // deprecated), so a concurrent `fetch_add` from the stack only forces a
-    // retry and can never drop the `freed` bytes. The accounting test below
-    // covers that race.
-    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-        Some(cur.saturating_sub(freed))
-    });
-    true
+    while from_stack.try_recv().is_ok() {}
+    let freed = counter.swap(0, Ordering::AcqRel);
+    freed > 0
 }
 
 impl Drop for TunTcpReader {
@@ -499,8 +491,9 @@ mod accounting_tests {
 
     #[test]
     fn dropping_the_relay_reader_never_loses_in_flight_bytes() {
-        // `release_queued_in_flight` races the stack's `fetch_add` when a relay
-        // dies. The racing thread below charges and releases bytes with a net
+        // Terminal drops swap the counter to zero, so even a Tokio `Permit`
+        // reserved before `close()` cannot leave permanently charged bytes.
+        // The racing thread below charges and releases bytes with a net
         // change of zero, so any lost release leaves a non-zero residue.
         for round in 0..500 {
             let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
@@ -538,5 +531,27 @@ mod accounting_tests {
                 "round {round}: queued bytes must be fully released"
             );
         }
+    }
+
+    #[test]
+    fn terminal_drop_zeroes_reserved_permit_residue() {
+        // Simulates a `try_reserve` permit taken before `close()`: the counter
+        // holds charged bytes with no chunk left in the channel. A terminal
+        // drop must still swap to zero.
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let counter = Arc::new(AtomicUsize::new(0));
+        counter.fetch_add(1024, Ordering::AcqRel);
+        let stream = TunTcpStream::new_with_accounting(
+            rx,
+            _tx,
+            Arc::new(Notify::new()),
+            None,
+            Some(Arc::clone(&counter)),
+            None,
+            RelayBufPool::new(),
+        );
+        let (reader, _writer) = stream.into_split();
+        drop(reader);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 }

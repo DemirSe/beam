@@ -150,8 +150,7 @@ static int tunnel_present(void)
 }
 
 static int read_client_status(char *state_out, size_t state_cap, long *rtt_out,
-                              int *bypass_ok_out, char *reason_out, size_t reason_cap,
-                              long *dial_failures_out)
+                              int *bypass_ok_out, char *reason_out, size_t reason_cap)
 {
     FILE *fp;
     /* Wide enough for the longest status line (`drops=...`) without splitting it
@@ -167,7 +166,6 @@ static int read_client_status(char *state_out, size_t state_cap, long *rtt_out,
     *bypass_ok_out = 1;
     if (reason_cap > 0)
         reason_out[0] = '\0';
-    *dial_failures_out = 0;
 
     fp = fopen(STATUS_FILE, "r");
     if (!fp)
@@ -217,12 +215,6 @@ static int read_client_status(char *state_out, size_t state_cap, long *rtt_out,
                 memcpy(reason_out, line + 7, copy_len);
                 reason_out[copy_len] = '\0';
             }
-        } else if (strncmp(line, "dial_failures=", 14) == 0) {
-            char *end = NULL;
-            errno = 0;
-            long val = strtol(line + 14, &end, 10);
-            if (errno == 0 && end != line + 14 && *end == '\0' && val >= 0)
-                *dial_failures_out = val;
         }
     }
     fclose(fp);
@@ -246,7 +238,6 @@ static void update_ui(void)
     char reason[32];
     char label[96];
     long rtt_ms = -1;
-    long dial_failures = 0;
     int bypass_ok = 1;
     const char *icon = connected ? "network-vpn-symbolic" : "network-vpn-disconnected-symbolic";
     const char *desc = connected ? "Interface up" : "Disconnected";
@@ -260,8 +251,7 @@ static void update_ui(void)
     if (g_helper_failed) {
         set_status_label("Beam: error");
     } else if (native_up && read_client_status(state, sizeof(state), &rtt_ms,
-                                              &bypass_ok, reason, sizeof(reason),
-                                              &dial_failures)) {
+                                              &bypass_ok, reason, sizeof(reason))) {
         if (strcmp(state, "connected") == 0 && bypass_ok) {
             if (rtt_ms >= 0)
                 snprintf(label, sizeof(label), "Beam: connected (%ld ms)", rtt_ms);
