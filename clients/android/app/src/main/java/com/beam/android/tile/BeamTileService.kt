@@ -1,5 +1,6 @@
 package com.beam.android.tile
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
@@ -158,6 +159,9 @@ class BeamTileService : TileService() {
         else -> R.string.status_disconnected
     }
 
+    // The Intent overload is the only one below API 34; lint's
+    // StartActivityAndCollapseDeprecated check does not follow the guard.
+    @SuppressLint("StartActivityAndCollapseDeprecated")
     private fun openApp() {
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP

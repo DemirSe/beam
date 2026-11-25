@@ -147,16 +147,8 @@ jobs:
             -no-snapshot-save -no-window -gpu swiftshader_indirect
             -noaudio -no-boot-anim
           script: |
-            set -euo pipefail
-            cd clients/android
-            ./gradlew -Pbeam.includeX86_64=true connectedDebugAndroidTest
+            cd clients/android && ./gradlew -Pbeam.includeX86_64=true connectedDebugAndroidTest
             adb shell am start -W -n com.beam.android/.ui.MainActivity
             sleep 10
-            pid="$(adb shell pidof com.beam.android | tr -d '\r')"
-            if [ -z "$pid" ]; then
-              echo "error: com.beam.android died after launch"
-              adb logcat -d -t 200
-              exit 1
-            fi
-            echo "com.beam.android pid=$pid still alive after launch"
+            adb shell pidof com.beam.android || { echo "error: com.beam.android died after launch"; adb logcat -d -t 200; exit 1; }
             adb shell dumpsys meminfo com.beam.android | head -n 25
