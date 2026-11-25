@@ -1,7 +1,8 @@
 # Client backlog
 
-No client/TUN work is planned for now. This file records client-side items that
-affect the tunnel but are not server defects.
+Active native Android client work is planned in [`docs/ANDROID-PLAN.md`](../docs/ANDROID-PLAN.md).
+This file records client-platform constraints that affect the tunnel but are not
+server defects.
 
 ## Rootless Android cannot enable BBR while preserving REALITY/TCP cover
 

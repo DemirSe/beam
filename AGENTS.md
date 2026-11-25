@@ -17,8 +17,10 @@ supervision.
   section and adding a test.
 - Never commit credentials, private keys, UUIDs from real configs, or captures
   of real traffic.
-- No `unsafe` outside `crates/beam-sys`. Every unsafe block needs a `// SAFETY:`
-  comment that states the invariant.
+- No `unsafe` outside `crates/beam-sys`, except the narrow `#[unsafe(no_mangle)]`
+  JNI entrypoint declarations in `crates/beam-android/src/jni_bridge.rs` (FD
+  ownership and syscall wrappers still live in `crates/beam-sys`). Every unsafe
+  block or attribute needs a `// SAFETY:` comment that states the invariant.
 - No panics, `unwrap`, `expect`, `todo`, or `unimplemented` on paths reachable
   from network input.
 - Bound every allocation, queue, frame, handshake, and retry loop.
