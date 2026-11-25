@@ -1,0 +1,104 @@
+package com.beam.android.vpn
+
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class VpnConfigBuilderTest {
+
+    @Test
+    fun `build emits Rust AndroidEngineConfig schema`() {
+        val json = VpnConfigBuilder.buildConfigJson(
+            vlessUri = "vless://uuid@example.com:443?security=reality#t",
+            dohUrl = "https://cloudflare-dns.com/dns-query",
+            ipv4Only = true,
+            rejectQuic = true,
+            bypassCidrs = listOf("10.0.0.0/8"),
+            serverIp = "203.0.113.10",
+        )
+        val o = JSONObject(json)
+        assertEquals("vless://uuid@example.com:443?security=reality#t", o.getString("vless_uri"))
+        assertEquals(1500, o.getInt("mtu"))
+        assertEquals("beam0", o.getString("tun_name"))
+        assertEquals("198.19.0.1", o.getString("tun_ipv4"))
+        assertEquals("198.19.0.2", o.getString("tun_dns_ipv4"))
+        assertEquals("https://cloudflare-dns.com/dns-query", o.getString("doh_url"))
+        assertTrue(o.getBoolean("ipv4_only"))
+        assertTrue(o.getBoolean("reject_ipv6"))
+        assertTrue(o.getBoolean("reject_quic"))
+        val cidrs: JSONArray = o.getJSONArray("bypass_cidrs")
+        assertEquals(1, cidrs.length())
+        assertEquals("10.0.0.0/8", cidrs.getString(0))
+        assertEquals("203.0.113.10", o.getString("server_ip"))
+        assertEquals("info", o.getString("log_level"))
+    }
+
+    @Test
+    fun `unresolved server host omits server_ip`() {
+        val o = JSONObject(
+            VpnConfigBuilder.buildConfigJson(
+                vlessUri = "vless://x",
+                dohUrl = "https://dns.nextdns.io",
+                ipv4Only = true,
+                rejectQuic = false,
+                bypassCidrs = emptyList(),
+            ),
+        )
+        assertFalse(o.has("server_ip"))
+    }
+
+    @Test
+    fun `ipv4Only false leaves ipv6 path open`() {
+        val o = JSONObject(
+            VpnConfigBuilder.buildConfigJson(
+                "vless://x", "https://dns.nextdns.io", false, false, emptyList(),
+            ),
+        )
+        assertEquals(false, o.getBoolean("ipv4_only"))
+        assertEquals(false, o.getBoolean("reject_ipv6"))
+    }
+}
+
+class TelemetryDtoTest {
+
+    @Test
+    fun `fromJson parses engine snapshot`() {
+        val dto = TelemetryDto.fromJson(
+            """{"active_tcp_flows":3,"active_udp_sessions":5,"bytes_tx":100,"bytes_rx":200,"last_rtt_ms":42,"dial_failures":1,"drops":2,"state":2}""",
+        )
+        assertEquals(3, dto.activeTcpFlows)
+        assertEquals(5, dto.activeUdpSessions)
+        assertEquals(100L, dto.bytesTx)
+        assertEquals(200L, dto.bytesRx)
+        assertEquals(42L, dto.lastRttMs)
+        assertEquals(1, dto.dialFailures)
+        assertEquals(2, dto.drops)
+        assertEquals(VpnState.CONNECTED, dto.state)
+    }
+
+    @Test
+    fun `fromJson tolerates blank, garbage and null counters`() {
+        assertEquals(TelemetryDto(), TelemetryDto.fromJson(""))
+        assertEquals(TelemetryDto(), TelemetryDto.fromJson("not json"))
+        assertNull(TelemetryDto.fromJson("{}").lastRttMs)
+        val idle = TelemetryDto.fromJson(
+            """{"bytes_tx":null,"bytes_rx":null,"last_rtt_ms":null,"state":0}""",
+        )
+        assertNull(idle.bytesTx)
+        assertNull(idle.bytesRx)
+        assertNull(idle.lastRttMs)
+    }
+
+    @Test
+    fun `state ordinals match contract`() {
+        assertEquals(0, VpnState.DISCONNECTED)
+        assertEquals(1, VpnState.CONNECTING)
+        assertEquals(2, VpnState.CONNECTED)
+        assertEquals(3, VpnState.DEGRADED)
+        assertEquals(4, VpnState.DISCONNECTING)
+    }
+}

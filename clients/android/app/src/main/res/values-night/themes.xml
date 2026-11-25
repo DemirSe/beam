@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Kept in full: a style in a qualified folder replaces the base style. -->
+    <style name="Theme.Beam" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/beam_primary</item>
+        <item name="colorOnPrimary">@color/beam_on_primary</item>
+        <item name="colorPrimaryContainer">@color/beam_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/beam_on_primary_container</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+
+</resources>

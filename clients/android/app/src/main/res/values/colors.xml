@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <color name="beam_primary">#1150D8</color>
+    <color name="beam_on_primary">#FFFFFF</color>
+    <color name="beam_primary_container">#DCE1FF</color>
+    <color name="beam_on_primary_container">#001551</color>
+
+    <!-- Status badge foreground; the badge background uses the same color at low alpha. -->
+    <color name="status_connected">#1B7F3B</color>
+    <color name="status_connecting">#8A5A00</color>
+    <color name="status_degraded">#B3261E</color>
+    <color name="status_disconnected">#5A6472</color>
+
+    <!-- Camera overlay stays dark in both themes. -->
+    <color name="qr_scrim">#CC000000</color>
+    <color name="qr_text">#FFFFFF</color>
+
+    <color name="ic_launcher_background">#0E1B33</color>
+
+</resources>

@@ -26,6 +26,9 @@ __pycache__/
 /clients/linux-tray/beam-tray
 /clients/linux-tray/beam-helper
 
+# Generated Android native libraries (built from crates/)
+/clients/android/app/src/main/jniLibs/
+
 # Editor and backup leftovers, never product code
 *.save
 

@@ -1,0 +1,200 @@
+package com.beam.android.ui
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.os.SystemClock
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.content.ContextCompat
+import com.beam.android.R
+import com.beam.android.databinding.ActivityQrScannerBinding
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.common.HybridBinarizer
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+
+/** CameraX preview plus a ZXing multi-format reader limited to QR codes. */
+class QrScannerActivity : AppCompatActivity() {
+
+    private lateinit var binding: ActivityQrScannerBinding
+
+    private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private val handled = AtomicBoolean(false)
+    private var lastInvalidQrAtMs = 0L
+
+    private val reader = MultiFormatReader().apply {
+        setHints(
+            mapOf(
+                DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
+                DecodeHintType.TRY_HARDER to true,
+            ),
+        )
+    }
+
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            startCamera()
+        } else {
+            Toast.makeText(this, R.string.qr_permission_required, Toast.LENGTH_LONG).show()
+            finish()
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityQrScannerBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+        binding.closeButton.setOnClickListener { finish() }
+
+        val granted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.CAMERA,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) startCamera() else cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+    }
+
+    override fun onDestroy() {
+        cameraExecutor.shutdownNow()
+        super.onDestroy()
+    }
+
+    private fun startCamera() {
+        val future = ProcessCameraProvider.getInstance(this)
+        future.addListener({
+            val provider = runCatching { future.get() }.getOrNull() ?: return@addListener
+            val preview = Preview.Builder().build()
+            preview.setSurfaceProvider(binding.previewView.surfaceProvider)
+            val analysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+            analysis.setAnalyzer(cameraExecutor) { proxy -> analyze(proxy) }
+            val bound = runCatching {
+                provider.unbindAll()
+                provider.bindToLifecycle(
+                    this,
+                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview,
+                    analysis,
+                )
+            }
+            if (bound.isFailure) {
+                Toast.makeText(this, R.string.qr_error, Toast.LENGTH_LONG).show()
+                finish()
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun analyze(proxy: ImageProxy) {
+        try {
+            if (!handled.get()) decodeFrame(proxy)
+        } catch (_: Exception) {
+            // A bad frame is not fatal; keep scanning.
+        } finally {
+            proxy.close()
+        }
+    }
+
+    private fun decodeFrame(proxy: ImageProxy) {
+        val plane = proxy.planes.firstOrNull() ?: return
+        val buffer = plane.buffer
+        val data = ByteArray(buffer.remaining())
+        buffer.get(data)
+
+        val width = proxy.width
+        val height = proxy.height
+        val rowStride = plane.rowStride
+        if (rowStride < width) return
+        val source = luminanceSource(
+            data,
+            rowStride,
+            width,
+            height,
+            plane.pixelStride,
+            proxy.imageInfo.rotationDegrees,
+        ) ?: return
+        val text = try {
+            reader.decodeWithState(BinaryBitmap(HybridBinarizer(source)))?.text
+        } catch (_: Exception) {
+            null
+        } finally {
+            reader.reset()
+        }
+        if (text.isNullOrBlank()) return
+
+        if (!text.startsWith("vless://", ignoreCase = true)) {
+            notifyInvalidQr()
+            return
+        }
+        if (!handled.compareAndSet(false, true)) return
+        runOnUiThread {
+            setResult(RESULT_OK, Intent().putExtra(EXTRA_RESULT, text.take(MAX_RESULT_LENGTH)))
+            finish()
+        }
+    }
+
+    private fun notifyInvalidQr() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastInvalidQrAtMs < INVALID_QR_TOAST_INTERVAL_MS) return
+        lastInvalidQrAtMs = now
+        runOnUiThread { Toast.makeText(this, R.string.qr_invalid, Toast.LENGTH_SHORT).show() }
+    }
+
+    /**
+     * Builds an upright Y-plane source. CameraX stays in sensor orientation, so
+     * a QR code is unreadable until the plane is rotated by [rotationDegrees].
+     */
+    private fun luminanceSource(
+        data: ByteArray,
+        rowStride: Int,
+        width: Int,
+        height: Int,
+        pixelStride: Int,
+        rotationDegrees: Int,
+    ): PlanarYUVLuminanceSource? {
+        val rotation = ((rotationDegrees % 360) + 360) % 360
+        if (rotation == 0 && pixelStride == 1 && data.size >= rowStride * height) {
+            return PlanarYUVLuminanceSource(data, rowStride, height, 0, 0, width, height, false)
+        }
+        val swap = rotation == 90 || rotation == 270
+        val outWidth = if (swap) height else width
+        val outHeight = if (swap) width else height
+        val out = ByteArray(outWidth * outHeight)
+        for (y in 0 until height) {
+            val row = y * rowStride
+            if (row + (width - 1) * pixelStride >= data.size) return null
+            for (x in 0 until width) {
+                val value = data[row + x * pixelStride]
+                out[when (rotation) {
+                    90 -> x * outWidth + (height - 1 - y)
+                    180 -> (height - 1 - y) * width + (width - 1 - x)
+                    270 -> (width - 1 - x) * outWidth + y
+                    else -> y * width + x
+                }] = value
+            }
+        }
+        return PlanarYUVLuminanceSource(out, outWidth, outHeight, 0, 0, outWidth, outHeight, false)
+    }
+
+    companion object {
+        const val EXTRA_RESULT = "com.beam.android.extra.QR_RESULT"
+
+        // Matches beam-core MAX_CLIENT_LINK_LEN and the ProfilesFragment clip:
+        // a longer link is rejected by the engine anyway.
+        private const val MAX_RESULT_LENGTH = 2048
+        private const val INVALID_QR_TOAST_INTERVAL_MS = 2_000L
+    }
+}

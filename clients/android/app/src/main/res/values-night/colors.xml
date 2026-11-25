@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <color name="beam_primary">#A9C1FF</color>
+    <color name="beam_on_primary">#002E6B</color>
+    <color name="beam_primary_container">#10326F</color>
+    <color name="beam_on_primary_container">#DCE1FF</color>
+
+    <color name="status_connected">#5BE58A</color>
+    <color name="status_connecting">#FFC46B</color>
+    <color name="status_degraded">#FFB4AB</color>
+    <color name="status_disconnected">#A8B0BC</color>
+
+</resources>

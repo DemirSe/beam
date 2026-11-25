@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <string name="app_name">beam</string>
+
+    <!-- Bottom navigation / screen titles -->
+    <string name="nav_dashboard">Dashboard</string>
+    <string name="nav_profiles">Profiles</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Connection state -->
+    <string name="status_disconnected">Disconnected</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_connected">Connected</string>
+    <string name="status_degraded">Degraded</string>
+    <string name="status_disconnecting">Disconnecting…</string>
+
+    <!-- Dashboard -->
+    <string name="dashboard_active_profile">Active profile</string>
+    <string name="dashboard_no_profile">No profile selected</string>
+    <string name="dashboard_add_profile">Add a profile</string>
+    <string name="dashboard_telemetry">Telemetry</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="action_connecting">Connecting…</string>
+    <string name="action_disconnecting">Disconnecting…</string>
+    <string name="telemetry_rtt">RTT</string>
+    <string name="telemetry_flows">TCP / UDP flows</string>
+    <string name="telemetry_tx">Upload</string>
+    <string name="telemetry_rx">Download</string>
+    <string name="telemetry_dial_failures">Dial failures</string>
+    <string name="telemetry_drops">Drops</string>
+    <string name="telemetry_none">—</string>
+    <string name="telemetry_idle_hint">Live counters appear only while connected.</string>
+
+    <!-- Profiles -->
+    <string name="profiles_empty">No profiles yet.\nPaste a vless:// link or scan a QR code.</string>
+    <string name="profiles_add">Add profile</string>
+    <string name="profiles_scan">Scan QR code</string>
+    <string name="profiles_delete">Delete profile</string>
+    <string name="profiles_delete_title">Delete profile?</string>
+    <string name="profiles_delete_message">%1$s is removed from this device.</string>
+    <string name="profiles_add_title">Paste vless:// link</string>
+    <string name="profiles_add_hint">vless://…</string>
+    <string name="profiles_add_invalid">This is not a valid vless:// link.</string>
+    <string name="profiles_saved">Profile saved.</string>
+    <string name="profiles_save_failed">Could not save the profile.</string>
+    <string name="profiles_server_format">%1$s:%2$d</string>
+
+    <!-- QR scanner -->
+    <string name="qr_title">Scan QR code</string>
+    <string name="qr_hint">Point the camera at the vless:// QR code.</string>
+    <string name="qr_close">Close scanner</string>
+    <string name="qr_permission_required">Camera permission is required to scan a QR code.</string>
+    <string name="qr_invalid">This QR code does not contain a vless:// link.</string>
+    <string name="qr_error">The camera could not start. Close other camera apps and retry.</string>
+
+    <!-- Settings -->
+    <string name="settings_dns_title">DNS over HTTPS</string>
+    <string name="settings_dns_summary">DNS queries leave the tunnel encrypted, resolved inside beam.</string>
+    <string name="doh_cloudflare">Cloudflare</string>
+    <string name="doh_nextdns">NextDNS</string>
+    <string name="doh_custom">Custom URL</string>
+    <string name="doh_custom_hint">https://example.com/dns-query</string>
+    <string name="settings_doh_invalid">Enter a valid https:// DNS over HTTPS URL.</string>
+    <string name="settings_leak_title">Leak protection</string>
+    <string name="settings_ipv4_title">IPv4 only</string>
+    <string name="settings_ipv4_summary">Captures IPv6 and rejects it, so IPv6 never leaks in clear. Recommended.</string>
+    <string name="settings_quic_title">Reject QUIC (UDP/443)</string>
+    <string name="settings_quic_summary">Forces browsers to fall back to TCP inside the tunnel. Recommended on mobile networks.</string>
+    <string name="settings_bypass_title">Bypass CIDRs</string>
+    <string name="settings_bypass_summary">Traffic to these networks stays outside the tunnel. One CIDR per line.</string>
+    <string name="settings_bypass_invalid">Invalid CIDR: %1$s</string>
+    <string name="settings_bypass_ipv6_unsupported">IPv6 bypass (%1$s) needs Android 13 or newer. Use IPv4 CIDRs on this device.</string>
+    <string name="settings_bypass_default_route">Bypassing %1$s would leak all traffic outside the tunnel.</string>
+    <string name="settings_bypass_reset">Reset to LAN defaults</string>
+    <string name="settings_startup_title">Startup</string>
+    <string name="settings_boot_title">Start on boot</string>
+    <string name="settings_boot_summary">Reconnect after a reboot when a profile is active.</string>
+    <string name="settings_system_title">System</string>
+    <string name="settings_alwayson_title">Always-on VPN and kill-switch</string>
+    <string name="settings_alwayson_summary">Android settings: enable Always-on VPN and Block connections without VPN.</string>
+    <string name="settings_battery_title">Unrestricted battery</string>
+    <string name="settings_battery_summary">Stops Doze from pausing the tunnel in the background.</string>
+    <string name="settings_samsung_hint">Samsung One UI: open Settings, then Battery, then Background usage limits, then Never sleeping apps. Add beam and set it to Unrestricted.</string>
+    <string name="settings_save">Save settings</string>
+    <string name="settings_saved">Settings saved.</string>
+    <string name="settings_save_failed">Could not save settings.</string>
+    <string name="settings_open_failed">The system settings screen could not be opened.</string>
+
+    <string name="action_cancel">Cancel</string>
+    <string name="action_save">Save</string>
+    <string name="action_delete">Delete</string>
+
+    <!-- Errors and tile -->
+    <string name="vpn_consent_denied">VPN permission is required to connect.</string>
+    <string name="connect_failed">The VPN service is not reachable. Try again.</string>
+    <string name="tile_label">beam</string>
+    <string name="tile_no_profile">No profile</string>
+
+</resources>

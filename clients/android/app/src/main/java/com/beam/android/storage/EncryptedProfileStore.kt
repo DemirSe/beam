@@ -1,0 +1,129 @@
+package com.beam.android.storage
+
+import android.content.Context
+import java.io.File
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * Keystore AES-256-GCM encrypted profile store (key alias `beam_profiles_v1`).
+ *
+ * Multi-process safe: UI and `:vpn` are separate processes, so every public
+ * call holds one file lock across the whole read-modify-write, reads fresh
+ * bytes from disk, and writes atomic temp-file + rename. Never caches.
+ */
+class EncryptedProfileStore(context: Context) {
+
+    private val dir: File = context.filesDir
+    private val dataFile = File(dir, "profiles.enc")
+    private val lockFile = File(dir, "profiles.lock")
+
+    @Synchronized
+    fun listProfiles(): List<VlessProfile> = withFileLock(lockFile) { readAll() }
+
+    @Synchronized
+    fun getProfile(id: String): VlessProfile? =
+        withFileLock(lockFile) { readAll().find { it.id == id } }
+
+    @Synchronized
+    fun saveProfile(profile: VlessProfile) = withFileLock(lockFile) {
+        val payload = readPayload()
+        val all = readAll(payload).filterNot { it.id == profile.id } + profile
+        writeAll(all, activeIdOf(payload))
+    }
+
+    @Synchronized
+    fun deleteProfile(id: String) = withFileLock(lockFile) {
+        val payload = readPayload()
+        val all = readAll(payload).filterNot { it.id == id }
+        // If the deleted profile was active (or none was set), fall back to
+        // the first remaining profile so :vpn always has a valid target.
+        val active = activeIdOf(payload).takeIf { it != id && all.any { p -> p.id == it } }
+            ?: all.firstOrNull()?.id
+        writeAll(all, active)
+    }
+
+    @Synchronized
+    fun getActiveProfileId(): String? =
+        withFileLock(lockFile) { activeIdOf(readPayload()) }
+
+    @Synchronized
+    fun setActiveProfileId(id: String?) = withFileLock(lockFile) {
+        writeAll(readAll(readPayload()), id)
+    }
+
+    @Synchronized
+    fun getActiveProfile(): VlessProfile? = withFileLock(lockFile) {
+        val payload = readPayload()
+        val activeId = activeIdOf(payload) ?: return@withFileLock null
+        readAll(payload).find { it.id == activeId }
+    }
+
+    private fun activeIdOf(payload: JSONObject?): String? =
+        payload?.optString("active_id")?.ifBlank { null }
+
+    private fun readAll(payload: JSONObject? = readPayload()): List<VlessProfile> {
+        if (payload == null) return emptyList()
+        val out = mutableListOf<VlessProfile>()
+        val arr = payload.optJSONArray("profiles") ?: JSONArray()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            out += VlessProfile(
+                id = o.optString("id"),
+                name = o.optString("name"),
+                uri = o.optString("uri"),
+                serverHost = o.optString("server_host"),
+                serverPort = o.optInt("server_port", 443),
+                createdAtMs = o.optLong("created_at_ms"),
+            )
+        }
+        return out
+    }
+
+    private fun writeAll(profiles: List<VlessProfile>, activeId: String?) {
+        val arr = JSONArray()
+        for (p in profiles) {
+            arr.put(
+                JSONObject()
+                    .put("id", p.id)
+                    .put("name", p.name)
+                    .put("uri", p.uri)
+                    .put("server_host", p.serverHost)
+                    .put("server_port", p.serverPort)
+                    .put("created_at_ms", p.createdAtMs),
+            )
+        }
+        val payload = JSONObject()
+            .put("profiles", arr)
+            .put("active_id", activeId)
+            .toString()
+        val tmp = File(dir, "profiles.enc.tmp")
+        tmp.writeBytes(ProfileCrypto.encrypt(payload.toByteArray(Charsets.UTF_8)))
+        if (!tmp.renameTo(dataFile)) {
+            tmp.delete()
+            throw IllegalStateException("atomic profile write failed")
+        }
+    }
+
+    private fun readPayload(): JSONObject? {
+        if (!dataFile.exists()) return null
+        val bytes: ByteArray = dataFile.readBytes()
+        if (bytes.isEmpty()) return null
+        return try {
+            JSONObject(String(ProfileCrypto.decrypt(bytes), Charsets.UTF_8))
+        } catch (_: Exception) {
+            quarantineCorruptStore()
+            null
+        }
+    }
+
+    /**
+     * Parks an unreadable blob (corrupt file or a regenerated Keystore key) so
+     * the next save writes a fresh one instead of failing forever.
+     */
+    private fun quarantineCorruptStore() {
+        val target = File(dir, "profiles.enc.corrupt-${System.currentTimeMillis()}")
+        val moved = runCatching { dataFile.renameTo(target) }.getOrDefault(false)
+        if (!moved) runCatching { dataFile.delete() }
+    }
+}
