@@ -41,8 +41,9 @@
             android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
             android:textColor="?attr/colorOnSurfaceVariant" />
 
-        <com.google.android.material.floatingactionbutton.SmallFloatingActionButton
+        <com.google.android.material.floatingactionbutton.FloatingActionButton
             android:id="@+id/fabScanQr"
+            style="@style/Widget.Material3.FloatingActionButton.Small.Primary"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_gravity="bottom|end"

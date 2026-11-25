@@ -288,8 +288,20 @@ class BeamVpnService : VpnService() {
         if (Build.VERSION.SDK_INT >= 33) {
             builder.addRoute("0.0.0.0", 0)
             for (cidr in bypass) {
+                // IpPrefix takes an InetAddress and a prefix length, not a CIDR
+                // string. isValidCidr keeps hostnames out of getByName.
+                val text = cidr.trim()
+                if (!Ipv4RouteCalculator.isValidCidr(text, allowIpv6 = true)) {
+                    Log.w(TAG, "ignoring invalid bypass CIDR: $cidr")
+                    continue
+                }
                 try {
-                    builder.excludeRoute(IpPrefix(cidr))
+                    builder.excludeRoute(
+                        IpPrefix(
+                            InetAddress.getByName(text.substringBefore('/')),
+                            text.substringAfter('/').toInt(),
+                        ),
+                    )
                 } catch (e: IllegalArgumentException) {
                     Log.w(TAG, "ignoring invalid bypass CIDR: $cidr")
                 }
