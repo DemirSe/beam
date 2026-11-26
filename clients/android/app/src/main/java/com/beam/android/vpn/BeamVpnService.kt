@@ -65,6 +65,8 @@ class BeamVpnService : VpnService() {
     /** Guarded by [callbackLock]; tracks the last state/detail pushed to notification/callbacks. */
     private var lastPublishedState: Int = VpnState.DISCONNECTED
     private var lastPublishedDetail: String = ""
+    /** Guarded by [callbackLock]; prevents broadcasting after [onDestroy] calls `callbacks.kill()`. */
+    private var destroyed: Boolean = false
     @Volatile private var activeProfileId: String? = null
     @Volatile private var pendingProfileId: String? = null
     @Volatile private var activeServerHost: String? = null
@@ -87,7 +89,7 @@ class BeamVpnService : VpnService() {
     /** Serialises state transitions and establish()/detach() against teardown(). */
     private val stateLock = Any()
 
-    /** Serialises setState() + RemoteCallbackList.beginBroadcast() across IO/binder/JNI threads. */
+    /** Serialises [publishCurrentState] and `RemoteCallbackList` lifecycle across IO/binder/JNI threads. */
     private val callbackLock = Any()
 
     /** Bumped by every connect()/disconnect()/onRevoke()/onDestroy(); stale attempts abort. */
@@ -729,7 +731,10 @@ class BeamVpnService : VpnService() {
         // Graceful shutdown (not shutdownNow) so queued engine releases finish
         // nativeStop() + tun.close() off the main thread.
         cleanupExecutor.shutdown()
-        callbacks.kill()
+        synchronized(callbackLock) {
+            destroyed = true
+            callbacks.kill()
+        }
         super.onDestroy()
     }
 
@@ -877,6 +882,7 @@ class BeamVpnService : VpnService() {
      */
     private fun publishCurrentState() {
         synchronized(callbackLock) {
+            if (destroyed) return
             val snap = stateSnapshot
             val s = snap.state
             val detail = snap.detail
