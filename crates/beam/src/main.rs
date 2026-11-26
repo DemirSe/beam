@@ -669,13 +669,9 @@ async fn async_main(
             if let Err(error) = stream.set_nodelay(true) {
                 warn_socket_option_once(&TCP_NODELAY_WARNED, &error, "TCP_NODELAY", peer);
             }
-            if let Err(error) = beam_sys::set_tcp_keepalive(
-                stream.as_raw_fd(),
-                Duration::from_secs(60),
-                Duration::from_secs(15),
-            ) {
-                warn_socket_option_once(&TCP_KEEPALIVE_WARNED, &error, "TCP keepalive", peer);
-            }
+            // Leave client-facing TCP keepalive to the client so mobile
+            // devices are not woken every 60 s during Doze. Dead connections
+            // are still bounded by `handshake_timeout_ms` and `idle_timeout_ms`.
 
             match handle_connection_admitted(stream, tls_config, Some(preauth_permit)).await {
                 Ok(outcome) => tracing::debug!(%peer, ?outcome, "connection finished"),
@@ -955,7 +951,6 @@ fn record_accept_failure(metrics: &beam_core::metrics::Metrics, failure: beam_sy
 /// rejects the option for all of them. Each option has its own flag, so one
 /// failing option does not demote a different option that fails later.
 static TCP_NODELAY_WARNED: AtomicBool = AtomicBool::new(false);
-static TCP_KEEPALIVE_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn warn_socket_option_once(
     warned: &AtomicBool,

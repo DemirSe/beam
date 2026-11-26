@@ -28,15 +28,22 @@ pub fn init_logging(_level: &str) {
         use std::str::FromStr;
         use std::sync::Once;
 
+        use tracing_logcat::{LogcatMakeWriter, LogcatTag};
+        use tracing_subscriber::fmt::format::Format;
         use tracing_subscriber::layer::SubscriberExt;
 
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             let level = tracing::level_filters::LevelFilter::from_str(_level)
                 .unwrap_or(tracing::level_filters::LevelFilter::INFO);
-            let subscriber = tracing_subscriber::registry()
-                .with(tracing_android::layer("beam").ok())
-                .with(level);
+            let Ok(writer) = LogcatMakeWriter::new(LogcatTag::Fixed("beam".to_owned())) else {
+                return;
+            };
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .event_format(Format::default().with_level(false).without_time())
+                .with_writer(writer)
+                .with_ansi(false);
+            let subscriber = tracing_subscriber::registry().with(fmt_layer).with(level);
             let _ = tracing::subscriber::set_global_default(subscriber);
         });
     }

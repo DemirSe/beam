@@ -169,6 +169,14 @@ impl AndroidEngineConfig {
             .into_beam_client_config(server_addr)
             .map_err(|_| ConfigError::Invalid("REALITY parameters rejected".to_owned()))?;
         client.socket_protector = socket_protector.clone();
+        // Disable kernel TCP keepalive on mobile: periodic 30 s probes across
+        // idle background sockets keep the cellular modem in high-power RRC
+        // active state and wake the AP during Android Doze. `TCP_USER_TIMEOUT`
+        // still bounds dead sockets on active writes, and `NetworkMonitor`
+        // resets flows on network switches.
+        client.keepalive_idle = None;
+        client.keepalive_interval = None;
+        client.keepalive_count = None;
 
         let dns = self.dns_config(socket_protector)?;
         let mut bypass_nets = Vec::with_capacity(self.bypass_cidrs.len());
@@ -325,6 +333,9 @@ mod tests {
             .expect("engine config");
 
         assert!(shared_protector(&engine, &protector));
+        assert!(engine.client.keepalive_idle.is_none());
+        assert!(engine.client.keepalive_interval.is_none());
+        assert!(engine.client.keepalive_count.is_none());
         assert_eq!(
             engine.client.server_addr,
             "203.0.113.10:443".parse().unwrap()
