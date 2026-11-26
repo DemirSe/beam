@@ -95,15 +95,35 @@ class BeamTileService : TileService() {
     override fun onStartListening() {
         super.onStartListening()
         isListening = true
-        if (!isBound) {
-            isBound = bindService(
-                Intent(this, BeamVpnService::class.java),
-                serviceConnection,
-                Context.BIND_AUTO_CREATE,
-            )
-        }
         val bound = service
-        runOnWorker { refreshTile(bound) }
+        if (isBound || bound != null) {
+            runOnWorker { refreshTile(bound) }
+            return
+        }
+        // Avoid spawning the isolated :vpn process when no profile exists.
+        runOnWorker {
+            val lookup = runCatching { EncryptedProfileStore(this).getActiveProfileId() }
+            if (lookup.isSuccess && lookup.getOrNull() == null) {
+                cachedHasProfile = false
+                mainHandler.post {
+                    if (isListening) updateTile(VpnState.DISCONNECTED, hasProfile = false)
+                }
+                return@runOnWorker
+            }
+            if (lookup.isSuccess) cachedHasProfile = true
+            mainHandler.post {
+                if (!isListening) return@post
+                if (!isBound) {
+                    isBound = bindService(
+                        Intent(this, BeamVpnService::class.java),
+                        serviceConnection,
+                        Context.BIND_AUTO_CREATE,
+                    )
+                }
+                val current = service
+                runOnWorker { refreshTile(current) }
+            }
+        }
     }
 
     override fun onStopListening() {
@@ -151,13 +171,38 @@ class BeamTileService : TileService() {
 
     override fun onClick() {
         val connected = isActive(lastState)
+        val current = service
+        if (current == null && !connected && !cachedHasProfile && !isBound) {
+            // Fast path when no profile exists: avoid spawning :vpn just to open the app.
+            runOnWorker {
+                val profileId = activeProfileId()
+                cachedHasProfile = profileId != null
+                mainHandler.post {
+                    if (profileId == null) {
+                        updateTile(VpnState.DISCONNECTED, hasProfile = false)
+                        openApp()
+                    } else if (isListening) {
+                        updateTile(VpnState.CONNECTING, hasProfile = true)
+                        pendingToggle = true
+                        if (!isBound) {
+                            isBound = bindService(
+                                Intent(this, BeamVpnService::class.java),
+                                serviceConnection,
+                                Context.BIND_AUTO_CREATE,
+                            )
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         // Optimistic: the panel must react before the binder round trip ends.
         updateTile(
             if (connected) VpnState.DISCONNECTING else VpnState.CONNECTING,
             hasProfile = cachedHasProfile,
         )
 
-        val current = service
         if (current == null) {
             pendingToggle = true
             if (!isBound) {

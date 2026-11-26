@@ -407,6 +407,12 @@ impl UdpNatBridge {
             }
             alive
         });
+        // Drop the shared XUDP mux as soon as all NAT sessions have expired
+        // and nothing is queued so its reader/writer tasks and upstream socket
+        // close at the NAT idle boundary instead of holding an idle timer.
+        if self.sessions.is_empty() && self.pending_initial.is_empty() {
+            self.mux = None;
+        }
     }
 
     /// Returns the next timer delay needed for idle UDP session sweeping or

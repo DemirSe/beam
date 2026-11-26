@@ -53,7 +53,24 @@ class EncryptedProfileStore(context: Context) {
 
     @Synchronized
     fun setActiveProfileId(id: String?) = withFileLock(lockFile) {
-        writeAll(readAll(readPayload()), id)
+        val payload = readPayload()
+        if (activeIdOf(payload) == id) return@withFileLock
+        writeAll(readAll(payload), id)
+    }
+
+    /**
+     * Persists [id] as the active profile if it still exists in the store,
+     * skipping re-encryption when [id] is already active.
+     */
+    @Synchronized
+    fun setActiveProfileIdIfExists(id: String): Boolean = withFileLock(lockFile) {
+        val payload = readPayload()
+        val all = readAll(payload)
+        if (all.none { it.id == id }) return@withFileLock false
+        if (activeIdOf(payload) != id) {
+            writeAll(all, id)
+        }
+        true
     }
 
     @Synchronized

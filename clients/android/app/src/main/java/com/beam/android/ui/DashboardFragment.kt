@@ -129,10 +129,12 @@ class DashboardFragment : Fragment() {
     private suspend fun refreshTelemetry() {
         val main = requireActivity() as MainActivity
         val service = main.beam ?: return
-        val json = withContext(Dispatchers.IO) {
-            runCatching { service.getTelemetryJson() }.getOrNull()
+        val telemetry = withContext(Dispatchers.IO) {
+            runCatching { service.getTelemetryJson() }
+                .getOrNull()
+                ?.let(TelemetryDto::fromJson)
         } ?: return
-        renderTelemetry(TelemetryDto.fromJson(json))
+        renderTelemetry(telemetry)
     }
 
     private fun renderTelemetry(telemetry: TelemetryDto?) {

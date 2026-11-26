@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.SystemClock
+import android.util.Size
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -13,6 +14,8 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
@@ -41,8 +44,14 @@ class QrScannerActivity : AppCompatActivity() {
     // Reused on the single-threaded cameraExecutor to avoid per-frame GC churn.
     private var frameBuffer = ByteArray(0)
     private var rotatedBuffer = ByteArray(0)
+    private var lastAnalyzeAtMs = 0L
+    private var analyzedFrames = 0
 
-    private val reader = MultiFormatReader().apply {
+    private val fastReader = MultiFormatReader().apply {
+        setHints(mapOf(DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE)))
+    }
+
+    private val hardReader = MultiFormatReader().apply {
         setHints(
             mapOf(
                 DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
@@ -102,7 +111,16 @@ class QrScannerActivity : AppCompatActivity() {
             val provider = runCatching { future.get() }.getOrNull() ?: return@addListener
             val preview = Preview.Builder().build()
             preview.setSurfaceProvider(binding.previewView.surfaceProvider)
+            val resolutionSelector = ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        Size(TARGET_ANALYSIS_WIDTH, TARGET_ANALYSIS_HEIGHT),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                    ),
+                )
+                .build()
             val analysis = ImageAnalysis.Builder()
+                .setResolutionSelector(resolutionSelector)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
             analysis.setAnalyzer(cameraExecutor) { proxy -> analyze(proxy) }
@@ -133,6 +151,11 @@ class QrScannerActivity : AppCompatActivity() {
     }
 
     private fun decodeFrame(proxy: ImageProxy) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastAnalyzeAtMs < MIN_ANALYZE_INTERVAL_MS) return
+        lastAnalyzeAtMs = now
+        analyzedFrames += 1
+
         val plane = proxy.planes.firstOrNull() ?: return
         val buffer = plane.buffer
         val remaining = buffer.remaining()
@@ -152,13 +175,13 @@ class QrScannerActivity : AppCompatActivity() {
             plane.pixelStride,
             proxy.imageInfo.rotationDegrees,
         ) ?: return
-        val text = try {
-            reader.decodeWithState(BinaryBitmap(HybridBinarizer(source)))?.text
-        } catch (_: Exception) {
-            null
-        } finally {
-            reader.reset()
-        }
+        val bitmap = BinaryBitmap(HybridBinarizer(source))
+        val text = decodeWith(fastReader, bitmap)
+            ?: if (analyzedFrames % TRY_HARDER_EVERY_N_FRAMES == 0) {
+                decodeWith(hardReader, bitmap)
+            } else {
+                null
+            }
         if (text.isNullOrBlank()) return
 
         if (!text.startsWith("vless://", ignoreCase = true)) {
@@ -170,6 +193,14 @@ class QrScannerActivity : AppCompatActivity() {
             setResult(RESULT_OK, Intent().putExtra(EXTRA_RESULT, text.take(MAX_RESULT_LENGTH)))
             finish()
         }
+    }
+
+    private fun decodeWith(reader: MultiFormatReader, bitmap: BinaryBitmap): String? = try {
+        reader.decodeWithState(bitmap)?.text
+    } catch (_: Exception) {
+        null
+    } finally {
+        reader.reset()
     }
 
     private fun notifyInvalidQr() {
@@ -252,5 +283,9 @@ class QrScannerActivity : AppCompatActivity() {
         // a longer link is rejected by the engine anyway.
         private const val MAX_RESULT_LENGTH = 2048
         private const val INVALID_QR_TOAST_INTERVAL_MS = 2_000L
+        private const val TARGET_ANALYSIS_WIDTH = 1280
+        private const val TARGET_ANALYSIS_HEIGHT = 720
+        private const val MIN_ANALYZE_INTERVAL_MS = 100L
+        private const val TRY_HARDER_EVERY_N_FRAMES = 3
     }
 }

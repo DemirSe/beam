@@ -135,7 +135,8 @@ impl AndroidEngine {
             .worker_threads(android_worker_threads())
             .max_blocking_threads(4)
             .thread_name("beam-android")
-            .enable_all()
+            .enable_io()
+            .enable_time()
             .build()
             .map_err(AndroidEngineError::Runtime)?;
 
@@ -247,18 +248,15 @@ impl AndroidEngine {
 
     /// Returns the current state code after re-deriving it from telemetry.
     ///
-    /// A running engine is [`STATE_CONNECTED`] until a recent dial-failure
+    /// A running engine is [`STATE_CONNECTED`] until a consecutive dial-failure
     /// streak marks it [`STATE_DEGRADED`], or the engine task exits and marks
-    /// it [`STATE_DISCONNECTED`]. Both callers poll on demand, so an idle
-    /// tunnel holds no timer and no wakeup.
+    /// it [`STATE_DISCONNECTED`]. Once degraded, the engine stays degraded
+    /// until an upstream dial succeeds or a network reset clears the streak.
     pub fn refresh_state(&self) -> u8 {
         if self.stopped.load(Ordering::SeqCst) || self.exited.load(Ordering::SeqCst) {
             return self.state.load(Ordering::Relaxed);
         }
-        let failures = self
-            .telemetry
-            .activity
-            .recent_failure_streak(DEGRADED_WINDOW);
+        let failures = self.telemetry.activity.consecutive_failure_count();
         let state = if failures >= DEGRADED_FAILURE_STREAK {
             STATE_DEGRADED
         } else {
@@ -407,6 +405,14 @@ mod tests {
         assert_eq!(engine.refresh_state(), STATE_DEGRADED);
 
         engine.telemetry.activity.record_dial_success(42);
+        assert_eq!(engine.refresh_state(), STATE_CONNECTED);
+
+        // Network reset also clears a degraded failure streak.
+        for _ in 0..DEGRADED_FAILURE_STREAK {
+            engine.telemetry.activity.record_dial_failure(failure);
+        }
+        assert_eq!(engine.refresh_state(), STATE_DEGRADED);
+        engine.telemetry.activity.reset_failure_streak();
         assert_eq!(engine.refresh_state(), STATE_CONNECTED);
 
         let value: serde_json::Value =

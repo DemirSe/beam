@@ -1,6 +1,7 @@
 //! JSON configuration DTO and `vless://` link preview for the Android client.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::time::Duration;
 
 use beam_core::client::{ClientLinkError, ParsedClientLink, SocketProtector, parse_client_link};
 use beam_sys::validate_ifname;
@@ -19,6 +20,11 @@ pub const MAX_MTU: usize = 9000;
 pub const MIN_MTU: usize = 576;
 /// Upper bound on configured bypass prefixes.
 pub const MAX_BYPASS_CIDRS: usize = 256;
+/// Mobile idle timeout for TCP relay writes and idle XUDP mux connections.
+/// Relay reads remain uncapped (`tcp_relay_idle_timeout: None`) for push sockets.
+pub const MOBILE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Mobile DNS LRU cache cap (4x smaller than desktop's 1024 to bound worst-case RSS).
+pub const MOBILE_DNS_CACHE_SIZE: usize = 256;
 
 /// Configuration that `BeamNativeBridge.nativeStart` receives as JSON.
 ///
@@ -177,6 +183,9 @@ impl AndroidEngineConfig {
         client.keepalive_idle = None;
         client.keepalive_interval = None;
         client.keepalive_count = None;
+        // Bound stalled TCP relay writes and idle XUDP muxes to 60 s instead of
+        // the desktop 300 s default while keeping relay reads uncapped for push.
+        client.idle_timeout = MOBILE_IDLE_TIMEOUT;
 
         let dns = self.dns_config(socket_protector)?;
         let mut bypass_nets = Vec::with_capacity(self.bypass_cidrs.len());
@@ -215,6 +224,7 @@ impl AndroidEngineConfig {
         }
         let upstream = DnsUpstream::parse(&self.doh_url).map_err(|_| ConfigError::Dns)?;
         let mut dns = DnsConfig::new(upstream, None);
+        dns.cache_size = MOBILE_DNS_CACHE_SIZE;
         dns.ipv4_only = self.ipv4_only;
         dns.local_socket_protector = socket_protector;
         Ok(Some(dns))
@@ -336,6 +346,7 @@ mod tests {
         assert!(engine.client.keepalive_idle.is_none());
         assert!(engine.client.keepalive_interval.is_none());
         assert!(engine.client.keepalive_count.is_none());
+        assert_eq!(engine.client.idle_timeout, MOBILE_IDLE_TIMEOUT);
         assert_eq!(
             engine.client.server_addr,
             "203.0.113.10:443".parse().unwrap()
@@ -355,6 +366,7 @@ mod tests {
 
         let dns = engine.dns.as_ref().expect("dns interceptor");
         assert!(dns.ipv4_only);
+        assert_eq!(dns.cache_size, MOBILE_DNS_CACHE_SIZE);
         assert!(matches!(dns.upstream, DnsUpstream::Doh { .. }));
     }
 
