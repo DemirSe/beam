@@ -26,15 +26,14 @@ pub const STATE_DISCONNECTED: u8 = 0;
 pub const STATE_CONNECTING: u8 = 1;
 /// The engine is running and has not hit a recent dial-failure streak.
 pub const STATE_CONNECTED: u8 = 2;
-/// At least three consecutive upstream dials failed within 30 s.
+/// At least three consecutive upstream dials failed; cleared by dial recovery
+/// or a network reset.
 pub const STATE_DEGRADED: u8 = 3;
 /// Shutdown is in progress.
 pub const STATE_DISCONNECTING: u8 = 4;
 
 /// Shutdown deadline before the runtime is dropped.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
-/// Window in which consecutive dial failures count toward degradation.
-pub const DEGRADED_WINDOW: Duration = Duration::from_secs(30);
 /// Consecutive dial failures that mark the link as degraded.
 pub const DEGRADED_FAILURE_STREAK: u64 = 3;
 /// Max age of a dial RTT reported to the UI.

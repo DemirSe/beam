@@ -84,6 +84,7 @@ class BeamTileService : TileService() {
 
         override fun onBindingDied(name: ComponentName?) {
             service = null
+            pendingToggle = false
             if (isBound) {
                 runCatching { unbindService(serviceConnection) }
                 isBound = false

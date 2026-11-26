@@ -55,10 +55,13 @@ class BeamVpnService : VpnService() {
 
     private data class ActiveEngine(val handle: Long, val generation: Long)
 
+    private data class StateSnapshot(val state: Int, val detail: String)
+
     private class DnsResolutionException(message: String) : IllegalStateException(message)
 
-    @Volatile private var state: Int = VpnState.DISCONNECTED
-    @Volatile private var stateDetail: String = ""
+    @Volatile private var stateSnapshot: StateSnapshot = StateSnapshot(VpnState.DISCONNECTED, "")
+    private val state: Int get() = stateSnapshot.state
+    private val stateDetail: String get() = stateSnapshot.detail
     /** Guarded by [callbackLock]; tracks the last state/detail pushed to notification/callbacks. */
     private var lastPublishedState: Int = VpnState.DISCONNECTED
     private var lastPublishedDetail: String = ""
@@ -184,11 +187,14 @@ class BeamVpnService : VpnService() {
                         releaseResources(released)
                         val stateChanged = synchronized(stateLock) {
                             if (startGen != connectGeneration.get()) return@launch
-                            val changed = updateStateLocked(VpnState.DISCONNECTED, "")
-                            stopSelfResult(startId)
-                            changed
+                            updateStateLocked(VpnState.DISCONNECTED, "")
                         }
                         if (stateChanged) publishCurrentState()
+                        synchronized(stateLock) {
+                            if (startGen == connectGeneration.get()) {
+                                stopSelfResult(startId)
+                            }
+                        }
                     }
                 }
             }
@@ -250,17 +256,20 @@ class BeamVpnService : VpnService() {
             val failedChanged = synchronized(stateLock) {
                 if (connectGeneration.get() == myGen) {
                     pendingProfileId = null
-                    val changed = updateStateLocked(
+                    updateStateLocked(
                         VpnState.DISCONNECTED,
                         getString(R.string.vpn_error_generic),
                     )
-                    stopSelf()
-                    changed
                 } else {
                     false
                 }
             }
             if (failedChanged) publishCurrentState()
+            synchronized(stateLock) {
+                if (connectGeneration.get() == myGen) {
+                    stopSelf()
+                }
+            }
             return
         }
         publishCurrentState()
@@ -367,7 +376,12 @@ class BeamVpnService : VpnService() {
             var staleRelease: ReleasedResources? = null
             synchronized(stateLock) {
                 if (connectGeneration.get() != myGen) {
-                    staleRelease = ReleasedResources(handle, pfd, stopForeground = false)
+                    staleRelease = ReleasedResources(
+                        handle = handle,
+                        tun = pfd,
+                        stopForeground = false,
+                        generation = myGen,
+                    )
                 } else {
                     tun = pfd
                     activeEngine = ActiveEngine(handle, myGen)
@@ -485,11 +499,14 @@ class BeamVpnService : VpnService() {
             releaseResources(released)
             val errChanged = synchronized(stateLock) {
                 if (connectGeneration.get() != myGen) return
-                val changed = updateStateLocked(VpnState.DISCONNECTED, userFacingError(t))
-                stopSelf()
-                changed
+                updateStateLocked(VpnState.DISCONNECTED, userFacingError(t))
             }
             if (errChanged) publishCurrentState()
+            synchronized(stateLock) {
+                if (connectGeneration.get() == myGen) {
+                    stopSelf()
+                }
+            }
         }
     }
 
@@ -589,34 +606,50 @@ class BeamVpnService : VpnService() {
         runCatching { setUnderlyingNetworks(arrayOf(network)) }
             .onFailure { Log.w(TAG, "setUnderlyingNetworks failed", it) }
         val host = activeServerHost
-        var updatedIp: String? = null
-        if (host != null && !SettingsValidator.isIpLiteral(host)) {
-            val totalAttempts = NETWORK_SWITCH_RESOLVE_BACKOFF_MS.size + 1
-            for (attempt in 0 until totalAttempts) {
-                if (connectGeneration.get() != expectedGen ||
-                    networkSwitchGeneration.get() != expectedSwitchGen
-                ) {
-                    return
-                }
-                updatedIp = withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
-                    resolveServerHostOnNetwork(network, host, activeIpv4Only)
-                }
-                if (updatedIp != null) break
-                if (attempt < NETWORK_SWITCH_RESOLVE_BACKOFF_MS.size) {
-                    delay(NETWORK_SWITCH_RESOLVE_BACKOFF_MS[attempt])
-                }
-            }
+        if (host == null || SettingsValidator.isIpLiteral(host)) {
+            notifyNativeNetworkChange(null)
+            return
+        }
+        val firstIp = withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
+            resolveServerHostOnNetwork(network, host, activeIpv4Only)
         }
         if (connectGeneration.get() != expectedGen || networkSwitchGeneration.get() != expectedSwitchGen) {
             return
         }
-        notifyNativeNetworkChange(updatedIp)
+        if (firstIp != null) {
+            notifyNativeNetworkChange(firstIp)
+            return
+        }
+        // Reset stale flows from the previous network immediately instead of
+        // waiting through the full retry budget, then update server_ip once DNS recovers.
+        notifyNativeNetworkChange(null)
+        for (backoffMs in NETWORK_SWITCH_RESOLVE_BACKOFF_MS) {
+            delay(backoffMs)
+            if (connectGeneration.get() != expectedGen ||
+                networkSwitchGeneration.get() != expectedSwitchGen
+            ) {
+                return
+            }
+            val retriedIp = withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
+                resolveServerHostOnNetwork(network, host, activeIpv4Only)
+            }
+            if (connectGeneration.get() != expectedGen ||
+                networkSwitchGeneration.get() != expectedSwitchGen
+            ) {
+                return
+            }
+            if (retriedIp != null) {
+                notifyNativeNetworkChange(retriedIp)
+                return
+            }
+        }
     }
 
     private data class ReleasedResources(
         val handle: Long,
         val tun: ParcelFileDescriptor?,
         val stopForeground: Boolean,
+        val generation: Long,
     )
 
     private fun stopSelfIfIdle(expectedGen: Long, startId: Int) {
@@ -661,18 +694,21 @@ class BeamVpnService : VpnService() {
     private fun finalizeDisconnect(myGen: Long) {
         val changed = synchronized(stateLock) {
             if (connectGeneration.get() == myGen) {
-                val updated = if (state != VpnState.DISCONNECTED) {
+                if (state != VpnState.DISCONNECTED) {
                     updateStateLocked(VpnState.DISCONNECTED, "")
                 } else {
                     false
                 }
-                stopSelf()
-                updated
             } else {
                 false
             }
         }
         if (changed) publishCurrentState()
+        synchronized(stateLock) {
+            if (connectGeneration.get() == myGen) {
+                stopSelf()
+            }
+        }
     }
 
     override fun onRevoke() {
@@ -743,7 +779,12 @@ class BeamVpnService : VpnService() {
         activeEngine = null
         val pfd = tun
         tun = null
-        return ReleasedResources(h, pfd, stopForeground = !keepForeground)
+        return ReleasedResources(
+            handle = h,
+            tun = pfd,
+            stopForeground = !keepForeground,
+            generation = connectGeneration.get(),
+        )
     }
 
     private fun releaseResources(released: ReleasedResources) {
@@ -758,7 +799,8 @@ class BeamVpnService : VpnService() {
             released.tun?.close()
         } catch (_: Throwable) {
         }
-        if (released.stopForeground) {
+        // Only remove the foreground notification if no newer connect() superseded this teardown.
+        if (released.stopForeground && connectGeneration.get() == released.generation) {
             runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         }
     }
@@ -818,24 +860,26 @@ class BeamVpnService : VpnService() {
         }
     }
 
-    /** Updates [state] and [stateDetail] while holding [stateLock]; call [publishCurrentState] outside. */
+    /** Updates [stateSnapshot] while holding [stateLock]; call [publishCurrentState] outside. */
     private fun updateStateLocked(s: Int, detail: String): Boolean {
-        val changed = (s != state) || (detail != stateDetail)
-        state = s
-        stateDetail = detail
+        val prev = stateSnapshot
+        val changed = (s != prev.state) || (detail != prev.detail)
+        if (changed) stateSnapshot = StateSnapshot(s, detail)
         return changed
     }
 
     /**
-     * Publishes the latest [state]/[stateDetail] to the notification and AIDL
-     * callbacks under [callbackLock], never while holding [stateLock]. Reading
-     * the current volatile values inside [callbackLock] preserves transition
-     * order even when two threads release [stateLock] concurrently.
+     * Publishes the latest [stateSnapshot] to the notification (on state
+     * transitions only) and AIDL callbacks (on state or detail changes) under
+     * [callbackLock], never while holding [stateLock]. Reading a single
+     * immutable volatile snapshot inside [callbackLock] avoids torn pairs and
+     * preserves transition order when threads release [stateLock] concurrently.
      */
     private fun publishCurrentState() {
         synchronized(callbackLock) {
-            val s = state
-            val detail = stateDetail
+            val snap = stateSnapshot
+            val s = snap.state
+            val detail = snap.detail
             val stateChanged = (s != lastPublishedState)
             if (!stateChanged && detail == lastPublishedDetail) return
             lastPublishedState = s
