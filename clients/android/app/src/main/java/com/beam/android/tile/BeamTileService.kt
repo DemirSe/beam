@@ -57,7 +57,7 @@ class BeamTileService : TileService() {
         }
     }
 
-    private val serviceConnection = object : ServiceConnection {
+    private val serviceConnection: ServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val bound = binder?.let { IBeamVpnService.Stub.asInterface(it) } ?: return
             service = bound
