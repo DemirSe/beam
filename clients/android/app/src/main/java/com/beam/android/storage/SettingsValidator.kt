@@ -66,9 +66,9 @@ object SettingsValidator {
         if (parts.size != 4) return false
         return parts.all { part ->
             if (part.isEmpty() || part.length > 3) return false
-            // Rust `Ipv4Addr::from_str` rejects leading zeros (e.g. "01").
+            // Rust `Ipv4Addr::from_str` rejects leading zeros (e.g. "01") and non-ASCII digits.
             if (part.length > 1 && part[0] == '0') return false
-            part.all(Char::isDigit) && (part.toIntOrNull() in 0..255)
+            part.all { it in '0'..'9' } && (part.toIntOrNull() in 0..255)
         }
     }
 
@@ -129,6 +129,9 @@ object SettingsValidator {
         if (isIpv4Literal(host)) return true
         if (host.startsWith('.') || host.endsWith('.') || host.contains("..")) return false
         val labels = host.split('.')
+        // Mirrors RFC 3696 / rustls `ServerName::try_from`: final label must not be all-numeric
+        // (rejects malformed IPv4-like strings such as "01.2.3.4" and "999.1.1.1").
+        if (labels.last().all { it in '0'..'9' }) return false
         return labels.all { label ->
             label.isNotEmpty() &&
                 label.length <= 63 &&

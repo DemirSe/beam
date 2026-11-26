@@ -41,6 +41,7 @@ class SettingsValidatorTest {
         assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://[notav6]:443/dns-query"))
         assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://[::1::2]/dns-query"))
         assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://01.2.3.4/dns-query"))
+        assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://999.1.1.1/dns-query"))
         assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://dns.example.com/" + "a".repeat(520)))
         // UTF-8 byte length > 512 even though UTF-16 char count < 512.
         assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://dns.example.com/" + "ü".repeat(260)))

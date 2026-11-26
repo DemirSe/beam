@@ -374,24 +374,33 @@ class BeamVpnService : VpnService() {
                         .onFailure { Log.w(TAG, "initial setUnderlyingNetworks failed", it) }
                 },
                 onNetworkSwitch = { network ->
-                    val switchGen = networkSwitchGeneration.incrementAndGet()
-                    synchronized(stateLock) {
-                        if (connectGeneration.get() != myGen) return@synchronized
-                        networkSwitchJob?.cancel()
-                        networkSwitchJob = serviceScope.launch {
-                            handleNetworkSwitch(network, myGen, switchGen)
+                    if (connectGeneration.get() == myGen) {
+                        synchronized(stateLock) {
+                            if (connectGeneration.get() == myGen) {
+                                val switchGen = networkSwitchGeneration.incrementAndGet()
+                                networkSwitchJob?.cancel()
+                                networkSwitchJob = serviceScope.launch {
+                                    handleNetworkSwitch(network, myGen, switchGen)
+                                }
+                            }
                         }
                     }
                 },
                 onNetworkLost = {
-                    networkSwitchGeneration.incrementAndGet()
-                    synchronized(stateLock) {
-                        networkSwitchJob?.cancel()
-                        networkSwitchJob = null
+                    if (connectGeneration.get() == myGen) {
+                        synchronized(stateLock) {
+                            if (connectGeneration.get() == myGen) {
+                                networkSwitchGeneration.incrementAndGet()
+                                networkSwitchJob?.cancel()
+                                networkSwitchJob = null
+                            }
+                        }
+                        if (connectGeneration.get() == myGen) {
+                            runCatching { setUnderlyingNetworks(null) }
+                                .onFailure { Log.w(TAG, "setUnderlyingNetworks(null) failed", it) }
+                            notifyNativeNetworkChange(serverIp = null)
+                        }
                     }
-                    runCatching { setUnderlyingNetworks(null) }
-                        .onFailure { Log.w(TAG, "setUnderlyingNetworks(null) failed", it) }
-                    notifyNativeNetworkChange(serverIp = null)
                 },
             ).also { it.start() }
 
@@ -429,10 +438,16 @@ class BeamVpnService : VpnService() {
             // Throwable, not Exception: a missing or stale libbeam_android.so
             // surfaces as LinkageError/ExceptionInInitializerError.
             Log.e(TAG, "connect failed", t)
-            val released = synchronized(stateLock) { detachResources() }
+            val released = synchronized(stateLock) {
+                if (connectGeneration.get() != myGen) return
+                detachResources()
+            }
             releaseResources(released)
-            setState(VpnState.DISCONNECTED, userFacingError(t))
-            stopSelfIfGen(myGen)
+            synchronized(stateLock) {
+                if (connectGeneration.get() != myGen) return
+                setState(VpnState.DISCONNECTED, userFacingError(t))
+                stopSelf()
+            }
         }
     }
 
@@ -550,13 +565,6 @@ class BeamVpnService : VpnService() {
         val tun: ParcelFileDescriptor?,
         val stopForeground: Boolean,
     )
-
-    private fun stopSelfIfGen(expectedGen: Long, startId: Int? = null) {
-        synchronized(stateLock) {
-            if (connectGeneration.get() != expectedGen) return
-            if (startId != null) stopSelfResult(startId) else stopSelf()
-        }
-    }
 
     private fun stopSelfIfIdle(expectedGen: Long, startId: Int) {
         synchronized(stateLock) {
@@ -699,15 +707,22 @@ class BeamVpnService : VpnService() {
     }
 
     private fun applyReportedState(reported: Int, gen: Long) {
-        val active = activeEngine ?: return
-        if (gen != connectGeneration.get() || gen != active.generation) return
-        if (reported == VpnState.DISCONNECTED) {
-            serviceScope.launch { disconnect(expectedGen = gen) }
-            return
+        val shouldDisconnect = synchronized(stateLock) {
+            val active = activeEngine ?: return
+            if (gen != connectGeneration.get() || gen != active.generation) return
+            if (reported == VpnState.DISCONNECTED) {
+                true
+            } else {
+                if (reported != state) {
+                    // Telemetry owns the state, not the detail: never forward a stale one.
+                    setState(reported, if (reported == VpnState.DEGRADED) "degraded" else "")
+                }
+                false
+            }
         }
-        if (reported == state) return
-        // Telemetry owns the state, not the detail: never forward a stale one.
-        setState(reported, if (reported == VpnState.DEGRADED) "degraded" else "")
+        if (shouldDisconnect) {
+            serviceScope.launch { disconnect(expectedGen = gen) }
+        }
     }
 
     private fun notifyNativeNetworkChange(serverIp: String? = null) {
