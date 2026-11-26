@@ -236,20 +236,22 @@ mod tests {
 
     mod detached_fd {
         use super::*;
+        use std::io::Read;
         use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         /// Returns a detached raw fd plus its live peer, like `detachFd()`.
         fn detached_socket() -> (RawFd, UnixStream) {
             let (stream, peer) = UnixStream::pair().expect("socketpair");
+            peer.set_nonblocking(true).expect("nonblocking peer");
             (stream.into_raw_fd(), peer)
         }
 
-        fn is_open(fd: RawFd) -> bool {
-            // SAFETY: `F_GETFD` takes no variadic argument and does not
-            // dereference a user pointer. The kernel reports `EBADF` for a
-            // closed descriptor.
-            (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
+        /// Observes closure via peer EOF instead of probing the raw fd number,
+        /// avoiding flakes when another parallel test thread reuses the closed fd.
+        fn peer_saw_eof(peer: &mut UnixStream) -> bool {
+            let mut byte = [0u8; 1];
+            matches!(peer.read(&mut byte), Ok(0))
         }
 
         fn get_flags(fd: RawFd, command: libc::c_int) -> libc::c_int {
@@ -270,18 +272,21 @@ mod tests {
         #[test]
         fn invalid_name_closes_the_detached_fd() {
             for name in ["", "0123456789abcdef", "tun\0", "tun/0"] {
-                let (raw, _peer) = detached_socket();
+                let (raw, mut peer) = detached_socket();
                 let Err(error) = LinuxTun::from_detached_fd(raw, name) else {
                     panic!("an invalid interface name {name:?} must be rejected");
                 };
                 assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name:?}");
-                assert!(!is_open(raw), "{name:?} must close the descriptor");
+                assert!(
+                    peer_saw_eof(&mut peer),
+                    "{name:?} must close the descriptor"
+                );
             }
         }
 
         #[test]
         fn valid_detached_fd_is_nonblocking_cloexec_and_owned() {
-            let (raw, peer) = detached_socket();
+            let (raw, mut peer) = detached_socket();
             // Clear both flags first, so the assertions prove that
             // `from_detached_fd` sets them instead of inheriting them.
             // SAFETY: `F_SETFD`/`F_SETFL` consume their `c_int` argument by
@@ -302,8 +307,10 @@ mod tests {
             assert_ne!(get_flags(raw, libc::F_GETFD) & libc::FD_CLOEXEC, 0);
 
             drop(tun);
-            assert!(!is_open(raw), "dropping the TUN must close its descriptor");
-            drop(peer);
+            assert!(
+                peer_saw_eof(&mut peer),
+                "dropping the TUN must close its descriptor"
+            );
         }
     }
 }
