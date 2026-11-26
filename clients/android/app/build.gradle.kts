@@ -44,9 +44,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfigs.findByName("release")?.let {
-                signingConfig = it
-            } ?: if (providers.gradleProperty("beam.signReleaseWithDebug").orNull == "true") {
+            val releaseSigning = signingConfigs.findByName("release")
+            if (releaseSigning != null) {
+                signingConfig = releaseSigning
+            } else if (providers.gradleProperty("beam.signReleaseWithDebug").orNull == "true") {
                 signingConfig = signingConfigs.getByName("debug")
             }
         }
