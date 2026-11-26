@@ -260,6 +260,12 @@ pub struct TunnelActivity {
     last_failure_stage: AtomicU64,
     /// [`DialFailureKind::code`] of the last failure (`0` = none).
     last_failure_kind: AtomicU64,
+    /// Number of currently active proxied TCP relay tasks.
+    active_tcp_flows: AtomicU64,
+    /// Total proxied TCP payload bytes written upstream (client -> server).
+    bytes_tx: AtomicU64,
+    /// Total proxied TCP payload bytes read from upstream (server -> client).
+    bytes_rx: AtomicU64,
     /// Drop counters shared with the TUN engine, attached once at start.
     drops: OnceLock<Arc<DropCounters>>,
 }
@@ -276,6 +282,9 @@ impl TunnelActivity {
             last_failure_ms_plus_one: AtomicU64::new(0),
             last_failure_stage: AtomicU64::new(0),
             last_failure_kind: AtomicU64::new(0),
+            active_tcp_flows: AtomicU64::new(0),
+            bytes_tx: AtomicU64::new(0),
+            bytes_rx: AtomicU64::new(0),
             drops: OnceLock::new(),
         }
     }
@@ -335,6 +344,40 @@ impl TunnelActivity {
     /// Consecutive failed upstream dials since the last success.
     pub fn consecutive_failure_count(&self) -> u64 {
         self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    /// Number of currently active proxied TCP relay flows.
+    pub fn active_tcp_flows(&self) -> u64 {
+        self.active_tcp_flows.load(Ordering::Relaxed)
+    }
+
+    /// Total proxied TCP payload bytes sent upstream (client -> server).
+    pub fn bytes_tx(&self) -> u64 {
+        self.bytes_tx.load(Ordering::Relaxed)
+    }
+
+    /// Total proxied TCP payload bytes received from upstream (server -> client).
+    pub fn bytes_rx(&self) -> u64 {
+        self.bytes_rx.load(Ordering::Relaxed)
+    }
+
+    /// Adds `n` upstream-sent payload bytes.
+    pub fn record_bytes_tx(&self, n: u64) {
+        self.bytes_tx.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Adds `n` upstream-received payload bytes.
+    pub fn record_bytes_rx(&self, n: u64) {
+        self.bytes_rx.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Increments the active TCP flow counter; returns an RAII guard that
+    /// decrements it when the relay task finishes or is cancelled.
+    fn enter_tcp_flow(self: &Arc<Self>) -> ActiveTcpFlowGuard {
+        self.active_tcp_flows.fetch_add(1, Ordering::Relaxed);
+        ActiveTcpFlowGuard {
+            activity: Arc::clone(self),
+        }
     }
 
     /// Returns the most recent [`DialFailure`] regardless of age, or `None`
@@ -888,6 +931,18 @@ async fn send_tun_packet<D: TunDevice>(
     }
 }
 
+struct ActiveTcpFlowGuard {
+    activity: Arc<TunnelActivity>,
+}
+
+impl Drop for ActiveTcpFlowGuard {
+    fn drop(&mut self) {
+        self.activity
+            .active_tcp_flows
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Bounds concurrent upstream handshakes (queuing normal bursts rather than
 /// RSTing them) and fast-fails excess dials during sustained server outages.
 struct DialGate {
@@ -1075,6 +1130,10 @@ fn spawn_tcp_relay(
             }
         };
 
+        let _flow_guard = activity.as_ref().map(TunnelActivity::enter_tcp_flow);
+        let c2s_tracker = activity.clone();
+        let s2c_tracker = activity.clone();
+
         // Push-safe mode unbounds reads only. Writes keep a deadline in both
         // modes, so a peer that stops draining can never wedge this task.
         let read_idle = relay_idle;
@@ -1100,7 +1159,11 @@ fn spawn_tcp_relay(
                 let coalesced = coalesce_c2s(&chunk, &mut scratch, || tun_r.try_recv_chunk());
                 let out: &[u8] = if coalesced { &scratch } else { &chunk };
                 match with_relay_idle(Some(write_idle), up_w.write_all(out)).await {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        if let Some(tracker) = c2s_tracker.as_ref() {
+                            tracker.record_bytes_tx(out.len() as u64);
+                        }
+                    }
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "write", &err);
                         break;
@@ -1158,7 +1221,11 @@ fn spawn_tcp_relay(
                     }
                 };
                 match with_relay_idle(Some(write_idle), tun_w.send_chunk_pooled(&buf[..n])).await {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        if let Some(tracker) = s2c_tracker.as_ref() {
+                            tracker.record_bytes_rx(n as u64);
+                        }
+                    }
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "send_chunk", &err);
                         break;
@@ -1597,5 +1664,24 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[test]
+    fn tunnel_activity_tracks_active_flows_and_bytes() {
+        let activity = Arc::new(TunnelActivity::new());
+        assert_eq!(activity.active_tcp_flows(), 0);
+        assert_eq!(activity.bytes_tx(), 0);
+        assert_eq!(activity.bytes_rx(), 0);
+
+        {
+            let _g1 = activity.enter_tcp_flow();
+            let _g2 = activity.enter_tcp_flow();
+            assert_eq!(activity.active_tcp_flows(), 2);
+            activity.record_bytes_tx(1_500);
+            activity.record_bytes_rx(4_096);
+        }
+        assert_eq!(activity.active_tcp_flows(), 0);
+        assert_eq!(activity.bytes_tx(), 1_500);
+        assert_eq!(activity.bytes_rx(), 4_096);
     }
 }

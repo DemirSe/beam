@@ -82,6 +82,18 @@ android {
         aidl = true
     }
 
+    packaging {
+        resources {
+            excludes += listOf(
+                "DebugProbesKt.bin",
+                "META-INF/*.version",
+                "META-INF/CHANGES",
+                "META-INF/README.md",
+                "kotlin-tooling-metadata.json",
+            )
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

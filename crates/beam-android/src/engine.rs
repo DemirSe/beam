@@ -240,15 +240,11 @@ impl AndroidEngine {
             + drops.udp_session_table_full;
         let activity = &self.telemetry.activity;
         let last_rtt_ms = activity.recent_rtt(RTT_MAX_AGE);
-        // shortcut: `beam-tun` exposes no per-flow or byte counters yet, so
-        // these five fields stay unknown until it does.
-        let bytes_tx: Option<u64> = None;
-        let bytes_rx: Option<u64> = None;
         json!({
-            "active_tcp_flows": 0,
+            "active_tcp_flows": activity.active_tcp_flows(),
             "active_udp_sessions": 0,
-            "bytes_tx": bytes_tx,
-            "bytes_rx": bytes_rx,
+            "bytes_tx": activity.bytes_tx(),
+            "bytes_rx": activity.bytes_rx(),
             "last_rtt_ms": last_rtt_ms,
             "dial_failures": activity.dial_failure_count(),
             "drops": total_drops,
@@ -391,16 +387,26 @@ mod tests {
         let json = engine.telemetry_json();
         let value: serde_json::Value = serde_json::from_str(&json).expect("telemetry JSON");
 
-        for key in ["active_tcp_flows", "active_udp_sessions"] {
+        for key in [
+            "active_tcp_flows",
+            "active_udp_sessions",
+            "bytes_tx",
+            "bytes_rx",
+            "dial_failures",
+            "drops",
+            "state",
+        ] {
             assert!(value.get(key).is_some_and(|field| field.is_u64()), "{key}");
         }
-        for key in ["bytes_tx", "bytes_rx", "last_rtt_ms"] {
-            assert!(value.get(key).is_some_and(|field| field.is_null()), "{key}");
-        }
-        for key in ["dial_failures", "drops", "state"] {
-            assert!(value.get(key).is_some_and(|field| field.is_u64()), "{key}");
-        }
+        assert!(
+            value
+                .get("last_rtt_ms")
+                .is_some_and(|field| field.is_null()),
+            "last_rtt_ms"
+        );
         assert_eq!(value["state"], u64::from(STATE_CONNECTED));
+        assert_eq!(value["bytes_tx"], 0);
+        assert_eq!(value["bytes_rx"], 0);
         assert_eq!(value["drops"], 0);
         assert!(!json.contains("vless"));
         assert!(!json.contains("203.0.113.10"));
