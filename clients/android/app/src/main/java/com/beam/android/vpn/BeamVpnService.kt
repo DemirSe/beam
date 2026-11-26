@@ -83,7 +83,10 @@ class BeamVpnService : VpnService() {
 
     /** Bumped by every connect()/disconnect()/onRevoke()/onDestroy(); stale attempts abort. */
     private val connectGeneration = AtomicLong(0L)
+    /** Monotonic counter ordering concurrent network-switch re-resolutions. */
+    private val networkSwitchGeneration = AtomicLong(0L)
     private var connectJob: Job? = null
+    private var networkSwitchJob: Job? = null
 
     private val binder = object : IBeamVpnService.Stub() {
         override fun connect(profileId: String) {
@@ -168,10 +171,16 @@ class BeamVpnService : VpnService() {
                         connect(id)
                     } else {
                         // Nothing to connect to: stop instead of idling in foreground.
-                        val released = synchronized(stateLock) { detachResources() }
+                        val released = synchronized(stateLock) {
+                            if (startGen != connectGeneration.get()) return@launch
+                            detachResources()
+                        }
                         releaseResources(released)
-                        setState(VpnState.DISCONNECTED, "")
-                        stopSelfIfGen(startGen, startId)
+                        synchronized(stateLock) {
+                            if (startGen != connectGeneration.get()) return@launch
+                            setState(VpnState.DISCONNECTED, "")
+                            stopSelfResult(startId)
+                        }
                     }
                 }
             }
@@ -253,9 +262,10 @@ class BeamVpnService : VpnService() {
                 ?: throw IllegalArgumentException("unknown profile")
             val settings = SettingsStore(this).load()
 
-            // Resolve before establish(): once the TUN is up, a blocking lookup
-            // would stall for 10-30 s. Fail fast if a hostname cannot be resolved
-            // within the budget instead of falling through to unbounded getaddrinfo.
+            // Resolve before establish(): once the TUN is up, a platform lookup
+            // could stall behind the new route. The 5 s deadline is best effort
+            // because InetAddress.getAllByName is blocking, but failing here on
+            // timeout/error avoids falling through to unbounded Rust getaddrinfo.
             val serverIp = if (SettingsValidator.isIpLiteral(profile.serverHost)) {
                 profile.serverHost.trim().removePrefix("[").removeSuffix("]")
             } else {
@@ -312,12 +322,11 @@ class BeamVpnService : VpnService() {
                 )
             } catch (e: LinkageError) {
                 // nativeStart was never entered, so Rust never took the fd:
-                // closing it here is the only owner, exactly once.
+                // closing it here is the only owner, exactly once. For any
+                // post-entry throw, Rust's LinuxTun::from_detached_fd already
+                // adopted and closed the fd on error.
                 runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
                 throw e
-            } catch (t: Throwable) {
-                runCatching { pfd.close() }
-                throw t
             }
 
             var staleRelease: ReleasedResources? = null
@@ -345,7 +354,17 @@ class BeamVpnService : VpnService() {
                 disconnect(expectedGen = myGen)
                 return
             }
-            setState(liveState, if (liveState == VpnState.DEGRADED) "degraded" else "")
+            // Re-check generation and active handle under stateLock so a concurrent
+            // onDestroy()/disconnect() cannot have CONNECTED re-posted after teardown.
+            val stillOwner = synchronized(stateLock) {
+                if (connectGeneration.get() == myGen && activeEngine?.handle == handle) {
+                    setState(liveState, if (liveState == VpnState.DEGRADED) "degraded" else "")
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!stillOwner) return
 
             val cm = getSystemService(ConnectivityManager::class.java)
             val newMonitor = NetworkMonitor(
@@ -355,11 +374,21 @@ class BeamVpnService : VpnService() {
                         .onFailure { Log.w(TAG, "initial setUnderlyingNetworks failed", it) }
                 },
                 onNetworkSwitch = { network ->
-                    serviceScope.launch {
-                        handleNetworkSwitch(network, myGen)
+                    val switchGen = networkSwitchGeneration.incrementAndGet()
+                    synchronized(stateLock) {
+                        if (connectGeneration.get() != myGen) return@synchronized
+                        networkSwitchJob?.cancel()
+                        networkSwitchJob = serviceScope.launch {
+                            handleNetworkSwitch(network, myGen, switchGen)
+                        }
                     }
                 },
                 onNetworkLost = {
+                    networkSwitchGeneration.incrementAndGet()
+                    synchronized(stateLock) {
+                        networkSwitchJob?.cancel()
+                        networkSwitchJob = null
+                    }
                     runCatching { setUnderlyingNetworks(null) }
                         .onFailure { Log.w(TAG, "setUnderlyingNetworks(null) failed", it) }
                     notifyNativeNetworkChange(serverIp = null)
@@ -379,9 +408,13 @@ class BeamVpnService : VpnService() {
                 return
             }
 
-            // Only persist active profile if it still exists (not deleted during connect).
+            // Only persist active profile if this attempt still owns the tunnel and
+            // the profile was not deleted during connect.
+            if (connectGeneration.get() != myGen) return
             if (store.getProfile(profile.id) != null) {
-                store.setActiveProfileId(profile.id)
+                if (connectGeneration.get() == myGen) {
+                    store.setActiveProfileId(profile.id)
+                }
             } else {
                 disconnect(expectedGen = myGen)
                 return
@@ -488,8 +521,14 @@ class BeamVpnService : VpnService() {
         return (preferred ?: addresses.first()).hostAddress
     }
 
-    private suspend fun handleNetworkSwitch(network: Network, expectedGen: Long) {
-        if (connectGeneration.get() != expectedGen) return
+    private suspend fun handleNetworkSwitch(
+        network: Network,
+        expectedGen: Long,
+        expectedSwitchGen: Long,
+    ) {
+        if (connectGeneration.get() != expectedGen || networkSwitchGeneration.get() != expectedSwitchGen) {
+            return
+        }
         runCatching { setUnderlyingNetworks(arrayOf(network)) }
             .onFailure { Log.w(TAG, "setUnderlyingNetworks failed", it) }
         val host = activeServerHost
@@ -500,7 +539,9 @@ class BeamVpnService : VpnService() {
         } else {
             null
         }
-        if (connectGeneration.get() != expectedGen) return
+        if (connectGeneration.get() != expectedGen || networkSwitchGeneration.get() != expectedSwitchGen) {
+            return
+        }
         notifyNativeNetworkChange(updatedIp)
     }
 
@@ -576,11 +617,17 @@ class BeamVpnService : VpnService() {
     private fun scheduleRelease(released: ReleasedResources) {
         if (released.handle == 0L && released.tun == null && !released.stopForeground) return
         if (cleanupExecutor.isShutdown) {
-            releaseResources(released)
+            Thread({ releaseResources(released) }, "beam-cleanup-fallback").apply {
+                isDaemon = true
+            }.start()
             return
         }
         runCatching { cleanupExecutor.execute { releaseResources(released) } }
-            .onFailure { releaseResources(released) }
+            .onFailure {
+                Thread({ releaseResources(released) }, "beam-cleanup-fallback").apply {
+                    isDaemon = true
+                }.start()
+            }
     }
 
     /**
@@ -588,6 +635,9 @@ class BeamVpnService : VpnService() {
      * native shutdown so main-thread lifecycle calls cannot ANR behind the lock.
      */
     private fun detachResources(keepForeground: Boolean = false): ReleasedResources {
+        networkSwitchGeneration.incrementAndGet()
+        networkSwitchJob?.cancel()
+        networkSwitchJob = null
         monitor?.stop()
         monitor = null
         pendingProfileId = null

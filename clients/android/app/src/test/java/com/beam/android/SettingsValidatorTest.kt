@@ -37,7 +37,13 @@ class SettingsValidatorTest {
         assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://dns.example.com:0/dns-query"))
         assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://dns.example.com:70000/dns-query"))
         assertNull(SettingsValidator.normalizeAndValidateDohUrl("https:///dns-query"))
+        assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://[1.1.1.1]/dns-query"))
+        assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://[notav6]:443/dns-query"))
+        assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://[::1::2]/dns-query"))
+        assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://01.2.3.4/dns-query"))
         assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://dns.example.com/" + "a".repeat(520)))
+        // UTF-8 byte length > 512 even though UTF-16 char count < 512.
+        assertNull(SettingsValidator.normalizeAndValidateDohUrl("https://dns.example.com/" + "ü".repeat(260)))
     }
 
     @Test
@@ -46,8 +52,12 @@ class SettingsValidatorTest {
         assertTrue(SettingsValidator.isIpLiteral("203.0.113.10"))
         assertTrue(SettingsValidator.isIpLiteral("2001:db8::1"))
         assertTrue(SettingsValidator.isIpLiteral("[2001:db8::1]"))
+        assertTrue(SettingsValidator.isIpLiteral("::ffff:192.0.2.1"))
         assertFalse(SettingsValidator.isIpLiteral("vpn.example.com"))
         assertFalse(SettingsValidator.isIpLiteral("999.1.1.1"))
+        assertFalse(SettingsValidator.isIpLiteral("01.2.3.4"))
+        assertFalse(SettingsValidator.isIpLiteral("::1::2"))
+        assertFalse(SettingsValidator.isIpLiteral("[1.1.1.1]"))
         assertFalse(SettingsValidator.isIpLiteral(""))
     }
 }
