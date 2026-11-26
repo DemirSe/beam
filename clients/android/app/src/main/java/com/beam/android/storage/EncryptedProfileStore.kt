@@ -2,6 +2,7 @@ package com.beam.android.storage
 
 import android.content.Context
 import java.io.File
+import java.io.FileOutputStream
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -98,7 +99,12 @@ class EncryptedProfileStore(context: Context) {
             .put("active_id", activeId)
             .toString()
         val tmp = File(dir, "profiles.enc.tmp")
-        tmp.writeBytes(ProfileCrypto.encrypt(payload.toByteArray(Charsets.UTF_8)))
+        val encrypted = ProfileCrypto.encrypt(payload.toByteArray(Charsets.UTF_8))
+        FileOutputStream(tmp).use { out ->
+            out.write(encrypted)
+            out.flush()
+            out.fd.sync()
+        }
         if (!tmp.renameTo(dataFile)) {
             tmp.delete()
             throw IllegalStateException("atomic profile write failed")

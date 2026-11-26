@@ -6,6 +6,8 @@ plugins {
 // Production APK stays arm64-only. `-Pbeam.includeX86_64=true` adds x86_64 for
 // the GitHub Actions KVM emulator (debug builds only in practice).
 val includeX86_64 = providers.gradleProperty("beam.includeX86_64").orNull == "true"
+val beamVersionCode = providers.gradleProperty("beam.versionCode").orNull?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+val beamVersionName = providers.gradleProperty("beam.versionName").orNull?.takeIf { it.isNotBlank() } ?: "0.1.0"
 
 android {
     namespace = "com.beam.android"
@@ -15,9 +17,11 @@ android {
         applicationId = "com.beam.android"
         minSdk = 31
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = beamVersionCode
+        versionName = beamVersionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Strip unused AppCompat/Material translations to keep the release APK lean.
+        resourceConfigurations += listOf("en")
 
         ndk {
             abiFilters += listOf("arm64-v8a") + if (includeX86_64) listOf("x86_64") else emptyList()
@@ -36,11 +40,19 @@ android {
         }
         val ksPath = System.getenv("BEAM_KEYSTORE_PATH")
         if (!ksPath.isNullOrBlank()) {
+            val ksPassword = System.getenv("BEAM_KEYSTORE_PASSWORD")
+            val ksAlias = System.getenv("BEAM_KEY_ALIAS")
+            val ksKeyPassword = System.getenv("BEAM_KEY_PASSWORD")
+            if (ksPassword.isNullOrBlank() || ksAlias.isNullOrBlank() || ksKeyPassword.isNullOrBlank()) {
+                throw org.gradle.api.GradleException(
+                    "Incomplete release signing env: BEAM_KEYSTORE_PATH requires BEAM_KEYSTORE_PASSWORD, BEAM_KEY_ALIAS, and BEAM_KEY_PASSWORD",
+                )
+            }
             create("release") {
                 storeFile = file(ksPath)
-                storePassword = System.getenv("BEAM_KEYSTORE_PASSWORD") ?: ""
-                keyAlias = System.getenv("BEAM_KEY_ALIAS") ?: ""
-                keyPassword = System.getenv("BEAM_KEY_PASSWORD") ?: ""
+                storePassword = ksPassword
+                keyAlias = ksAlias
+                keyPassword = ksKeyPassword
             }
         }
     }

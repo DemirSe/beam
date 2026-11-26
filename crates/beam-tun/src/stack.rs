@@ -203,12 +203,21 @@ pub trait NetStack: Send + 'static {
     fn set_drop_counters(&mut self, _drops: Arc<DropCounters>) {}
 }
 
+type WriteReserveFuture = Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mpsc::OwnedPermit<Vec<u8>>, mpsc::error::SendError<()>>,
+            > + Send,
+    >,
+>;
+
 /// Async TCP stream bridged to a [`NetStack`] socket.
 pub struct TunTcpStream {
     from_stack: mpsc::Receiver<Vec<u8>>,
     read_buf: Vec<u8>,
     read_offset: usize,
     to_stack: Option<mpsc::Sender<Vec<u8>>>,
+    write_reserve: Option<WriteReserveFuture>,
     waker: Arc<Notify>,
     flow_waker: Option<Arc<dyn FlowWaker>>,
     in_flight_relay: Option<Arc<AtomicUsize>>,
@@ -373,6 +382,7 @@ impl TunTcpStream {
             read_buf: Vec::new(),
             read_offset: 0,
             to_stack: Some(to_stack),
+            write_reserve: None,
             waker,
             flow_waker,
             in_flight_relay,
@@ -473,6 +483,7 @@ impl AsyncWrite for TunTcpStream {
             return Poll::Ready(Ok(0));
         }
         let Some(tx) = this.to_stack.as_ref() else {
+            this.write_reserve = None;
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "TUN TCP stream already shut down",
@@ -480,20 +491,45 @@ impl AsyncWrite for TunTcpStream {
         };
 
         let chunk_len = buf.len().min(64 * 1024);
-        match tx.try_send(buf[..chunk_len].to_vec()) {
-            Ok(()) => {
+        if this.write_reserve.is_none() {
+            match tx.try_reserve() {
+                Ok(permit) => {
+                    permit.send(buf[..chunk_len].to_vec());
+                    wake_stack(&this.waker, this.flow_waker.as_ref());
+                    return Poll::Ready(Ok(chunk_len));
+                }
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "TUN TCP socket closed",
+                    )));
+                }
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    wake_stack(&this.waker, this.flow_waker.as_ref());
+                    this.write_reserve = Some(Box::pin(tx.clone().reserve_owned()));
+                }
+            }
+        }
+
+        let fut = this
+            .write_reserve
+            .as_mut()
+            .expect("write_reserve initialized above");
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(permit)) => {
+                this.write_reserve = None;
+                permit.send(buf[..chunk_len].to_vec());
                 wake_stack(&this.waker, this.flow_waker.as_ref());
                 Poll::Ready(Ok(chunk_len))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "TUN TCP socket closed",
-            ))),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                wake_stack(&this.waker, this.flow_waker.as_ref());
-                cx.waker().wake_by_ref();
-                Poll::Pending
+            Poll::Ready(Err(_)) => {
+                this.write_reserve = None;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "TUN TCP socket closed",
+                )))
             }
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -504,6 +540,7 @@ impl AsyncWrite for TunTcpStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        this.write_reserve = None;
         this.to_stack.take();
         wake_stack(&this.waker, this.flow_waker.as_ref());
         Poll::Ready(Ok(()))

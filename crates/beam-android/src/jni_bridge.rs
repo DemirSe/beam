@@ -18,7 +18,7 @@ use jni::objects::{GlobalRef, JObject, JString, JValue};
 use jni::sys::{jint, jlong, jstring};
 
 use crate::config::{AndroidEngineConfig, parse_vless_link_json};
-use crate::engine::{AndroidEngine, AndroidEngineStart, StateCallback};
+use crate::engine::{AndroidEngine, AndroidEngineStart, STATE_DISCONNECTED, StateCallback};
 
 /// Started engines by handle. `BTreeMap::new` is `const`, so the registry needs
 /// no lazy initialisation and no allocation until the first start.
@@ -299,6 +299,26 @@ pub extern "system" fn Java_com_beam_android_vpn_BeamNativeBridge_nativeNotifyNe
     if outcome.is_err() {
         throw_illegal_state(&mut env, "beam engine panicked on network change");
     }
+}
+
+/// Returns the current engine state code without serializing telemetry JSON.
+///
+/// An unknown handle returns `STATE_DISCONNECTED` (`0`).
+///
+/// # Safety
+///
+/// The JVM calls this with a valid `JNIEnv`. `handle` need not be known.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_beam_android_vpn_BeamNativeBridge_nativeRefreshState<'local>(
+    _env: JNIEnv<'local>,
+    _class: JObject<'local>,
+    handle: jlong,
+) -> jint {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match find(handle) {
+        Some(engine) => jint::from(engine.refresh_state()),
+        None => jint::from(STATE_DISCONNECTED),
+    }));
+    outcome.unwrap_or_else(|_| jint::from(STATE_DISCONNECTED))
 }
 
 /// Returns one telemetry snapshot as JSON; an unknown handle reports idle.

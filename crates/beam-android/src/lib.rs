@@ -22,29 +22,35 @@ pbk=WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo&sid=0123456789abcdef&type=tcp&\
 flow=xtls-rprx-vision#beam";
 
 /// Installs the logcat subscriber on Android. A no-op on host builds.
+///
+/// Retries on a later call if `/dev/socket/logdw` was temporarily unavailable
+/// on the first start.
 pub fn init_logging(_level: &str) {
     #[cfg(target_os = "android")]
     {
         use std::str::FromStr;
-        use std::sync::Once;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         use tracing_logcat::{LogcatMakeWriter, LogcatTag};
         use tracing_subscriber::fmt::format::Format;
         use tracing_subscriber::layer::SubscriberExt;
 
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let level = tracing::level_filters::LevelFilter::from_str(_level)
-                .unwrap_or(tracing::level_filters::LevelFilter::INFO);
-            let Ok(writer) = LogcatMakeWriter::new(LogcatTag::Fixed("beam".to_owned())) else {
-                return;
-            };
-            let fmt_layer = tracing_subscriber::fmt::layer()
-                .event_format(Format::default().with_level(false).without_time())
-                .with_writer(writer)
-                .with_ansi(false);
-            let subscriber = tracing_subscriber::registry().with(fmt_layer).with(level);
-            let _ = tracing::subscriber::set_global_default(subscriber);
-        });
+        static INITIALIZED: AtomicBool = AtomicBool::new(false);
+        if INITIALIZED.load(Ordering::Acquire) {
+            return;
+        }
+        let level = tracing::level_filters::LevelFilter::from_str(_level)
+            .unwrap_or(tracing::level_filters::LevelFilter::INFO);
+        let Ok(writer) = LogcatMakeWriter::new(LogcatTag::Fixed("beam".to_owned())) else {
+            return;
+        };
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .event_format(Format::default().with_level(false).without_time())
+            .with_writer(writer)
+            .with_ansi(false);
+        let subscriber = tracing_subscriber::registry().with(fmt_layer).with(level);
+        if tracing::subscriber::set_global_default(subscriber).is_ok() {
+            INITIALIZED.store(true, Ordering::Release);
+        }
     }
 }

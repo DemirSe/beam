@@ -4,7 +4,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use beam_core::address::{Address, NetLocation};
@@ -29,8 +29,22 @@ const MAX_PACKET_BUF: usize = 65_536;
 const TUN_TX_CHANNEL_CAP: usize = 512;
 const RX_BATCH_MAX: usize = 128;
 const C2S_COALESCE_TARGET: usize = 64 * 1024;
+// Android uses 16 KiB (one max TLS 1.3 record) to cut worst-case 128-flow
+// transient RSS by 4x without hurting TLS throughput.
+#[cfg(target_os = "android")]
+const S2C_READ_BUF_BYTES: usize = 16 * 1024;
+#[cfg(not(target_os = "android"))]
 const S2C_READ_BUF_BYTES: usize = 64 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound on simultaneous upstream REALITY handshakes so an outage or
+/// burst of new flows cannot starve active relay tasks on small worker pools.
+const MAX_CONCURRENT_DIALS: usize = 16;
+/// Consecutive dial failures within [`FAILURE_STREAK_WINDOW`] that engage
+/// outage fast-fail backoff (allowing one probe per [`OUTAGE_PROBE_INTERVAL_MS`]).
+const OUTAGE_BACKOFF_STREAK: u64 = 5;
+const OUTAGE_PROBE_INTERVAL_MS: u64 = 1_000;
+/// Minimum idle age before a relay can be evicted when `tcp_permits` is full.
+const IDLE_EVICT_MIN_AGE_MS: u64 = 60_000;
 /// Gap after which a new dial failure starts a fresh streak instead of reviving
 /// an ancient one, so one blip never keeps the link degraded for minutes.
 pub const FAILURE_STREAK_WINDOW: Duration = Duration::from_secs(30);
@@ -43,6 +57,9 @@ static RELAY_IO_LOG: LazyLock<RateLimiter> =
     LazyLock::new(|| RateLimiter::new(3, Duration::from_secs(10)));
 /// At most 2 connection-limit RST warnings per 10 s window.
 static TCP_LIMIT_LOG: LazyLock<RateLimiter> =
+    LazyLock::new(|| RateLimiter::new(2, Duration::from_secs(10)));
+/// At most 2 transient TUN send warnings per 10 s window.
+static TUN_SEND_LOG: LazyLock<RateLimiter> =
     LazyLock::new(|| RateLimiter::new(2, Duration::from_secs(10)));
 
 /// Configuration for [`run_tun_engine`].
@@ -563,6 +580,11 @@ where
     }
     let stack_waker = stack.waker();
     let tcp_permits = Arc::new(Semaphore::new(config.max_tcp_connections.max(1)));
+    let dial_gate = Arc::new(DialGate::new(
+        config.max_tcp_connections.clamp(1, MAX_CONCURRENT_DIALS),
+        start,
+    ));
+    let idle_registry = Arc::new(IdleRelayRegistry::new());
     let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(TUN_TX_CHANNEL_CAP);
     stack.set_drop_counters(Arc::clone(&drops));
     if let Some(tracker) = activity.as_ref() {
@@ -616,9 +638,7 @@ where
         stack.poll(now_ms, &mut tx_batch, &mut accepted);
 
         for pkt in tx_batch.drain(..) {
-            if let Err(err) = device.send(&pkt).await {
-                return Err(EngineError::Device(err));
-            }
+            send_tun_packet(&mut device, &pkt, &drops).await?;
         }
 
         for conn in accepted.drain(..) {
@@ -626,6 +646,9 @@ where
                 conn,
                 config.client.clone(),
                 Arc::clone(&tcp_permits),
+                Arc::clone(&dial_gate),
+                Arc::clone(&idle_registry),
+                start,
                 network_reset.clone(),
                 activity.clone(),
                 Arc::clone(&drops),
@@ -635,9 +658,7 @@ where
 
         // Drain any pending UDP/ICMP reply packets immediately.
         while let Ok(pkt) = tun_rx.try_recv() {
-            if let Err(err) = device.send(&pkt).await {
-                return Err(EngineError::Device(err));
-            }
+            send_tun_packet(&mut device, &pkt, &drops).await?;
         }
 
         let tcp_delay = stack.poll_delay_ms(start.elapsed().as_millis() as i64);
@@ -680,9 +701,7 @@ where
                 info!(generation, "network transition detected; resetting TCP flows, XUDP mux, and local DNS cache");
                 stack.reset_all(&mut tx_batch);
                 for pkt in tx_batch.drain(..) {
-                    if let Err(err) = device.send(&pkt).await {
-                        return Err(EngineError::Device(err));
-                    }
+                    send_tun_packet(&mut device, &pkt, &drops).await?;
                 }
                 udp_bridge.reset();
                 if let Some(dns) = dns_interceptor.as_ref() {
@@ -690,7 +709,7 @@ where
                 }
             }
             Some(reply_pkt) = tun_rx.recv() => {
-                device.send(&reply_pkt).await?;
+                send_tun_packet(&mut device, &reply_pkt, &drops).await?;
             }
             read_res = device.recv(&mut recv_buf) => {
                 let mut n = read_res?;
@@ -720,20 +739,22 @@ where
                                         }
                                     }
                                 }
-                                RouteDecision::RejectTcpRst => {
-                                    if let Some(rst) = build_tcp_rst_for_packet(&ip)
-                                        && tun_tx.try_send(rst).is_err()
-                                    {
-                                        drops.tun_tx_full.incr();
+                                RouteDecision::RejectTcpRst => match tun_tx.try_reserve() {
+                                    Ok(permit) => {
+                                        if let Some(rst) = build_tcp_rst_for_packet(&ip) {
+                                            permit.send(rst);
+                                        }
                                     }
-                                }
-                                RouteDecision::RejectIcmpUnreachable => {
-                                    if let Some(icmp) = build_icmp_port_unreachable(&ip)
-                                        && tun_tx.try_send(icmp).is_err()
-                                    {
-                                        drops.tun_tx_full.incr();
+                                    Err(_) => drops.tun_tx_full.incr(),
+                                },
+                                RouteDecision::RejectIcmpUnreachable => match tun_tx.try_reserve() {
+                                    Ok(permit) => {
+                                        if let Some(icmp) = build_icmp_port_unreachable(&ip) {
+                                            permit.send(icmp);
+                                        }
                                     }
-                                }
+                                    Err(_) => drops.tun_tx_full.incr(),
+                                },
                                 RouteDecision::Drop => drops.route.incr(),
                             }
                         } else if is_fragment(raw) {
@@ -825,24 +846,232 @@ fn relay_write_idle(relay_idle: Option<Duration>, client_idle: Duration) -> Dura
     relay_idle.unwrap_or(client_idle)
 }
 
+/// Returns `true` when a TUN write error means the interface or descriptor is
+/// permanently gone (`EBADF`, `ENXIO`, `ENODEV`, broken pipe, EOF). Transient
+/// errors such as `ENOMEM`, `ENOBUFS`, or `EAGAIN` are counted and dropped so
+/// brief memory/queue pressure cannot kill the whole tunnel.
+fn is_fatal_tun_send_error(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof | io::ErrorKind::NotConnected
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        const ENXIO: i32 = 6;
+        const EBADF: i32 = 9;
+        const ENODEV: i32 = 19;
+        if matches!(err.raw_os_error(), Some(ENXIO | EBADF | ENODEV)) {
+            return true;
+        }
+    }
+    false
+}
+
+async fn send_tun_packet<D: TunDevice>(
+    device: &mut D,
+    pkt: &[u8],
+    drops: &DropCounters,
+) -> Result<(), EngineError> {
+    match device.send(pkt).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_fatal_tun_send_error(&err) => Err(EngineError::Device(err)),
+        Err(err) => {
+            drops.tun_tx_full.incr();
+            if let Some(suppressed) = TUN_SEND_LOG.allow() {
+                warn!(
+                    error = %err,
+                    kind = ?err.kind(),
+                    suppressed,
+                    "transient TUN send error; dropping packet"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Bounds concurrent upstream handshakes and fast-fails during server outages.
+struct DialGate {
+    permits: Arc<Semaphore>,
+    next_probe_ms: AtomicU64,
+    engine_start: Instant,
+}
+
+impl DialGate {
+    fn new(max_concurrent: usize, engine_start: Instant) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            next_probe_ms: AtomicU64::new(0),
+            engine_start,
+        }
+    }
+
+    fn try_acquire(
+        &self,
+        activity: Option<&TunnelActivity>,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let in_outage = activity.is_some_and(|tracker| {
+            tracker.recent_failure_streak(FAILURE_STREAK_WINDOW) >= OUTAGE_BACKOFF_STREAK
+        });
+        if in_outage {
+            let now_ms = self.engine_start.elapsed().as_millis() as u64;
+            let next = self.next_probe_ms.load(Ordering::Relaxed);
+            if now_ms < next {
+                return None;
+            }
+            let next_deadline = now_ms.saturating_add(OUTAGE_PROBE_INTERVAL_MS);
+            if self
+                .next_probe_ms
+                .compare_exchange(next, next_deadline, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
+                return None;
+            }
+        }
+        Arc::clone(&self.permits).try_acquire_owned().ok()
+    }
+
+    fn record_success(&self) {
+        self.next_probe_ms.store(0, Ordering::Relaxed);
+    }
+}
+
+struct IdleRelayEntry {
+    id: u64,
+    last_activity_ms: Arc<AtomicU64>,
+    evict_tx: watch::Sender<bool>,
+}
+
+/// Tracks active relays so long-idle sockets can be evicted when `tcp_permits`
+/// reaches saturation instead of starving fresh user flows with RSTs.
+struct IdleRelayRegistry {
+    next_id: AtomicU64,
+    entries: Mutex<Vec<IdleRelayEntry>>,
+}
+
+struct RelayRegistrationGuard {
+    registry: Arc<IdleRelayRegistry>,
+    id: u64,
+}
+
+impl Drop for RelayRegistrationGuard {
+    fn drop(&mut self) {
+        let mut entries = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pos) = entries.iter().position(|entry| entry.id == self.id) {
+            entries.swap_remove(pos);
+        }
+    }
+}
+
+impl IdleRelayRegistry {
+    fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        now_ms: u64,
+    ) -> (
+        RelayRegistrationGuard,
+        Arc<AtomicU64>,
+        watch::Receiver<bool>,
+    ) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let last_activity_ms = Arc::new(AtomicU64::new(now_ms));
+        let (evict_tx, evict_rx) = watch::channel(false);
+        {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            entries.push(IdleRelayEntry {
+                id,
+                last_activity_ms: Arc::clone(&last_activity_ms),
+                evict_tx,
+            });
+        }
+        (
+            RelayRegistrationGuard {
+                registry: Arc::clone(self),
+                id,
+            },
+            last_activity_ms,
+            evict_rx,
+        )
+    }
+
+    /// Signals the oldest relay idle for at least `min_age_ms` to close.
+    fn evict_oldest_idle(&self, now_ms: u64, min_age_ms: u64) -> bool {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let candidate = entries
+            .iter()
+            .filter_map(|entry| {
+                let last = entry.last_activity_ms.load(Ordering::Relaxed);
+                let age = now_ms.saturating_sub(last);
+                (age >= min_age_ms && !*entry.evict_tx.borrow()).then_some((age, entry))
+            })
+            .max_by_key(|(age, _)| *age)
+            .map(|(_, entry)| entry);
+        if let Some(entry) = candidate {
+            let _ = entry.evict_tx.send(true);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_tcp_relay(
     mut conn: AcceptedTcpStream,
     client_config: BeamClientConfig,
     permits: Arc<Semaphore>,
+    dial_gate: Arc<DialGate>,
+    idle_registry: Arc<IdleRelayRegistry>,
+    engine_start: Instant,
     mut network_reset: Option<watch::Receiver<u64>>,
     activity: Option<Arc<TunnelActivity>>,
     drops: Arc<DropCounters>,
     relay_idle: Option<Duration>,
 ) {
     let Ok(permit) = permits.try_acquire_owned() else {
-        debug!(dst = %conn.dst, "TCP connection limit reached; aborting with RST");
+        let now_ms = engine_start.elapsed().as_millis() as u64;
+        let evicted = idle_registry.evict_oldest_idle(now_ms, IDLE_EVICT_MIN_AGE_MS);
+        debug!(
+            dst = %conn.dst,
+            evicted_idle = evicted,
+            "TCP connection limit reached; aborting with RST"
+        );
         if let Some(suppressed) = TCP_LIMIT_LOG.allow() {
             warn!(
                 dst = %conn.dst,
+                evicted_idle = evicted,
                 suppressed,
                 "TCP connection limit reached; resetting new flow"
             );
         }
+        drops.tcp_limit.incr();
+        conn.stream.abort();
+        return;
+    };
+
+    let Some(dial_permit) = dial_gate.try_acquire(activity.as_deref()) else {
+        debug!(
+            dst = %conn.dst,
+            "upstream dial throttled by concurrency limit or outage backoff; resetting flow"
+        );
         drops.tcp_limit.incr();
         conn.stream.abort();
         return;
@@ -867,50 +1096,60 @@ fn spawn_tcp_relay(
                     None => std::future::pending().await,
                 }
             } => {
+                drop(dial_permit);
                 conn.stream.abort();
                 return;
             }
-            res = dial_tcp(&client_config, dest) => match res {
-                Ok(stream) => {
-                    if let Some(tracker) = activity.as_ref() {
-                        let rtt_ms = u64::try_from(dial_start.elapsed().as_millis())
-                            .unwrap_or(u64::MAX);
-                        tracker.record_dial_success(rtt_ms);
+            res = dial_tcp(&client_config, dest) => {
+                drop(dial_permit);
+                match res {
+                    Ok(stream) => {
+                        dial_gate.record_success();
+                        if let Some(tracker) = activity.as_ref() {
+                            let rtt_ms = u64::try_from(dial_start.elapsed().as_millis())
+                                .unwrap_or(u64::MAX);
+                            tracker.record_dial_success(rtt_ms);
+                        }
+                        stream
                     }
-                    stream
-                }
-                Err(err) => {
-                    let failure = DialFailure::from_client_error(&err);
-                    if let Some(tracker) = activity.as_ref() {
-                        tracker.record_dial_failure(failure);
-                    }
-                    debug!(
-                        dst = %conn.dst,
-                        error = %err,
-                        stage = failure.stage.as_str(),
-                        kind = failure.kind.as_str(),
-                        "dial_tcp failed"
-                    );
-                    if let Some(suppressed) = DIAL_FAILURE_LOG.allow() {
-                        warn!(
+                    Err(err) => {
+                        let failure = DialFailure::from_client_error(&err);
+                        if let Some(tracker) = activity.as_ref() {
+                            tracker.record_dial_failure(failure);
+                        }
+                        debug!(
                             dst = %conn.dst,
-                            server = %client_config.server_addr,
                             error = %err,
                             stage = failure.stage.as_str(),
                             kind = failure.kind.as_str(),
-                            consecutive = activity
-                                .as_ref()
-                                .map(|t| t.consecutive_failure_count())
-                                .unwrap_or(0),
-                            suppressed,
-                            "upstream dial failed; resetting local flow"
+                            "dial_tcp failed"
                         );
+                        if let Some(suppressed) = DIAL_FAILURE_LOG.allow() {
+                            warn!(
+                                dst = %conn.dst,
+                                server = %client_config.server_addr,
+                                error = %err,
+                                stage = failure.stage.as_str(),
+                                kind = failure.kind.as_str(),
+                                consecutive = activity
+                                    .as_ref()
+                                    .map(|t| t.consecutive_failure_count())
+                                    .unwrap_or(0),
+                                suppressed,
+                                "upstream dial failed; resetting local flow"
+                            );
+                        }
+                        conn.stream.abort();
+                        return;
                     }
-                    conn.stream.abort();
-                    return;
                 }
             }
         };
+
+        let now_ms = engine_start.elapsed().as_millis() as u64;
+        let (_registration, last_activity_ms, mut evict_rx) = idle_registry.register(now_ms);
+        let c2s_activity = Arc::clone(&last_activity_ms);
+        let s2c_activity = Arc::clone(&last_activity_ms);
 
         // Push-safe mode unbounds reads only. Writes keep a deadline in both
         // modes, so a peer that stops draining can never wedge this task.
@@ -932,6 +1171,7 @@ fn spawn_tcp_relay(
                     }
                     Err(_) => break,
                 };
+                c2s_activity.store(engine_start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 // Coalesce immediately-queued small chunks up to C2S_COALESCE_TARGET
                 // so multi-flow uploads write full TLS records with fewer syscalls.
                 let coalesced = coalesce_c2s(&chunk, &mut scratch, || tun_r.try_recv_chunk());
@@ -994,6 +1234,7 @@ fn spawn_tcp_relay(
                         break;
                     }
                 };
+                s2c_activity.store(engine_start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 match with_relay_idle(Some(write_idle), tun_w.send_chunk_pooled(&buf[..n])).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
@@ -1017,6 +1258,9 @@ fn spawn_tcp_relay(
                     None => std::future::pending().await,
                 }
             } => {}
+            Ok(()) = evict_rx.changed() => {
+                debug!(dst = %conn.dst, "evicting idle TCP relay to free permit");
+            }
             _ = async { tokio::join!(c2s, s2c) } => {}
         }
     });
@@ -1352,5 +1596,72 @@ mod tests {
 
         // Without DNS counters the snapshot carries no DNS section.
         assert!(EngineTelemetry::new().snapshot().dns.is_none());
+    }
+
+    #[test]
+    fn fatal_tun_send_error_classifies_transient_vs_permanent() {
+        assert!(is_fatal_tun_send_error(&io::Error::from(
+            io::ErrorKind::BrokenPipe
+        )));
+        assert!(is_fatal_tun_send_error(&io::Error::from(
+            io::ErrorKind::UnexpectedEof
+        )));
+        assert!(!is_fatal_tun_send_error(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+        assert!(!is_fatal_tun_send_error(&io::Error::from(
+            io::ErrorKind::OutOfMemory
+        )));
+        #[cfg(unix)]
+        {
+            assert!(is_fatal_tun_send_error(&io::Error::from_raw_os_error(9))); // EBADF
+            assert!(is_fatal_tun_send_error(&io::Error::from_raw_os_error(19))); // ENODEV
+            assert!(!is_fatal_tun_send_error(&io::Error::from_raw_os_error(12))); // ENOMEM
+        }
+    }
+
+    #[test]
+    fn dial_gate_caps_concurrency_and_throttles_during_outage() {
+        let gate = DialGate::new(2, Instant::now());
+        let p1 = gate.try_acquire(None).expect("first permit");
+        let p2 = gate.try_acquire(None).expect("second permit");
+        assert!(gate.try_acquire(None).is_none(), "capped at 2");
+        drop(p1);
+        drop(p2);
+
+        let activity = TunnelActivity::new();
+        for _ in 0..OUTAGE_BACKOFF_STREAK {
+            activity.record_dial_failure(test_failure());
+        }
+        // First call during outage gets the single probe permit; immediate second fast-fails.
+        let probe = gate
+            .try_acquire(Some(&activity))
+            .expect("initial outage probe");
+        assert!(
+            gate.try_acquire(Some(&activity)).is_none(),
+            "subsequent dials fast-fail during outage backoff window"
+        );
+        drop(probe);
+
+        // Once a dial succeeds, backoff clears immediately.
+        activity.record_dial_success(15);
+        gate.record_success();
+        assert!(gate.try_acquire(Some(&activity)).is_some());
+    }
+
+    #[test]
+    fn idle_relay_registry_evicts_oldest_idle_only() {
+        let registry = Arc::new(IdleRelayRegistry::new());
+        let (_g1, _a1, rx1) = registry.register(1_000);
+        let (_g2, _a2, rx2) = registry.register(50_000);
+
+        // Neither is idle >= 60_000 ms at t=60_000.
+        assert!(!registry.evict_oldest_idle(60_000, 60_000));
+        assert!(!*rx1.borrow() && !*rx2.borrow());
+
+        // At t=70_000, g1 is idle 69_000 ms (>= 60_000) while g2 is only 20_000 ms.
+        assert!(registry.evict_oldest_idle(70_000, 60_000));
+        assert!(*rx1.borrow());
+        assert!(!*rx2.borrow());
     }
 }

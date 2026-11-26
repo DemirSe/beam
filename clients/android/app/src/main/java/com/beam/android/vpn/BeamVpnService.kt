@@ -39,6 +39,7 @@ class BeamVpnService : VpnService() {
         const val ACTION_START = "com.beam.android.action.START"
         const val ACTION_STOP = "com.beam.android.action.STOP"
         const val EXTRA_PROFILE_ID = "profile_id"
+        private const val EXTRA_KEEP_ALIVE_ONLY = "keep_alive_only"
 
         /** DNS must never hold up the foreground service start. */
         private const val RESOLVE_TIMEOUT_MS = 5_000L
@@ -77,8 +78,8 @@ class BeamVpnService : VpnService() {
         }
 
         override fun getState(): Int {
-            // Poll so binder callers see the state the engine derived last.
-            if (this@BeamVpnService.engineHandle != 0L) this@BeamVpnService.pollTelemetry()
+            // Lightweight JNI state refresh without serializing telemetry JSON.
+            if (this@BeamVpnService.engineHandle != 0L) this@BeamVpnService.refreshNativeState()
             return this@BeamVpnService.state
         }
 
@@ -112,9 +113,17 @@ class BeamVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_STOP -> disconnect()
+            ACTION_STOP -> {
+                // Bump generation on main immediately, then run teardown off main
+                // so nativeStop() (up to 2 s) never stalls the service main thread.
+                connectGeneration.incrementAndGet()
+                serviceScope.launch { disconnect() }
+            }
             // ACTION_START, null action, or SERVICE_INTERFACE (Always-on VPN): connect.
             else -> {
+                if (intent?.getBooleanExtra(EXTRA_KEEP_ALIVE_ONLY, false) == true) {
+                    return START_NOT_STICKY
+                }
                 // startForegroundService() callers are killed when the foreground
                 // notification is late, so post it before the profile lookup.
                 if (state == VpnState.DISCONNECTED || state == VpnState.DISCONNECTING) {
@@ -156,36 +165,22 @@ class BeamVpnService : VpnService() {
      * disconnect() can cancel it.
      */
     private fun connect(profileId: String) {
-        if ((state == VpnState.CONNECTING || state == VpnState.CONNECTED) &&
-            (activeProfileId == profileId || pendingProfileId == profileId)
-        ) {
-            return
-        }
-        val myGen = connectGeneration.incrementAndGet()
-        // Android 12+ kills the service if the foreground notification is late,
-        // so it goes up before any DNS or Keystore work.
-        startForeground(
-            VpnNotificationManager.NOTIFICATION_ID,
-            notifications.build(VpnState.CONNECTING, ""),
-        )
-        // Claim a started-service reference so unbinding MainActivity / TileService
-        // never tears down an active tunnel when Always-on VPN is off.
-        runCatching {
-            startService(
-                Intent(this, BeamVpnService::class.java)
-                    .setAction(ACTION_START)
-                    .putExtra(EXTRA_PROFILE_ID, profileId),
-            )
-        }
+        val myGen: Long
         synchronized(stateLock) {
-            connectJob?.cancel()
-            connectJob = null
-            // a disconnect() that landed in between owns the cleanup.
-            if (connectGeneration.get() != myGen) {
-                teardown()
-                setState(VpnState.DISCONNECTED, "")
+            if ((state == VpnState.CONNECTING || state == VpnState.CONNECTED) &&
+                (activeProfileId == profileId || pendingProfileId == profileId)
+            ) {
                 return
             }
+            myGen = connectGeneration.incrementAndGet()
+            connectJob?.cancel()
+            connectJob = null
+            // Android 12+ kills the service if the foreground notification is late,
+            // so it goes up before any DNS or Keystore work.
+            startForeground(
+                VpnNotificationManager.NOTIFICATION_ID,
+                notifications.build(VpnState.CONNECTING, ""),
+            )
             // A new profile drops the old engine before the new one starts.
             teardown(keepForeground = true)
             // Track pending attempt separately so getActiveProfileId() only
@@ -193,6 +188,17 @@ class BeamVpnService : VpnService() {
             pendingProfileId = profileId
             setState(VpnState.CONNECTING, "")
             connectJob = serviceScope.launch { runConnect(profileId, myGen) }
+        }
+        // Claim a started-service reference so unbinding MainActivity / TileService
+        // never tears down an active tunnel when Always-on VPN is off.
+        // EXTRA_KEEP_ALIVE_ONLY prevents onStartCommand from re-entering connect().
+        runCatching {
+            startService(
+                Intent(this, BeamVpnService::class.java)
+                    .setAction(ACTION_START)
+                    .putExtra(EXTRA_PROFILE_ID, profileId)
+                    .putExtra(EXTRA_KEEP_ALIVE_ONLY, true),
+            )
         }
     }
 
@@ -235,6 +241,14 @@ class BeamVpnService : VpnService() {
                         fd, configJson, this,
                         object : NativeStateListener {
                             override fun onNativeStateChanged(s: Int, detail: String) {
+                                // Ignore callbacks from a torn-down or superseded engine so
+                                // teardown(keepForeground = true) never cancels the FGS notification.
+                                if (myGen != connectGeneration.get()) return
+                                if (s == VpnState.DISCONNECTED && engineHandle != 0L && myGen == engineGeneration) {
+                                    // Unexpected engine exit (e.g. fatal TUN error): tear down FGS cleanly.
+                                    serviceScope.launch { disconnect() }
+                                    return
+                                }
                                 // Reserve stateDetail for user-facing errors, not raw state labels.
                                 setState(s, "")
                             }
@@ -413,6 +427,18 @@ class BeamVpnService : VpnService() {
         if (!keepForeground) stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
+    private fun refreshNativeState() {
+        val h = engineHandle
+        val gen = engineGeneration
+        if (h == 0L || gen == 0L) return
+        try {
+            val reported = BeamNativeBridge.nativeRefreshState(h)
+            applyReportedState(reported, gen)
+        } catch (t: Throwable) {
+            Log.w(TAG, "nativeRefreshState failed", t)
+        }
+    }
+
     private fun pollTelemetry(): String {
         val h = engineHandle
         val gen = engineGeneration
@@ -429,11 +455,19 @@ class BeamVpnService : VpnService() {
 
     /** The engine re-derives CONNECTED/DEGRADED on every poll. */
     private fun applyNativeState(json: String, gen: Long) {
-        if (gen != connectGeneration.get()) return
         val reported = runCatching { JSONObject(json) }.getOrNull()
             ?.takeIf { it.has("state") }
             ?.optInt("state")
             ?: return
+        applyReportedState(reported, gen)
+    }
+
+    private fun applyReportedState(reported: Int, gen: Long) {
+        if (gen != connectGeneration.get() || gen != engineGeneration) return
+        if (reported == VpnState.DISCONNECTED && engineHandle != 0L) {
+            serviceScope.launch { disconnect() }
+            return
+        }
         if (reported == state) return
         // Telemetry owns the state, not the detail: never forward a stale one.
         setState(reported, if (reported == VpnState.DEGRADED) "degraded" else "")

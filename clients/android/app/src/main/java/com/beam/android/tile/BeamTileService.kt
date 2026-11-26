@@ -35,6 +35,8 @@ import java.util.concurrent.Executors
 class BeamTileService : TileService() {
 
     @Volatile private var service: IBeamVpnService? = null
+    @Volatile private var isListening: Boolean = false
+    @Volatile private var cachedHasProfile: Boolean = true
     private var isBound = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -47,11 +49,11 @@ class BeamTileService : TileService() {
 
     private val stateCallback = object : IBeamStateCallback.Stub() {
         override fun onStateChanged(state: Int, detail: String?) {
-            // Read real profile presence on worker, then update qsTile on main thread.
-            worker.execute {
-                val hasProfile = activeProfileId() != null
-                mainHandler.post { updateTile(state, hasProfile) }
-            }
+            if (!isListening || worker.isShutdown) return
+            // Use the cached profile flag refreshed on bind/listen instead of
+            // triggering a Keystore AES-GCM decrypt on every state push.
+            val hasProfile = cachedHasProfile
+            mainHandler.post { if (isListening) updateTile(state, hasProfile) }
         }
     }
 
@@ -61,7 +63,8 @@ class BeamTileService : TileService() {
             service = bound
             val shouldToggle = pendingToggle
             pendingToggle = false
-            worker.execute {
+            runOnWorker {
+                if (!isListening) return@runOnWorker
                 runCatching { bound.registerCallback(stateCallback) }
                 if (shouldToggle) {
                     performToggle(bound)
@@ -73,11 +76,22 @@ class BeamTileService : TileService() {
 
         override fun onServiceDisconnected(name: ComponentName?) {
             service = null
+            mainHandler.post { if (isListening) updateTile(VpnState.DISCONNECTED, cachedHasProfile) }
+        }
+
+        override fun onBindingDied(name: ComponentName?) {
+            service = null
+            if (isBound) {
+                runCatching { unbindService(serviceConnection) }
+                isBound = false
+            }
+            mainHandler.post { if (isListening) updateTile(VpnState.DISCONNECTED, cachedHasProfile) }
         }
     }
 
     override fun onStartListening() {
         super.onStartListening()
+        isListening = true
         if (!isBound) {
             isBound = bindService(
                 Intent(this, BeamVpnService::class.java),
@@ -86,24 +100,36 @@ class BeamTileService : TileService() {
             )
         }
         val bound = service
-        worker.execute { refreshTile(bound) }
+        runOnWorker { refreshTile(bound) }
     }
 
     override fun onStopListening() {
+        isListening = false
         pendingToggle = false
         mainHandler.removeCallbacksAndMessages(null)
+        val bound = service
+        service = null
         if (isBound) {
-            runCatching { service?.unregisterCallback(stateCallback) }
+            // Queue unregister on the same single-threaded worker so it always
+            // executes AFTER any in-flight registerCallback() from onServiceConnected().
+            if (bound != null) {
+                runOnWorker { runCatching { bound.unregisterCallback(stateCallback) } }
+            }
             runCatching { unbindService(serviceConnection) }
             isBound = false
         }
-        service = null
         super.onStopListening()
     }
 
     override fun onDestroy() {
+        isListening = false
         worker.shutdownNow()
         super.onDestroy()
+    }
+
+    private fun runOnWorker(block: () -> Unit) {
+        if (worker.isShutdown) return
+        runCatching { worker.execute(block) }
     }
 
     override fun onClick() {
@@ -123,13 +149,14 @@ class BeamTileService : TileService() {
             }
             return
         }
-        worker.execute { performToggle(current) }
+        runOnWorker { performToggle(current) }
     }
 
     private fun performToggle(bound: IBeamVpnService) {
         val state = runCatching { bound.getState() }.getOrDefault(lastState)
         val connected = isActive(state)
         val profileId = activeProfileId()
+        cachedHasProfile = profileId != null
         val consent = runCatching { VpnService.prepare(this) }.getOrNull()
         if (profileId == null || (!connected && consent != null)) {
             mainHandler.post {
@@ -149,8 +176,10 @@ class BeamTileService : TileService() {
     private fun refreshTile(bound: IBeamVpnService?) {
         val state = bound?.let { runCatching { it.getState() }.getOrNull() }
             ?: VpnState.DISCONNECTED
-        val hasProfile = activeProfileId() != null
-        mainHandler.post { updateTile(state, hasProfile) }
+        val hasProfile = (bound?.let { runCatching { it.getActiveProfileId() }.getOrNull() } != null) ||
+            (activeProfileId() != null)
+        cachedHasProfile = hasProfile
+        mainHandler.post { if (isListening) updateTile(state, hasProfile) }
     }
 
     private fun activeProfileId(): String? = runCatching {

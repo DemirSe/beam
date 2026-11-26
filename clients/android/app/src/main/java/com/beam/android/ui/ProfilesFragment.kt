@@ -11,6 +11,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.core.view.isVisible
 import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.Fragment
@@ -41,6 +42,7 @@ class ProfilesFragment : Fragment() {
 
     private lateinit var store: EncryptedProfileStore
     private lateinit var adapter: ProfilesAdapter
+    private var activeDialog: AlertDialog? = null
 
     private val scanLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -88,6 +90,8 @@ class ProfilesFragment : Fragment() {
     }
 
     override fun onDestroyView() {
+        activeDialog?.dismiss()
+        activeDialog = null
         _binding = null
         super.onDestroyView()
     }
@@ -158,30 +162,35 @@ class ProfilesFragment : Fragment() {
                 }
             }
         }
+        activeDialog?.dismiss()
+        activeDialog = dialog
+        dialog.setOnDismissListener { if (activeDialog === dialog) activeDialog = null }
         dialog.show()
     }
 
     private fun confirmDelete(profile: VlessProfile) {
         val main = activity as? MainActivity
-        MaterialAlertDialogBuilder(requireContext())
+        val dialog = MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.profiles_delete_title)
             .setMessage(getString(R.string.profiles_delete_message, profile.name))
             .setNegativeButton(R.string.action_cancel, null)
             .setPositiveButton(R.string.action_delete) { _, _ ->
                 viewLifecycleOwner.lifecycleScope.launch {
-                    val connectedId = withContext(Dispatchers.IO) {
-                        runCatching { main?.beam?.getActiveProfileId() }.getOrNull()
-                    }
-                    if (main?.isTunnelActive() == true && connectedId == profile.id) {
-                        main.requestDisconnect()
-                    }
                     withContext(Dispatchers.IO) {
+                        val connectedId = runCatching { main?.beam?.getActiveProfileId() }.getOrNull()
+                        if (main?.isTunnelActive() == true && connectedId == profile.id) {
+                            runCatching { main.beam?.disconnect() }
+                        }
                         runCatching { store.deleteProfile(profile.id) }
                     }
-                    reload()
+                    if (_binding != null) reload()
                 }
             }
-            .show()
+            .create()
+        activeDialog?.dismiss()
+        activeDialog = dialog
+        dialog.setOnDismissListener { if (activeDialog === dialog) activeDialog = null }
+        dialog.show()
     }
 
     private fun showAddDialog() {
@@ -208,6 +217,9 @@ class ProfilesFragment : Fragment() {
                 }
             }
         }
+        activeDialog?.dismiss()
+        activeDialog = dialog
+        dialog.setOnDismissListener { if (activeDialog === dialog) activeDialog = null }
         dialog.show()
     }
 

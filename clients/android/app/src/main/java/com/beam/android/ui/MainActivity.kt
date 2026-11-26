@@ -56,8 +56,13 @@ class MainActivity : AppCompatActivity() {
     var beam: IBeamVpnService? = null
         private set
 
+    private var boundBinder: IBinder? = null
     private var isBound = false
     private var pendingProfileId: String? = null
+
+    private val binderDeathRecipient = IBinder.DeathRecipient {
+        runOnUiThread { handleBinderDied() }
+    }
 
     private val stateCallback = object : IBeamStateCallback.Stub() {
         override fun onStateChanged(state: Int, detail: String?) {
@@ -68,6 +73,9 @@ class MainActivity : AppCompatActivity() {
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val service = binder?.let { IBeamVpnService.Stub.asInterface(it) } ?: return
+            unlinkBinderDeath()
+            boundBinder = binder
+            runCatching { binder.linkToDeath(binderDeathRecipient, 0) }
             beam = service
             runCatching { service.registerCallback(stateCallback) }
             lifecycleScope.launch {
@@ -85,7 +93,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
+            unlinkBinderDeath()
             beam = null
+            _status.value = BeamStatus(VpnState.DISCONNECTED)
+        }
+
+        override fun onBindingDied(name: ComponentName?) {
+            handleBinderDied()
         }
     }
 
@@ -142,6 +156,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        unlinkBinderDeath()
         if (isBound) {
             runCatching { beam?.unregisterCallback(stateCallback) }
             runCatching { unbindService(serviceConnection) }
@@ -149,6 +164,27 @@ class MainActivity : AppCompatActivity() {
         }
         beam = null
         super.onStop()
+    }
+
+    private fun unlinkBinderDeath() {
+        val prev = boundBinder
+        boundBinder = null
+        if (prev != null) {
+            runCatching { prev.unlinkToDeath(binderDeathRecipient, 0) }
+        }
+    }
+
+    private fun handleBinderDied() {
+        unlinkBinderDeath()
+        beam = null
+        _status.value = BeamStatus(VpnState.DISCONNECTED)
+        if (isBound) {
+            runCatching { unbindService(serviceConnection) }
+            isBound = false
+        }
+        if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
+            ensureBound()
+        }
     }
 
     /** Connect with [profileId], after the Android VPN consent dialog when needed. */

@@ -2,6 +2,7 @@ package com.beam.android.storage
 
 import android.content.Context
 import java.io.File
+import java.io.FileOutputStream
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -49,7 +50,12 @@ class SettingsStore(context: Context) {
             .put("treat_as_unmetered", settings.treatAsUnmetered)
             .toString()
         val tmp = File(dir, "settings.json.tmp")
-        tmp.writeText(json, Charsets.UTF_8)
+        val bytes = json.toByteArray(Charsets.UTF_8)
+        FileOutputStream(tmp).use { out ->
+            out.write(bytes)
+            out.flush()
+            out.fd.sync()
+        }
         if (!tmp.renameTo(file)) {
             tmp.delete()
             throw IllegalStateException("atomic settings write failed")

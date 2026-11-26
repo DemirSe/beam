@@ -126,10 +126,17 @@ class SettingsFragment : Fragment() {
             )
             return
         }
-        val defaultRoute = cidrs.firstOrNull { it.substringAfter('/', missingDelimiterValue = "") == "0" }
+        val defaultRoute = cidrs.firstOrNull {
+            it.substringAfter('/', missingDelimiterValue = "").toIntOrNull() == 0
+        }
         if (defaultRoute != null) {
             binding.bypassLayout.error = getString(R.string.settings_bypass_default_route, defaultRoute)
             return
+        }
+        val normalizedCidrs = cidrs.map { cidr ->
+            val host = cidr.substringBefore('/')
+            val prefix = cidr.substringAfter('/').toInt()
+            "$host/$prefix"
         }
         binding.bypassLayout.error = null
 
@@ -137,7 +144,7 @@ class SettingsFragment : Fragment() {
             dohUrl = dohUrl,
             ipv4Only = binding.switchIpv4Only.isChecked,
             rejectQuic = binding.switchQuic.isChecked,
-            bypassCidrs = cidrs,
+            bypassCidrs = normalizedCidrs,
             startOnBoot = binding.switchStartOnBoot.isChecked,
             treatAsUnmetered = binding.switchUnmetered.isChecked,
         )

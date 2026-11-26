@@ -10,15 +10,12 @@ import com.beam.android.storage.SettingsStore
 
 /**
  * Starts the tunnel after boot when the user enabled start-on-boot.
- * `USER_UNLOCKED` covers devices that boot straight into a locked state.
+ * Because this receiver is not `directBootAware`, `ACTION_BOOT_COMPLETED`
+ * is delivered only after the user unlocks credential-protected storage.
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        when (intent.action) {
-            Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_USER_UNLOCKED -> Unit
-            else -> return
-        }
-        // Storage is credential-protected; retry on USER_UNLOCKED instead.
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
         if (context.getSystemService(UserManager::class.java)?.isUserUnlocked == false) return
         val appContext = context.applicationContext
         val pendingResult = goAsync()

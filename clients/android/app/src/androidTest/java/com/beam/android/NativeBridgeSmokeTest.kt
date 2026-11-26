@@ -8,6 +8,7 @@ import com.beam.android.storage.EncryptedProfileStore
 import com.beam.android.storage.SettingsStore
 import com.beam.android.storage.VlessProfile
 import com.beam.android.vpn.BeamNativeBridge
+import com.beam.android.vpn.VpnState
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -39,6 +40,11 @@ class NativeBridgeSmokeTest {
         // The bridge must never echo the UUID or the link itself.
         assertFalse(json.contains(UUID))
         assertFalse(json.contains("WlpaWlpa"))
+    }
+
+    @Test
+    fun nativeRefreshStateReturnsDisconnectedForUnknownHandle() {
+        assertEquals(VpnState.DISCONNECTED, BeamNativeBridge.nativeRefreshState(0L))
     }
 
     @Test

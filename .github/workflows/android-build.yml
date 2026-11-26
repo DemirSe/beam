@@ -91,6 +91,15 @@ jobs:
             printf '%s' "$BEAM_DEBUG_KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
           fi
 
+      - name: Restore release keystore (if configured)
+        env:
+          BEAM_RELEASE_KEYSTORE_B64: ${{ secrets.BEAM_RELEASE_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$BEAM_RELEASE_KEYSTORE_B64" ]; then
+            printf '%s' "$BEAM_RELEASE_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "BEAM_KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+          fi
+
       - name: Build libbeam_android.so (aarch64, NDK r27c)
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
@@ -109,11 +118,24 @@ jobs:
              clients/android/app/src/main/jniLibs/arm64-v8a/
 
       - name: Gradle unit tests + lint + APKs
+        env:
+          BEAM_KEYSTORE_PASSWORD: ${{ secrets.BEAM_KEYSTORE_PASSWORD }}
+          BEAM_KEY_ALIAS: ${{ secrets.BEAM_KEY_ALIAS }}
+          BEAM_KEY_PASSWORD: ${{ secrets.BEAM_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           test -d "$ANDROID_HOME"
           cd clients/android
-          ./gradlew testDebugUnitTest lintDebug assembleDebug assembleRelease
+          SIGN_FLAG=""
+          if [ -z "${BEAM_KEYSTORE_PATH:-}" ]; then
+            SIGN_FLAG="-Pbeam.signReleaseWithDebug=true"
+          fi
+          ./gradlew \
+            -Pbeam.versionCode="${{ github.run_number }}" \
+            $SIGN_FLAG \
+            testDebugUnitTest lintDebug lintRelease assembleDebug assembleRelease
+          ls -lh app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk
+          test -f app/build/outputs/mapping/release/mapping.txt
 
       - name: Upload debug APK (installable on device)
         uses: actions/upload-artifact@v4
@@ -121,11 +143,17 @@ jobs:
           name: beam-android-debug-apk
           path: clients/android/app/build/outputs/apk/debug/*.apk
 
-      - name: Upload release APK (unsigned)
+      - name: Upload release APK (R8 minified)
         uses: actions/upload-artifact@v4
         with:
           name: beam-android-apk
           path: clients/android/app/build/outputs/apk/release/*.apk
+
+      - name: Upload R8 release mapping
+        uses: actions/upload-artifact@v4
+        with:
+          name: beam-android-release-mapping
+          path: clients/android/app/build/outputs/mapping/release/mapping.txt
 
   emulator-lab:
     name: Emulator smoke test (x86_64 KVM)
@@ -211,12 +239,13 @@ jobs:
           cp target/x86_64-linux-android/release/libbeam_android.so \
              clients/android/app/src/main/jniLibs/x86_64/
 
-      - name: Compile debug and instrumentation APKs
+      - name: Compile debug, instrumentation, and R8 release APKs
         run: |
           cd clients/android
-          ./gradlew -Pbeam.includeX86_64=true assembleDebug assembleDebugAndroidTest
+          ./gradlew -Pbeam.includeX86_64=true -Pbeam.signReleaseWithDebug=true \
+            assembleDebug assembleDebugAndroidTest assembleRelease
 
-      - name: Boot emulator, run instrumentation tests, launch app
+      - name: Boot emulator, run instrumentation tests, and smoke-test R8 release APK
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 31
@@ -229,11 +258,25 @@ jobs:
             -no-snapshot-save -no-window -gpu swiftshader_indirect
             -noaudio -no-boot-anim
           script: |
-            cd clients/android && (./gradlew -Pbeam.includeX86_64=true connectedDebugAndroidTest || { echo '=== instrumentation results ==='; find app/build/outputs/androidTest-results -name '*.xml' -print -exec cat {} +; exit 1; })
-            adb install -r clients/android/app/build/outputs/apk/debug/app-debug.apk
+            set -euo pipefail
+            cd clients/android
+            ./gradlew -Pbeam.includeX86_64=true connectedDebugAndroidTest || {
+              echo '=== instrumentation results ==='
+              find app/build/outputs/androidTest-results -name '*.xml' -print -exec cat {} +
+              exit 1
+            }
+            # Install and launch the R8-minified release APK to verify ProGuard/JNI/AIDL at runtime.
+            adb uninstall com.beam.android || true
+            adb logcat -b crash -c || true
+            adb install -r app/build/outputs/apk/release/app-release.apk
             adb shell am start -W -n com.beam.android/.ui.MainActivity
             sleep 10
-            adb shell pidof com.beam.android || { echo "error: com.beam.android died after launch"; adb logcat -d -t 200; exit 1; }
+            adb shell pidof com.beam.android || { echo "error: release com.beam.android died after launch"; adb logcat -d -t 200; exit 1; }
+            if adb shell logcat -b crash -d | grep -q "com.beam.android"; then
+              echo "error: crash detected in release APK"
+              adb shell logcat -b crash -d
+              exit 1
+            fi
             adb shell dumpsys meminfo com.beam.android | head -n 25
 
       - name: Upload emulator test reports
