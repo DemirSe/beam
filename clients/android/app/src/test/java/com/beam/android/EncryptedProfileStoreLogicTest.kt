@@ -48,4 +48,28 @@ class EncryptedProfileStoreLogicTest {
         assertEquals("p2", parsed[0].id)
         assertEquals("Good", parsed[0].name)
     }
+
+    @Test
+    fun `parseProfilesWithActiveId returns profiles and active id in one pass`() {
+        val arr = JSONArray().put(
+            JSONObject()
+                .put("id", "p1")
+                .put("name", "One")
+                .put("uri", "vless://uuid@1.2.3.4:443")
+                .put("server_host", "1.2.3.4")
+                .put("server_port", 443)
+                .put("created_at_ms", 10L),
+        )
+        val payload = JSONObject().put("profiles", arr).put("active_id", "p1")
+        val (profiles, activeId) = EncryptedProfileStore.parseProfilesWithActiveId(payload)
+        assertEquals(1, profiles.size)
+        assertEquals("p1", activeId)
+    }
+
+    @Test
+    fun `resolveActiveIdAfterSave activates saved profile only when none is active`() {
+        assertEquals("p1", EncryptedProfileStore.resolveActiveIdAfterSave(null, "p1"))
+        assertEquals("p1", EncryptedProfileStore.resolveActiveIdAfterSave("   ", "p1"))
+        assertEquals("existing", EncryptedProfileStore.resolveActiveIdAfterSave("existing", "p2"))
+    }
 }

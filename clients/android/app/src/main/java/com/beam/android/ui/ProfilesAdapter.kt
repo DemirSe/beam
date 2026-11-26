@@ -3,6 +3,8 @@ package com.beam.android.ui
 import android.view.LayoutInflater
 import android.view.ViewGroup
 import androidx.core.view.isVisible
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import com.beam.android.R
 import com.beam.android.databinding.ItemProfileBinding
@@ -13,22 +15,20 @@ class ProfilesAdapter(
     private val onSelect: (VlessProfile) -> Unit,
     private val onRename: (VlessProfile) -> Unit,
     private val onDelete: (VlessProfile) -> Unit,
-) : RecyclerView.Adapter<ProfilesAdapter.Holder>() {
+) : ListAdapter<ProfilesAdapter.ProfileItem, ProfilesAdapter.Holder>(DIFF) {
 
-    private var items: List<VlessProfile> = emptyList()
-    private var activeId: String? = null
+    data class ProfileItem(val profile: VlessProfile, val isActive: Boolean)
 
     fun submit(profiles: List<VlessProfile>, active: String?) {
-        items = profiles
-        activeId = active
-        notifyDataSetChanged()
+        submitList(profiles.map { ProfileItem(it, it.id == active) })
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder =
         Holder(ItemProfileBinding.inflate(LayoutInflater.from(parent.context), parent, false))
 
     override fun onBindViewHolder(holder: Holder, position: Int) {
-        val profile = items[position]
+        val item = getItem(position)
+        val profile = item.profile
         val binding = holder.binding
         binding.profileName.text = profile.name
         binding.profileServer.text = holder.itemView.context.getString(
@@ -36,7 +36,7 @@ class ProfilesAdapter(
             profile.serverHost,
             profile.serverPort,
         )
-        binding.profileActiveIcon.isVisible = profile.id == activeId
+        binding.profileActiveIcon.isVisible = item.isActive
         binding.root.setOnClickListener { onSelect(profile) }
         binding.root.setOnLongClickListener {
             onRename(profile)
@@ -45,7 +45,15 @@ class ProfilesAdapter(
         binding.profileDelete.setOnClickListener { onDelete(profile) }
     }
 
-    override fun getItemCount(): Int = items.size
-
     class Holder(val binding: ItemProfileBinding) : RecyclerView.ViewHolder(binding.root)
+
+    private companion object {
+        val DIFF = object : DiffUtil.ItemCallback<ProfileItem>() {
+            override fun areItemsTheSame(oldItem: ProfileItem, newItem: ProfileItem): Boolean =
+                oldItem.profile.id == newItem.profile.id
+
+            override fun areContentsTheSame(oldItem: ProfileItem, newItem: ProfileItem): Boolean =
+                oldItem == newItem
+        }
+    }
 }

@@ -62,9 +62,11 @@ class BeamVpnService : VpnService() {
     @Volatile private var stateSnapshot: StateSnapshot = StateSnapshot(VpnState.DISCONNECTED, "")
     private val state: Int get() = stateSnapshot.state
     private val stateDetail: String get() = stateSnapshot.detail
-    /** Guarded by [callbackLock]; tracks the last state/detail pushed to notification/callbacks. */
+    /** Guarded by [callbackLock]; tracks the last state/detail pushed to callbacks. */
     private var lastPublishedState: Int = VpnState.DISCONNECTED
     private var lastPublishedDetail: String = ""
+    /** Guarded by [callbackLock]; tracks the last state posted to NotificationManager. */
+    private var lastNotifiedState: Int = VpnState.DISCONNECTED
     /** Guarded by [callbackLock]; prevents broadcasting after [onDestroy] calls `callbacks.kill()`. */
     private var destroyed: Boolean = false
     @Volatile private var activeProfileId: String? = null
@@ -163,6 +165,9 @@ class BeamVpnService : VpnService() {
                         VpnNotificationManager.NOTIFICATION_ID,
                         notifications.build(VpnState.CONNECTING, ""),
                     )
+                    synchronized(callbackLock) {
+                        lastNotifiedState = VpnState.CONNECTING
+                    }
                 }
                 val startGen = connectGeneration.get()
                 serviceScope.launch {
@@ -274,6 +279,9 @@ class BeamVpnService : VpnService() {
             }
             return
         }
+        synchronized(callbackLock) {
+            lastNotifiedState = VpnState.CONNECTING
+        }
         publishCurrentState()
         synchronized(stateLock) {
             if (connectGeneration.get() == myGen) {
@@ -301,10 +309,6 @@ class BeamVpnService : VpnService() {
                 } ?: throw DnsResolutionException("server host could not be resolved")
             }
             if (connectGeneration.get() != myGen) return
-            // Re-check that the profile was not deleted while resolving DNS.
-            if (store.getProfile(profileId) == null) {
-                throw IllegalArgumentException("unknown profile")
-            }
 
             // A bypass CIDR that covers the TUN /30 would bypass the TUN DNS.
             val bypass = settings.bypassCidrs.filterNot(Ipv4RouteCalculator::overlapsTunSubnet)
@@ -650,6 +654,7 @@ class BeamVpnService : VpnService() {
     private data class ReleasedResources(
         val handle: Long,
         val tun: ParcelFileDescriptor?,
+        val monitor: NetworkMonitor? = null,
         val stopForeground: Boolean,
         val generation: Long,
     )
@@ -686,7 +691,7 @@ class BeamVpnService : VpnService() {
         if (disconnectingChanged) publishCurrentState()
         // Release native engine (up to 2 s shutdown) and TUN off the caller's
         // binder thread so UI/tile toggles never stall behind nativeStop().
-        if (released.handle == 0L && released.tun == null && !released.stopForeground) {
+        if (released.handle == 0L && released.tun == null && released.monitor == null && !released.stopForeground) {
             finalizeDisconnect(myGen)
         } else {
             scheduleRelease(released) { finalizeDisconnect(myGen) }
@@ -742,7 +747,7 @@ class BeamVpnService : VpnService() {
         released: ReleasedResources,
         onDone: (() -> Unit)? = null,
     ) {
-        if (released.handle == 0L && released.tun == null && !released.stopForeground) {
+        if (released.handle == 0L && released.tun == null && released.monitor == null && !released.stopForeground) {
             onDone?.invoke()
             return
         }
@@ -775,8 +780,9 @@ class BeamVpnService : VpnService() {
         networkSwitchGeneration.incrementAndGet()
         networkSwitchJob?.cancel()
         networkSwitchJob = null
-        monitor?.stop()
+        val oldMonitor = monitor
         monitor = null
+        oldMonitor?.markStopped()
         pendingProfileId = null
         activeProfileId = null
         activeServerHost = null
@@ -787,12 +793,14 @@ class BeamVpnService : VpnService() {
         return ReleasedResources(
             handle = h,
             tun = pfd,
+            monitor = oldMonitor,
             stopForeground = !keepForeground,
             generation = connectGeneration.get(),
         )
     }
 
     private fun releaseResources(released: ReleasedResources) {
+        released.monitor?.unregister()
         if (released.handle != 0L) {
             try {
                 BeamNativeBridge.nativeStop(released.handle)
@@ -807,6 +815,9 @@ class BeamVpnService : VpnService() {
         // Only remove the foreground notification if no newer connect() superseded this teardown.
         if (released.stopForeground && connectGeneration.get() == released.generation) {
             runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+            synchronized(callbackLock) {
+                lastNotifiedState = VpnState.DISCONNECTED
+            }
         }
     }
 
@@ -890,14 +901,6 @@ class BeamVpnService : VpnService() {
             if (!stateChanged && detail == lastPublishedDetail) return
             lastPublishedState = s
             lastPublishedDetail = detail
-            // Notification ONLY on state transitions.
-            if (stateChanged) {
-                if (s == VpnState.DISCONNECTED) {
-                    notifications.cancel()
-                } else {
-                    notifications.notify(s, detail)
-                }
-            }
             val n = callbacks.beginBroadcast()
             try {
                 for (i in 0 until n) {
@@ -908,6 +911,15 @@ class BeamVpnService : VpnService() {
                 }
             } finally {
                 callbacks.finishBroadcast()
+            }
+            // Notification ONLY on state transitions not already posted (e.g. by startForeground).
+            if (s != lastNotifiedState) {
+                lastNotifiedState = s
+                if (s == VpnState.DISCONNECTED) {
+                    notifications.cancel()
+                } else {
+                    notifications.notify(s, detail)
+                }
             }
         }
     }

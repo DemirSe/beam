@@ -26,6 +26,11 @@ class EncryptedProfileStore(context: Context) {
     fun listProfiles(): List<VlessProfile> = withFileLock(lockFile) { readAll() }
 
     @Synchronized
+    fun listProfilesWithActiveId(): Pair<List<VlessProfile>, String?> = withFileLock(lockFile) {
+        parseProfilesWithActiveId(readPayload())
+    }
+
+    @Synchronized
     fun getProfile(id: String): VlessProfile? =
         withFileLock(lockFile) { readAll().find { it.id == id } }
 
@@ -34,6 +39,14 @@ class EncryptedProfileStore(context: Context) {
         val payload = readPayload()
         val all = readAll(payload).filterNot { it.id == profile.id } + profile
         writeAll(all, activeIdOf(payload))
+    }
+
+    @Synchronized
+    fun saveProfileAndActivateIfNone(profile: VlessProfile) = withFileLock(lockFile) {
+        val payload = readPayload()
+        val all = readAll(payload).filterNot { it.id == profile.id } + profile
+        val active = resolveActiveIdAfterSave(activeIdOf(payload), profile.id)
+        writeAll(all, active)
     }
 
     @Synchronized
@@ -79,9 +92,6 @@ class EncryptedProfileStore(context: Context) {
         val activeId = activeIdOf(payload) ?: return@withFileLock null
         readAll(payload).find { it.id == activeId }
     }
-
-    private fun activeIdOf(payload: JSONObject?): String? =
-        payload?.optString("active_id")?.ifBlank { null }
 
     private fun readAll(payload: JSONObject? = readPayload()): List<VlessProfile> =
         parseProfiles(payload)
@@ -150,6 +160,15 @@ class EncryptedProfileStore(context: Context) {
                 e is KeyPermanentlyInvalidatedException ||
                 e is IllegalArgumentException ||
                 e is JSONException
+
+        fun activeIdOf(payload: JSONObject?): String? =
+            payload?.optString("active_id")?.ifBlank { null }
+
+        fun parseProfilesWithActiveId(payload: JSONObject?): Pair<List<VlessProfile>, String?> =
+            parseProfiles(payload) to activeIdOf(payload)
+
+        fun resolveActiveIdAfterSave(currentActiveId: String?, savedProfileId: String): String =
+            currentActiveId?.ifBlank { null } ?: savedProfileId
 
         fun parseProfiles(payload: JSONObject?): List<VlessProfile> {
             if (payload == null) return emptyList()

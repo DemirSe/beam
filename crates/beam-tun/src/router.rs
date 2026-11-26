@@ -263,9 +263,13 @@ impl RoutePolicy {
         if self.exclude_ips.contains(pkt.dst_ip) {
             return RouteDecision::Drop;
         }
+        let udp = if pkt.protocol == IP_PROTO_UDP {
+            parse_udp(pkt.payload)
+        } else {
+            None
+        };
         if self.intercept_dns
-            && pkt.protocol == IP_PROTO_UDP
-            && let Some(udp) = parse_udp(pkt.payload)
+            && let Some(ref udp) = udp
             && udp.dst_port == 53
         {
             return RouteDecision::InterceptDns;
@@ -287,7 +291,7 @@ impl RoutePolicy {
         match pkt.protocol {
             IP_PROTO_TCP => RouteDecision::ProxyTcp,
             IP_PROTO_UDP => {
-                if let Some(udp) = parse_udp(pkt.payload) {
+                if let Some(udp) = udp {
                     if self.reject_quic && udp.dst_port == 443 {
                         return RouteDecision::RejectIcmpUnreachable;
                     }

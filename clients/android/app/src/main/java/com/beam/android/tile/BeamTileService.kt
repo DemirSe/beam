@@ -47,6 +47,9 @@ class BeamTileService : TileService() {
     /** Last state known to the UI; only [updateTile] writes it. */
     private var lastState: Int = VpnState.DISCONNECTED
     private var pendingToggle: Boolean = false
+    private var lastRenderedTileState: Int? = null
+    private var lastRenderedDescription: String? = null
+    private val tileIcon: Icon by lazy { Icon.createWithResource(this, R.drawable.ic_tile) }
 
     private val stateCallback = object : IBeamStateCallback.Stub() {
         override fun onStateChanged(state: Int, detail: String?) {
@@ -96,6 +99,8 @@ class BeamTileService : TileService() {
     override fun onStartListening() {
         super.onStartListening()
         isListening = true
+        lastRenderedTileState = null
+        lastRenderedDescription = null
         val bound = service
         if (isBound || bound != null) {
             runOnWorker { refreshTile(bound) }
@@ -122,7 +127,9 @@ class BeamTileService : TileService() {
                     )
                 }
                 val current = service
-                runOnWorker { refreshTile(current) }
+                if (current != null || !lookup.isSuccess || !isBound) {
+                    runOnWorker { refreshTile(current) }
+                }
             }
         }
     }
@@ -259,16 +266,23 @@ class BeamTileService : TileService() {
     private fun updateTile(state: Int, hasProfile: Boolean) {
         lastState = state
         val tile = qsTile ?: return
-        tile.state = when {
+        val newTileState = when {
             isActive(state) -> Tile.STATE_ACTIVE
             !hasProfile -> Tile.STATE_INACTIVE
             service == null && isBound -> Tile.STATE_UNAVAILABLE
             else -> Tile.STATE_INACTIVE
         }
-        tile.label = getString(R.string.tile_label)
-        tile.stateDescription =
+        val newDescription =
             getString(if (hasProfile) statusLabel(state) else R.string.tile_no_profile)
-        tile.icon = Icon.createWithResource(this, R.drawable.ic_tile)
+        if (newTileState == lastRenderedTileState && newDescription == lastRenderedDescription) {
+            return
+        }
+        lastRenderedTileState = newTileState
+        lastRenderedDescription = newDescription
+        tile.state = newTileState
+        tile.label = getString(R.string.tile_label)
+        tile.stateDescription = newDescription
+        tile.icon = tileIcon
         tile.updateTile()
     }
 

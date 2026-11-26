@@ -19,6 +19,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
+import androidx.fragment.app.commit
 import androidx.fragment.app.commitNow
 import androidx.lifecycle.lifecycleScope
 import com.beam.android.R
@@ -143,7 +144,10 @@ class MainActivity : AppCompatActivity() {
         }
         if (supportFragmentManager.fragments.isEmpty()) {
             val restored = binding.bottomNav.selectedItemId
-            showTab(if (TAB_TAGS.containsKey(restored)) restored else R.id.nav_dashboard)
+            showTab(
+                if (TAB_TAGS.containsKey(restored)) restored else R.id.nav_dashboard,
+                immediate = true,
+            )
         }
     }
 
@@ -233,19 +237,21 @@ class MainActivity : AppCompatActivity() {
 
     private fun startVpn(profileId: String) {
         requestNotificationPermission()
-        val consent = runCatching { VpnService.prepare(this) }.getOrNull()
-        if (consent != null) {
-            pendingProfileId = profileId
-            vpnConsentLauncher.launch(consent)
-            return
-        }
-        val service = beam
-        if (service == null) {
-            pendingProfileId = profileId
-            ensureBound()
-            return
-        }
         lifecycleScope.launch {
+            val consent = withContext(Dispatchers.IO) {
+                runCatching { VpnService.prepare(this@MainActivity) }.getOrNull()
+            }
+            if (consent != null) {
+                pendingProfileId = profileId
+                vpnConsentLauncher.launch(consent)
+                return@launch
+            }
+            val service = beam
+            if (service == null) {
+                pendingProfileId = profileId
+                ensureBound()
+                return@launch
+            }
             val connected = withContext(Dispatchers.IO) {
                 runCatching { service.connect(profileId) }.isSuccess
             }
@@ -277,10 +283,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showTab(itemId: Int) {
+    private fun showTab(itemId: Int, immediate: Boolean = false) {
         val tag = TAB_TAGS[itemId] ?: return
         val manager = supportFragmentManager
-        manager.commitNow {
+        val apply: androidx.fragment.app.FragmentTransaction.() -> Unit = {
+            setReorderingAllowed(true)
             for (fragment in manager.fragments) hide(fragment)
             val existing = manager.findFragmentByTag(tag)
             if (existing == null) {
@@ -288,6 +295,11 @@ class MainActivity : AppCompatActivity() {
             } else {
                 show(existing)
             }
+        }
+        if (immediate) {
+            manager.commitNow(body = apply)
+        } else {
+            manager.commit(body = apply)
         }
     }
 

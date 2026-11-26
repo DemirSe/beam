@@ -4,6 +4,7 @@
 //! the life of a `VpnService` session. State is derived from lock-free
 //! telemetry on demand, so an idle tunnel holds no timer and no wakeup.
 
+use std::fmt::Write as _;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -13,7 +14,6 @@ use std::time::Duration;
 use beam_core::client::SocketProtector;
 use beam_sys::LinuxTun;
 use beam_tun::{EngineTelemetry, ProxyTcpStack, run_tun_engine_with_telemetry};
-use serde_json::json;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
 
@@ -270,7 +270,7 @@ impl AndroidEngine {
     /// The payload holds counters only: no server address, UUID, key, or link.
     /// A value the engine cannot measure yet is JSON `null`, never a fake `0`.
     pub fn telemetry_json(&self) -> String {
-        let drops = &self.telemetry.snapshot().drops;
+        let drops = self.telemetry.drops.snapshot();
         let total_drops = drops.tun_tx_full
             + drops.ip_parse
             + drops.fragment
@@ -284,17 +284,26 @@ impl AndroidEngine {
             + drops.udp_session_table_full;
         let activity = &self.telemetry.activity;
         let last_rtt_ms = activity.recent_rtt(RTT_MAX_AGE);
-        json!({
-            "active_tcp_flows": activity.active_tcp_flows(),
-            "active_udp_sessions": activity.active_udp_sessions(),
-            "bytes_tx": activity.bytes_tx(),
-            "bytes_rx": activity.bytes_rx(),
-            "last_rtt_ms": last_rtt_ms,
-            "dial_failures": activity.dial_failure_count(),
-            "drops": total_drops,
-            "state": self.refresh_state(),
-        })
-        .to_string()
+        let state = self.refresh_state();
+        let mut out = String::with_capacity(224);
+        let _ = write!(
+            out,
+            "{{\"active_tcp_flows\":{},\"active_udp_sessions\":{},\"bytes_tx\":{},\"bytes_rx\":{},\"dial_failures\":{},\"drops\":{},\"last_rtt_ms\":",
+            activity.active_tcp_flows(),
+            activity.active_udp_sessions(),
+            activity.bytes_tx(),
+            activity.bytes_rx(),
+            activity.dial_failure_count(),
+            total_drops,
+        );
+        match last_rtt_ms {
+            Some(rtt) => {
+                let _ = write!(out, "{rtt}");
+            }
+            None => out.push_str("null"),
+        }
+        let _ = write!(out, ",\"state\":{state}}}");
+        out
     }
 
     /// Stops the engine and waits at most [`SHUTDOWN_DEADLINE`] for teardown.

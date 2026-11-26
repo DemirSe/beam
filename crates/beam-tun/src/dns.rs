@@ -746,15 +746,19 @@ fn build_synthetic_dns_response(
 /// Returns `true` if `qname` equals `suffix` or is a subdomain of `suffix`
 /// (case-insensitive, leading/trailing dots normalized).
 pub fn matches_domain_suffix(qname: &str, suffix: &str) -> bool {
-    let q = qname.trim_matches('.').to_ascii_lowercase();
-    let s = suffix.trim_matches('.').to_ascii_lowercase();
+    let q = qname.trim_matches('.');
+    let s = suffix.trim_matches('.');
     if q.is_empty() || s.is_empty() {
         return false;
     }
-    if q == s {
-        return true;
+    if q.len() == s.len() {
+        return q.eq_ignore_ascii_case(s);
     }
-    q.len() > s.len() && q.ends_with(&s) && q.as_bytes()[q.len() - s.len() - 1] == b'.'
+    if q.len() <= s.len() {
+        return false;
+    }
+    let split = q.len() - s.len();
+    q.as_bytes()[split - 1] == b'.' && q[split..].eq_ignore_ascii_case(s)
 }
 
 /// Non-name part of a [`DnsCache`] key: the `qname` lives in the outer

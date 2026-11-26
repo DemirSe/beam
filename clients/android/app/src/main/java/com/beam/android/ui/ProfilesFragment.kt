@@ -99,8 +99,8 @@ class ProfilesFragment : Fragment() {
     private fun reload() {
         viewLifecycleOwner.lifecycleScope.launch {
             val (profiles, activeId) = withContext(Dispatchers.IO) {
-                runCatching { store.listProfiles() }.getOrDefault(emptyList()) to
-                    runCatching { store.getActiveProfileId() }.getOrNull()
+                runCatching { store.listProfilesWithActiveId() }
+                    .getOrDefault(emptyList<VlessProfile>() to null)
             }
             val binding = _binding ?: return@launch
             adapter.submit(profiles, activeId)
@@ -226,25 +226,22 @@ class ProfilesFragment : Fragment() {
     /** Validates and stores [raw]; [onSaved] gets false and nothing is saved when invalid. */
     private fun saveProfile(raw: String, onSaved: (Boolean) -> Unit = {}) {
         val uri = raw.trim().take(MAX_LINK_LENGTH)
-        val link = parseLink(uri)
-        if (link == null) {
-            onSaved(false)
-            return
-        }
-        val profile = VlessProfile(
-            id = UUID.randomUUID().toString(),
-            name = link.name.take(MAX_NAME_LENGTH),
-            uri = uri,
-            serverHost = link.host,
-            serverPort = link.port,
-            createdAtMs = System.currentTimeMillis(),
-        )
         viewLifecycleOwner.lifecycleScope.launch {
+            val link = withContext(Dispatchers.IO) { parseLink(uri) }
+            if (link == null) {
+                onSaved(false)
+                return@launch
+            }
+            val profile = VlessProfile(
+                id = UUID.randomUUID().toString(),
+                name = link.name.take(MAX_NAME_LENGTH),
+                uri = uri,
+                serverHost = link.host,
+                serverPort = link.port,
+                createdAtMs = System.currentTimeMillis(),
+            )
             val saved = withContext(Dispatchers.IO) {
-                runCatching {
-                    store.saveProfile(profile)
-                    if (store.getActiveProfileId() == null) store.setActiveProfileId(profile.id)
-                }.isSuccess
+                runCatching { store.saveProfileAndActivateIfNone(profile) }.isSuccess
             }
             if (!saved) {
                 toast(R.string.profiles_save_failed)

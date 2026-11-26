@@ -48,7 +48,7 @@ class NetworkMonitor(
         connectivityManager.registerDefaultNetworkCallback(this)
     }
 
-    fun stop() {
+    fun markStopped() {
         synchronized(callbackLock) {
             stopped = true
             pending?.let(handler::removeCallbacks)
@@ -58,11 +58,19 @@ class NetworkMonitor(
             lastNetworkHandle = null
             lastValidated = false
         }
+    }
+
+    fun unregister() {
         try {
             connectivityManager.unregisterNetworkCallback(this)
         } catch (_: Exception) {
             // Already unregistered.
         }
+    }
+
+    fun stop() {
+        markStopped()
+        unregister()
     }
 
     override fun onAvailable(network: Network) {

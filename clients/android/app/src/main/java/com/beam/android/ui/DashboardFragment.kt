@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.TextView
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.ColorUtils
 import androidx.core.view.isVisible
@@ -39,6 +40,9 @@ class DashboardFragment : Fragment() {
     private var _binding: FragmentDashboardBinding? = null
     private val binding get() = _binding!!
     private val tabVisible = MutableStateFlow(true)
+    private var lastTelemetryJson: String? = null
+    private var lastRenderedTelemetry: TelemetryDto? = null
+    private var hasRenderedTelemetry: Boolean = false
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -70,6 +74,9 @@ class DashboardFragment : Fragment() {
     }
 
     override fun onDestroyView() {
+        lastTelemetryJson = null
+        lastRenderedTelemetry = null
+        hasRenderedTelemetry = false
         _binding = null
         super.onDestroyView()
     }
@@ -129,33 +136,52 @@ class DashboardFragment : Fragment() {
     private suspend fun refreshTelemetry() {
         val main = requireActivity() as MainActivity
         val service = main.beam ?: return
-        val telemetry = withContext(Dispatchers.IO) {
-            runCatching { service.getTelemetryJson() }
-                .getOrNull()
-                ?.let(TelemetryDto::fromJson)
+        val previousJson = lastTelemetryJson
+        val skipIfUnchanged = hasRenderedTelemetry
+        val result = withContext(Dispatchers.IO) {
+            val rawJson = runCatching { service.getTelemetryJson() }.getOrNull()
+                ?: return@withContext null
+            if (skipIfUnchanged && rawJson == previousJson) return@withContext null
+            rawJson to TelemetryDto.fromJson(rawJson)
         } ?: return
-        renderTelemetry(telemetry)
+        lastTelemetryJson = result.first
+        renderTelemetry(result.second)
     }
 
     private fun renderTelemetry(telemetry: TelemetryDto?) {
         val binding = _binding ?: return
+        if (telemetry == null) lastTelemetryJson = null
+        if (hasRenderedTelemetry && telemetry == lastRenderedTelemetry) return
+        hasRenderedTelemetry = true
+        lastRenderedTelemetry = telemetry
         val dash = getString(R.string.telemetry_none)
-        binding.rttValue.text = telemetry?.lastRttMs
-            ?.let { String.format(Locale.US, "%d ms", it) } ?: dash
+        setTextIfChanged(
+            binding.rttValue,
+            telemetry?.lastRttMs?.let { String.format(Locale.US, "%d ms", it) } ?: dash,
+        )
         val showFlows = telemetry != null && (telemetry.activeTcpFlows > 0L || telemetry.activeUdpSessions > 0L)
         binding.flowsColumn.isVisible = showFlows
         if (showFlows) {
-            binding.flowsValue.text = "${telemetry!!.activeTcpFlows} / ${telemetry.activeUdpSessions}"
+            setTextIfChanged(
+                binding.flowsValue,
+                "${telemetry!!.activeTcpFlows} / ${telemetry.activeUdpSessions}",
+            )
         }
         val showBytes = telemetry?.bytesTx != null || telemetry?.bytesRx != null
         binding.txRxRow.isVisible = showBytes
         if (showBytes) {
-            binding.txValue.text = telemetry?.bytesTx?.let(::formatBytes) ?: dash
-            binding.rxValue.text = telemetry?.bytesRx?.let(::formatBytes) ?: dash
+            setTextIfChanged(binding.txValue, telemetry?.bytesTx?.let(::formatBytes) ?: dash)
+            setTextIfChanged(binding.rxValue, telemetry?.bytesRx?.let(::formatBytes) ?: dash)
         }
-        binding.dialFailuresValue.text = telemetry?.dialFailures?.toString() ?: dash
-        binding.dropsValue.text = telemetry?.drops?.toString() ?: dash
+        setTextIfChanged(binding.dialFailuresValue, telemetry?.dialFailures?.toString() ?: dash)
+        setTextIfChanged(binding.dropsValue, telemetry?.drops?.toString() ?: dash)
         binding.telemetryHint.isVisible = telemetry == null
+    }
+
+    private fun setTextIfChanged(view: TextView, value: CharSequence) {
+        if (view.text?.toString() != value.toString()) {
+            view.text = value
+        }
     }
 
     private fun renderStatus(status: BeamStatus) {

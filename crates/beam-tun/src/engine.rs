@@ -672,6 +672,7 @@ where
             None => DnsInterceptor::new(config.client.clone(), dns_cfg.clone(), tun_tx.clone()),
         });
     let mut network_reset = config.network_reset.clone();
+    let client_config = Arc::new(config.client);
 
     let mut recv_buf = vec![0u8; device.mtu().clamp(2048, MAX_PACKET_BUF)];
     let mut tx_batch: Vec<Vec<u8>> = Vec::with_capacity(64);
@@ -707,7 +708,7 @@ where
         for conn in accepted.drain(..) {
             spawn_tcp_relay(
                 conn,
-                config.client.clone(),
+                Arc::clone(&client_config),
                 Arc::clone(&tcp_permits),
                 Arc::clone(&dial_gate),
                 network_reset.clone(),
@@ -1040,7 +1041,7 @@ impl DialGate {
 #[allow(clippy::too_many_arguments)]
 fn spawn_tcp_relay(
     mut conn: AcceptedTcpStream,
-    client_config: BeamClientConfig,
+    client_config: Arc<BeamClientConfig>,
     permits: Arc<Semaphore>,
     dial_gate: Arc<DialGate>,
     mut network_reset: Option<watch::Receiver<u64>>,
