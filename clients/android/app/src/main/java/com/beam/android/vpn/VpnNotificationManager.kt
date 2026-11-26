@@ -34,13 +34,13 @@ class VpnNotificationManager(private val context: Context) {
     }
 
     fun build(state: Int, detail: String): Notification {
-        val label = context.getString(context.applicationInfo.labelRes)
-        val (title, text) = when (state) {
-            VpnState.CONNECTED -> label to "Connected"
-            VpnState.CONNECTING -> label to "Connecting…"
-            VpnState.DEGRADED -> label to "Unstable connection"
-            VpnState.DISCONNECTING -> label to "Disconnecting…"
-            else -> label to detail.ifBlank { "Disconnected" }
+        val label = context.getString(R.string.app_name)
+        val text = when (state) {
+            VpnState.CONNECTED -> context.getString(R.string.status_connected)
+            VpnState.CONNECTING -> context.getString(R.string.status_connecting)
+            VpnState.DEGRADED -> context.getString(R.string.status_degraded)
+            VpnState.DISCONNECTING -> context.getString(R.string.status_disconnecting)
+            else -> detail.ifBlank { context.getString(R.string.status_disconnected) }
         }
         // Tap re-opens the dashboard.
         val openIntent = Intent(context, MainActivity::class.java).apply {
@@ -50,14 +50,29 @@ class VpnNotificationManager(private val context: Context) {
             context, 0, openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        return NotificationCompat.Builder(context, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_vpn_notification)
-            .setContentTitle(title)
+            .setContentTitle(label)
             .setContentText(text)
             .setContentIntent(pending)
             .setOngoing(state != VpnState.DISCONNECTED)
             .setOnlyAlertOnce(true)
-            .build()
+
+        if (state == VpnState.CONNECTED || state == VpnState.DEGRADED || state == VpnState.CONNECTING) {
+            val stopIntent = Intent(context, BeamVpnService::class.java).apply {
+                action = BeamVpnService.ACTION_STOP
+            }
+            val stopPending = PendingIntent.getService(
+                context, 1, stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(
+                0,
+                context.getString(R.string.action_disconnect),
+                stopPending,
+            )
+        }
+        return builder.build()
     }
 
     fun notify(state: Int, detail: String) {

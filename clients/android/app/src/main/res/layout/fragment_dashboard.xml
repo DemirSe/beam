@@ -171,10 +171,12 @@
                     </LinearLayout>
 
                     <LinearLayout
+                        android:id="@+id/flowsColumn"
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:orientation="vertical">
+                        android:orientation="vertical"
+                        android:visibility="gone">
 
                         <TextView
                             android:layout_width="wrap_content"
@@ -195,10 +197,12 @@
                 </LinearLayout>
 
                 <LinearLayout
+                    android:id="@+id/txRxRow"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="12dp"
-                    android:orientation="horizontal">
+                    android:orientation="horizontal"
+                    android:visibility="gone">
 
                     <LinearLayout
                         android:layout_width="0dp"

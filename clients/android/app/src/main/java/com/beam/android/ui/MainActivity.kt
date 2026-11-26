@@ -11,9 +11,13 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.widget.Toast
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.commitNow
 import androidx.lifecycle.lifecycleScope
@@ -21,8 +25,10 @@ import com.beam.android.R
 import com.beam.android.databinding.ActivityMainBinding
 import com.beam.android.ipc.IBeamStateCallback
 import com.beam.android.ipc.IBeamVpnService
+import com.beam.android.storage.EncryptedProfileStore
 import com.beam.android.vpn.BeamVpnService
 import com.beam.android.vpn.VpnState
+import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -102,9 +108,18 @@ class MainActivity : AppCompatActivity() {
     ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        ViewCompat.setOnApplyWindowInsetsListener(binding.mainRoot) { _, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            binding.fragmentContainer.updatePadding(left = bars.left, top = bars.top, right = bars.right)
+            binding.bottomNav.updatePadding(left = bars.left, right = bars.right, bottom = bars.bottom)
+            WindowInsetsCompat.CONSUMED
+        }
         binding.bottomNav.setOnItemSelectedListener { item ->
             showTab(item.itemId)
             true
@@ -145,6 +160,27 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             withContext(Dispatchers.IO) { runCatching { service.disconnect() } }
         }
+    }
+
+    fun isTunnelActive(): Boolean {
+        val s = status.value.state
+        return s == VpnState.CONNECTED || s == VpnState.DEGRADED || s == VpnState.CONNECTING
+    }
+
+    fun showReconnectHint() {
+        if (!isTunnelActive()) return
+        Snackbar.make(binding.fragmentContainer, R.string.reconnect_to_apply, Snackbar.LENGTH_LONG)
+            .setAnchorView(binding.bottomNav)
+            .setAction(R.string.action_reconnect) {
+                lifecycleScope.launch {
+                    val activeId = withContext(Dispatchers.IO) {
+                        runCatching { beam?.disconnect() }
+                        runCatching { EncryptedProfileStore(this@MainActivity).getActiveProfileId() }.getOrNull()
+                    } ?: return@launch
+                    requestConnect(activeId)
+                }
+            }
+            .show()
     }
 
     fun openProfiles() {

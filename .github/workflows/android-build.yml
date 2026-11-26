@@ -33,6 +33,14 @@ jobs:
           components: rustfmt, clippy
           targets: aarch64-linux-android
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-aarch64
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
       - name: Rust fmt
         run: cargo fmt --all -- --check
 
@@ -117,6 +125,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-x86_64
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
 
       - uses: actions/setup-java@v4
         with:

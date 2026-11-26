@@ -45,6 +45,9 @@
     <string name="profiles_add_invalid">This is not a valid vless:// link.</string>
     <string name="profiles_saved">Profile saved.</string>
     <string name="profiles_save_failed">Could not save the profile.</string>
+    <string name="profiles_rename_title">Rename profile</string>
+    <string name="profiles_rename_hint">Profile name</string>
+    <string name="profiles_renamed">Profile renamed.</string>
     <string name="profiles_server_format">%1$s:%2$d</string>
 
     <!-- QR scanner -->
@@ -95,6 +98,12 @@
     <!-- Errors and tile -->
     <string name="vpn_consent_denied">VPN permission is required to connect.</string>
     <string name="connect_failed">The VPN service is not reachable. Try again.</string>
+    <string name="vpn_error_consent">VPN permission was revoked. Tap Connect to grant it again.</string>
+    <string name="vpn_error_profile">Selected profile could not be found.</string>
+    <string name="vpn_error_native">The tunnel engine could not start. Check your profile and retry.</string>
+    <string name="vpn_error_generic">Could not establish the VPN tunnel.</string>
+    <string name="reconnect_to_apply">Reconnect to apply changes.</string>
+    <string name="action_reconnect">Reconnect</string>
     <string name="tile_label">beam</string>
     <string name="tile_no_profile">No profile</string>
 

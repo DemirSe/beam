@@ -60,6 +60,11 @@ class DashboardFragment : Fragment() {
         renderActiveProfile()
     }
 
+    override fun onHiddenChanged(hidden: Boolean) {
+        super.onHiddenChanged(hidden)
+        if (!hidden && _binding != null) renderActiveProfile()
+    }
+
     override fun onDestroyView() {
         _binding = null
         super.onDestroyView()
@@ -127,10 +132,17 @@ class DashboardFragment : Fragment() {
         val dash = getString(R.string.telemetry_none)
         binding.rttValue.text = telemetry?.lastRttMs
             ?.let { String.format(Locale.US, "%d ms", it) } ?: dash
-        binding.flowsValue.text = telemetry
-            ?.let { "${it.activeTcpFlows} / ${it.activeUdpSessions}" } ?: dash
-        binding.txValue.text = telemetry?.bytesTx?.let(::formatBytes) ?: dash
-        binding.rxValue.text = telemetry?.bytesRx?.let(::formatBytes) ?: dash
+        val showFlows = telemetry != null && (telemetry.activeTcpFlows > 0L || telemetry.activeUdpSessions > 0L)
+        binding.flowsColumn.isVisible = showFlows
+        if (showFlows) {
+            binding.flowsValue.text = "${telemetry!!.activeTcpFlows} / ${telemetry.activeUdpSessions}"
+        }
+        val showBytes = telemetry?.bytesTx != null || telemetry?.bytesRx != null
+        binding.txRxRow.isVisible = showBytes
+        if (showBytes) {
+            binding.txValue.text = telemetry?.bytesTx?.let(::formatBytes) ?: dash
+            binding.rxValue.text = telemetry?.bytesRx?.let(::formatBytes) ?: dash
+        }
         binding.dialFailuresValue.text = telemetry?.dialFailures?.toString() ?: dash
         binding.dropsValue.text = telemetry?.drops?.toString() ?: dash
         binding.telemetryHint.isVisible = telemetry == null

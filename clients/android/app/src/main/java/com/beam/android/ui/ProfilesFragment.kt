@@ -65,6 +65,7 @@ class ProfilesFragment : Fragment() {
         store = EncryptedProfileStore(requireContext())
         adapter = ProfilesAdapter(
             onSelect = { profile -> selectProfile(profile) },
+            onRename = { profile -> showRenameDialog(profile) },
             onDelete = { profile -> confirmDelete(profile) },
         )
         binding.profilesList.layoutManager = LinearLayoutManager(requireContext())
@@ -78,6 +79,11 @@ class ProfilesFragment : Fragment() {
     override fun onResume() {
         super.onResume()
         reload()
+    }
+
+    override fun onHiddenChanged(hidden: Boolean) {
+        super.onHiddenChanged(hidden)
+        if (!hidden && _binding != null) reload()
     }
 
     override fun onDestroyView() {
@@ -99,21 +105,65 @@ class ProfilesFragment : Fragment() {
     }
 
     private fun selectProfile(profile: VlessProfile) {
+        val main = activity as? MainActivity
         viewLifecycleOwner.lifecycleScope.launch {
             val saved = withContext(Dispatchers.IO) {
                 runCatching { store.setActiveProfileId(profile.id) }.isSuccess
             }
-            if (saved) reload() else toast(R.string.profiles_save_failed)
+            if (saved) {
+                reload()
+                main?.showReconnectHint()
+            } else {
+                toast(R.string.profiles_save_failed)
+            }
         }
     }
 
+    private fun showRenameDialog(profile: VlessProfile) {
+        val content = layoutInflater.inflate(R.layout.dialog_add_profile, null)
+        val input = content.findViewById<TextInputEditText>(R.id.dialogLinkInput)
+        val layout = content.findViewById<TextInputLayout>(R.id.dialogLinkLayout)
+        layout.hint = getString(R.string.profiles_rename_hint)
+        input.setText(profile.name)
+        input.setSelection(profile.name.length)
+        input.doAfterTextChanged { layout.error = null }
+
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(R.string.profiles_rename_title)
+            .setView(content)
+            .setNegativeButton(R.string.action_cancel, null)
+            .setPositiveButton(R.string.action_save) { _, _ ->
+                val newName = input.text?.toString()?.trim()?.take(MAX_NAME_LENGTH).orEmpty()
+                if (newName.isEmpty()) return@setPositiveButton
+                viewLifecycleOwner.lifecycleScope.launch {
+                    val saved = withContext(Dispatchers.IO) {
+                        runCatching { store.saveProfile(profile.copy(name = newName)) }.isSuccess
+                    }
+                    if (saved) {
+                        reload()
+                        toast(R.string.profiles_renamed)
+                    } else {
+                        toast(R.string.profiles_save_failed)
+                    }
+                }
+            }
+            .show()
+    }
+
     private fun confirmDelete(profile: VlessProfile) {
+        val main = activity as? MainActivity
         MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.profiles_delete_title)
             .setMessage(getString(R.string.profiles_delete_message, profile.name))
             .setNegativeButton(R.string.action_cancel, null)
             .setPositiveButton(R.string.action_delete) { _, _ ->
                 viewLifecycleOwner.lifecycleScope.launch {
+                    val connectedId = withContext(Dispatchers.IO) {
+                        runCatching { main?.beam?.getActiveProfileId() }.getOrNull()
+                    }
+                    if (main?.isTunnelActive() == true && connectedId == profile.id) {
+                        main.requestDisconnect()
+                    }
                     withContext(Dispatchers.IO) {
                         runCatching { store.deleteProfile(profile.id) }
                     }

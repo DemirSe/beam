@@ -72,5 +72,10 @@ info "APK: ${APK:-<none found>}"
 # 4. Optional install ----------------------------------------------------------
 if [ "$INSTALL" = 1 ]; then
     [ -n "$APK" ] || { echo "error: no APK to install" >&2; exit 1; }
+    if [[ "$APK" == *unsigned*.apk ]]; then
+        echo "error: $APK is unsigned and cannot be installed via adb." >&2
+        echo "set BEAM_KEYSTORE_PATH/PASSWORD/ALIAS or pass -Pbeam.signReleaseWithDebug=true (or use --debug)." >&2
+        exit 1
+    fi
     adb install -r "$APK"
 fi

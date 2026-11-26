@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.SystemClock
 import android.widget.Toast
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
@@ -14,6 +15,9 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updatePadding
 import com.beam.android.R
 import com.beam.android.databinding.ActivityQrScannerBinding
 import com.google.zxing.BarcodeFormat
@@ -33,6 +37,10 @@ class QrScannerActivity : AppCompatActivity() {
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private val handled = AtomicBoolean(false)
     private var lastInvalidQrAtMs = 0L
+
+    // Reused on the single-threaded cameraExecutor to avoid per-frame GC churn.
+    private var frameBuffer = ByteArray(0)
+    private var rotatedBuffer = ByteArray(0)
 
     private val reader = MultiFormatReader().apply {
         setHints(
@@ -55,9 +63,24 @@ class QrScannerActivity : AppCompatActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         binding = ActivityQrScannerBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        val initialTop = binding.qrTopBar.paddingTop
+        val initialLeft = binding.qrTopBar.paddingLeft
+        val initialRight = binding.qrTopBar.paddingRight
+        ViewCompat.setOnApplyWindowInsetsListener(binding.qrTopBar) { v, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            v.updatePadding(
+                left = initialLeft + bars.left,
+                top = initialTop + bars.top,
+                right = initialRight + bars.right,
+            )
+            insets
+        }
         binding.closeButton.setOnClickListener { finish() }
 
         val granted = ContextCompat.checkSelfPermission(
@@ -111,15 +134,17 @@ class QrScannerActivity : AppCompatActivity() {
     private fun decodeFrame(proxy: ImageProxy) {
         val plane = proxy.planes.firstOrNull() ?: return
         val buffer = plane.buffer
-        val data = ByteArray(buffer.remaining())
-        buffer.get(data)
+        val remaining = buffer.remaining()
+        if (frameBuffer.size < remaining) frameBuffer = ByteArray(remaining)
+        buffer.get(frameBuffer, 0, remaining)
 
         val width = proxy.width
         val height = proxy.height
         val rowStride = plane.rowStride
         if (rowStride < width) return
         val source = luminanceSource(
-            data,
+            frameBuffer,
+            remaining,
             rowStride,
             width,
             height,
@@ -159,6 +184,7 @@ class QrScannerActivity : AppCompatActivity() {
      */
     private fun luminanceSource(
         data: ByteArray,
+        dataLen: Int,
         rowStride: Int,
         width: Int,
         height: Int,
@@ -166,16 +192,18 @@ class QrScannerActivity : AppCompatActivity() {
         rotationDegrees: Int,
     ): PlanarYUVLuminanceSource? {
         val rotation = ((rotationDegrees % 360) + 360) % 360
-        if (rotation == 0 && pixelStride == 1 && data.size >= rowStride * height) {
+        if (rotation == 0 && pixelStride == 1 && dataLen >= rowStride * height) {
             return PlanarYUVLuminanceSource(data, rowStride, height, 0, 0, width, height, false)
         }
         val swap = rotation == 90 || rotation == 270
         val outWidth = if (swap) height else width
         val outHeight = if (swap) width else height
-        val out = ByteArray(outWidth * outHeight)
+        val needed = outWidth * outHeight
+        if (rotatedBuffer.size < needed) rotatedBuffer = ByteArray(needed)
+        val out = rotatedBuffer
         for (y in 0 until height) {
             val row = y * rowStride
-            if (row + (width - 1) * pixelStride >= data.size) return null
+            if (row + (width - 1) * pixelStride >= dataLen) return null
             for (x in 0 until width) {
                 val value = data[row + x * pixelStride]
                 out[when (rotation) {

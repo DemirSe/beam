@@ -34,7 +34,7 @@ import java.util.concurrent.Executors
  */
 class BeamTileService : TileService() {
 
-    private var service: IBeamVpnService? = null
+    @Volatile private var service: IBeamVpnService? = null
     private var isBound = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -43,6 +43,7 @@ class BeamTileService : TileService() {
 
     /** Last state known to the UI; only [updateTile] writes it. */
     private var lastState: Int = VpnState.DISCONNECTED
+    private var pendingToggle: Boolean = false
 
     private val stateCallback = object : IBeamStateCallback.Stub() {
         override fun onStateChanged(state: Int, detail: String?) {
@@ -55,9 +56,15 @@ class BeamTileService : TileService() {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val bound = binder?.let { IBeamVpnService.Stub.asInterface(it) } ?: return
             service = bound
+            val shouldToggle = pendingToggle
+            pendingToggle = false
             worker.execute {
                 runCatching { bound.registerCallback(stateCallback) }
-                refreshTile(bound)
+                if (shouldToggle) {
+                    performToggle(bound)
+                } else {
+                    refreshTile(bound)
+                }
             }
         }
 
@@ -95,27 +102,41 @@ class BeamTileService : TileService() {
     }
 
     override fun onClick() {
-        val bound = service
         val connected = isActive(lastState)
-        val previous = lastState
         // Optimistic: the panel must react before the binder round trip ends.
         updateTile(if (connected) VpnState.DISCONNECTING else VpnState.CONNECTING, hasProfile = true)
 
-        worker.execute {
-            val profileId = activeProfileId()
-            val consent = runCatching { VpnService.prepare(this) }.getOrNull()
-            if (profileId == null || bound == null || consent != null) {
-                mainHandler.post {
-                    updateTile(previous, hasProfile = profileId != null)
-                    openApp()
-                }
-                return@execute
+        val current = service
+        if (current == null) {
+            pendingToggle = true
+            if (!isBound) {
+                isBound = bindService(
+                    Intent(this, BeamVpnService::class.java),
+                    serviceConnection,
+                    Context.BIND_AUTO_CREATE,
+                )
             }
-            if (connected) {
-                runCatching { bound.disconnect() }
-            } else {
-                runCatching { bound.connect(profileId) }
+            return
+        }
+        worker.execute { performToggle(current) }
+    }
+
+    private fun performToggle(bound: IBeamVpnService) {
+        val state = runCatching { bound.getState() }.getOrDefault(lastState)
+        val connected = isActive(state)
+        val profileId = activeProfileId()
+        val consent = runCatching { VpnService.prepare(this) }.getOrNull()
+        if (profileId == null || (!connected && consent != null)) {
+            mainHandler.post {
+                updateTile(state, hasProfile = profileId != null)
+                openApp()
             }
+            return
+        }
+        if (connected) {
+            runCatching { bound.disconnect() }
+        } else {
+            runCatching { bound.connect(profileId) }
         }
     }
 

@@ -139,7 +139,16 @@ class SettingsFragment : Fragment() {
             val saved = withContext(Dispatchers.IO) {
                 runCatching { store.save(settings) }.isSuccess
             }
-            toast(if (saved) R.string.settings_saved else R.string.settings_save_failed)
+            if (saved) {
+                val main = activity as? MainActivity
+                if (main?.isTunnelActive() == true) {
+                    main.showReconnectHint()
+                } else {
+                    toast(R.string.settings_saved)
+                }
+            } else {
+                toast(R.string.settings_save_failed)
+            }
         }
     }
 

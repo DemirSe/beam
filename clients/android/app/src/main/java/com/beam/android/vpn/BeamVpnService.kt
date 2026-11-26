@@ -9,6 +9,7 @@ import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.os.RemoteCallbackList
 import android.util.Log
+import com.beam.android.R
 import com.beam.android.ipc.IBeamStateCallback
 import com.beam.android.ipc.IBeamVpnService
 import com.beam.android.storage.EncryptedProfileStore
@@ -264,9 +265,19 @@ class BeamVpnService : VpnService() {
             // surfaces as LinkageError/ExceptionInInitializerError.
             Log.e(TAG, "connect failed", t)
             synchronized(stateLock) { teardown() }
-            setState(VpnState.DISCONNECTED, t.message ?: "connect failed")
+            setState(VpnState.DISCONNECTED, userFacingError(t))
             stopSelf()
         }
+    }
+
+    private fun userFacingError(t: Throwable): String = when {
+        t is IllegalArgumentException && t.message?.contains("profile", ignoreCase = true) == true ->
+            getString(R.string.vpn_error_profile)
+        t is IllegalStateException && t.message?.contains("establish()", ignoreCase = true) == true ->
+            getString(R.string.vpn_error_consent)
+        t is LinkageError || t is IllegalStateException ->
+            getString(R.string.vpn_error_native)
+        else -> getString(R.string.vpn_error_generic)
     }
 
     /** Builds the TUN parameters; the caller holds [stateLock] for establish(). */

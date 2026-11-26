@@ -24,6 +24,18 @@ android {
         }
     }
 
+    signingConfigs {
+        val ksPath = System.getenv("BEAM_KEYSTORE_PATH")
+        if (!ksPath.isNullOrBlank()) {
+            create("release") {
+                storeFile = file(ksPath)
+                storePassword = System.getenv("BEAM_KEYSTORE_PASSWORD") ?: ""
+                keyAlias = System.getenv("BEAM_KEY_ALIAS") ?: ""
+                keyPassword = System.getenv("BEAM_KEY_PASSWORD") ?: ""
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -32,6 +44,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfigs.findByName("release")?.let {
+                signingConfig = it
+            } ?: if (providers.gradleProperty("beam.signReleaseWithDebug").orNull == "true") {
+                signingConfig = signingConfigs.getByName("debug")
+            }
         }
         debug {
             isMinifyEnabled = false

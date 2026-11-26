@@ -11,6 +11,7 @@ import com.beam.android.storage.VlessProfile
 /** Profile list: name and `host:port` only. The URI stays out of the UI. */
 class ProfilesAdapter(
     private val onSelect: (VlessProfile) -> Unit,
+    private val onRename: (VlessProfile) -> Unit,
     private val onDelete: (VlessProfile) -> Unit,
 ) : RecyclerView.Adapter<ProfilesAdapter.Holder>() {
 
@@ -37,6 +38,10 @@ class ProfilesAdapter(
         )
         binding.profileActiveIcon.isVisible = profile.id == activeId
         binding.root.setOnClickListener { onSelect(profile) }
+        binding.root.setOnLongClickListener {
+            onRename(profile)
+            true
+        }
         binding.profileDelete.setOnClickListener { onDelete(profile) }
     }
 
