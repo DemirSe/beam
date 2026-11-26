@@ -3,10 +3,7 @@ package com.beam.android.storage
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
-import java.security.InvalidKeyException
 import java.security.KeyStore
-import java.security.KeyStoreException
-import java.security.UnrecoverableKeyException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -20,11 +17,11 @@ internal object ProfileCrypto {
     private const val GCM_TAG_BITS = 128
     private const val IV_BYTES = 12
 
-    private fun isBrokenKeyError(e: Exception): Boolean =
-        e is KeyPermanentlyInvalidatedException ||
-            e is UnrecoverableKeyException ||
-            e is KeyStoreException ||
-            e is InvalidKeyException
+    // Only delete the Keystore alias when Android explicitly reports permanent
+    // key invalidation. Transient KeyStoreException / TEE hiccups must rethrow
+    // without wiping the key so saved profiles remain decryptable on retry.
+    private fun isPermanentlyInvalidated(e: Exception): Boolean =
+        e is KeyPermanentlyInvalidatedException
 
     private fun deleteAlias() {
         runCatching {
@@ -50,7 +47,7 @@ internal object ProfileCrypto {
         try {
             (ks.getEntry(ALIAS, null) as? KeyStore.SecretKeyEntry)?.let { return it.secretKey }
         } catch (e: Exception) {
-            if (!isBrokenKeyError(e)) throw e
+            if (!isPermanentlyInvalidated(e)) throw e
             runCatching { ks.deleteEntry(ALIAS) }
         }
         return generateKey()
@@ -60,11 +57,11 @@ internal object ProfileCrypto {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         // Android Keystore enforces randomized encryption by default and
         // rejects a caller-provided encryption IV, so ask the cipher for one.
-        // If Cipher.init() surfaces an invalidated/broken alias, drop and re-key once.
+        // If Cipher.init() surfaces a permanently invalidated alias, drop and re-key once.
         try {
             cipher.init(Cipher.ENCRYPT_MODE, key())
         } catch (e: Exception) {
-            if (!isBrokenKeyError(e)) throw e
+            if (!isPermanentlyInvalidated(e)) throw e
             deleteAlias()
             cipher.init(Cipher.ENCRYPT_MODE, generateKey())
         }
@@ -82,7 +79,7 @@ internal object ProfileCrypto {
                 GCMParameterSpec(GCM_TAG_BITS, blob, 0, IV_BYTES),
             )
         } catch (e: Exception) {
-            if (isBrokenKeyError(e)) {
+            if (isPermanentlyInvalidated(e)) {
                 // Drop the invalidated alias so subsequent encrypt() calls can
                 // create a fresh key; the caller quarantines the unreadable blob.
                 deleteAlias()

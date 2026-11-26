@@ -4,7 +4,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use beam_core::address::{Address, NetLocation};
@@ -40,11 +40,10 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// burst of new flows cannot starve active relay tasks on small worker pools.
 const MAX_CONCURRENT_DIALS: usize = 16;
 /// Consecutive dial failures within [`FAILURE_STREAK_WINDOW`] that engage
-/// outage fast-fail backoff (allowing one probe per [`OUTAGE_PROBE_INTERVAL_MS`]).
+/// outage fast-fail backoff (probing with exponential delay 1 s -> 5 s).
 const OUTAGE_BACKOFF_STREAK: u64 = 5;
-const OUTAGE_PROBE_INTERVAL_MS: u64 = 1_000;
-/// Minimum idle age before a relay can be evicted when `tcp_permits` is full.
-const IDLE_EVICT_MIN_AGE_MS: u64 = 60_000;
+const OUTAGE_PROBE_INITIAL_MS: u64 = 1_000;
+const OUTAGE_PROBE_MAX_MS: u64 = 5_000;
 /// Gap after which a new dial failure starts a fresh streak instead of reviving
 /// an ancient one, so one blip never keeps the link degraded for minutes.
 pub const FAILURE_STREAK_WINDOW: Duration = Duration::from_secs(30);
@@ -584,7 +583,6 @@ where
         config.max_tcp_connections.clamp(1, MAX_CONCURRENT_DIALS),
         start,
     ));
-    let idle_registry = Arc::new(IdleRelayRegistry::new());
     let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(TUN_TX_CHANNEL_CAP);
     stack.set_drop_counters(Arc::clone(&drops));
     if let Some(tracker) = activity.as_ref() {
@@ -647,8 +645,6 @@ where
                 config.client.clone(),
                 Arc::clone(&tcp_permits),
                 Arc::clone(&dial_gate),
-                Arc::clone(&idle_registry),
-                start,
                 network_reset.clone(),
                 activity.clone(),
                 Arc::clone(&drops),
@@ -892,7 +888,8 @@ async fn send_tun_packet<D: TunDevice>(
     }
 }
 
-/// Bounds concurrent upstream handshakes and fast-fails during server outages.
+/// Bounds concurrent upstream handshakes (queuing normal bursts rather than
+/// RSTing them) and fast-fails excess dials during sustained server outages.
 struct DialGate {
     permits: Arc<Semaphore>,
     next_probe_ms: AtomicU64,
@@ -908,128 +905,53 @@ impl DialGate {
         }
     }
 
-    fn try_acquire(
+    fn outage_backoff_ms(streak: u64) -> u64 {
+        let shift = streak.saturating_sub(OUTAGE_BACKOFF_STREAK).min(3) as u32;
+        OUTAGE_PROBE_INITIAL_MS
+            .saturating_mul(1_u64 << shift)
+            .min(OUTAGE_PROBE_MAX_MS)
+    }
+
+    /// Acquires a dial concurrency permit. Normal bursts above
+    /// `MAX_CONCURRENT_DIALS` queue cleanly (bounded by `wait_budget`). During
+    /// a sustained outage, only one probe per backoff interval is permitted and
+    /// excess flows fast-fail without piling up REALITY handshakes.
+    async fn acquire(
         &self,
         activity: Option<&TunnelActivity>,
+        wait_budget: Duration,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let in_outage = activity.is_some_and(|tracker| {
-            tracker.recent_failure_streak(FAILURE_STREAK_WINDOW) >= OUTAGE_BACKOFF_STREAK
-        });
-        if in_outage {
+        let streak = activity
+            .map(|tracker| tracker.recent_failure_streak(FAILURE_STREAK_WINDOW))
+            .unwrap_or(0);
+        if streak >= OUTAGE_BACKOFF_STREAK {
             let now_ms = self.engine_start.elapsed().as_millis() as u64;
             let next = self.next_probe_ms.load(Ordering::Relaxed);
             if now_ms < next {
                 return None;
             }
-            let next_deadline = now_ms.saturating_add(OUTAGE_PROBE_INTERVAL_MS);
+            // Acquire the semaphore permit before advancing `next_probe_ms` so
+            // an exhausted pool cannot burn the outage-probe slot.
+            let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
+            let next_deadline = now_ms.saturating_add(Self::outage_backoff_ms(streak));
             if self
                 .next_probe_ms
                 .compare_exchange(next, next_deadline, Ordering::Relaxed, Ordering::Relaxed)
                 .is_err()
             {
+                drop(permit);
                 return None;
             }
+            return Some(permit);
         }
-        Arc::clone(&self.permits).try_acquire_owned().ok()
+        timeout(wait_budget, Arc::clone(&self.permits).acquire_owned())
+            .await
+            .ok()?
+            .ok()
     }
 
     fn record_success(&self) {
         self.next_probe_ms.store(0, Ordering::Relaxed);
-    }
-}
-
-struct IdleRelayEntry {
-    id: u64,
-    last_activity_ms: Arc<AtomicU64>,
-    evict_tx: watch::Sender<bool>,
-}
-
-/// Tracks active relays so long-idle sockets can be evicted when `tcp_permits`
-/// reaches saturation instead of starving fresh user flows with RSTs.
-struct IdleRelayRegistry {
-    next_id: AtomicU64,
-    entries: Mutex<Vec<IdleRelayEntry>>,
-}
-
-struct RelayRegistrationGuard {
-    registry: Arc<IdleRelayRegistry>,
-    id: u64,
-}
-
-impl Drop for RelayRegistrationGuard {
-    fn drop(&mut self) {
-        let mut entries = self
-            .registry
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(pos) = entries.iter().position(|entry| entry.id == self.id) {
-            entries.swap_remove(pos);
-        }
-    }
-}
-
-impl IdleRelayRegistry {
-    fn new() -> Self {
-        Self {
-            next_id: AtomicU64::new(1),
-            entries: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn register(
-        self: &Arc<Self>,
-        now_ms: u64,
-    ) -> (
-        RelayRegistrationGuard,
-        Arc<AtomicU64>,
-        watch::Receiver<bool>,
-    ) {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let last_activity_ms = Arc::new(AtomicU64::new(now_ms));
-        let (evict_tx, evict_rx) = watch::channel(false);
-        {
-            let mut entries = self
-                .entries
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            entries.push(IdleRelayEntry {
-                id,
-                last_activity_ms: Arc::clone(&last_activity_ms),
-                evict_tx,
-            });
-        }
-        (
-            RelayRegistrationGuard {
-                registry: Arc::clone(self),
-                id,
-            },
-            last_activity_ms,
-            evict_rx,
-        )
-    }
-
-    /// Signals the oldest relay idle for at least `min_age_ms` to close.
-    fn evict_oldest_idle(&self, now_ms: u64, min_age_ms: u64) -> bool {
-        let entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let candidate = entries
-            .iter()
-            .filter_map(|entry| {
-                let last = entry.last_activity_ms.load(Ordering::Relaxed);
-                let age = now_ms.saturating_sub(last);
-                (age >= min_age_ms && !*entry.evict_tx.borrow()).then_some((age, entry))
-            })
-            .max_by_key(|(age, _)| *age)
-            .map(|(_, entry)| entry);
-        if let Some(entry) = candidate {
-            let _ = entry.evict_tx.send(true);
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -1039,25 +961,16 @@ fn spawn_tcp_relay(
     client_config: BeamClientConfig,
     permits: Arc<Semaphore>,
     dial_gate: Arc<DialGate>,
-    idle_registry: Arc<IdleRelayRegistry>,
-    engine_start: Instant,
     mut network_reset: Option<watch::Receiver<u64>>,
     activity: Option<Arc<TunnelActivity>>,
     drops: Arc<DropCounters>,
     relay_idle: Option<Duration>,
 ) {
     let Ok(permit) = permits.try_acquire_owned() else {
-        let now_ms = engine_start.elapsed().as_millis() as u64;
-        let evicted = idle_registry.evict_oldest_idle(now_ms, IDLE_EVICT_MIN_AGE_MS);
-        debug!(
-            dst = %conn.dst,
-            evicted_idle = evicted,
-            "TCP connection limit reached; aborting with RST"
-        );
+        debug!(dst = %conn.dst, "TCP connection limit reached; aborting with RST");
         if let Some(suppressed) = TCP_LIMIT_LOG.allow() {
             warn!(
                 dst = %conn.dst,
-                evicted_idle = evicted,
                 suppressed,
                 "TCP connection limit reached; resetting new flow"
             );
@@ -1067,18 +980,34 @@ fn spawn_tcp_relay(
         return;
     };
 
-    let Some(dial_permit) = dial_gate.try_acquire(activity.as_deref()) else {
-        debug!(
-            dst = %conn.dst,
-            "upstream dial throttled by concurrency limit or outage backoff; resetting flow"
-        );
-        drops.tcp_limit.incr();
-        conn.stream.abort();
-        return;
-    };
-
     tokio::spawn(async move {
         let _permit = permit;
+        let dial_permit = tokio::select! {
+            biased;
+            Ok(()) = async {
+                match network_reset.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                conn.stream.abort();
+                return;
+            }
+            slot = dial_gate.acquire(activity.as_deref(), client_config.handshake_timeout) => {
+                match slot {
+                    Some(slot) => slot,
+                    None => {
+                        debug!(
+                            dst = %conn.dst,
+                            "upstream dial throttled by outage backoff or timeout; resetting flow"
+                        );
+                        drops.tcp_limit.incr();
+                        conn.stream.abort();
+                        return;
+                    }
+                }
+            }
+        };
         let address = match conn.dst.ip() {
             IpAddr::V4(v4) => Address::Ipv4(v4),
             IpAddr::V6(v6) => Address::Ipv6(v6),
@@ -1146,11 +1075,6 @@ fn spawn_tcp_relay(
             }
         };
 
-        let now_ms = engine_start.elapsed().as_millis() as u64;
-        let (_registration, last_activity_ms, mut evict_rx) = idle_registry.register(now_ms);
-        let c2s_activity = Arc::clone(&last_activity_ms);
-        let s2c_activity = Arc::clone(&last_activity_ms);
-
         // Push-safe mode unbounds reads only. Writes keep a deadline in both
         // modes, so a peer that stops draining can never wedge this task.
         let read_idle = relay_idle;
@@ -1171,7 +1095,6 @@ fn spawn_tcp_relay(
                     }
                     Err(_) => break,
                 };
-                c2s_activity.store(engine_start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 // Coalesce immediately-queued small chunks up to C2S_COALESCE_TARGET
                 // so multi-flow uploads write full TLS records with fewer syscalls.
                 let coalesced = coalesce_c2s(&chunk, &mut scratch, || tun_r.try_recv_chunk());
@@ -1234,7 +1157,6 @@ fn spawn_tcp_relay(
                         break;
                     }
                 };
-                s2c_activity.store(engine_start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 match with_relay_idle(Some(write_idle), tun_w.send_chunk_pooled(&buf[..n])).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
@@ -1258,9 +1180,6 @@ fn spawn_tcp_relay(
                     None => std::future::pending().await,
                 }
             } => {}
-            Ok(()) = evict_rx.changed() => {
-                debug!(dst = %conn.dst, "evicting idle TCP relay to free permit");
-            }
             _ = async { tokio::join!(c2s, s2c) } => {}
         }
     });
@@ -1620,25 +1539,52 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dial_gate_caps_concurrency_and_throttles_during_outage() {
-        let gate = DialGate::new(2, Instant::now());
-        let p1 = gate.try_acquire(None).expect("first permit");
-        let p2 = gate.try_acquire(None).expect("second permit");
-        assert!(gate.try_acquire(None).is_none(), "capped at 2");
+    #[tokio::test]
+    async fn dial_gate_queues_normal_bursts_and_throttles_during_outage() {
+        let gate = Arc::new(DialGate::new(2, Instant::now()));
+        let p1 = gate
+            .acquire(None, Duration::from_millis(200))
+            .await
+            .expect("first permit");
+        let p2 = gate
+            .acquire(None, Duration::from_millis(200))
+            .await
+            .expect("second permit");
+
+        // A 3rd normal burst dial queues instead of immediately failing, and
+        // succeeds as soon as one of the first two releases.
+        let gate_clone = Arc::clone(&gate);
+        let waiter =
+            tokio::spawn(async move { gate_clone.acquire(None, Duration::from_millis(500)).await });
+        tokio::time::sleep(Duration::from_millis(15)).await;
         drop(p1);
+        let p3 = waiter.await.expect("join").expect("queued burst permit");
         drop(p2);
+        drop(p3);
 
         let activity = TunnelActivity::new();
         for _ in 0..OUTAGE_BACKOFF_STREAK {
             activity.record_dial_failure(test_failure());
         }
+        assert_eq!(DialGate::outage_backoff_ms(OUTAGE_BACKOFF_STREAK), 1_000);
+        assert_eq!(
+            DialGate::outage_backoff_ms(OUTAGE_BACKOFF_STREAK + 1),
+            2_000
+        );
+        assert_eq!(
+            DialGate::outage_backoff_ms(OUTAGE_BACKOFF_STREAK + 3),
+            5_000
+        );
+
         // First call during outage gets the single probe permit; immediate second fast-fails.
         let probe = gate
-            .try_acquire(Some(&activity))
+            .acquire(Some(&activity), Duration::from_millis(200))
+            .await
             .expect("initial outage probe");
         assert!(
-            gate.try_acquire(Some(&activity)).is_none(),
+            gate.acquire(Some(&activity), Duration::from_millis(200))
+                .await
+                .is_none(),
             "subsequent dials fast-fail during outage backoff window"
         );
         drop(probe);
@@ -1646,22 +1592,10 @@ mod tests {
         // Once a dial succeeds, backoff clears immediately.
         activity.record_dial_success(15);
         gate.record_success();
-        assert!(gate.try_acquire(Some(&activity)).is_some());
-    }
-
-    #[test]
-    fn idle_relay_registry_evicts_oldest_idle_only() {
-        let registry = Arc::new(IdleRelayRegistry::new());
-        let (_g1, _a1, rx1) = registry.register(1_000);
-        let (_g2, _a2, rx2) = registry.register(50_000);
-
-        // Neither is idle >= 60_000 ms at t=60_000.
-        assert!(!registry.evict_oldest_idle(60_000, 60_000));
-        assert!(!*rx1.borrow() && !*rx2.borrow());
-
-        // At t=70_000, g1 is idle 69_000 ms (>= 60_000) while g2 is only 20_000 ms.
-        assert!(registry.evict_oldest_idle(70_000, 60_000));
-        assert!(*rx1.borrow());
-        assert!(!*rx2.borrow());
+        assert!(
+            gate.acquire(Some(&activity), Duration::from_millis(200))
+                .await
+                .is_some()
+        );
     }
 }

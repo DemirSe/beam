@@ -93,6 +93,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
+            // Ignore a stale disconnect from a previous dead binding after rebind succeeded.
+            if (boundBinder?.isBinderAlive == true) return
             unlinkBinderDeath()
             beam = null
             _status.value = BeamStatus(VpnState.DISCONNECTED)

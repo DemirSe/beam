@@ -202,17 +202,44 @@ class QrScannerActivity : AppCompatActivity() {
         val needed = outWidth * outHeight
         if (rotatedBuffer.size < needed) rotatedBuffer = ByteArray(needed)
         val out = rotatedBuffer
-        for (y in 0 until height) {
-            val row = y * rowStride
-            if (row + (width - 1) * pixelStride >= dataLen) return null
-            for (x in 0 until width) {
-                val value = data[row + x * pixelStride]
-                out[when (rotation) {
-                    90 -> x * outWidth + (height - 1 - y)
-                    180 -> (height - 1 - y) * width + (width - 1 - x)
-                    270 -> (width - 1 - x) * outWidth + y
-                    else -> y * width + x
-                }] = value
+        if (height > 0 && (height - 1) * rowStride + (width - 1) * pixelStride >= dataLen) {
+            return null
+        }
+        when (rotation) {
+            90 -> {
+                for (y in 0 until height) {
+                    val row = y * rowStride
+                    val dstCol = height - 1 - y
+                    for (x in 0 until width) {
+                        out[x * outWidth + dstCol] = data[row + x * pixelStride]
+                    }
+                }
+            }
+            180 -> {
+                for (y in 0 until height) {
+                    val row = y * rowStride
+                    val dstRow = (height - 1 - y) * width
+                    for (x in 0 until width) {
+                        out[dstRow + (width - 1 - x)] = data[row + x * pixelStride]
+                    }
+                }
+            }
+            270 -> {
+                for (y in 0 until height) {
+                    val row = y * rowStride
+                    for (x in 0 until width) {
+                        out[(width - 1 - x) * outWidth + y] = data[row + x * pixelStride]
+                    }
+                }
+            }
+            else -> {
+                for (y in 0 until height) {
+                    val row = y * rowStride
+                    val dstRow = y * width
+                    for (x in 0 until width) {
+                        out[dstRow + x] = data[row + x * pixelStride]
+                    }
+                }
             }
         }
         return PlanarYUVLuminanceSource(out, outWidth, outHeight, 0, 0, outWidth, outHeight, false)

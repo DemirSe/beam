@@ -257,27 +257,7 @@ jobs:
             ${{ env.KVM_AVAILABLE == '0' && '-accel off' || '' }}
             -no-snapshot-save -no-window -gpu swiftshader_indirect
             -noaudio -no-boot-anim
-          script: |
-            set -euo pipefail
-            cd clients/android
-            ./gradlew -Pbeam.includeX86_64=true connectedDebugAndroidTest || {
-              echo '=== instrumentation results ==='
-              find app/build/outputs/androidTest-results -name '*.xml' -print -exec cat {} +
-              exit 1
-            }
-            # Install and launch the R8-minified release APK to verify ProGuard/JNI/AIDL at runtime.
-            adb uninstall com.beam.android || true
-            adb logcat -b crash -c || true
-            adb install -r app/build/outputs/apk/release/app-release.apk
-            adb shell am start -W -n com.beam.android/.ui.MainActivity
-            sleep 10
-            adb shell pidof com.beam.android || { echo "error: release com.beam.android died after launch"; adb logcat -d -t 200; exit 1; }
-            if adb shell logcat -b crash -d | grep -q "com.beam.android"; then
-              echo "error: crash detected in release APK"
-              adb shell logcat -b crash -d
-              exit 1
-            fi
-            adb shell dumpsys meminfo com.beam.android | head -n 25
+          script: bash scripts/android-emulator-smoke.sh
 
       - name: Upload emulator test reports
         if: failure()

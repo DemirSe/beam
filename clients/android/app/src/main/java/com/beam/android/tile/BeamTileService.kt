@@ -35,8 +35,9 @@ import java.util.concurrent.Executors
 class BeamTileService : TileService() {
 
     @Volatile private var service: IBeamVpnService? = null
+    @Volatile private var lastRegisteredService: IBeamVpnService? = null
     @Volatile private var isListening: Boolean = false
-    @Volatile private var cachedHasProfile: Boolean = true
+    @Volatile private var cachedHasProfile: Boolean = false
     private var isBound = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -65,7 +66,9 @@ class BeamTileService : TileService() {
             pendingToggle = false
             runOnWorker {
                 if (!isListening) return@runOnWorker
-                runCatching { bound.registerCallback(stateCallback) }
+                if (runCatching { bound.registerCallback(stateCallback) }.isSuccess) {
+                    lastRegisteredService = bound
+                }
                 if (shouldToggle) {
                     performToggle(bound)
                 } else {
@@ -113,7 +116,10 @@ class BeamTileService : TileService() {
             // Queue unregister on the same single-threaded worker so it always
             // executes AFTER any in-flight registerCallback() from onServiceConnected().
             if (bound != null) {
-                runOnWorker { runCatching { bound.unregisterCallback(stateCallback) } }
+                runOnWorker {
+                    runCatching { bound.unregisterCallback(stateCallback) }
+                    if (lastRegisteredService === bound) lastRegisteredService = null
+                }
             }
             runCatching { unbindService(serviceConnection) }
             isBound = false
@@ -123,6 +129,17 @@ class BeamTileService : TileService() {
 
     override fun onDestroy() {
         isListening = false
+        // Unregister synchronously before shutdownNow() discards any queued worker task.
+        val registered = lastRegisteredService ?: service
+        lastRegisteredService = null
+        service = null
+        if (registered != null) {
+            runCatching { registered.unregisterCallback(stateCallback) }
+        }
+        if (isBound) {
+            runCatching { unbindService(serviceConnection) }
+            isBound = false
+        }
         worker.shutdownNow()
         super.onDestroy()
     }

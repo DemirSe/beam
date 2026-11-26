@@ -25,14 +25,17 @@ class NetworkMonitor(
     private val handler = Handler(Looper.getMainLooper())
     private var pending: Runnable? = null
     private var pendingLoss: Runnable? = null
+    @Volatile private var stopped: Boolean = false
     @Volatile private var lastNetworkHandle: Long? = null
     @Volatile private var lastValidated: Boolean = false
 
     fun start() {
+        stopped = false
         connectivityManager.registerDefaultNetworkCallback(this)
     }
 
     fun stop() {
+        stopped = true
         pending?.let(handler::removeCallbacks)
         pending = null
         pendingLoss?.let(handler::removeCallbacks)
@@ -47,6 +50,7 @@ class NetworkMonitor(
     }
 
     override fun onAvailable(network: Network) {
+        if (stopped) return
         val handle = network.networkHandle
         val previous = lastNetworkHandle
         if (previous == handle) {
@@ -61,6 +65,7 @@ class NetworkMonitor(
     }
 
     override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+        if (stopped) return
         val handle = network.networkHandle
         val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
         val sameNetwork = (lastNetworkHandle == handle)
@@ -78,6 +83,7 @@ class NetworkMonitor(
     }
 
     override fun onLost(network: Network) {
+        if (stopped) return
         if (lastNetworkHandle != null && lastNetworkHandle != network.networkHandle) return
         // A queued switch to the lost network must not apply afterwards.
         pending?.let(handler::removeCallbacks)
@@ -86,6 +92,7 @@ class NetworkMonitor(
         pendingLoss?.let(handler::removeCallbacks)
         val r = Runnable {
             pendingLoss = null
+            if (stopped) return@Runnable
             lastNetworkHandle = null
             lastValidated = false
             onNetworkLost()
@@ -95,11 +102,13 @@ class NetworkMonitor(
     }
 
     private fun debounce(network: Network) {
+        if (stopped) return
         pendingLoss?.let(handler::removeCallbacks)
         pendingLoss = null
         pending?.let(handler::removeCallbacks)
         val r = Runnable {
             pending = null
+            if (stopped) return@Runnable
             onNetworkSwitch(network)
         }
         pending = r

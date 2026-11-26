@@ -5,6 +5,9 @@
 -keep class com.beam.android.vpn.NativeStateListener {
     *;
 }
+-keepclassmembers class * implements com.beam.android.vpn.NativeStateListener {
+    public void onNativeStateChanged(int, java.lang.String);
+}
 
 # Rust calls VpnService.protect(int) via JNI by name and signature.
 -keepclassmembers class * extends android.net.VpnService {
