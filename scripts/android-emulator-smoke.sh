@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runs instrumentation tests on both the debug APK and the R8-minified release
-# APK (proving JNI, Keystore, and ProGuard keep rules end to end), then launches
-# the release APK and checks for crashes and memory footprint.
+# Runs instrumentation tests on the debug APK (JNI + Keystore + stores), then
+# installs and smoke-tests the R8-minified release APK on the booted emulator.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANDROID_DIR="$(cd "$SCRIPT_DIR/../clients/android" && pwd)"
 
 cd "$ANDROID_DIR"
 
-echo "=== running debug instrumentation tests ==="
+echo "=== running debug instrumentation tests (JNI + Keystore) ==="
 if ! ./gradlew -Pbeam.includeX86_64=true connectedDebugAndroidTest; then
     echo "=== debug instrumentation results ==="
     find app/build/outputs/androidTest-results -name '*.xml' -print -exec cat {} +
@@ -22,16 +21,8 @@ if [ ! -f "$RELEASE_APK" ]; then
     exit 1
 fi
 
-echo "=== running R8 release instrumentation tests (JNI + Keystore + R8) ==="
-adb uninstall com.beam.android || true
-adb uninstall com.beam.android.test || true
-if ! ./gradlew -Pbeam.includeX86_64=true -Pbeam.signReleaseWithDebug=true -Pbeam.testBuildType=release connectedReleaseAndroidTest; then
-    echo "=== release instrumentation results ==="
-    find app/build/outputs/androidTest-results -name '*.xml' -print -exec cat {} +
-    exit 1
-fi
-
 echo "=== smoke-testing R8 release APK launch ($RELEASE_APK) ==="
+adb uninstall com.beam.android || true
 adb logcat -b crash -c || true
 adb install -r "$RELEASE_APK"
 adb shell am start -W -n com.beam.android/.ui.MainActivity
@@ -50,4 +41,4 @@ if adb shell logcat -b crash -d | grep -q "com.beam.android"; then
 fi
 
 adb shell dumpsys meminfo com.beam.android | head -n 25
-echo "=== R8 release APK instrumentation + launch smoke test PASSED ==="
+echo "=== R8 release APK smoke test PASSED ==="

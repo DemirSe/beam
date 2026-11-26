@@ -16,6 +16,8 @@ import com.beam.android.storage.EncryptedProfileStore
 import com.beam.android.storage.SettingsStore
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -57,6 +59,8 @@ class BeamVpnService : VpnService() {
     private lateinit var notifications: VpnNotificationManager
     private val callbacks = RemoteCallbackList<IBeamStateCallback>()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /** Dedicated non-cancellable executor for releasing detached engines/TUN fds. */
+    private val cleanupExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     /** Serialises establish()/nativeStart() against teardown(). */
     private val stateLock = Any()
@@ -191,14 +195,13 @@ class BeamVpnService : VpnService() {
             VpnNotificationManager.NOTIFICATION_ID,
             notifications.build(VpnState.CONNECTING, ""),
         )
+        // Always release any detached previous engine/TUN on the dedicated
+        // cleanup executor so cancelling connectJob or serviceScope can never
+        // leak an old Rust runtime or TUN descriptor.
+        scheduleRelease(previous)
         synchronized(stateLock) {
             if (connectGeneration.get() == myGen) {
-                connectJob = serviceScope.launch {
-                    releaseResources(previous)
-                    runConnect(profileId, myGen)
-                }
-            } else {
-                serviceScope.launch { releaseResources(previous) }
+                connectJob = serviceScope.launch { runConnect(profileId, myGen) }
             }
         }
         // Claim a started-service reference so unbinding MainActivity / TileService
@@ -420,7 +423,7 @@ class BeamVpnService : VpnService() {
         }
         val released: ReleasedResources
         synchronized(stateLock) {
-            if (expectedGen != null && connectGeneration.get() != expectedGen) return
+            if (connectGeneration.get() != myGen) return
             connectJob?.cancel()
             connectJob = null
             if (state != VpnState.DISCONNECTED) setState(VpnState.DISCONNECTING, "")
@@ -448,8 +451,21 @@ class BeamVpnService : VpnService() {
             detachResources()
         }
         releaseResources(released)
+        // Graceful shutdown (not shutdownNow) so any already-queued previous
+        // engine release finishes nativeStop() + tun.close().
+        cleanupExecutor.shutdown()
         callbacks.kill()
         super.onDestroy()
+    }
+
+    private fun scheduleRelease(released: ReleasedResources) {
+        if (released.handle == 0L && released.tun == null && !released.stopForeground) return
+        if (cleanupExecutor.isShutdown) {
+            releaseResources(released)
+            return
+        }
+        runCatching { cleanupExecutor.execute { releaseResources(released) } }
+            .onFailure { releaseResources(released) }
     }
 
     /**

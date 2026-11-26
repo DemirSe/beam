@@ -135,7 +135,13 @@ jobs:
             $SIGN_FLAG \
             testDebugUnitTest lintDebug lintRelease assembleDebug assembleRelease
           ls -lh app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk
-          test -f app/build/outputs/mapping/release/mapping.txt
+          MAPPING="app/build/outputs/mapping/release/mapping.txt"
+          test -f "$MAPPING"
+          # Verify R8 kept all JNI and cross-process AIDL contracts intact.
+          grep -q 'com\.beam\.android\.vpn\.BeamNativeBridge -> com\.beam\.android\.vpn\.BeamNativeBridge:' "$MAPPING"
+          grep -q 'com\.beam\.android\.vpn\.NativeStateListener -> com\.beam\.android\.vpn\.NativeStateListener:' "$MAPPING"
+          grep -q 'void onNativeStateChanged(int,java\.lang\.String) -> onNativeStateChanged' "$MAPPING"
+          grep -q 'com\.beam\.android\.ipc\.IBeamVpnService -> com\.beam\.android\.ipc\.IBeamVpnService:' "$MAPPING"
 
       - name: Upload debug APK (installable on device)
         uses: actions/upload-artifact@v4
