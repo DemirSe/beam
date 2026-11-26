@@ -1,9 +1,12 @@
 package com.beam.android.storage
 
 import android.content.Context
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import java.io.File
 import java.io.FileOutputStream
+import javax.crypto.AEADBadTagException
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 
 /**
@@ -63,23 +66,8 @@ class EncryptedProfileStore(context: Context) {
     private fun activeIdOf(payload: JSONObject?): String? =
         payload?.optString("active_id")?.ifBlank { null }
 
-    private fun readAll(payload: JSONObject? = readPayload()): List<VlessProfile> {
-        if (payload == null) return emptyList()
-        val out = mutableListOf<VlessProfile>()
-        val arr = payload.optJSONArray("profiles") ?: JSONArray()
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            out += VlessProfile(
-                id = o.optString("id"),
-                name = o.optString("name"),
-                uri = o.optString("uri"),
-                serverHost = o.optString("server_host"),
-                serverPort = o.optInt("server_port", 443),
-                createdAtMs = o.optLong("created_at_ms"),
-            )
-        }
-        return out
-    }
+    private fun readAll(payload: JSONObject? = readPayload()): List<VlessProfile> =
+        parseProfiles(payload)
 
     private fun writeAll(profiles: List<VlessProfile>, activeId: String?) {
         val arr = JSONArray()
@@ -117,9 +105,15 @@ class EncryptedProfileStore(context: Context) {
         if (bytes.isEmpty()) return null
         return try {
             JSONObject(String(ProfileCrypto.decrypt(bytes), Charsets.UTF_8))
-        } catch (_: Exception) {
-            quarantineCorruptStore()
-            null
+        } catch (e: Exception) {
+            // Only quarantine on permanent ciphertext/key/JSON corruption.
+            // Transient Keystore/TEE hiccups must rethrow without wiping profiles.enc.
+            if (isPermanentCorruption(e)) {
+                quarantineCorruptStore()
+                null
+            } else {
+                throw e
+            }
         }
     }
 
@@ -131,5 +125,34 @@ class EncryptedProfileStore(context: Context) {
         val target = File(dir, "profiles.enc.corrupt-${System.currentTimeMillis()}")
         val moved = runCatching { dataFile.renameTo(target) }.getOrDefault(false)
         if (!moved) runCatching { dataFile.delete() }
+    }
+
+    internal companion object {
+        fun isPermanentCorruption(e: Throwable): Boolean =
+            e is AEADBadTagException ||
+                e is KeyPermanentlyInvalidatedException ||
+                e is IllegalArgumentException ||
+                e is JSONException
+
+        fun parseProfiles(payload: JSONObject?): List<VlessProfile> {
+            if (payload == null) return emptyList()
+            val out = mutableListOf<VlessProfile>()
+            val arr = payload.optJSONArray("profiles") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val id = o.optString("id")
+                val uri = o.optString("uri")
+                if (id.isBlank() || uri.isBlank()) continue
+                out += VlessProfile(
+                    id = id,
+                    name = o.optString("name"),
+                    uri = uri,
+                    serverHost = o.optString("server_host"),
+                    serverPort = o.optInt("server_port", 443),
+                    createdAtMs = o.optLong("created_at_ms"),
+                )
+            }
+            return out
+        }
     }
 }

@@ -262,6 +262,8 @@ pub struct TunnelActivity {
     last_failure_kind: AtomicU64,
     /// Number of currently active proxied TCP relay tasks.
     active_tcp_flows: AtomicU64,
+    /// Number of currently active proxied UDP NAT sessions.
+    active_udp_sessions: Arc<AtomicU64>,
     /// Total proxied TCP payload bytes written upstream (client -> server).
     bytes_tx: AtomicU64,
     /// Total proxied TCP payload bytes read from upstream (server -> client).
@@ -283,6 +285,7 @@ impl TunnelActivity {
             last_failure_stage: AtomicU64::new(0),
             last_failure_kind: AtomicU64::new(0),
             active_tcp_flows: AtomicU64::new(0),
+            active_udp_sessions: Arc::new(AtomicU64::new(0)),
             bytes_tx: AtomicU64::new(0),
             bytes_rx: AtomicU64::new(0),
             drops: OnceLock::new(),
@@ -346,9 +349,24 @@ impl TunnelActivity {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
 
+    /// Clears the consecutive failure streak (e.g. after a network handoff so
+    /// a dead previous network does not throttle dials on the new network).
+    pub fn reset_failure_streak(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
     /// Number of currently active proxied TCP relay flows.
     pub fn active_tcp_flows(&self) -> u64 {
         self.active_tcp_flows.load(Ordering::Relaxed)
+    }
+
+    /// Number of currently active proxied UDP NAT sessions.
+    pub fn active_udp_sessions(&self) -> u64 {
+        self.active_udp_sessions.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn udp_session_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.active_udp_sessions)
     }
 
     /// Total proxied TCP payload bytes sent upstream (client -> server).
@@ -631,12 +649,15 @@ where
     if let Some(tracker) = activity.as_ref() {
         tracker.attach_drop_counters(Arc::clone(&drops));
     }
-    let mut udp_bridge = UdpNatBridge::new(
+    let mut udp_bridge = UdpNatBridge::with_session_counter(
         config.client.clone(),
         config.udp,
         tun_tx.clone(),
         Arc::clone(&stack_waker),
         Arc::clone(&drops),
+        activity
+            .as_ref()
+            .map(|tracker| tracker.udp_session_counter()),
     );
     let dns_interceptor = config
         .dns
@@ -745,6 +766,10 @@ where
                     stack.recycle_tx_buf(pkt);
                 }
                 udp_bridge.reset();
+                dial_gate.record_success();
+                if let Some(tracker) = activity.as_ref() {
+                    tracker.reset_failure_streak();
+                }
                 if let Some(dns) = dns_interceptor.as_ref() {
                     dns.on_network_change();
                 }
@@ -1113,7 +1138,7 @@ fn spawn_tcp_relay(
                         if let Some(suppressed) = DIAL_FAILURE_LOG.allow() {
                             warn!(
                                 dst = %conn.dst,
-                                server = %client_config.server_addr,
+                                server = %client_config.resolved_server_addr(),
                                 error = %err,
                                 stage = failure.stage.as_str(),
                                 kind = failure.kind.as_str(),
@@ -1677,6 +1702,32 @@ mod tests {
             gate.acquire(Some(&activity), Duration::from_millis(200))
                 .await
                 .is_some()
+        );
+
+        // Network reset clears outage backoff and consecutive failure streak
+        // without waiting for an old outage probe window to expire.
+        for _ in 0..OUTAGE_BACKOFF_STREAK {
+            activity.record_dial_failure(test_failure());
+        }
+        let probe2 = gate
+            .acquire(Some(&activity), Duration::from_millis(200))
+            .await
+            .expect("second outage probe");
+        assert!(
+            gate.acquire(Some(&activity), Duration::from_millis(200))
+                .await
+                .is_none()
+        );
+        drop(probe2);
+
+        activity.reset_failure_streak();
+        gate.record_success();
+        assert_eq!(activity.consecutive_failure_count(), 0);
+        assert!(
+            gate.acquire(Some(&activity), Duration::from_millis(200))
+                .await
+                .is_some(),
+            "network reset must immediately allow dials on the new network"
         );
     }
 

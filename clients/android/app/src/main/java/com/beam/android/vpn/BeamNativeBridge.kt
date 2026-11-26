@@ -31,6 +31,8 @@ object BeamNativeBridge {
 
     @JvmStatic external fun nativeNotifyNetworkChange(handle: Long)
 
+    @JvmStatic external fun nativeNotifyNetworkChangeWithServerIp(handle: Long, serverIp: String?)
+
     @JvmStatic external fun nativeRefreshState(handle: Long): Int
 
     @JvmStatic external fun nativePollTelemetry(handle: Long): String?

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="profiles.enc" />
+        <exclude domain="file" path="profiles.lock" />
+        <exclude domain="file" path="settings.json" />
+        <exclude domain="file" path="settings.lock" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="profiles.enc" />
+        <exclude domain="file" path="profiles.lock" />
+        <exclude domain="file" path="settings.json" />
+        <exclude domain="file" path="settings.lock" />
+    </device-transfer>
+</data-extraction-rules>

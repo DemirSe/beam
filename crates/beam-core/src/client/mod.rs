@@ -13,8 +13,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -65,6 +65,9 @@ pub const STAGE_VLESS_FLUSH: &str = "VLESS request flush";
 pub struct BeamClientConfig {
     /// Server TCP address (`ip:port`).
     pub server_addr: SocketAddr,
+    /// Optional dynamically updated server address shared across tasks (e.g.
+    /// Android Wi-Fi IPv4 <-> 5G IPv6/NAT64 transitions for hostname profiles).
+    pub server_addr_override: Option<Arc<RwLock<SocketAddr>>>,
     /// REALITY client parameters (public key, short id, cover SNI).
     pub reality: RealityClientConfig,
     /// Raw 16-byte VLESS user UUID.
@@ -89,6 +92,7 @@ impl BeamClientConfig {
     pub fn new(server_addr: SocketAddr, reality: RealityClientConfig, user_id: [u8; 16]) -> Self {
         Self {
             server_addr,
+            server_addr_override: None,
             reality,
             user_id,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -99,12 +103,21 @@ impl BeamClientConfig {
             keepalive_count: Some(DEFAULT_KEEPALIVE_COUNT),
         }
     }
+
+    /// Returns the active server address, preferring `server_addr_override` when
+    /// set (e.g. after a mobile network handoff re-resolves a hostname).
+    pub fn resolved_server_addr(&self) -> SocketAddr {
+        match &self.server_addr_override {
+            Some(slot) => *slot.read().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            None => self.server_addr,
+        }
+    }
 }
 
 impl fmt::Debug for BeamClientConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BeamClientConfig")
-            .field("server_addr", &self.server_addr)
+            .field("server_addr", &self.resolved_server_addr())
             .field("reality", &self.reality)
             .field("user_id", &"<redacted>")
             .field("handshake_timeout", &self.handshake_timeout)
@@ -176,8 +189,9 @@ pub(crate) async fn dial_vless(
     destination: Option<NetLocation>,
 ) -> Result<VlessClientStream<TlsStream>, ClientError> {
     let deadline = Instant::now() + config.handshake_timeout;
+    let server_addr = config.resolved_server_addr();
 
-    let tcp_socket = match config.server_addr {
+    let tcp_socket = match server_addr {
         SocketAddr::V4(_) => TcpSocket::new_v4(),
         SocketAddr::V6(_) => TcpSocket::new_v6(),
     }
@@ -197,7 +211,7 @@ pub(crate) async fn dial_vless(
         })?;
     }
 
-    let socket = timeout_at(deadline, tcp_socket.connect(config.server_addr))
+    let socket = timeout_at(deadline, tcp_socket.connect(server_addr))
         .await
         .map_err(|_| ClientError::Timeout {
             stage: STAGE_TCP_CONNECT,

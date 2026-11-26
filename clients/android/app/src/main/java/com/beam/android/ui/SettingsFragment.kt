@@ -15,6 +15,7 @@ import com.beam.android.R
 import com.beam.android.databinding.FragmentSettingsBinding
 import com.beam.android.storage.AppSettings
 import com.beam.android.storage.SettingsStore
+import com.beam.android.storage.SettingsValidator
 import com.beam.android.vpn.Ipv4RouteCalculator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -92,13 +93,14 @@ class SettingsFragment : Fragment() {
     }
 
     private fun save() {
-        val dohUrl = when {
+        val rawDohUrl = when {
             binding.radioDohNextDns.isChecked -> AppSettings.DOH_NEXTDNS
             binding.radioDohCustom.isChecked ->
                 binding.inputDohCustom.text?.toString()?.trim().orEmpty()
             else -> AppSettings.DOH_CLOUDFLARE
         }
-        if (!isValidDohUrl(dohUrl)) {
+        val dohUrl = SettingsValidator.normalizeAndValidateDohUrl(rawDohUrl)
+        if (dohUrl == null) {
             binding.dohCustomLayout.error = getString(R.string.settings_doh_invalid)
             return
         }
@@ -109,6 +111,11 @@ class SettingsFragment : Fragment() {
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .toList()
+        if (cidrs.size > SettingsValidator.MAX_BYPASS_CIDRS) {
+            binding.bypassLayout.error =
+                getString(R.string.settings_bypass_too_many, SettingsValidator.MAX_BYPASS_CIDRS)
+            return
+        }
         val allowIpv6 = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
         val invalid = cidrs.firstOrNull { !Ipv4RouteCalculator.isValidCidr(it, allowIpv6) }
         if (invalid != null) {
@@ -163,12 +170,6 @@ class SettingsFragment : Fragment() {
                 toast(R.string.settings_save_failed)
             }
         }
-    }
-
-    private fun isValidDohUrl(url: String): Boolean {
-        if (url.isBlank()) return false
-        val parsed = runCatching { android.net.Uri.parse(url) }.getOrNull() ?: return false
-        return parsed.scheme?.equals("https", ignoreCase = true) == true && !parsed.host.isNullOrBlank()
     }
 
     private fun openSystemSettings(action: String) {

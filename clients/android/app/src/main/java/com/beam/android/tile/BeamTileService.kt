@@ -152,7 +152,10 @@ class BeamTileService : TileService() {
     override fun onClick() {
         val connected = isActive(lastState)
         // Optimistic: the panel must react before the binder round trip ends.
-        updateTile(if (connected) VpnState.DISCONNECTING else VpnState.CONNECTING, hasProfile = true)
+        updateTile(
+            if (connected) VpnState.DISCONNECTING else VpnState.CONNECTING,
+            hasProfile = cachedHasProfile,
+        )
 
         val current = service
         if (current == null) {

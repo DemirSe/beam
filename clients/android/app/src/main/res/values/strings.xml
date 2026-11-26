@@ -79,6 +79,7 @@
     <string name="settings_bypass_invalid">Invalid CIDR: %1$s</string>
     <string name="settings_bypass_ipv6_unsupported">IPv6 bypass (%1$s) needs Android 13 or newer. Use IPv4 CIDRs on this device.</string>
     <string name="settings_bypass_default_route">Bypassing %1$s would leak all traffic outside the tunnel.</string>
+    <string name="settings_bypass_too_many">At most %1$d bypass CIDRs are supported.</string>
     <string name="settings_bypass_reset">Reset to LAN defaults</string>
     <string name="settings_startup_title">Startup</string>
     <string name="settings_boot_title">Start on boot</string>
@@ -104,7 +105,10 @@
     <string name="vpn_error_consent">VPN permission was revoked. Tap Connect to grant it again.</string>
     <string name="vpn_error_profile">Selected profile could not be found.</string>
     <string name="vpn_error_native">The tunnel engine could not start. Check your profile and retry.</string>
+    <string name="vpn_error_dns">Could not resolve the server address. Check your network and retry.</string>
     <string name="vpn_error_generic">Could not establish the VPN tunnel.</string>
+    <string name="boot_start_failed_title">Could not reconnect after reboot</string>
+    <string name="boot_start_failed_body">Tap to open beam and start the tunnel.</string>
     <string name="reconnect_to_apply">Reconnect to apply changes.</string>
     <string name="action_reconnect">Reconnect</string>
     <string name="tile_label">beam</string>

@@ -1,10 +1,14 @@
 package com.beam.android.vpn
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.UserManager
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.beam.android.storage.EncryptedProfileStore
 import com.beam.android.storage.SettingsStore
 
@@ -31,7 +35,17 @@ class BootReceiver : BroadcastReceiver() {
                     .setAction(BeamVpnService.ACTION_START)
                 // An already connected service returns early in connect().
                 runCatching { appContext.startForegroundService(start) }
-                    .onFailure { Log.w(TAG, "startForegroundService failed", it) }
+                    .onFailure { err ->
+                        Log.w(TAG, "startForegroundService failed", err)
+                        val canNotify = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                            ContextCompat.checkSelfPermission(
+                                appContext,
+                                Manifest.permission.POST_NOTIFICATIONS,
+                            ) == PackageManager.PERMISSION_GRANTED
+                        if (canNotify) {
+                            runCatching { VpnNotificationManager(appContext).notifyBootStartFailed() }
+                        }
+                    }
             } finally {
                 pendingResult.finish()
             }

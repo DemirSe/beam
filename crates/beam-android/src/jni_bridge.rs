@@ -301,6 +301,37 @@ pub extern "system" fn Java_com_beam_android_vpn_BeamNativeBridge_nativeNotifyNe
     }
 }
 
+/// Signals a network switch with an optional freshly resolved server IP (for
+/// hostname profiles transitioning across IPv4/IPv6/NAT64 networks).
+///
+/// # Safety
+///
+/// The JVM calls this with a valid `JNIEnv`. `handle` need not be known and
+/// `server_ip` may be `null`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_beam_android_vpn_BeamNativeBridge_nativeNotifyNetworkChangeWithServerIp<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JObject<'local>,
+    handle: jlong,
+    server_ip: JString<'local>,
+) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let updated_ip: Option<String> = if server_ip.as_raw().is_null() {
+            None
+        } else {
+            env.get_string(&server_ip).ok().map(Into::into)
+        };
+        if let Some(engine) = find(handle) {
+            engine.notify_network_change_with_server_ip(updated_ip.as_deref());
+        }
+    }));
+    if outcome.is_err() {
+        throw_illegal_state(&mut env, "beam engine panicked on network change");
+    }
+}
+
 /// Returns the current engine state code without serializing telemetry JSON.
 ///
 /// An unknown handle returns `STATE_DISCONNECTED` (`0`).

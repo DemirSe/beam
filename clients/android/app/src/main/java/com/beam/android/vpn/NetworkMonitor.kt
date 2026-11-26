@@ -16,6 +16,7 @@ class NetworkMonitor(
     private val connectivityManager: ConnectivityManager,
     private val onNetworkSwitch: (Network) -> Unit,
     private val onNetworkLost: () -> Unit,
+    private val onInitialNetwork: (Network) -> Unit = {},
 ) : ConnectivityManager.NetworkCallback() {
 
     companion object {
@@ -31,6 +32,18 @@ class NetworkMonitor(
 
     fun start() {
         stopped = false
+        // Seed baseline from the already-active default network so the immediate
+        // onAvailable()/onCapabilitiesChanged() delivered by registerDefaultNetworkCallback()
+        // does not fire a spurious network_reset ~300 ms after every VPN connect.
+        val active = runCatching { connectivityManager.activeNetwork }.getOrNull()
+        if (active != null) {
+            lastNetworkHandle = active.networkHandle
+            lastValidated = runCatching {
+                connectivityManager.getNetworkCapabilities(active)
+                    ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+            }.getOrDefault(false)
+            onInitialNetwork(active)
+        }
         connectivityManager.registerDefaultNetworkCallback(this)
     }
 

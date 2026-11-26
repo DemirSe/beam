@@ -19,6 +19,7 @@ class VpnNotificationManager(private val context: Context) {
     companion object {
         const val CHANNEL_ID = "beam_vpn"
         const val NOTIFICATION_ID = 1
+        const val BOOT_FAILURE_NOTIFICATION_ID = 2
     }
 
     private val manager: NotificationManager =
@@ -81,5 +82,25 @@ class VpnNotificationManager(private val context: Context) {
 
     fun cancel() {
         manager.cancel(NOTIFICATION_ID)
+    }
+
+    fun notifyBootStartFailed() {
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pending = PendingIntent.getActivity(
+            context,
+            2,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_vpn_notification)
+            .setContentTitle(context.getString(R.string.boot_start_failed_title))
+            .setContentText(context.getString(R.string.boot_start_failed_body))
+            .setContentIntent(pending)
+            .setAutoCancel(true)
+            .build()
+        runCatching { manager.notify(BOOT_FAILURE_NOTIFICATION_ID, notification) }
     }
 }

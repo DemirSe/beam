@@ -5,8 +5,9 @@
 //! telemetry on demand, so an idle tunnel holds no timer and no wakeup.
 
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use beam_core::client::SocketProtector;
@@ -104,6 +105,7 @@ pub struct AndroidEngine {
     runtime: Mutex<Option<Runtime>>,
     shutdown_tx: watch::Sender<bool>,
     network_reset_tx: watch::Sender<u64>,
+    server_addr_override: Arc<RwLock<SocketAddr>>,
     telemetry: Arc<EngineTelemetry>,
     state: Arc<AtomicU8>,
     stopped: Arc<AtomicBool>,
@@ -144,7 +146,10 @@ impl AndroidEngine {
         let tun = AndroidTun::new(tun, config.mtu)?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (network_reset_tx, network_reset_rx) = watch::channel(0_u64);
-        let engine_config = config.build_engine_config(socket_protector, Some(network_reset_rx))?;
+        let mut engine_config =
+            config.build_engine_config(socket_protector, Some(network_reset_rx))?;
+        let server_addr_override = Arc::new(RwLock::new(engine_config.client.server_addr));
+        engine_config.client.server_addr_override = Some(Arc::clone(&server_addr_override));
         let telemetry = Arc::new(if engine_config.dns.is_some() {
             EngineTelemetry::with_dns()
         } else {
@@ -200,6 +205,7 @@ impl AndroidEngine {
             runtime: Mutex::new(Some(runtime)),
             shutdown_tx,
             network_reset_tx,
+            server_addr_override,
             telemetry,
             state,
             stopped,
@@ -211,6 +217,28 @@ impl AndroidEngine {
     /// Bumps the network-reset generation so the engine resets TCP flows,
     /// XUDP sessions, and the local DNS cache after a network switch.
     pub fn notify_network_change(&self) {
+        self.notify_network_change_with_server_ip(None);
+    }
+
+    /// Updates the upstream server IP (preserving the configured port) when a
+    /// freshly resolved address is provided, then bumps the network-reset
+    /// generation so active flows re-dial over the new network.
+    pub fn notify_network_change_with_server_ip(&self, new_server_ip: Option<&str>) {
+        if let Some(raw) = new_server_ip.map(str::trim).filter(|s| !s.is_empty()) {
+            match raw.parse::<IpAddr>() {
+                Ok(ip) => {
+                    let mut slot = self
+                        .server_addr_override
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let port = slot.port();
+                    *slot = SocketAddr::new(ip, port);
+                }
+                Err(_) => {
+                    tracing::warn!("ignoring invalid server_ip update on network change");
+                }
+            }
+        }
         self.network_reset_tx.send_modify(|generation| {
             *generation = generation.wrapping_add(1);
         });
@@ -261,7 +289,7 @@ impl AndroidEngine {
         let last_rtt_ms = activity.recent_rtt(RTT_MAX_AGE);
         json!({
             "active_tcp_flows": activity.active_tcp_flows(),
-            "active_udp_sessions": 0,
+            "active_udp_sessions": activity.active_udp_sessions(),
             "bytes_tx": activity.bytes_tx(),
             "bytes_rx": activity.bytes_rx(),
             "last_rtt_ms": last_rtt_ms,
@@ -525,5 +553,36 @@ mod tests {
         assert_eq!(android_worker_threads_from(3), 3);
         assert_eq!(android_worker_threads_from(4), 4);
         assert_eq!(android_worker_threads_from(16), 4);
+    }
+
+    #[test]
+    fn network_change_updates_server_ip_override_and_ignores_invalid() {
+        let (engine, _peer) = test_engine(None);
+        let original = *engine
+            .server_addr_override
+            .read()
+            .expect("server_addr_override read");
+        assert_eq!(original.port(), 443);
+
+        engine.notify_network_change_with_server_ip(Some("2001:db8::42"));
+        let updated = *engine
+            .server_addr_override
+            .read()
+            .expect("server_addr_override read");
+        assert_eq!(
+            updated,
+            SocketAddr::new("2001:db8::42".parse().expect("v6"), original.port())
+        );
+
+        // Invalid IP strings must be ignored without corrupting the stored address.
+        engine.notify_network_change_with_server_ip(Some("not-an-ip"));
+        assert_eq!(
+            *engine
+                .server_addr_override
+                .read()
+                .expect("server_addr_override read"),
+            updated
+        );
+        engine.stop();
     }
 }

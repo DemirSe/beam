@@ -69,12 +69,49 @@ mod mobile_tests {
         assert_eq!(cfg.max_sessions, 128);
         assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
     }
+
+    #[test]
+    fn active_udp_session_guard_tracks_lifecycle() {
+        let counter = Arc::new(AtomicU64::new(0));
+        {
+            let _g1 = ActiveUdpSessionGuard::enter(Some(&counter));
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+            {
+                let _g2 = ActiveUdpSessionGuard::enter(Some(&counter));
+                assert_eq!(counter.load(Ordering::Relaxed), 2);
+            }
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
 }
 
 struct NatEntry {
     tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     last_active_ms: Arc<AtomicU64>,
     task: JoinHandle<()>,
+}
+
+struct ActiveUdpSessionGuard {
+    counter: Option<Arc<AtomicU64>>,
+}
+
+impl ActiveUdpSessionGuard {
+    fn enter(counter: Option<&Arc<AtomicU64>>) -> Self {
+        let counter = counter.map(|c| {
+            c.fetch_add(1, Ordering::Relaxed);
+            Arc::clone(c)
+        });
+        Self { counter }
+    }
+}
+
+impl Drop for ActiveUdpSessionGuard {
+    fn drop(&mut self) {
+        if let Some(counter) = self.counter.as_ref() {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Bridges TUN UDP packets (IPv4 and IPv6) over a shared [`XudpClient`] mux,
@@ -93,6 +130,7 @@ pub struct UdpNatBridge {
     pending_initial: VecDeque<(SocketAddr, SocketAddr, Vec<u8>)>,
     sessions: HashMap<SocketAddr, NatEntry>,
     drops: Arc<DropCounters>,
+    active_sessions: Option<Arc<AtomicU64>>,
 }
 
 impl UdpNatBridge {
@@ -105,6 +143,19 @@ impl UdpNatBridge {
         tun_tx: mpsc::Sender<Vec<u8>>,
         waker: Arc<Notify>,
         drops: Arc<DropCounters>,
+    ) -> Self {
+        Self::with_session_counter(client_config, bridge_config, tun_tx, waker, drops, None)
+    }
+
+    /// Creates a new UDP NAT bridge with an optional lock-free active session
+    /// counter updated via an RAII guard on each session task.
+    pub fn with_session_counter(
+        client_config: BeamClientConfig,
+        bridge_config: UdpBridgeConfig,
+        tun_tx: mpsc::Sender<Vec<u8>>,
+        waker: Arc<Notify>,
+        drops: Arc<DropCounters>,
+        active_sessions: Option<Arc<AtomicU64>>,
     ) -> Self {
         Self {
             start: Instant::now(),
@@ -120,6 +171,7 @@ impl UdpNatBridge {
             pending_initial: VecDeque::with_capacity(MAX_PENDING_CONNECT_DATAGRAMS),
             sessions: HashMap::new(),
             drops,
+            active_sessions,
         }
     }
 
@@ -264,8 +316,10 @@ impl UdpNatBridge {
         let last_active_ms = Arc::new(AtomicU64::new(now_ms));
         let task_active = Arc::clone(&last_active_ms);
         let start = self.start;
+        let session_guard = ActiveUdpSessionGuard::enter(self.active_sessions.as_ref());
 
         let task = tokio::spawn(async move {
+            let _session_guard = session_guard;
             let mut last_dst = dst;
             // No idle timer here: `sweep_idle` expires the session and aborts
             // this task, so per-datagram timer churn is not needed.
