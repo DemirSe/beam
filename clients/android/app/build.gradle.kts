@@ -25,6 +25,15 @@ android {
     }
 
     signingConfigs {
+        getByName("debug") {
+            val ciDebugKs = file("${System.getProperty("user.home")}/.android/debug.keystore")
+            if (ciDebugKs.exists()) {
+                storeFile = ciDebugKs
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
         val ksPath = System.getenv("BEAM_KEYSTORE_PATH")
         if (!ksPath.isNullOrBlank()) {
             create("release") {
