@@ -329,18 +329,58 @@ pub fn build_ip_tcp_packet_slices(
     payload_a: &[u8],
     payload_b: &[u8],
 ) -> Option<Vec<u8>> {
+    let mut pkt = Vec::new();
+    if build_ip_tcp_packet_slices_into(
+        &mut pkt, src_ip, src_port, dst_ip, dst_port, seq, ack, flags, window, options, payload_a,
+        payload_b,
+    ) {
+        Some(pkt)
+    } else {
+        None
+    }
+}
+
+/// Builds a complete IPv4 or IPv6 TCP packet directly into a caller-supplied
+/// buffer `pkt`, reusing its allocation when capacity is already sufficient.
+///
+/// Returns `true` on success (with `pkt.len() == total_len`), or `false` on
+/// invalid arguments (leaving `pkt` cleared).
+#[allow(clippy::too_many_arguments)]
+pub fn build_ip_tcp_packet_slices_into(
+    pkt: &mut Vec<u8>,
+    src_ip: IpAddr,
+    src_port: u16,
+    dst_ip: IpAddr,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    options: &[u8],
+    payload_a: &[u8],
+    payload_b: &[u8],
+) -> bool {
+    pkt.clear();
     if options.len() > 40 || !options.len().is_multiple_of(4) {
-        return None;
+        return false;
     }
     let tcp_header_len = TCP_MIN_HEADER_LEN + options.len();
-    let payload_len = payload_a.len().checked_add(payload_b.len())?;
-    let tcp_len = tcp_header_len.checked_add(payload_len)?;
+    let Some(payload_len) = payload_a.len().checked_add(payload_b.len()) else {
+        return false;
+    };
+    let Some(tcp_len) = tcp_header_len.checked_add(payload_len) else {
+        return false;
+    };
 
     match (src_ip, dst_ip) {
         (IpAddr::V4(s4), IpAddr::V4(d4)) => {
-            let total_len = IPV4_MIN_HEADER_LEN.checked_add(tcp_len)?;
-            let total_len_u16 = u16::try_from(total_len).ok()?;
-            let mut pkt = vec![0u8; total_len];
+            let Some(total_len) = IPV4_MIN_HEADER_LEN.checked_add(tcp_len) else {
+                return false;
+            };
+            let Ok(total_len_u16) = u16::try_from(total_len) else {
+                return false;
+            };
+            pkt.resize(total_len, 0);
             pkt[0] = 0x45;
             pkt[2..4].copy_from_slice(&total_len_u16.to_be_bytes());
             pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
@@ -357,12 +397,16 @@ pub fn build_ip_tcp_packet_slices(
             );
             let tcp_cksum = l4_ipv4_checksum(s4, d4, IP_PROTO_TCP, tcp);
             tcp[16..18].copy_from_slice(&tcp_cksum.to_be_bytes());
-            Some(pkt)
+            true
         }
         (IpAddr::V6(s6), IpAddr::V6(d6)) => {
-            let tcp_len_u16 = u16::try_from(tcp_len).ok()?;
-            let total_len = IPV6_HEADER_LEN.checked_add(tcp_len)?;
-            let mut pkt = vec![0u8; total_len];
+            let Ok(tcp_len_u16) = u16::try_from(tcp_len) else {
+                return false;
+            };
+            let Some(total_len) = IPV6_HEADER_LEN.checked_add(tcp_len) else {
+                return false;
+            };
+            pkt.resize(total_len, 0);
             pkt[0] = 0x60; // version 6
             pkt[4..6].copy_from_slice(&tcp_len_u16.to_be_bytes());
             pkt[6] = IP_PROTO_TCP;
@@ -376,9 +420,9 @@ pub fn build_ip_tcp_packet_slices(
             );
             let tcp_cksum = l4_ipv6_checksum(s6, d6, IP_PROTO_TCP, tcp);
             tcp[16..18].copy_from_slice(&tcp_cksum.to_be_bytes());
-            Some(pkt)
+            true
         }
-        _ => None,
+        _ => false,
     }
 }
 

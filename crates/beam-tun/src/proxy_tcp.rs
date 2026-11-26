@@ -13,7 +13,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::packet::{
     IP_PROTO_TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, build_ip_tcp_packet_slices,
-    parse_ip, parse_tcp, parse_tcp_syn_options,
+    build_ip_tcp_packet_slices_into, parse_ip, parse_tcp, parse_tcp_syn_options,
 };
 use crate::stack::{
     AcceptedTcpStream, FlowWaker, NetStack, RelayBufPool, TcpStackConfig, TunTcpStream,
@@ -28,6 +28,11 @@ const MAX_INCOMING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OOO_SEGMENTS: usize = 256;
 const STREAM_CHANNEL_CAP: usize = 16;
 const RELAY_COALESCE_BYTES: usize = 64 * 1024;
+/// Upper bound on recycled outbound IP/TCP packet buffers held by [`ProxyTcpStack`].
+/// At ~1.5 KiB per MTU packet this caps retained pool memory around ~192 KiB.
+const TX_BUF_POOL_MAX: usize = 128;
+/// Do not retain oversized buffers in `tx_buf_pool`.
+const TX_BUF_MAX_RETAIN_CAP: usize = 4096;
 const INITIAL_RTO_MS: i64 = 200;
 const MAX_RTO_MS: i64 = 4_000;
 /// Data retransmit ceiling: 200 ms doubling to the 4 s cap, 20 retransmits
@@ -197,6 +202,41 @@ impl TcpConn {
         u16::try_from(wnd).unwrap_or(u16::MAX)
     }
 
+    fn build_packet_slices_pooled(
+        &mut self,
+        flags: u8,
+        options: &[u8],
+        payload_a: &[u8],
+        payload_b: &[u8],
+        seq: u32,
+        tx_pool: &mut Vec<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        let wnd_scaled = self.advertised_window();
+        self.last_advertised_wnd = u32::from(wnd_scaled) << self.our_wscale;
+        let mut pkt = tx_pool.pop().unwrap_or_default();
+        if build_ip_tcp_packet_slices_into(
+            &mut pkt,
+            self.flow.2,
+            self.flow.3,
+            self.flow.0,
+            self.flow.1,
+            seq,
+            self.rcv_nxt,
+            flags,
+            wnd_scaled,
+            options,
+            payload_a,
+            payload_b,
+        ) {
+            Some(pkt)
+        } else {
+            if tx_pool.len() < TX_BUF_POOL_MAX && pkt.capacity() <= TX_BUF_MAX_RETAIN_CAP {
+                tx_pool.push(pkt);
+            }
+            None
+        }
+    }
+
     fn build_packet_slices(
         &mut self,
         flags: u8,
@@ -234,6 +274,7 @@ impl TcpConn {
         flags: u8,
         seq: u32,
         tx_out: &mut Vec<Vec<u8>>,
+        mut tx_pool: Option<&mut Vec<Vec<u8>>>,
     ) -> usize {
         if len == 0
             || !offset
@@ -265,7 +306,12 @@ impl TcpConn {
         );
         let wnd_scaled = self.advertised_window();
         self.last_advertised_wnd = u32::from(wnd_scaled) << self.our_wscale;
-        if let Some(pkt) = build_ip_tcp_packet_slices(
+        let mut pkt = tx_pool
+            .as_deref_mut()
+            .and_then(Vec::pop)
+            .unwrap_or_default();
+        if build_ip_tcp_packet_slices_into(
+            &mut pkt,
             self.flow.2,
             self.flow.3,
             self.flow.0,
@@ -280,6 +326,12 @@ impl TcpConn {
         ) {
             tx_out.push(pkt);
             return len;
+        }
+        if let Some(pool) = tx_pool
+            && pool.len() < TX_BUF_POOL_MAX
+            && pkt.capacity() <= TX_BUF_MAX_RETAIN_CAP
+        {
+            pool.push(pkt);
         }
         0
     }
@@ -532,7 +584,7 @@ impl TcpConn {
             self.dup_acks = self.dup_acks.saturating_add(1);
             if self.dup_acks == 3 {
                 let len = self.tx_buf.len().min(self.mss);
-                self.emit_tx_segment(0, len, TCP_ACK | TCP_PSH, self.snd_una, tx_out);
+                self.emit_tx_segment(0, len, TCP_ACK | TCP_PSH, self.snd_una, tx_out, None);
                 self.rto_deadline_ms = Some(now_ms + self.rto_ms);
             }
         }
@@ -688,7 +740,7 @@ impl TcpConn {
         }
     }
 
-    fn flush_tx(&mut self, now_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
+    fn flush_tx(&mut self, now_ms: i64, tx_out: &mut Vec<Vec<u8>>, tx_pool: &mut Vec<Vec<u8>>) {
         if !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
             return;
         }
@@ -719,7 +771,7 @@ impl TcpConn {
                 TCP_ACK
             };
             let seq = self.snd_nxt;
-            let sent = self.emit_tx_segment(in_flight, seg_len, flags, seq, tx_out);
+            let sent = self.emit_tx_segment(in_flight, seg_len, flags, seq, tx_out, Some(tx_pool));
             if sent == 0 {
                 break;
             }
@@ -735,7 +787,9 @@ impl TcpConn {
             && (self.snd_nxt.wrapping_sub(self.snd_una) as usize) >= self.tx_buf.len()
         {
             let seq = self.snd_nxt;
-            if let Some(pkt) = self.build_packet_slices(TCP_FIN | TCP_ACK, &[], &[], &[], seq) {
+            if let Some(pkt) =
+                self.build_packet_slices_pooled(TCP_FIN | TCP_ACK, &[], &[], &[], seq, tx_pool)
+            {
                 tx_out.push(pkt);
             }
             self.fin_sent = true;
@@ -841,7 +895,7 @@ impl TcpConn {
                 | TcpState::LastAck => {
                     if !self.tx_buf.is_empty() {
                         let len = self.tx_buf.len().min(self.mss);
-                        self.emit_tx_segment(0, len, TCP_ACK | TCP_PSH, self.snd_una, tx_out);
+                        self.emit_tx_segment(0, len, TCP_ACK | TCP_PSH, self.snd_una, tx_out, None);
                     } else if self.fin_sent
                         && self.snd_una == self.fin_seq
                         && let Some(pkt) =
@@ -867,6 +921,7 @@ pub struct ProxyTcpStack {
     timers: BinaryHeap<Reverse<(i64, FlowKey)>>,
     poll_batch: Vec<FlowKey>,
     relay_pool: Arc<RelayBufPool>,
+    tx_buf_pool: Vec<Vec<u8>>,
     drops: Option<Arc<DropCounters>>,
     #[cfg(test)]
     last_poll_count: usize,
@@ -887,6 +942,7 @@ impl ProxyTcpStack {
             timers: BinaryHeap::new(),
             poll_batch: Vec::with_capacity(64),
             relay_pool: RelayBufPool::new(),
+            tx_buf_pool: Vec::with_capacity(64),
             drops: None,
             #[cfg(test)]
             last_poll_count: 0,
@@ -1032,6 +1088,13 @@ impl NetStack for ProxyTcpStack {
 
     fn set_drop_counters(&mut self, drops: Arc<DropCounters>) {
         self.drops = Some(drops);
+    }
+
+    fn recycle_tx_buf(&mut self, mut buf: Vec<u8>) {
+        if self.tx_buf_pool.len() < TX_BUF_POOL_MAX && buf.capacity() <= TX_BUF_MAX_RETAIN_CAP {
+            buf.clear();
+            self.tx_buf_pool.push(buf);
+        }
     }
 
     fn poll(
@@ -1216,7 +1279,7 @@ impl NetStack for ProxyTcpStack {
                 } else {
                     conn.flush_rcv_to_relay();
                     conn.drain_from_relay(now_ms, &self.relay_pool);
-                    conn.flush_tx(now_ms, tx_out);
+                    conn.flush_tx(now_ms, tx_out, &mut self.tx_buf_pool);
 
                     // Emit a Window Update ACK promptly when:
                     // 1. Reopening from a low/zero advertised window to >= reopen_threshold, OR
@@ -1242,9 +1305,14 @@ impl NetStack for ProxyTcpStack {
                     }
 
                     if conn.need_ack && conn.state != TcpState::Closed {
-                        if let Some(pkt) =
-                            conn.build_packet_slices(TCP_ACK, &[], &[], &[], conn.snd_nxt)
-                        {
+                        if let Some(pkt) = conn.build_packet_slices_pooled(
+                            TCP_ACK,
+                            &[],
+                            &[],
+                            &[],
+                            conn.snd_nxt,
+                            &mut self.tx_buf_pool,
+                        ) {
                             tx_out.push(pkt);
                         }
                         conn.need_ack = false;
@@ -2470,5 +2538,53 @@ mod tests {
         assert_eq!(tx.len(), 1, "idle expiration must emit RST");
         let rst = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
         assert_ne!(rst.flags & TCP_RST, 0);
+    }
+
+    #[test]
+    fn tx_buf_pool_recycles_within_bounds_and_clears_stale_bytes() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        // Oversized buffer must be rejected.
+        stack.recycle_tx_buf(vec![0xAA; TX_BUF_MAX_RETAIN_CAP + 1]);
+        assert!(stack.tx_buf_pool.is_empty());
+
+        // Pool caps at TX_BUF_POOL_MAX entries.
+        for _ in 0..(TX_BUF_POOL_MAX + 16) {
+            stack.recycle_tx_buf(vec![0xFF; 1500]);
+        }
+        assert_eq!(stack.tx_buf_pool.len(), TX_BUF_POOL_MAX);
+
+        // Reusing a dirty buffer must produce an identical packet to a fresh allocation.
+        let mut dirty = vec![0xDE; 1500];
+        let ptr = dirty.as_ptr();
+        assert!(build_ip_tcp_packet_slices_into(
+            &mut dirty,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            443,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            50000,
+            1000,
+            2000,
+            TCP_ACK | TCP_PSH,
+            1024,
+            &[],
+            b"hello ",
+            b"world",
+        ));
+        assert_eq!(dirty.as_ptr(), ptr, "buffer capacity must be reused");
+        let fresh = build_ip_tcp_packet_slices(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            443,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            50000,
+            1000,
+            2000,
+            TCP_ACK | TCP_PSH,
+            1024,
+            &[],
+            b"hello ",
+            b"world",
+        )
+        .expect("fresh packet");
+        assert_eq!(dirty, fresh);
     }
 }

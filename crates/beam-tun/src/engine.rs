@@ -680,6 +680,7 @@ where
 
         for pkt in tx_batch.drain(..) {
             send_tun_packet(&mut device, &pkt, &drops).await?;
+            stack.recycle_tx_buf(pkt);
         }
 
         for conn in accepted.drain(..) {
@@ -741,6 +742,7 @@ where
                 stack.reset_all(&mut tx_batch);
                 for pkt in tx_batch.drain(..) {
                     send_tun_packet(&mut device, &pkt, &drops).await?;
+                    stack.recycle_tx_buf(pkt);
                 }
                 udp_bridge.reset();
                 if let Some(dns) = dns_interceptor.as_ref() {
@@ -1199,28 +1201,41 @@ fn spawn_tcp_relay(
         };
 
         let s2c = async {
-            let mut buf = vec![0u8; S2C_READ_BUF_BYTES];
             loop {
+                // Read directly into a pooled buffer and move it into the stack
+                // channel so high-throughput downloads avoid an extra memcpy
+                // per read chunk.
+                let mut buf = tun_w.take_buf(S2C_READ_BUF_BYTES);
+                buf.resize(S2C_READ_BUF_BYTES, 0);
                 let read_res = tokio::select! {
                     biased;
-                    () = tun_w.closed() => break,
+                    () = tun_w.closed() => {
+                        tun_w.return_buf(buf);
+                        break;
+                    }
                     res = async { with_relay_idle(read_idle, up_r.read(&mut buf)).await } => res,
                 };
                 let n = match read_res {
-                    Ok(Ok(0)) => break,
+                    Ok(Ok(0)) => {
+                        tun_w.return_buf(buf);
+                        break;
+                    }
                     Ok(Ok(n)) => n,
                     Ok(Err(err)) => {
+                        tun_w.return_buf(buf);
                         warn_relay_io(conn.dst, "read", &err);
                         break;
                     }
                     Err(_) => {
+                        tun_w.return_buf(buf);
                         if let Some(budget) = read_idle {
                             warn_relay_timeout(conn.dst, "read", budget);
                         }
                         break;
                     }
                 };
-                match with_relay_idle(Some(write_idle), tun_w.send_chunk_pooled(&buf[..n])).await {
+                buf.truncate(n);
+                match with_relay_idle(Some(write_idle), tun_w.send_chunk(buf)).await {
                     Ok(Ok(())) => {
                         if let Some(tracker) = s2c_tracker.as_ref() {
                             tracker.record_bytes_rx(n as u64);

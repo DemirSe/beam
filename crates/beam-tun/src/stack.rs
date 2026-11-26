@@ -17,7 +17,7 @@ const DEFAULT_MAX_TCP_CONNECTIONS: usize = 256;
 const DEFAULT_TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000;
-const RELAY_BUF_POOL_MAX: usize = 8;
+const RELAY_BUF_POOL_MAX: usize = 24;
 
 /// Bounded, passive pool of relay read buffers shared by the TCP relay task and
 /// the stack's server-to-client drain path.
@@ -78,6 +78,41 @@ mod pool_tests {
         assert!(buf.is_empty(), "returned buffers are cleared");
         assert!(buf.capacity() > 0);
         assert_eq!(pool.len(), RELAY_BUF_POOL_MAX - 1);
+    }
+
+    #[test]
+    fn writer_take_buf_and_return_buf_reuse_without_losing_small_buffers() {
+        let (_tx_in, rx_in) = mpsc::channel::<Vec<u8>>(4);
+        let (tx_out, _rx_out) = mpsc::channel::<Vec<u8>>(4);
+        let pool = RelayBufPool::new();
+        let stream = TunTcpStream::new_with_accounting(
+            rx_in,
+            tx_out,
+            Arc::new(Notify::new()),
+            None,
+            None,
+            None,
+            Arc::clone(&pool),
+        );
+        let (_reader, writer) = stream.into_split();
+
+        let small = Vec::with_capacity(64);
+        writer.return_buf(small);
+        assert_eq!(pool.len(), 1);
+
+        // Requesting a larger buffer keeps the undersized one in the pool.
+        let large = writer.take_buf(4096);
+        assert!(large.capacity() >= 4096);
+        assert_eq!(pool.len(), 1);
+
+        // Returning the large buffer puts it on top for immediate reuse.
+        let large_ptr = large.as_ptr();
+        writer.return_buf(large);
+        assert_eq!(pool.len(), 2);
+
+        let reused = writer.take_buf(4096);
+        assert_eq!(reused.as_ptr(), large_ptr);
+        assert!(reused.is_empty());
     }
 }
 
@@ -201,6 +236,10 @@ pub trait NetStack: Send + 'static {
     /// (for example an overflowing receive queue). Implementations that cannot
     /// drop silently keep the default no-op.
     fn set_drop_counters(&mut self, _drops: Arc<DropCounters>) {}
+
+    /// Returns a transmitted packet buffer from `tx_out` back to the stack for
+    /// reuse so high-throughput paths avoid per-packet heap allocations.
+    fn recycle_tx_buf(&mut self, _buf: Vec<u8>) {}
 }
 
 type WriteReserveFuture = Pin<
@@ -315,20 +354,35 @@ impl TunTcpWriter {
         Ok(())
     }
 
+    /// Takes a cleared buffer with at least `min_cap` capacity from the shared
+    /// relay pool, allocating a fresh one only when the pool is empty or holds
+    /// an undersized buffer.
+    pub fn take_buf(&self, min_cap: usize) -> Vec<u8> {
+        match self.pool.take() {
+            Some(mut buf) if buf.capacity() >= min_cap => {
+                buf.clear();
+                buf
+            }
+            Some(undersized) => {
+                // Keep the small buffer for a later read instead of dropping it.
+                self.pool.put(undersized);
+                Vec::with_capacity(min_cap)
+            }
+            None => Vec::with_capacity(min_cap),
+        }
+    }
+
+    /// Returns an unused buffer back to the shared relay pool (for example on
+    /// EOF, read error, or shutdown before sending).
+    pub fn return_buf(&self, buf: Vec<u8>) {
+        self.pool.put(buf);
+    }
+
     /// Sends `data` using a recycled relay buffer when one is available, so a
     /// download does not allocate a fresh chunk per read (falls back to a plain
     /// copy when the pool is empty).
     pub async fn send_chunk_pooled(&mut self, data: &[u8]) -> io::Result<()> {
-        let mut buf = match self.pool.take() {
-            Some(buf) if buf.capacity() >= data.len() => buf,
-            Some(undersized) => {
-                // Keep the small buffer for a later read instead of dropping it.
-                self.pool.put(undersized);
-                Vec::with_capacity(data.len())
-            }
-            None => Vec::with_capacity(data.len()),
-        };
-        buf.clear();
+        let mut buf = self.take_buf(data.len());
         buf.extend_from_slice(data);
         self.send_chunk(buf).await
     }

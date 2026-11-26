@@ -39,6 +39,19 @@ pub const DEGRADED_FAILURE_STREAK: u64 = 3;
 /// Max age of a dial RTT reported to the UI.
 const RTT_MAX_AGE: Duration = Duration::from_secs(30);
 
+/// Minimum and maximum Tokio worker threads for the mobile engine runtime.
+/// Idle workers sleep in `epoll_wait` with zero wakeups, while up to 4 workers
+/// let high-throughput 5G TLS streams run in parallel with the TUN loop.
+const MIN_WORKER_THREADS: usize = 2;
+const MAX_WORKER_THREADS: usize = 4;
+
+fn android_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(MIN_WORKER_THREADS)
+        .clamp(MIN_WORKER_THREADS, MAX_WORKER_THREADS)
+}
+
 /// Callback invoked on every state change with a code and a short label.
 pub type StateCallback = Arc<dyn Fn(u8, &str) + Send + Sync>;
 
@@ -102,7 +115,7 @@ fn publish_state(state_slot: &AtomicU8, on_state: Option<&StateCallback>, state:
 }
 
 impl AndroidEngine {
-    /// Takes the TUN device and starts the engine on a two-worker runtime.
+    /// Takes the TUN device and starts the engine on a bounded multi-worker runtime.
     pub fn start(start: AndroidEngineStart) -> Result<Self, AndroidEngineError> {
         let AndroidEngineStart {
             tun,
@@ -111,7 +124,7 @@ impl AndroidEngine {
             on_state,
         } = start;
         let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(android_worker_threads())
             .max_blocking_threads(4)
             .thread_name("beam-android")
             .enable_all()
@@ -497,5 +510,14 @@ mod tests {
             Some(&(STATE_DISCONNECTED, "engine error".to_owned()))
         );
         engine.stop();
+    }
+
+    #[test]
+    fn android_worker_threads_stays_within_mobile_bounds() {
+        let workers = android_worker_threads();
+        assert!(
+            (MIN_WORKER_THREADS..=MAX_WORKER_THREADS).contains(&workers),
+            "workers={workers} outside {MIN_WORKER_THREADS}..={MAX_WORKER_THREADS}"
+        );
     }
 }
