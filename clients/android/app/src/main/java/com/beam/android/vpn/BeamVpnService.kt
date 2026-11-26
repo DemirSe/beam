@@ -74,15 +74,15 @@ class BeamVpnService : VpnService() {
 
         override fun getState(): Int {
             // Poll so binder callers see the state the engine derived last.
-            if (engineHandle != 0L) pollTelemetry()
-            return state
+            if (this@BeamVpnService.engineHandle != 0L) this@BeamVpnService.pollTelemetry()
+            return this@BeamVpnService.state
         }
 
-        override fun getStateDetail(): String = stateDetail
+        override fun getStateDetail(): String = this@BeamVpnService.stateDetail
 
-        override fun getActiveProfileId(): String? = activeProfileId
+        override fun getActiveProfileId(): String? = this@BeamVpnService.activeProfileId
 
-        override fun getTelemetryJson(): String = pollTelemetry()
+        override fun getTelemetryJson(): String = this@BeamVpnService.pollTelemetry()
 
         override fun registerCallback(cb: IBeamStateCallback) {
             callbacks.register(cb)
