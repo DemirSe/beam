@@ -21,7 +21,7 @@
             android:gravity="top|start"
             android:importantForAutofill="no"
             android:inputType="textUri"
-            android:maxLength="4096"
+            android:maxLength="2048"
             android:maxLines="4"
             android:minLines="2" />
 

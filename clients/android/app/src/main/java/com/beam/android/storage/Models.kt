@@ -15,6 +15,7 @@ data class AppSettings(
     val rejectQuic: Boolean = true,
     val bypassCidrs: List<String> = DEFAULT_BYPASS_CIDRS,
     val startOnBoot: Boolean = false,
+    val treatAsUnmetered: Boolean = false,
 ) {
     companion object {
         const val DOH_CLOUDFLARE = "https://cloudflare-dns.com/dns-query"

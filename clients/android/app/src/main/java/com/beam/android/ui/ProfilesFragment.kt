@@ -48,7 +48,7 @@ class ProfilesFragment : Fragment() {
         if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
         val scanned = result.data?.getStringExtra(QrScannerActivity.EXTRA_RESULT)
         if (scanned != null) {
-            saveProfile(scanned)
+            saveProfile(scanned) { ok -> if (!ok) toast(R.string.profiles_add_invalid) }
         }
     }
 
@@ -281,7 +281,7 @@ class ProfilesFragment : Fragment() {
     }
 
     private fun toast(resId: Int) {
-        Toast.makeText(requireContext(), resId, Toast.LENGTH_SHORT).show()
+        context?.let { Toast.makeText(it, resId, Toast.LENGTH_SHORT).show() }
     }
 
     private data class LinkInfo(val name: String, val host: String, val port: Int)

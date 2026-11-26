@@ -110,6 +110,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        pendingProfileId = savedInstanceState?.getString(STATE_PENDING_PROFILE_ID)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         ViewCompat.setOnApplyWindowInsetsListener(binding.mainRoot) { _, insets ->
@@ -128,6 +129,11 @@ class MainActivity : AppCompatActivity() {
             val restored = binding.bottomNav.selectedItemId
             showTab(if (TAB_TAGS.containsKey(restored)) restored else R.id.nav_dashboard)
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pendingProfileId?.let { outState.putString(STATE_PENDING_PROFILE_ID, it) }
     }
 
     override fun onStart() {
@@ -258,6 +264,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private companion object {
+        const val STATE_PENDING_PROFILE_ID = "pending_profile_id"
         const val TAG_DASHBOARD = "dashboard"
         const val TAG_PROFILES = "profiles"
         const val TAG_SETTINGS = "settings"

@@ -47,8 +47,11 @@ class BeamTileService : TileService() {
 
     private val stateCallback = object : IBeamStateCallback.Stub() {
         override fun onStateChanged(state: Int, detail: String?) {
-            // Pushed from the :vpn binder thread; Tile updates are main-only.
-            mainHandler.post { updateTile(state, hasProfile = true) }
+            // Read real profile presence on worker, then update qsTile on main thread.
+            worker.execute {
+                val hasProfile = activeProfileId() != null
+                mainHandler.post { updateTile(state, hasProfile) }
+            }
         }
     }
 
@@ -87,6 +90,8 @@ class BeamTileService : TileService() {
     }
 
     override fun onStopListening() {
+        pendingToggle = false
+        mainHandler.removeCallbacksAndMessages(null)
         if (isBound) {
             runCatching { service?.unregisterCallback(stateCallback) }
             runCatching { unbindService(serviceConnection) }

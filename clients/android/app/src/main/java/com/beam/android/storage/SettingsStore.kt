@@ -31,6 +31,7 @@ class SettingsStore(context: Context) {
                     List(arr.length()) { i -> arr.optString(i) }.filter { it.isNotBlank() }
                 } ?: AppSettings.DEFAULT_BYPASS_CIDRS,
                 startOnBoot = o.optBoolean("start_on_boot", false),
+                treatAsUnmetered = o.optBoolean("treat_as_unmetered", false),
             )
         } catch (_: Exception) {
             AppSettings()
@@ -45,6 +46,7 @@ class SettingsStore(context: Context) {
             .put("reject_quic", settings.rejectQuic)
             .put("bypass_cidrs", JSONArray(settings.bypassCidrs))
             .put("start_on_boot", settings.startOnBoot)
+            .put("treat_as_unmetered", settings.treatAsUnmetered)
             .toString()
         val tmp = File(dir, "settings.json.tmp")
         tmp.writeText(json, Charsets.UTF_8)

@@ -162,16 +162,24 @@ class BeamVpnService : VpnService() {
             return
         }
         val myGen = connectGeneration.incrementAndGet()
-        connectJob?.cancel()
-        connectJob = null
-
         // Android 12+ kills the service if the foreground notification is late,
         // so it goes up before any DNS or Keystore work.
         startForeground(
             VpnNotificationManager.NOTIFICATION_ID,
             notifications.build(VpnState.CONNECTING, ""),
         )
+        // Claim a started-service reference so unbinding MainActivity / TileService
+        // never tears down an active tunnel when Always-on VPN is off.
+        runCatching {
+            startService(
+                Intent(this, BeamVpnService::class.java)
+                    .setAction(ACTION_START)
+                    .putExtra(EXTRA_PROFILE_ID, profileId),
+            )
+        }
         synchronized(stateLock) {
+            connectJob?.cancel()
+            connectJob = null
             // a disconnect() that landed in between owns the cleanup.
             if (connectGeneration.get() != myGen) {
                 teardown()
@@ -219,7 +227,7 @@ class BeamVpnService : VpnService() {
                 // disconnect() or a newer connect() may have won while we
                 // resolved: this attempt owns nothing, so never start the engine.
                 if (connectGeneration.get() != myGen) return
-                val pfd = buildTunBuilder(bypass).establish()
+                val pfd = buildTunBuilder(bypass, settings.treatAsUnmetered).establish()
                     ?: throw IllegalStateException("establish() returned null")
                 val fd = pfd.detachFd()
                 val handle = try {
@@ -227,7 +235,8 @@ class BeamVpnService : VpnService() {
                         fd, configJson, this,
                         object : NativeStateListener {
                             override fun onNativeStateChanged(s: Int, detail: String) {
-                                setState(s, detail)
+                                // Reserve stateDetail for user-facing errors, not raw state labels.
+                                setState(s, "")
                             }
                         },
                     )
@@ -264,6 +273,8 @@ class BeamVpnService : VpnService() {
             // was already established.
             throw c
         } catch (t: Throwable) {
+            // Stale attempt: a newer connect() or disconnect() already owns the lifecycle.
+            if (connectGeneration.get() != myGen) return
             // Throwable, not Exception: a missing or stale libbeam_android.so
             // surfaces as LinkageError/ExceptionInInitializerError.
             Log.e(TAG, "connect failed", t)
@@ -284,7 +295,7 @@ class BeamVpnService : VpnService() {
     }
 
     /** Builds the TUN parameters; the caller holds [stateLock] for establish(). */
-    private fun buildTunBuilder(bypass: List<String>): Builder {
+    private fun buildTunBuilder(bypass: List<String>, treatAsUnmetered: Boolean): Builder {
         val builder = Builder()
             .setMtu(VpnConfigBuilder.MTU)
             .addAddress(VpnConfigBuilder.TUN_IPV4, VpnConfigBuilder.TUN_PREFIX)
@@ -292,8 +303,10 @@ class BeamVpnService : VpnService() {
             .addAddress("fd00:be:a::1", 126)
             .addRoute("::", 0)
             .addDnsServer(VpnConfigBuilder.TUN_DNS_IPV4)
-            .setMetered(false)
             .setBlocking(false)
+        if (treatAsUnmetered) {
+            builder.setMetered(false)
+        }
         try {
             builder.addDisallowedApplication(packageName)
         } catch (e: Exception) {
@@ -346,9 +359,9 @@ class BeamVpnService : VpnService() {
     private fun disconnect() {
         // Bump first: an in-flight connect() must not establish behind our back.
         connectGeneration.incrementAndGet()
-        connectJob?.cancel()
-        connectJob = null
         synchronized(stateLock) {
+            connectJob?.cancel()
+            connectJob = null
             if (state != VpnState.DISCONNECTED) setState(VpnState.DISCONNECTING, "")
             teardown()
             if (state != VpnState.DISCONNECTED) setState(VpnState.DISCONNECTED, "")
@@ -363,10 +376,12 @@ class BeamVpnService : VpnService() {
 
     override fun onDestroy() {
         connectGeneration.incrementAndGet()
-        connectJob?.cancel()
-        connectJob = null
         serviceScope.cancel()
-        synchronized(stateLock) { teardown() }
+        synchronized(stateLock) {
+            connectJob?.cancel()
+            connectJob = null
+            teardown()
+        }
         callbacks.kill()
         super.onDestroy()
     }
@@ -379,6 +394,7 @@ class BeamVpnService : VpnService() {
         monitor?.stop()
         monitor = null
         pendingProfileId = null
+        activeProfileId = null
         val h = engineHandle
         engineHandle = 0L
         engineGeneration = 0L

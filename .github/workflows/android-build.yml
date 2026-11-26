@@ -6,6 +6,10 @@ on:
     paths:
       - 'crates/beam-android/**'
       - 'crates/beam-sys/**'
+      - 'crates/beam-core/**'
+      - 'crates/beam-tun/**'
+      - 'crates/beam-client/**'
+      - 'Cargo.lock'
       - 'clients/android/**'
       - 'scripts/android-*.sh'
       - '.github/workflows/android-build.yml'
@@ -13,6 +17,10 @@ on:
     paths:
       - 'crates/beam-android/**'
       - 'crates/beam-sys/**'
+      - 'crates/beam-core/**'
+      - 'crates/beam-tun/**'
+      - 'crates/beam-client/**'
+      - 'Cargo.lock'
       - 'clients/android/**'
       - 'scripts/android-*.sh'
       - '.github/workflows/android-build.yml'

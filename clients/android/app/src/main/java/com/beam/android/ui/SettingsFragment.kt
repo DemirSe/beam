@@ -40,11 +40,15 @@ class SettingsFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         store = SettingsStore(requireContext())
+        binding.buttonSave.isEnabled = false
         viewLifecycleOwner.lifecycleScope.launch {
             val settings = withContext(Dispatchers.IO) {
                 runCatching { store.load() }.getOrDefault(AppSettings())
             }
-            if (_binding != null) bind(settings)
+            if (_binding != null) {
+                bind(settings)
+                binding.buttonSave.isEnabled = true
+            }
         }
 
         binding.dohGroup.setOnCheckedChangeListener { _, _ -> updateDohCustomVisibility() }
@@ -77,6 +81,7 @@ class SettingsFragment : Fragment() {
         }
         binding.switchIpv4Only.isChecked = settings.ipv4Only
         binding.switchQuic.isChecked = settings.rejectQuic
+        binding.switchUnmetered.isChecked = settings.treatAsUnmetered
         binding.switchStartOnBoot.isChecked = settings.startOnBoot
         binding.inputBypass.setText(settings.bypassCidrs.joinToString("\n"))
         updateDohCustomVisibility()
@@ -134,6 +139,7 @@ class SettingsFragment : Fragment() {
             rejectQuic = binding.switchQuic.isChecked,
             bypassCidrs = cidrs,
             startOnBoot = binding.switchStartOnBoot.isChecked,
+            treatAsUnmetered = binding.switchUnmetered.isChecked,
         )
         viewLifecycleOwner.lifecycleScope.launch {
             val saved = withContext(Dispatchers.IO) {
@@ -170,6 +176,6 @@ class SettingsFragment : Fragment() {
     }
 
     private fun toast(resId: Int) {
-        Toast.makeText(requireContext(), resId, Toast.LENGTH_SHORT).show()
+        context?.let { Toast.makeText(it, resId, Toast.LENGTH_SHORT).show() }
     }
 }

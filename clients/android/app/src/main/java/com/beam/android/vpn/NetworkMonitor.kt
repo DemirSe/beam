@@ -25,6 +25,8 @@ class NetworkMonitor(
     private val handler = Handler(Looper.getMainLooper())
     private var pending: Runnable? = null
     private var pendingLoss: Runnable? = null
+    @Volatile private var lastNetworkHandle: Long? = null
+    @Volatile private var lastValidated: Boolean = false
 
     fun start() {
         connectivityManager.registerDefaultNetworkCallback(this)
@@ -35,6 +37,8 @@ class NetworkMonitor(
         pending = null
         pendingLoss?.let(handler::removeCallbacks)
         pendingLoss = null
+        lastNetworkHandle = null
+        lastValidated = false
         try {
             connectivityManager.unregisterNetworkCallback(this)
         } catch (_: Exception) {
@@ -43,30 +47,61 @@ class NetworkMonitor(
     }
 
     override fun onAvailable(network: Network) {
+        val handle = network.networkHandle
+        val previous = lastNetworkHandle
+        if (previous == handle) {
+            // Network came back before loss debounce fired; cancel the loss.
+            pendingLoss?.let(handler::removeCallbacks)
+            pendingLoss = null
+            return
+        }
+        lastNetworkHandle = handle
+        lastValidated = false
         debounce(network)
     }
 
     override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+        val handle = network.networkHandle
+        val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val sameNetwork = (lastNetworkHandle == handle)
+        if (sameNetwork) {
+            // Signal/bandwidth fluctuations on the same network must not RST flows.
+            // Only re-arm if the network just became validated (e.g. captive portal).
+            if (!validated || lastValidated) return
+            lastValidated = true
+            debounce(network)
+            return
+        }
+        lastNetworkHandle = handle
+        lastValidated = validated
         debounce(network)
     }
 
     override fun onLost(network: Network) {
+        if (lastNetworkHandle != null && lastNetworkHandle != network.networkHandle) return
         // A queued switch to the lost network must not apply afterwards.
         pending?.let(handler::removeCallbacks)
         pending = null
-        // A queued loss must not survive stop() and poke a torn-down engine.
+        // Debounce loss so a rapid Wi-Fi <-> 5G handoff doesn't reset twice.
         pendingLoss?.let(handler::removeCallbacks)
         val r = Runnable {
             pendingLoss = null
+            lastNetworkHandle = null
+            lastValidated = false
             onNetworkLost()
         }
         pendingLoss = r
-        handler.post(r)
+        handler.postDelayed(r, DEBOUNCE_MS)
     }
 
     private fun debounce(network: Network) {
+        pendingLoss?.let(handler::removeCallbacks)
+        pendingLoss = null
         pending?.let(handler::removeCallbacks)
-        val r = Runnable { onNetworkSwitch(network) }
+        val r = Runnable {
+            pending = null
+            onNetworkSwitch(network)
+        }
         pending = r
         handler.postDelayed(r, DEBOUNCE_MS)
     }
