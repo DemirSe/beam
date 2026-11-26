@@ -20,7 +20,9 @@ import com.beam.android.vpn.VpnState
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -36,6 +38,7 @@ class DashboardFragment : Fragment() {
 
     private var _binding: FragmentDashboardBinding? = null
     private val binding get() = _binding!!
+    private val tabVisible = MutableStateFlow(true)
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -62,6 +65,7 @@ class DashboardFragment : Fragment() {
 
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
+        tabVisible.value = !hidden
         if (!hidden && _binding != null) renderActiveProfile()
     }
 
@@ -72,17 +76,21 @@ class DashboardFragment : Fragment() {
 
     private fun observeStatus() {
         val main = requireActivity() as MainActivity
+        tabVisible.value = !isHidden
         viewLifecycleOwner.lifecycleScope.launch {
             viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
                 launch {
                     main.status.collectLatest { renderStatus(it) }
                 }
                 launch {
-                    main.status
-                        .map { it.state }
+                    combine(
+                        main.status.map { it.state }.distinctUntilChanged(),
+                        tabVisible,
+                    ) { state, visible -> state to visible }
                         .distinctUntilChanged()
-                        .collectLatest { state ->
+                        .collectLatest { (state, visible) ->
                             if (state == VpnState.CONNECTED || state == VpnState.DEGRADED) {
+                                if (!visible) return@collectLatest
                                 while (true) {
                                     refreshTelemetry()
                                     delay(POLL_INTERVAL_MS)

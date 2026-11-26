@@ -98,6 +98,7 @@ class QrScannerActivity : AppCompatActivity() {
     private fun startCamera() {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
+            if (isFinishing || isDestroyed) return@addListener
             val provider = runCatching { future.get() }.getOrNull() ?: return@addListener
             val preview = Preview.Builder().build()
             preview.setSurfaceProvider(binding.previewView.surfaceProvider)

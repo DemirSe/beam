@@ -60,6 +60,9 @@ class BeamVpnService : VpnService() {
     /** Serialises establish()/nativeStart() against teardown(). */
     private val stateLock = Any()
 
+    /** Serialises setState() + RemoteCallbackList.beginBroadcast() across IO/binder/JNI threads. */
+    private val callbackLock = Any()
+
     /** Bumped by every connect()/disconnect()/onRevoke()/onDestroy(); stale attempts abort. */
     private val connectGeneration = AtomicLong(0L)
     private var connectJob: Job? = null
@@ -431,24 +434,29 @@ class BeamVpnService : VpnService() {
     }
 
     private fun setState(s: Int, detail: String) {
-        val changed = (s != state)
-        state = s
-        stateDetail = detail
-        // Notification ONLY on transitions.
-        if (changed) {
-            if (s == VpnState.DISCONNECTED) {
-                notifications.cancel()
-            } else {
-                notifications.notify(s, detail)
-            }
-            val n = callbacks.beginBroadcast()
-            for (i in 0 until n) {
+        synchronized(callbackLock) {
+            val changed = (s != state)
+            state = s
+            stateDetail = detail
+            // Notification ONLY on transitions.
+            if (changed) {
+                if (s == VpnState.DISCONNECTED) {
+                    notifications.cancel()
+                } else {
+                    notifications.notify(s, detail)
+                }
+                val n = callbacks.beginBroadcast()
                 try {
-                    callbacks.getBroadcastItem(i).onStateChanged(s, detail)
-                } catch (_: Exception) {
+                    for (i in 0 until n) {
+                        try {
+                            callbacks.getBroadcastItem(i).onStateChanged(s, detail)
+                        } catch (_: Exception) {
+                        }
+                    }
+                } finally {
+                    callbacks.finishBroadcast()
                 }
             }
-            callbacks.finishBroadcast()
         }
     }
 }

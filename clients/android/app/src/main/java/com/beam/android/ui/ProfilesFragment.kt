@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.DialogInterface
 import android.content.Intent
 import android.os.Bundle
+import android.text.InputType
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -124,22 +125,31 @@ class ProfilesFragment : Fragment() {
         val input = content.findViewById<TextInputEditText>(R.id.dialogLinkInput)
         val layout = content.findViewById<TextInputLayout>(R.id.dialogLinkLayout)
         layout.hint = getString(R.string.profiles_rename_hint)
+        input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
+        input.isSingleLine = true
         input.setText(profile.name)
         input.setSelection(profile.name.length)
         input.doAfterTextChanged { layout.error = null }
 
-        MaterialAlertDialogBuilder(requireContext())
+        val dialog = MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.profiles_rename_title)
             .setView(content)
             .setNegativeButton(R.string.action_cancel, null)
-            .setPositiveButton(R.string.action_save) { _, _ ->
+            .setPositiveButton(R.string.action_save, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
                 val newName = input.text?.toString()?.trim()?.take(MAX_NAME_LENGTH).orEmpty()
-                if (newName.isEmpty()) return@setPositiveButton
+                if (newName.isEmpty()) {
+                    layout.error = getString(R.string.profiles_rename_invalid)
+                    return@setOnClickListener
+                }
                 viewLifecycleOwner.lifecycleScope.launch {
                     val saved = withContext(Dispatchers.IO) {
                         runCatching { store.saveProfile(profile.copy(name = newName)) }.isSuccess
                     }
                     if (saved) {
+                        dialog.dismiss()
                         reload()
                         toast(R.string.profiles_renamed)
                     } else {
@@ -147,7 +157,8 @@ class ProfilesFragment : Fragment() {
                     }
                 }
             }
-            .show()
+        }
+        dialog.show()
     }
 
     private fun confirmDelete(profile: VlessProfile) {

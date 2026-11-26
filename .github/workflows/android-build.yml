@@ -59,8 +59,29 @@ jobs:
         with:
           packages: 'platform-tools'
 
+      - name: Cache NDK r27c
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+          key: android-ndk-${{ runner.os }}-${{ env.NDK_VERSION }}
+
       - name: Install NDK r27c + SDK 35
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION"
+        run: |
+          if [ -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]; then
+            sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          else
+            sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION"
+          fi
+
+      - name: Restore persistent CI debug keystore (if configured)
+        env:
+          BEAM_DEBUG_KEYSTORE_B64: ${{ secrets.BEAM_DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$BEAM_DEBUG_KEYSTORE_B64" ]; then
+            mkdir -p "$HOME/.android"
+            printf '%s' "$BEAM_DEBUG_KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
+          fi
 
       - name: Build libbeam_android.so (aarch64, NDK r27c)
         env:
@@ -143,8 +164,29 @@ jobs:
         with:
           packages: 'platform-tools'
 
+      - name: Cache NDK r27c
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+          key: android-ndk-${{ runner.os }}-${{ env.NDK_VERSION }}
+
       - name: Install NDK r27c + SDK 35
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION"
+        run: |
+          if [ -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]; then
+            sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          else
+            sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION"
+          fi
+
+      - name: Restore persistent CI debug keystore (if configured)
+        env:
+          BEAM_DEBUG_KEYSTORE_B64: ${{ secrets.BEAM_DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$BEAM_DEBUG_KEYSTORE_B64" ]; then
+            mkdir -p "$HOME/.android"
+            printf '%s' "$BEAM_DEBUG_KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
+          fi
 
       - name: Build libbeam_android.so (x86_64, NDK r27c)
         env:
