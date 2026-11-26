@@ -1202,18 +1202,18 @@ fn spawn_tcp_relay(
 
         let s2c = async {
             loop {
-                // Read directly into a pooled buffer and move it into the stack
-                // channel so high-throughput downloads avoid an extra memcpy
-                // per read chunk.
+                // Read directly into a pooled buffer's uninitialized spare
+                // capacity (`read_buf`) and move it into the stack channel so
+                // high-throughput downloads avoid both an extra memcpy and a
+                // per-read zero-fill memset.
                 let mut buf = tun_w.take_buf(S2C_READ_BUF_BYTES);
-                buf.resize(S2C_READ_BUF_BYTES, 0);
                 let read_res = tokio::select! {
                     biased;
                     () = tun_w.closed() => {
                         tun_w.return_buf(buf);
                         break;
                     }
-                    res = async { with_relay_idle(read_idle, up_r.read(&mut buf)).await } => res,
+                    res = async { with_relay_idle(read_idle, up_r.read_buf(&mut buf)).await } => res,
                 };
                 let n = match read_res {
                     Ok(Ok(0)) => {
@@ -1234,7 +1234,6 @@ fn spawn_tcp_relay(
                         break;
                     }
                 };
-                buf.truncate(n);
                 match with_relay_idle(Some(write_idle), tun_w.send_chunk(buf)).await {
                     Ok(Ok(())) => {
                         if let Some(tracker) = s2c_tracker.as_ref() {

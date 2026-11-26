@@ -18,6 +18,9 @@ const DEFAULT_TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000;
 const RELAY_BUF_POOL_MAX: usize = 24;
+/// Upper capacity bound for buffers retained in [`RelayBufPool`], preventing an
+/// oversized caller buffer from pinning memory in the pool.
+const RELAY_BUF_MAX_RETAIN_CAP: usize = 64 * 1024;
 
 /// Bounded, passive pool of relay read buffers shared by the TCP relay task and
 /// the stack's server-to-client drain path.
@@ -37,12 +40,22 @@ impl RelayBufPool {
         Arc::new(Self::default())
     }
 
+    #[cfg(test)]
     fn take(&self) -> Option<Vec<u8>> {
         self.free.lock().ok()?.pop()
     }
 
-    /// Returns `buf` to the pool unless the pool is full.
+    fn take_at_least(&self, min_cap: usize) -> Option<Vec<u8>> {
+        let mut free = self.free.lock().ok()?;
+        let idx = free.iter().rposition(|b| b.capacity() >= min_cap)?;
+        Some(free.swap_remove(idx))
+    }
+
+    /// Returns `buf` to the pool unless it is empty, oversized, or the pool is full.
     pub fn put(&self, mut buf: Vec<u8>) {
+        if buf.capacity() == 0 || buf.capacity() > RELAY_BUF_MAX_RETAIN_CAP {
+            return;
+        }
         let Ok(mut free) = self.free.lock() else {
             return;
         };
@@ -105,14 +118,22 @@ mod pool_tests {
         assert!(large.capacity() >= 4096);
         assert_eq!(pool.len(), 1);
 
-        // Returning the large buffer puts it on top for immediate reuse.
+        // Returning the large buffer then a small buffer must still let
+        // `take_buf(4096)` find the large buffer (no LIFO head-of-line poisoning).
         let large_ptr = large.as_ptr();
         writer.return_buf(large);
-        assert_eq!(pool.len(), 2);
+        writer.return_buf(Vec::with_capacity(64));
+        assert_eq!(pool.len(), 3);
 
         let reused = writer.take_buf(4096);
         assert_eq!(reused.as_ptr(), large_ptr);
         assert!(reused.is_empty());
+
+        // Oversized and zero-capacity buffers must not be retained.
+        let before = pool.len();
+        writer.return_buf(Vec::new());
+        writer.return_buf(Vec::with_capacity(RELAY_BUF_MAX_RETAIN_CAP + 1));
+        assert_eq!(pool.len(), before);
     }
 }
 
@@ -355,18 +376,12 @@ impl TunTcpWriter {
     }
 
     /// Takes a cleared buffer with at least `min_cap` capacity from the shared
-    /// relay pool, allocating a fresh one only when the pool is empty or holds
-    /// an undersized buffer.
+    /// relay pool, allocating a fresh one only when no pooled buffer fits.
     pub fn take_buf(&self, min_cap: usize) -> Vec<u8> {
-        match self.pool.take() {
-            Some(mut buf) if buf.capacity() >= min_cap => {
+        match self.pool.take_at_least(min_cap) {
+            Some(mut buf) => {
                 buf.clear();
                 buf
-            }
-            Some(undersized) => {
-                // Keep the small buffer for a later read instead of dropping it.
-                self.pool.put(undersized);
-                Vec::with_capacity(min_cap)
             }
             None => Vec::with_capacity(min_cap),
         }
@@ -378,9 +393,9 @@ impl TunTcpWriter {
         self.pool.put(buf);
     }
 
-    /// Sends `data` using a recycled relay buffer when one is available, so a
-    /// download does not allocate a fresh chunk per read (falls back to a plain
-    /// copy when the pool is empty).
+    /// Copies `data` into a pooled buffer and sends it to the TUN TCP socket.
+    /// Callers that can read directly into a `Vec<u8>` should prefer
+    /// [`Self::take_buf`] + [`Self::send_chunk`] to avoid the copy.
     pub async fn send_chunk_pooled(&mut self, data: &[u8]) -> io::Result<()> {
         let mut buf = self.take_buf(data.len());
         buf.extend_from_slice(data);

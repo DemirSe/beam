@@ -1,8 +1,8 @@
 //! Owner of the mobile `beam-tun` engine: runtime, channels, and telemetry.
 //!
-//! The engine runs on its own two-worker runtime for the life of a
-//! `VpnService` session. State is derived from lock-free telemetry on demand,
-//! so an idle tunnel holds no timer and no wakeup.
+//! The engine runs on its own bounded multi-worker runtime (2..=4 workers) for
+//! the life of a `VpnService` session. State is derived from lock-free
+//! telemetry on demand, so an idle tunnel holds no timer and no wakeup.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -40,16 +40,22 @@ pub const DEGRADED_FAILURE_STREAK: u64 = 3;
 const RTT_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// Minimum and maximum Tokio worker threads for the mobile engine runtime.
-/// Idle workers sleep in `epoll_wait` with zero wakeups, while up to 4 workers
-/// let high-throughput 5G TLS streams run in parallel with the TUN loop.
+/// Idle workers park with zero periodic wakeups, while up to 4 workers let
+/// high-throughput upstream REALITY TLS relay tasks run in parallel with the
+/// TUN loop.
 const MIN_WORKER_THREADS: usize = 2;
 const MAX_WORKER_THREADS: usize = 4;
 
+fn android_worker_threads_from(available: usize) -> usize {
+    available.clamp(MIN_WORKER_THREADS, MAX_WORKER_THREADS)
+}
+
 fn android_worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(MIN_WORKER_THREADS)
-        .clamp(MIN_WORKER_THREADS, MAX_WORKER_THREADS)
+    android_worker_threads_from(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(MIN_WORKER_THREADS),
+    )
 }
 
 /// Callback invoked on every state change with a code and a short label.
@@ -513,11 +519,11 @@ mod tests {
     }
 
     #[test]
-    fn android_worker_threads_stays_within_mobile_bounds() {
-        let workers = android_worker_threads();
-        assert!(
-            (MIN_WORKER_THREADS..=MAX_WORKER_THREADS).contains(&workers),
-            "workers={workers} outside {MIN_WORKER_THREADS}..={MAX_WORKER_THREADS}"
-        );
+    fn android_worker_threads_clamps_to_mobile_bounds() {
+        assert_eq!(android_worker_threads_from(1), 2);
+        assert_eq!(android_worker_threads_from(2), 2);
+        assert_eq!(android_worker_threads_from(3), 3);
+        assert_eq!(android_worker_threads_from(4), 4);
+        assert_eq!(android_worker_threads_from(16), 4);
     }
 }

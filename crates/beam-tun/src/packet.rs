@@ -380,7 +380,10 @@ pub fn build_ip_tcp_packet_slices_into(
             let Ok(total_len_u16) = u16::try_from(total_len) else {
                 return false;
             };
-            pkt.resize(total_len, 0);
+            pkt.reserve(total_len);
+            // Zero only the fixed IPv4 + TCP header; options and payload are
+            // appended below without redundant zero-filling.
+            pkt.resize(IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN, 0);
             pkt[0] = 0x45;
             pkt[2..4].copy_from_slice(&total_len_u16.to_be_bytes());
             pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
@@ -391,10 +394,26 @@ pub fn build_ip_tcp_packet_slices_into(
             let ip_cksum = internet_checksum(&pkt[..IPV4_MIN_HEADER_LEN]);
             pkt[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
 
-            let tcp = &mut pkt[IPV4_MIN_HEADER_LEN..];
-            write_tcp_segment(
-                tcp, src_port, dst_port, seq, ack, flags, window, options, payload_a, payload_b,
+            write_tcp_header(
+                &mut pkt[IPV4_MIN_HEADER_LEN..],
+                src_port,
+                dst_port,
+                seq,
+                ack,
+                flags,
+                window,
+                tcp_header_len,
             );
+            if !options.is_empty() {
+                pkt.extend_from_slice(options);
+            }
+            if !payload_a.is_empty() {
+                pkt.extend_from_slice(payload_a);
+            }
+            if !payload_b.is_empty() {
+                pkt.extend_from_slice(payload_b);
+            }
+            let tcp = &mut pkt[IPV4_MIN_HEADER_LEN..];
             let tcp_cksum = l4_ipv4_checksum(s4, d4, IP_PROTO_TCP, tcp);
             tcp[16..18].copy_from_slice(&tcp_cksum.to_be_bytes());
             true
@@ -406,7 +425,8 @@ pub fn build_ip_tcp_packet_slices_into(
             let Some(total_len) = IPV6_HEADER_LEN.checked_add(tcp_len) else {
                 return false;
             };
-            pkt.resize(total_len, 0);
+            pkt.reserve(total_len);
+            pkt.resize(IPV6_HEADER_LEN + TCP_MIN_HEADER_LEN, 0);
             pkt[0] = 0x60; // version 6
             pkt[4..6].copy_from_slice(&tcp_len_u16.to_be_bytes());
             pkt[6] = IP_PROTO_TCP;
@@ -414,10 +434,26 @@ pub fn build_ip_tcp_packet_slices_into(
             pkt[8..24].copy_from_slice(&s6.octets());
             pkt[24..40].copy_from_slice(&d6.octets());
 
-            let tcp = &mut pkt[IPV6_HEADER_LEN..];
-            write_tcp_segment(
-                tcp, src_port, dst_port, seq, ack, flags, window, options, payload_a, payload_b,
+            write_tcp_header(
+                &mut pkt[IPV6_HEADER_LEN..],
+                src_port,
+                dst_port,
+                seq,
+                ack,
+                flags,
+                window,
+                tcp_header_len,
             );
+            if !options.is_empty() {
+                pkt.extend_from_slice(options);
+            }
+            if !payload_a.is_empty() {
+                pkt.extend_from_slice(payload_a);
+            }
+            if !payload_b.is_empty() {
+                pkt.extend_from_slice(payload_b);
+            }
+            let tcp = &mut pkt[IPV6_HEADER_LEN..];
             let tcp_cksum = l4_ipv6_checksum(s6, d6, IP_PROTO_TCP, tcp);
             tcp[16..18].copy_from_slice(&tcp_cksum.to_be_bytes());
             true
@@ -427,7 +463,7 @@ pub fn build_ip_tcp_packet_slices_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_tcp_segment(
+fn write_tcp_header(
     tcp: &mut [u8],
     src_port: u16,
     dst_port: u16,
@@ -435,11 +471,8 @@ fn write_tcp_segment(
     ack: u32,
     flags: u8,
     window: u16,
-    options: &[u8],
-    payload_a: &[u8],
-    payload_b: &[u8],
+    tcp_header_len: usize,
 ) {
-    let tcp_header_len = TCP_MIN_HEADER_LEN + options.len();
     tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
     tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     tcp[4..8].copy_from_slice(&seq.to_be_bytes());
@@ -447,16 +480,6 @@ fn write_tcp_segment(
     tcp[12] = ((tcp_header_len / 4) as u8) << 4;
     tcp[13] = flags;
     tcp[14..16].copy_from_slice(&window.to_be_bytes());
-    if !options.is_empty() {
-        tcp[TCP_MIN_HEADER_LEN..tcp_header_len].copy_from_slice(options);
-    }
-    let a_end = tcp_header_len + payload_a.len();
-    if !payload_a.is_empty() {
-        tcp[tcp_header_len..a_end].copy_from_slice(payload_a);
-    }
-    if !payload_b.is_empty() {
-        tcp[a_end..a_end + payload_b.len()].copy_from_slice(payload_b);
-    }
 }
 
 /// Builds a complete IPv4/UDP packet with valid IPv4 header and UDP checksums.

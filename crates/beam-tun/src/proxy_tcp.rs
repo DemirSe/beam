@@ -29,7 +29,7 @@ const MAX_OOO_SEGMENTS: usize = 256;
 const STREAM_CHANNEL_CAP: usize = 16;
 const RELAY_COALESCE_BYTES: usize = 64 * 1024;
 /// Upper bound on recycled outbound IP/TCP packet buffers held by [`ProxyTcpStack`].
-/// At ~1.5 KiB per MTU packet this caps retained pool memory around ~192 KiB.
+/// Capped at 128 entries <= 4096 B each (<= 512 KiB worst case, ~192 KiB at MTU).
 const TX_BUF_POOL_MAX: usize = 128;
 /// Do not retain oversized buffers in `tx_buf_pool`.
 const TX_BUF_MAX_RETAIN_CAP: usize = 4096;
@@ -209,11 +209,14 @@ impl TcpConn {
         payload_a: &[u8],
         payload_b: &[u8],
         seq: u32,
-        tx_pool: &mut Vec<Vec<u8>>,
+        mut tx_pool: Option<&mut Vec<Vec<u8>>>,
     ) -> Option<Vec<u8>> {
         let wnd_scaled = self.advertised_window();
         self.last_advertised_wnd = u32::from(wnd_scaled) << self.our_wscale;
-        let mut pkt = tx_pool.pop().unwrap_or_default();
+        let mut pkt = tx_pool
+            .as_deref_mut()
+            .and_then(Vec::pop)
+            .unwrap_or_default();
         if build_ip_tcp_packet_slices_into(
             &mut pkt,
             self.flow.2,
@@ -230,8 +233,12 @@ impl TcpConn {
         ) {
             Some(pkt)
         } else {
-            if tx_pool.len() < TX_BUF_POOL_MAX && pkt.capacity() <= TX_BUF_MAX_RETAIN_CAP {
-                tx_pool.push(pkt);
+            if let Some(pool) = tx_pool
+                && pkt.capacity() > 0
+                && pool.len() < TX_BUF_POOL_MAX
+                && pkt.capacity() <= TX_BUF_MAX_RETAIN_CAP
+            {
+                pool.push(pkt);
             }
             None
         }
@@ -245,21 +252,7 @@ impl TcpConn {
         payload_b: &[u8],
         seq: u32,
     ) -> Option<Vec<u8>> {
-        let wnd_scaled = self.advertised_window();
-        self.last_advertised_wnd = u32::from(wnd_scaled) << self.our_wscale;
-        build_ip_tcp_packet_slices(
-            self.flow.2,
-            self.flow.3,
-            self.flow.0,
-            self.flow.1,
-            seq,
-            self.rcv_nxt,
-            flags,
-            wnd_scaled,
-            options,
-            payload_a,
-            payload_b,
-        )
+        self.build_packet_slices_pooled(flags, options, payload_a, payload_b, seq, None)
     }
 
     /// Emits a TCP segment slicing `tx_buf[offset..offset+len]` directly via
@@ -328,6 +321,7 @@ impl TcpConn {
             return len;
         }
         if let Some(pool) = tx_pool
+            && pkt.capacity() > 0
             && pool.len() < TX_BUF_POOL_MAX
             && pkt.capacity() <= TX_BUF_MAX_RETAIN_CAP
         {
@@ -787,9 +781,14 @@ impl TcpConn {
             && (self.snd_nxt.wrapping_sub(self.snd_una) as usize) >= self.tx_buf.len()
         {
             let seq = self.snd_nxt;
-            if let Some(pkt) =
-                self.build_packet_slices_pooled(TCP_FIN | TCP_ACK, &[], &[], &[], seq, tx_pool)
-            {
+            if let Some(pkt) = self.build_packet_slices_pooled(
+                TCP_FIN | TCP_ACK,
+                &[],
+                &[],
+                &[],
+                seq,
+                Some(tx_pool),
+            ) {
                 tx_out.push(pkt);
             }
             self.fin_sent = true;
@@ -1091,7 +1090,10 @@ impl NetStack for ProxyTcpStack {
     }
 
     fn recycle_tx_buf(&mut self, mut buf: Vec<u8>) {
-        if self.tx_buf_pool.len() < TX_BUF_POOL_MAX && buf.capacity() <= TX_BUF_MAX_RETAIN_CAP {
+        if buf.capacity() > 0
+            && self.tx_buf_pool.len() < TX_BUF_POOL_MAX
+            && buf.capacity() <= TX_BUF_MAX_RETAIN_CAP
+        {
             buf.clear();
             self.tx_buf_pool.push(buf);
         }
@@ -1311,7 +1313,7 @@ impl NetStack for ProxyTcpStack {
                             &[],
                             &[],
                             conn.snd_nxt,
-                            &mut self.tx_buf_pool,
+                            Some(&mut self.tx_buf_pool),
                         ) {
                             tx_out.push(pkt);
                         }
@@ -2586,5 +2588,41 @@ mod tests {
         )
         .expect("fresh packet");
         assert_eq!(dirty, fresh);
+
+        // Same stale-byte check for IPv6 packets.
+        let mut dirty6 = vec![0xCD; 1500];
+        let ptr6 = dirty6.as_ptr();
+        let src6 = IpAddr::V6("2001:db8::2".parse().expect("ipv6"));
+        let dst6 = IpAddr::V6("2001:db8::1".parse().expect("ipv6"));
+        assert!(build_ip_tcp_packet_slices_into(
+            &mut dirty6,
+            src6,
+            443,
+            dst6,
+            50001,
+            3000,
+            4000,
+            TCP_ACK | TCP_PSH,
+            2048,
+            &[],
+            b"ipv6-",
+            b"reuse",
+        ));
+        assert_eq!(dirty6.as_ptr(), ptr6, "IPv6 buffer capacity must be reused");
+        let fresh6 = build_ip_tcp_packet_slices(
+            src6,
+            443,
+            dst6,
+            50001,
+            3000,
+            4000,
+            TCP_ACK | TCP_PSH,
+            2048,
+            &[],
+            b"ipv6-",
+            b"reuse",
+        )
+        .expect("fresh ipv6 packet");
+        assert_eq!(dirty6, fresh6);
     }
 }
