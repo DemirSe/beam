@@ -8,10 +8,14 @@ plugins {
 val includeX86_64 = providers.gradleProperty("beam.includeX86_64").orNull == "true"
 val beamVersionCode = providers.gradleProperty("beam.versionCode").orNull?.toIntOrNull()?.coerceAtLeast(1) ?: 1
 val beamVersionName = providers.gradleProperty("beam.versionName").orNull?.takeIf { it.isNotBlank() } ?: "0.1.0"
+val beamTestBuildType = providers.gradleProperty("beam.testBuildType").orNull
 
 android {
     namespace = "com.beam.android"
     compileSdk = 35
+    if (beamTestBuildType == "release") {
+        testBuildType = "release"
+    }
 
     defaultConfig {
         applicationId = "com.beam.android"

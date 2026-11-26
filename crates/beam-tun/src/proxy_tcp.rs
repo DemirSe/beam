@@ -919,6 +919,7 @@ impl ProxyTcpStack {
 
     /// Creates a socket for a pure SYN, or answers `RST|ACK` when the connection
     /// table is full. Returns `true` when a socket was inserted.
+    #[allow(clippy::too_many_arguments)]
     fn insert_new_conn(
         config: &TcpStackConfig,
         conns: &mut HashMap<FlowKey, TcpConn>,
@@ -927,8 +928,12 @@ impl ProxyTcpStack {
         seg: &crate::packet::TcpSegmentView<'_>,
         now_ms: i64,
         tx_out: &mut Vec<Vec<u8>>,
+        drops: Option<&DropCounters>,
     ) -> bool {
         if conns.len() >= config.max_connections {
+            if let Some(drops) = drops {
+                drops.tcp_limit.incr();
+            }
             if let Some(rst) = build_ip_tcp_packet_slices(
                 ip.dst_ip,
                 seg.dst_port,
@@ -1089,6 +1094,7 @@ impl NetStack for ProxyTcpStack {
                     &seg,
                     now_ms,
                     tx_out,
+                    self.drops.as_deref(),
                 ) && let Some(conn) = self.conns.get_mut(&flow)
                 {
                     conn.in_poll_batch = true;
