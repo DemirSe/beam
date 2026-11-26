@@ -142,12 +142,14 @@ class ProfilesFragment : Fragment() {
             .setPositiveButton(R.string.action_save, null)
             .create()
         dialog.setOnShowListener {
-            dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+            val positiveButton = dialog.getButton(DialogInterface.BUTTON_POSITIVE)
+            positiveButton.setOnClickListener {
                 val newName = input.text?.toString()?.trim()?.take(MAX_NAME_LENGTH).orEmpty()
                 if (newName.isEmpty()) {
                     layout.error = getString(R.string.profiles_rename_invalid)
                     return@setOnClickListener
                 }
+                positiveButton.isEnabled = false
                 viewLifecycleOwner.lifecycleScope.launch {
                     val saved = withContext(Dispatchers.IO) {
                         runCatching { store.saveProfile(profile.copy(name = newName)) }.isSuccess
@@ -157,6 +159,7 @@ class ProfilesFragment : Fragment() {
                         reload()
                         toast(R.string.profiles_renamed)
                     } else {
+                        positiveButton.isEnabled = true
                         toast(R.string.profiles_save_failed)
                     }
                 }
@@ -207,11 +210,14 @@ class ProfilesFragment : Fragment() {
             .setPositiveButton(R.string.action_save, null)
             .create()
         dialog.setOnShowListener {
-            dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+            val positiveButton = dialog.getButton(DialogInterface.BUTTON_POSITIVE)
+            positiveButton.setOnClickListener {
+                positiveButton.isEnabled = false
                 saveProfile(input.text?.toString().orEmpty()) { saved ->
                     if (saved) {
                         dialog.dismiss()
                     } else {
+                        positiveButton.isEnabled = true
                         layout.error = getString(R.string.profiles_add_invalid)
                     }
                 }

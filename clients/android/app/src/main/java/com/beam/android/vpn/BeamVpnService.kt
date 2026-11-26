@@ -309,6 +309,8 @@ class BeamVpnService : VpnService() {
                 } ?: throw DnsResolutionException("server host could not be resolved")
             }
             if (connectGeneration.get() != myGen) return
+            // A profile deleted mid-resolve is caught by setActiveProfileIdIfExists
+            // post-establish, avoiding a redundant Keystore decrypt on the connect path.
 
             // A bypass CIDR that covers the TUN /30 would bypass the TUN DNS.
             val bypass = settings.bypassCidrs.filterNot(Ipv4RouteCalculator::overlapsTunSubnet)
@@ -815,9 +817,11 @@ class BeamVpnService : VpnService() {
         // Only remove the foreground notification if no newer connect() superseded this teardown.
         if (released.stopForeground && connectGeneration.get() == released.generation) {
             runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-            synchronized(callbackLock) {
-                lastNotifiedState = VpnState.DISCONNECTED
-            }
+                .onSuccess {
+                    synchronized(callbackLock) {
+                        lastNotifiedState = VpnState.DISCONNECTED
+                    }
+                }
         }
     }
 

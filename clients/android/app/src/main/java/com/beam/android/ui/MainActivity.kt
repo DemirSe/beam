@@ -19,7 +19,6 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
-import androidx.fragment.app.commit
 import androidx.fragment.app.commitNow
 import androidx.lifecycle.lifecycleScope
 import com.beam.android.R
@@ -144,10 +143,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (supportFragmentManager.fragments.isEmpty()) {
             val restored = binding.bottomNav.selectedItemId
-            showTab(
-                if (TAB_TAGS.containsKey(restored)) restored else R.id.nav_dashboard,
-                immediate = true,
-            )
+            showTab(if (TAB_TAGS.containsKey(restored)) restored else R.id.nav_dashboard)
         }
     }
 
@@ -241,6 +237,10 @@ class MainActivity : AppCompatActivity() {
             val consent = withContext(Dispatchers.IO) {
                 runCatching { VpnService.prepare(this@MainActivity) }.getOrNull()
             }
+            if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
+                pendingProfileId = profileId
+                return@launch
+            }
             if (consent != null) {
                 pendingProfileId = profileId
                 vpnConsentLauncher.launch(consent)
@@ -283,10 +283,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showTab(itemId: Int, immediate: Boolean = false) {
+    private fun showTab(itemId: Int) {
         val tag = TAB_TAGS[itemId] ?: return
         val manager = supportFragmentManager
-        val apply: androidx.fragment.app.FragmentTransaction.() -> Unit = {
+        manager.commitNow {
             setReorderingAllowed(true)
             for (fragment in manager.fragments) hide(fragment)
             val existing = manager.findFragmentByTag(tag)
@@ -295,11 +295,6 @@ class MainActivity : AppCompatActivity() {
             } else {
                 show(existing)
             }
-        }
-        if (immediate) {
-            manager.commitNow(body = apply)
-        } else {
-            manager.commit(body = apply)
         }
     }
 
