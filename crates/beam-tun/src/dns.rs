@@ -1587,7 +1587,26 @@ impl DnsInterceptor {
             .bypass_domains
             .iter()
             .any(|s| matches_domain_suffix(&query.qname, s));
-        let use_local = (is_local || is_bypass_domain) && current_local.is_some();
+        let must_use_local = is_local || is_bypass_domain;
+        let use_local = must_use_local && current_local.is_some();
+
+        // A local/bypass name has no safe answer without the local resolver.
+        // Sending it to the public upstream leaks the name and can cache a
+        // misleading NXDOMAIN, so fail closed before any lookup or cache hit.
+        if must_use_local && current_local.is_none() {
+            if let Some(suppressed) = DNS_UPSTREAM_LOG.allow() {
+                warn!(
+                    qtype = query.qtype,
+                    stage = "no_local_upstream",
+                    suppressed,
+                    "local DNS name has no local upstream; replying with SERVFAIL"
+                );
+            }
+            if let Some(sf) = build_servfail_response(wire) {
+                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &sf, None);
+            }
+            return;
+        }
 
         // Loop guard: if a local/bypass query destined for `local_upstream`
         // itself re-entered the TUN (e.g. bypass route vanished mid-transition),
@@ -3209,6 +3228,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_and_bypass_names_fail_closed_without_local_upstream() {
+        // A connection here would prove that the tunneled resolver ran.
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind fake tunnel server");
+        let server_addr = listener.local_addr().expect("addr");
+        let (tun_tx, mut tun_rx) = mpsc::channel(8);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(server_addr, dummy_reality, [2u8; 16]);
+        let mut dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            None,
+        );
+        dns_cfg.bypass_domains = vec!["bypass.test".to_owned()];
+        dns_cfg.query_timeout = Duration::from_millis(200);
+        let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 55_020);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        for (tx_id, name) in [(0xa001u16, "router.lan"), (0xa002, "host.bypass.test")] {
+            let wire = build_query(tx_id, name, 1);
+            interceptor.handle_query(src, dst, &wire);
+            let pkt = tun_rx.try_recv().expect("immediate SERVFAIL");
+            let udp = crate::packet::parse_udp(crate::packet::parse_ip(&pkt).expect("ip").payload)
+                .expect("udp");
+            assert_eq!(u16::from_be_bytes([udp.payload[0], udp.payload[1]]), tx_id);
+            assert_eq!(udp.payload[3] & 0x0f, 2, "must be SERVFAIL");
+        }
+
+        assert_eq!(interceptor.stats().misses, 0, "no tunneled lookup started");
+        assert_eq!(interceptor.stats().hits, 0, "no cached answer was used");
+        assert_eq!(interceptor.cache.lock().expect("cache").len, 0);
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "the tunneled resolver must never connect"
+        );
+    }
+
+    #[tokio::test]
     async fn network_change_cancels_inflight_query_without_reply_or_cache_entry() {
         // A local upstream that binds but never answers, so the query can only
         // finish by reaching `query_timeout`.
@@ -4292,9 +4357,10 @@ mod tests {
         );
         let refires = Arc::new(AtomicUsize::new(0));
         let refires_cb = Arc::clone(&refires);
+        // A cached bypass answer still needs a detected local upstream.
         let mut dns_cfg = DnsConfig::new(
             DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
-            None,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53)),
         );
         dns_cfg.bypass_domains = vec!["bypass.test".to_owned()];
         dns_cfg.on_bypass_ips = Some(Arc::new(move |ips: Vec<IpAddr>| {
@@ -4595,9 +4661,10 @@ mod tests {
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_cb = Arc::clone(&calls);
+        // A cached bypass answer still needs a detected local upstream.
         let mut dns_cfg = DnsConfig::new(
             DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
-            None,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53)),
         );
         dns_cfg.bypass_domains = vec!["bypass.test".to_owned()];
         dns_cfg.on_bypass_ips = Some(Arc::new(move |ips: Vec<IpAddr>| {
