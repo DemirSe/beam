@@ -595,6 +595,12 @@ VLESS with `xtls-rprx-vision` is expected to work.
   is not an upstream delivery acknowledgment. A failed or timed-out dial
   resets the flow with RST and discards those bytes. Keeping the receive window
   closed until the dial succeeds is therefore not part of this proxy semantic.
+- IPv4-compatible IPv6 destinations (`::a.b.c.d`, RFC 4291) follow IPv4 policy:
+  they are mapped to the embedded IPv4 for the exclude, bypass, and
+  private-destination checks, as `::ffff:a.b.c.d` already is. `::1`, `::`, and
+  genuine IPv6 destinations keep their own policy. The dial target is
+  unchanged: a proxied destination is still sent as the address from the
+  packet.
 
 ## Client (`beam-client`)
 
