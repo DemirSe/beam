@@ -645,7 +645,10 @@ platform-independent core shared with the Android `VpnService` backend.
   or DoH upstream, it returns the full upstream response and keeps EDNS0 DO
   for queries up to 16 KiB. A UDP-only upstream accepts queries up to 1232
   bytes. The resolver returns SERVFAIL for a larger query. It never sends a
-  truncated query to a UDP-only upstream. Note the LAN DNS trust
+  truncated query to a UDP-only upstream. Android has no pre-VPN local DNS
+  upstream for the interceptor. Its profile sets `single_label_local = false`,
+  so dotless names use the tunneled resolver. Other clients keep the local
+  resolver default for dotless names. Note the LAN DNS trust
   boundary for `bypass.domains`: those names are resolved via the unauthenticated
   local LAN resolver (`dns.local_upstream` or auto-detected system DNS), and
   resolved IPs receive temporary, bounded, `info`-logged `/32` or `/128` host

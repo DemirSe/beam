@@ -2961,6 +2961,25 @@ mod tests {
         out
     }
 
+    /// Builds the exact wire form for root (`.`) and trailing-dot names.
+    fn build_dot_query(tx_id: u16, name: &str, qtype: u16) -> Vec<u8> {
+        let mut out = vec![0u8; 12];
+        out[0..2].copy_from_slice(&tx_id.to_be_bytes());
+        out[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
+        out[4..6].copy_from_slice(&1u16.to_be_bytes());
+        let labels = name.trim_end_matches('.');
+        if !labels.is_empty() {
+            for label in labels.split('.') {
+                out.push(label.len() as u8);
+                out.extend_from_slice(label.as_bytes());
+            }
+        }
+        out.push(0);
+        out.extend_from_slice(&qtype.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out
+    }
+
     fn build_a_response(query: &[u8], ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
         let mut out = query.to_vec();
         out[2] = 0x81; // QR=1, RD=1
@@ -3664,6 +3683,65 @@ mod tests {
         }
         server_task.await.expect("local server done");
         assert_eq!(interceptor.stats().servfail_upstream, 0);
+    }
+
+    #[tokio::test]
+    async fn root_uses_the_tunnel_and_trailing_dot_router_uses_local_dns() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind fake tunnel server");
+        let tunnel_addr = listener.local_addr().expect("tunnel address");
+        let local_dns = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local DNS");
+        let local_addr = local_dns.local_addr().expect("local DNS address");
+        let (seen_tx, mut seen_rx) = mpsc::channel(4);
+        let local_server = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, peer)) = local_dns.recv_from(&mut buf).await else {
+                    return;
+                };
+                if let Some(query) = parse_dns_query(&buf[..n]) {
+                    let _ = seen_tx.send(query.qname).await;
+                }
+                let resp = build_a_response(&buf[..n], Ipv4Addr::new(192, 168, 1, 9), 60);
+                let _ = local_dns.send_to(&resp, peer).await;
+            }
+        });
+
+        let (interceptor, mut tun_rx) = test_interceptor_with_server(tunnel_addr, Some(local_addr));
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_010);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+
+        interceptor.handle_query(src, dst, &build_dot_query(0xd101, ".", 1));
+        let root_pkt = timeout(Duration::from_secs(2), tun_rx.recv())
+            .await
+            .expect("root reply")
+            .expect("root packet");
+        let root_udp =
+            crate::packet::parse_udp(crate::packet::parse_ip(&root_pkt).expect("ip").payload)
+                .expect("udp");
+        assert_eq!(root_udp.payload[3] & 0x0f, 2, "root must use the tunnel");
+        assert!(
+            seen_rx.try_recv().is_err(),
+            "root must not use the local resolver"
+        );
+
+        interceptor.handle_query(src, dst, &build_dot_query(0xd102, "router.", 1));
+        let local_pkt = timeout(Duration::from_secs(2), tun_rx.recv())
+            .await
+            .expect("local reply")
+            .expect("local packet");
+        let local_udp =
+            crate::packet::parse_udp(crate::packet::parse_ip(&local_pkt).expect("ip").payload)
+                .expect("udp");
+        assert_eq!(
+            parse_dns_response_meta(local_udp.payload).1,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9))]
+        );
+        assert_eq!(seen_rx.recv().await.expect("local query"), "router");
+        local_server.abort();
     }
 
     #[tokio::test]

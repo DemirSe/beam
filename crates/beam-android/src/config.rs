@@ -241,6 +241,9 @@ impl AndroidEngineConfig {
         }
         let upstream = DnsUpstream::parse(&self.doh_url).map_err(|_| ConfigError::Dns)?;
         let mut dns = DnsConfig::new(upstream, None);
+        // No pre-VPN local resolver is available here. Keep dotless names on
+        // the tunneled resolver instead of failing them closed.
+        dns.single_label_local = false;
         dns.cache_size = MOBILE_DNS_CACHE_SIZE;
         dns.ipv4_only = self.ipv4_only;
         dns.local_socket_protector = socket_protector;
@@ -385,6 +388,18 @@ mod tests {
         assert!(dns.ipv4_only);
         assert_eq!(dns.cache_size, MOBILE_DNS_CACHE_SIZE);
         assert!(matches!(dns.upstream, DnsUpstream::Doh { .. }));
+    }
+
+    #[test]
+    fn mobile_dns_keeps_dotless_names_tunneled_without_a_local_upstream() {
+        let cfg = mobile_config();
+        let engine = cfg.build_engine_config(None, None).expect("engine config");
+        let dns = engine.dns.as_ref().expect("dns interceptor");
+        assert!(dns.local_upstream.is_none());
+        assert!(
+            !dns.single_label_local,
+            "SERVFAIL would replace tunneling without a local resolver"
+        );
     }
 
     #[test]
