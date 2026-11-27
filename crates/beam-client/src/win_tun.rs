@@ -122,7 +122,11 @@ impl TunDevice for AsyncWinTun {
             return Ok(None);
         };
         loop {
-            self.decoder.push_batch(queue.try_recv().ok()?);
+            let batch = match queue.try_recv() {
+                Ok(batch) => batch,
+                Err(_) => return Ok(None),
+            };
+            self.decoder.push_batch(batch);
             let Some(packet) = self.decoder.next_packet() else {
                 // Only our own encoder produces batches, so an empty one just
                 // means the packets ride in a later message; keep draining.
