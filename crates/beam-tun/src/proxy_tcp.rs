@@ -234,6 +234,16 @@ impl TcpConn {
         u32::try_from(avail).unwrap_or(max_scaled).min(max_scaled)
     }
 
+    /// `true` when eviction would discard bytes that are still queued.
+    fn has_buffered_data(&self) -> bool {
+        !self.tx_buf.is_empty()
+            || !self.pending_to_relay.is_empty()
+            || !self.rcv_coalesce.is_empty()
+            || !self.ooo.is_empty()
+            || self.in_flight_relay.load(Ordering::Acquire) > 0
+            || self.from_relay.as_ref().is_some_and(|rx| !rx.is_empty())
+    }
+
     fn advertised_window(&self) -> u16 {
         let wnd = self.rcv_wnd_bytes() >> self.our_wscale;
         u16::try_from(wnd).unwrap_or(u16::MAX)
@@ -1098,12 +1108,14 @@ impl ProxyTcpStack {
 
     /// Tiered soft eviction when the TCP table is full so closing/stale flows
     /// yield their slot before a new SYN is rejected with `tcp_limit`:
-    /// 1. Oldest closing flow (`FinWait1`/`FinWait2`/`Closing`/`LastAck`/`CloseWait`).
+    /// 1. Oldest idle closing flow (`FinWait1`/`FinWait2`/`Closing`/`LastAck`/
+    ///    `CloseWait`) with empty buffers.
     /// 2. Oldest half-open `SynReceived` flow idle for at least `SOFT_EVICT_SYN_MIN_AGE_MS`.
-    /// 3. Oldest quiescent `Established` flow with empty buffers idle for at least
+    /// 3. Oldest quiescent flow with empty buffers idle for at least
     ///    `SOFT_EVICT_ESTABLISHED_IDLE_MS`.
     ///
-    /// Active flows with buffered data or recent activity are never evicted.
+    /// Buffered closing flows fall through to tier 3, which also requires empty
+    /// buffers, so a stalled half-closed transfer is never truncated.
     fn evict_one_stale_conn(
         conns: &mut HashMap<FlowKey, TcpConn>,
         poll_batch: &mut Vec<FlowKey>,
@@ -1121,22 +1133,26 @@ impl ProxyTcpStack {
                 | TcpState::FinWait2
                 | TcpState::Closing
                 | TcpState::LastAck
-                | TcpState::CloseWait => {
-                    if best_closing.is_none_or(|(ts, _)| conn.last_activity_ms < ts) {
-                        best_closing = Some((conn.last_activity_ms, flow));
-                    }
+                | TcpState::CloseWait
+                    if !conn.has_buffered_data()
+                        && best_closing.is_none_or(|(ts, _)| conn.last_activity_ms < ts) =>
+                {
+                    best_closing = Some((conn.last_activity_ms, flow));
                 }
                 TcpState::SynReceived if age_ms >= SOFT_EVICT_SYN_MIN_AGE_MS => {
                     if best_syn.is_none_or(|(ts, _)| conn.last_activity_ms < ts) {
                         best_syn = Some((conn.last_activity_ms, flow));
                     }
                 }
-                TcpState::Established
+                TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::Closing
+                | TcpState::LastAck
+                | TcpState::CloseWait
+                | TcpState::Established
                     if age_ms >= SOFT_EVICT_ESTABLISHED_IDLE_MS
                         && !is_protected_push_port(flow.3)
-                        && conn.tx_buf.is_empty()
-                        && conn.pending_to_relay.is_empty()
-                        && conn.ooo.is_empty()
+                        && !conn.has_buffered_data()
                         && best_idle.is_none_or(|(ts, _)| conn.last_activity_ms < ts) =>
                 {
                     best_idle = Some((conn.last_activity_ms, flow));
@@ -3204,6 +3220,61 @@ mod tests {
         assert!(!stack.conns.contains_key(&(client, 40003, server, 443)));
         assert!(stack.conns.contains_key(&flow2));
         assert!(stack.conns.contains_key(&(client, 40004, server, 443)));
+
+        // A buffered, stalled CloseWait is not a tier-1 victim. When an idle
+        // established flow is available, that flow yields its slot instead.
+        let close_wait_flow: FlowKey = (client, 40004, server, 443);
+        let conn = stack
+            .conns
+            .get_mut(&close_wait_flow)
+            .expect("close wait flow");
+        conn.state = TcpState::CloseWait;
+        conn.state_deadline_ms = None;
+        conn.tx_buf.extend(b"unacked-download-tail");
+        conn.snd_wnd = 0; // peer's zero window keeps the tail buffered
+        let idle_at = 300 + SOFT_EVICT_SYN_MIN_AGE_MS;
+        let conn = stack.conns.get_mut(&flow2).expect("idle flow");
+        conn.tx_buf.clear();
+        conn.last_activity_ms = idle_at;
+
+        let syn5 = build_ip_tcp_packet_slices(
+            client,
+            40005,
+            server,
+            443,
+            5000,
+            0,
+            TCP_SYN,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("syn5");
+        stack.push_ip_tcp(&syn5);
+        stack.poll(
+            idle_at + SOFT_EVICT_ESTABLISHED_IDLE_MS,
+            &mut tx,
+            &mut accepted,
+        );
+        assert!(
+            stack.conns.contains_key(&close_wait_flow),
+            "buffered CloseWait must not be evicted"
+        );
+        assert!(
+            !stack
+                .conns
+                .get(&close_wait_flow)
+                .expect("close wait")
+                .tx_buf
+                .is_empty(),
+            "its unacked tail must survive"
+        );
+        assert!(
+            !stack.conns.contains_key(&flow2),
+            "idle empty flow must be evicted instead"
+        );
+        assert!(stack.conns.contains_key(&(client, 40005, server, 443)));
     }
 
     #[test]
