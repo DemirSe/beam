@@ -54,7 +54,9 @@ $PipeName = 'beam-client-ipc'
 $IpifyUrl = 'https://api.ipify.org'
 $TtfbUrl = 'https://1.1.1.1/cdn-cgi/trace'
 $DownUrlWarm = 'https://speed.cloudflare.com/__down?bytes=25000000'
-$DownUrlMeas = 'https://speed.cloudflare.com/__down?bytes=100000000'
+# Measured download is 4 chunks of the working 25 MB URL (100 MB total).
+$DownChunks = 4
+$DownChunkBytes = 25000000
 
 function Get-MedianDouble {
     param([double[]]$Values)
@@ -196,6 +198,8 @@ function Measure-HttpsTtfbMs {
 # Last bulk-download probe diagnostics (secret-free: exit code + HTTP code only).
 $script:LastCurlExit = -1
 $script:LastHttpCode = 'n/a'
+$script:LastMulti4CurlExit = -1
+$script:LastMulti4HttpCode = 'n/a'
 
 function Invoke-DownloadWarmup {
     # Discarded 25 MB request that warms the path before the measured one.
@@ -211,18 +215,114 @@ function Measure-DownloadMbps {
     $script:LastHttpCode = 'n/a'
     try {
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
-        $out = & curl.exe -sS -o NUL -w '%{http_code} %{speed_download}' --max-time 90 $DownUrlMeas 2>$null
-        $script:LastCurlExit = $LASTEXITCODE
-        $parts = @(((($out | Out-String).Trim()) -split '\s+'))
-        if ($parts.Count -ge 1) { $script:LastHttpCode = $parts[0] }
-        $speedText = ''
-        if ($parts.Count -ge 2) { $speedText = $parts[1] }
-        $bps = 0.0
-        if (-not [double]::TryParse($speedText, [System.Globalization.NumberStyles]::Float, $inv, [ref]$bps)) { return 'fail' }
-        if ($bps -le 0) { return 'fail' }
-        if ($script:LastCurlExit -ne 0) { return 'fail' }
-        return ([math]::Round($bps * 8.0 / 1000000.0, 1)).ToString('F1', $inv)
+        # One window over 4 chunks of the working 25 MB URL (100 MB total).
+        # Any non-2xx code or non-zero exit fails the round.
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        for ($c = 0; $c -lt $DownChunks; $c++) {
+            $out = & curl.exe -sS -o NUL -w '%{http_code}' --max-time 30 $DownUrlWarm 2>$null
+            $script:LastCurlExit = $LASTEXITCODE
+            $code = (($out | Out-String).Trim())
+            $script:LastHttpCode = $code
+            if ($LASTEXITCODE -ne 0) { $sw.Stop(); return 'fail' }
+            if ($code -notmatch '^2') { $sw.Stop(); return 'fail' }
+        }
+        $sw.Stop()
+        $secs = $sw.Elapsed.TotalSeconds
+        if ($secs -le 0) { return 'fail' }
+        $totalBytes = [double]$DownChunks * [double]$DownChunkBytes
+        $mbps = $totalBytes * 8.0 / $secs / 1000000.0
+        if ($mbps -le 0) { return 'fail' }
+        return ([math]::Round($mbps, 1)).ToString('F1', $inv)
     } catch {
+        return 'fail'
+    }
+}
+
+function Measure-Multi4DownloadMbps {
+    # Four concurrent 25 MB transfers (one curl.exe each), timed as one group.
+    # Aggregate is 100 MB over wall time; any non-2xx or non-zero exit fails.
+    $script:LastMulti4CurlExit = -1
+    $script:LastMulti4HttpCode = 'n/a'
+    $flows = 4
+    $tmpFiles = @()
+    $procs = @()
+    try {
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+        for ($i = 0; $i -lt $flows; $i++) {
+            $tmpFiles += [System.IO.Path]::GetTempFileName()
+        }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        for ($i = 0; $i -lt $flows; $i++) {
+            $p = Start-Process -FilePath 'curl.exe' -ArgumentList @('-sS', '-o', 'NUL', '-w', '%{http_code}', '--max-time', '60', $DownUrlWarm) -NoNewWindow -PassThru -RedirectStandardOutput $tmpFiles[$i]
+            $procs += $p
+        }
+        $allExited = $true
+        foreach ($p in $procs) {
+            try {
+                $exited = $p.WaitForExit(65000)
+                if (-not $exited) {
+                    $allExited = $false
+                    try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {
+                    }
+                }
+            } catch {
+                $allExited = $false
+            }
+        }
+        $sw.Stop()
+        $worstExit = 0
+        $worstHttp = '200'
+        $sawHttpFail = $false
+        $anyFail = (-not $allExited)
+        for ($i = 0; $i -lt $flows; $i++) {
+            $code = ''
+            try { $code = ((Get-Content -LiteralPath $tmpFiles[$i] -Raw -ErrorAction SilentlyContinue | Out-String).Trim()) } catch { $code = '' }
+            if ([string]::IsNullOrWhiteSpace($code)) { $code = 'n/a' }
+            if ($code -notmatch '^2') {
+                if (-not $sawHttpFail) { $worstHttp = $code }
+                $sawHttpFail = $true
+                $anyFail = $true
+            } else {
+                if (-not $sawHttpFail) { $worstHttp = $code }
+            }
+            $exit = -1
+            try {
+                if ($procs[$i].HasExited) { $exit = [int]$procs[$i].ExitCode } else { $exit = 124 }
+            } catch { $exit = -1 }
+            if ($exit -ne 0) {
+                $anyFail = $true
+                if ($worstExit -eq 0) { $worstExit = $exit }
+                if (($exit -gt $worstExit) -and ($worstExit -ne 0)) { $worstExit = $exit }
+            }
+        }
+        foreach ($t in $tmpFiles) {
+            try { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } catch {
+            }
+        }
+        if ((-not $allExited) -and ($worstExit -eq 0)) { $worstExit = 124 }
+        $script:LastMulti4CurlExit = $worstExit
+        $script:LastMulti4HttpCode = $worstHttp
+        if ($anyFail) { return 'fail' }
+        $secs = $sw.Elapsed.TotalSeconds
+        if ($secs -le 0) { return 'fail' }
+        $totalBytes = [double]$flows * [double]$DownChunkBytes
+        $mbps = $totalBytes * 8.0 / $secs / 1000000.0
+        if ($mbps -le 0) { return 'fail' }
+        return ([math]::Round($mbps, 1)).ToString('F1', $inv)
+    } catch {
+        foreach ($t in $tmpFiles) {
+            try { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } catch {
+            }
+        }
+        try {
+            foreach ($p in $procs) {
+                try {
+                    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+                } catch {
+                }
+            }
+        } catch {
+        }
         return 'fail'
     }
 }
@@ -259,11 +359,15 @@ function Measure-ConnectedMetrics {
     if (($cpu0 -ge 0) -and ($cpu1 -ge $cpu0)) {
         $cpu = ([math]::Round($cpu1 - $cpu0, 1)).ToString('F1', $inv)
     }
+    $multi4 = Measure-Multi4DownloadMbps
+    $multi4Exit = [string]$script:LastMulti4CurlExit
+    $multi4Http = [string]$script:LastMulti4HttpCode
     $dns = Measure-DnsMs
     $egress = Get-PublicIpv4
     $via = (($egress -ne '') -and ($VpsIpv4 -ne '') -and ($egress -eq $VpsIpv4))
     return @{
         ram_mb = $ram; https_ttfb_ms = $ttfb; download_mbps = $down
+        multi4_mbps = $multi4; multi4_curl_exit = $multi4Exit; multi4_http_code = $multi4Http
         dns_ms = $dns; cpu_s = $cpu; egress_via_vps = $via.ToString().ToLowerInvariant()
     }
 }
@@ -271,8 +375,9 @@ function Measure-ConnectedMetrics {
 function New-RoundRow {
     return @{
         connect_ms = 'fail'; ram_mb = 'n/a'; https_ttfb_ms = 'fail'
-        download_mbps = 'fail'; dns_ms = 'fail'; egress_via_vps = 'false'
+        download_mbps = 'fail'; multi4_mbps = 'fail'; dns_ms = 'fail'; egress_via_vps = 'false'
         cpu_s = 'n/a'; drops = 'none'; curl_exit = 'n/a'; http_code = 'n/a'
+        multi4_curl_exit = 'n/a'; multi4_http_code = 'n/a'
         rtt_ms = 'n/a'; error = ''
     }
 }
@@ -284,12 +389,15 @@ function Format-RoundLine {
         ' ram_mb=' + $Round['ram_mb'] +
         ' ttfb_ms=' + $Round['https_ttfb_ms'] +
         ' down_mbps=' + $Round['download_mbps'] +
+        ' multi4_mbps=' + $Round['multi4_mbps'] +
         ' dns_ms=' + $Round['dns_ms'] +
         ' cpu_s=' + $Round['cpu_s'] +
         ' drops=' + $Round['drops'] +
         ' rtt_ms=' + $Round['rtt_ms'] +
         ' curl_exit=' + $Round['curl_exit'] +
         ' http=' + $Round['http_code'] +
+        ' multi4_curl_exit=' + $Round['multi4_curl_exit'] +
+        ' multi4_http=' + $Round['multi4_http_code'] +
         ' egress=' + $Round['egress_via_vps'] +
         ' err=' + $Round['error'])
 }
@@ -687,12 +795,15 @@ try {
         ('| ram_mb | ' + (Format-AggCell -Rows $beamRounds -Key 'ram_mb' -Decimals 1) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'ram_mb' -Decimals 1) + ' |'),
         ('| https_ttfb_ms | ' + (Format-AggCell -Rows $beamRounds -Key 'https_ttfb_ms' -Decimals 0) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'https_ttfb_ms' -Decimals 0) + ' |'),
         ('| download_mbps | ' + (Format-AggCell -Rows $beamRounds -Key 'download_mbps' -Decimals 1) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'download_mbps' -Decimals 1) + ' |'),
+        ('| multi4_mbps | ' + (Format-AggCell -Rows $beamRounds -Key 'multi4_mbps' -Decimals 1) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'multi4_mbps' -Decimals 1) + ' |'),
         ('| dns_ms | ' + (Format-AggCell -Rows $beamRounds -Key 'dns_ms' -Decimals 0) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'dns_ms' -Decimals 0) + ' |'),
         ('| cpu_s | ' + (Format-AggCell -Rows $beamRounds -Key 'cpu_s' -Decimals 1) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'cpu_s' -Decimals 1) + ' |'),
         ('| drops | ' + (Format-JoinCell -Rows $beamRounds -Key 'drops') + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'drops') + ' |'),
         ('| rtt_ms | ' + (Format-AggCell -Rows $beamRounds -Key 'rtt_ms' -Decimals 0) + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'rtt_ms') + ' |'),
         ('| download_curl_exit | ' + (Format-JoinCell -Rows $beamRounds -Key 'curl_exit') + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'curl_exit') + ' |'),
         ('| download_http_code | ' + (Format-JoinCell -Rows $beamRounds -Key 'http_code') + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'http_code') + ' |'),
+        ('| multi4_curl_exit | ' + (Format-JoinCell -Rows $beamRounds -Key 'multi4_curl_exit') + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'multi4_curl_exit') + ' |'),
+        ('| multi4_http_code | ' + (Format-JoinCell -Rows $beamRounds -Key 'multi4_http_code') + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'multi4_http_code') + ' |'),
         ('| egress_via_vps | ' + (Format-EgressCell -Rows $beamRounds) + ' | ' + (Format-EgressCell -Rows $sbRounds) + ' |'),
         ('| rounds | ' + (Format-RoundsCell -Rows $beamRounds) + ' | ' + (Format-RoundsCell -Rows $sbRounds) + ' |')
     )

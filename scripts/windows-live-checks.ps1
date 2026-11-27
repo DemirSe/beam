@@ -128,6 +128,148 @@ function Get-BeamIfIndex {
     return -1
 }
 
+function Ensure-BoundDnsType {
+    $existing = ([System.Management.Automation.PSTypeName]'BeamBoundDns').Type
+    if ($null -ne $existing) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+public static class BeamBoundDns
+{
+    // Tri-state: 1 = the query reached the resolver or something answered on
+    // the wire (a leak), 0 = no reply inside the timeout (blocked), -1 = the
+    // probe itself could not run, so nothing is proven either way.
+    public static int TryBoundQuery(string serverIp, int ifIndex, string localIp, string name, int timeoutMs)
+    {
+        Socket sock = null;
+        try
+        {
+            if (serverIp == null) { return -1; }
+            if (name == null) { return -1; }
+            if (ifIndex < 0) { return -1; }
+            if (timeoutMs < 500) { timeoutMs = 500; }
+            if (timeoutMs > 10000) { timeoutMs = 10000; }
+            IPAddress server = null;
+            try { server = IPAddress.Parse(serverIp); }
+            catch { return -1; }
+            if (server.AddressFamily != AddressFamily.InterNetwork) { return -1; }
+            byte[] query = BuildQuery(name, 0x4242);
+            if (query == null) { return -1; }
+            IPEndPoint remote = new IPEndPoint(server, 53);
+            sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            // IP_UNICAST_IF takes the interface index in network byte order.
+            int idxNet = IPAddress.HostToNetworkOrder(ifIndex);
+            try { sock.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31, idxNet); }
+            catch { return -1; }
+            // Bind the physical source address too, so the packet cannot be
+            // routed into the WinTun split route.
+            if ((localIp != null) && (localIp.Length > 0))
+            {
+                try
+                {
+                    IPAddress local = IPAddress.Parse(localIp);
+                    if (local.AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        sock.Bind(new IPEndPoint(local, 0));
+                    }
+                }
+                catch { return -1; }
+            }
+            sock.SendTimeout = timeoutMs;
+            sock.ReceiveTimeout = timeoutMs;
+            try { sock.SendTo(query, remote); }
+            catch { return -1; }
+            bool readable = false;
+            try { readable = sock.Poll(timeoutMs * 1000, SelectMode.SelectRead); }
+            catch { return -1; }
+            if (readable == false) { return 0; }
+            byte[] buf = new byte[512];
+            EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+            int n = 0;
+            // An ICMP rejection is only possible after the query left the host,
+            // so a receive error still proves the packet reached the wire.
+            try { n = sock.ReceiveFrom(buf, ref from); }
+            catch { return 1; }
+            if (n < 12) { return 1; }
+            if (buf[0] != 0x42) { return 1; }
+            if (buf[1] != 0x42) { return 1; }
+            return 1;
+        }
+        catch { return -1; }
+        finally
+        {
+            if (sock != null)
+            {
+                try { sock.Close(); }
+                catch { }
+            }
+        }
+    }
+    private static byte[] BuildQuery(string name, int id)
+    {
+        try
+        {
+            if (name == null) { return null; }
+            string trimmed = name.Trim();
+            if (trimmed.Length == 0) { return null; }
+            if (trimmed.EndsWith(".")) { trimmed = trimmed.Substring(0, trimmed.Length - 1); }
+            string[] labels = trimmed.Split('.');
+            if (labels.Length == 0) { return null; }
+            byte[] tmp = new byte[512];
+            tmp[0] = (byte)((id >> 8) & 0xFF);
+            tmp[1] = (byte)(id & 0xFF);
+            tmp[2] = 0x01;
+            tmp[3] = 0x00;
+            tmp[4] = 0x00;
+            tmp[5] = 0x01;
+            tmp[6] = 0x00;
+            tmp[7] = 0x00;
+            tmp[8] = 0x00;
+            tmp[9] = 0x00;
+            tmp[10] = 0x00;
+            tmp[11] = 0x00;
+            int pos = 12;
+            foreach (string lab in labels)
+            {
+                if (lab == null) { return null; }
+                if (lab.Length == 0) { return null; }
+                if (lab.Length > 63) { return null; }
+                byte[] lb = Encoding.ASCII.GetBytes(lab);
+                if (pos + 1 + lb.Length + 5 >= tmp.Length) { return null; }
+                tmp[pos] = (byte)lb.Length;
+                pos = pos + 1;
+                int i = 0;
+                while (i < lb.Length)
+                {
+                    tmp[pos] = lb[i];
+                    pos = pos + 1;
+                    i = i + 1;
+                }
+            }
+            tmp[pos] = 0x00;
+            pos = pos + 1;
+            tmp[pos] = 0x00;
+            tmp[pos + 1] = 0x01;
+            tmp[pos + 2] = 0x00;
+            tmp[pos + 3] = 0x01;
+            pos = pos + 4;
+            byte[] outBuf = new byte[pos];
+            int j = 0;
+            while (j < pos)
+            {
+                outBuf[j] = tmp[j];
+                j = j + 1;
+            }
+            return outBuf;
+        }
+        catch { return null; }
+    }
+}
+'@
+}
+
 function Test-BeamAdapterUp {
     $adapters = Get-NetAdapter -ErrorAction SilentlyContinue
     foreach ($a in $adapters) {
@@ -269,34 +411,71 @@ function Test-DnsLeak {
         return
     }
     try {
-        $servers = New-Object System.Collections.Generic.List[string]
+        $physUp = $false
+        $allAdapters = Get-NetAdapter -ErrorAction SilentlyContinue
+        foreach ($na in $allAdapters) {
+            if ($na.Name -like 'Beam*') { continue }
+            if ($na.Status -eq 'Up') { $physUp = $true; break }
+        }
+        if (-not $physUp) {
+            Add-Check 'dns_leak' 'skip' 'no_physical_if'
+            return
+        }
+        $physProbes = @()
         $addrObjs = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue
         foreach ($o in $addrObjs) {
-            if ([int]$o.InterfaceIndex -eq $beamIf) { continue }
+            $oIf = -1
+            try { $oIf = [int]$o.InterfaceIndex } catch { continue }
+            if ($oIf -eq $beamIf) { continue }
             foreach ($s in $o.ServerAddresses) {
                 if ([string]::IsNullOrWhiteSpace($s)) { continue }
                 if ($s -like '127.*') { continue }
-                if (-not $servers.Contains($s)) { $servers.Add($s) }
+                $dup = $false
+                foreach ($e in $physProbes) {
+                    if (($e['Server'] -eq $s) -and ([int]$e['IfIndex'] -eq $oIf)) { $dup = $true; break }
+                }
+                if ($dup) { continue }
+                $localIp = ''
+                try {
+                    $own = Get-NetIPAddress -InterfaceIndex $oIf -AddressFamily IPv4 -ErrorAction SilentlyContinue
+                    foreach ($a in @($own)) {
+                        if (-not [string]::IsNullOrWhiteSpace($a.IPAddress)) { $localIp = [string]$a.IPAddress; break }
+                    }
+                } catch {
+                    $localIp = ''
+                }
+                $physProbes += @{ Server = $s; IfIndex = $oIf; LocalIp = $localIp }
             }
         }
-        Write-Host ('physical_dns_count=' + $servers.Count)
-        if ($servers.Count -eq 0) {
+        Write-Host ('physical_dns_count=' + $physProbes.Count)
+        if ($physProbes.Count -eq 0) {
             Add-Check 'dns_leak' 'skip' 'no_physical_dns'
             return
         }
+        Ensure-BoundDnsType
         $deadline = [DateTime]::UtcNow.AddSeconds($script:CheckTimeoutSec)
         $leaked = $false
-        foreach ($srv in $servers) {
+        $blocked = 0
+        $probeErrors = 0
+        foreach ($entry in $physProbes) {
             if ([DateTime]::UtcNow -ge $deadline) { break }
             try {
-                $answer = Resolve-DnsName -Name $DualStackName -Server $srv -ErrorAction Stop
-                if ($null -ne $answer) { $leaked = $true; break }
+                # Strictly interface-bound UDP: IP_UNICAST_IF (31) pins the
+                # query to the physical NIC so WinTun split routes cannot answer.
+                $rc = [BeamBoundDns]::TryBoundQuery([string]$entry['Server'], [int]$entry['IfIndex'], [string]$entry['LocalIp'], $DualStackName, 3000)
+                if ($rc -eq 1) { $leaked = $true; break }
+                if ($rc -eq 0) { $blocked = $blocked + 1 } else { $probeErrors = $probeErrors + 1 }
             } catch {
-                # Blocked or timed out: the WFP port-53 block is doing its job.
+                $probeErrors = $probeErrors + 1
             }
         }
         if ($leaked) {
-            Add-Check 'dns_leak' 'fail' 'plaintext_dns_answered'
+            Add-Check 'dns_leak' 'fail' 'plaintext_dns_answered_bound_probe'
+            return
+        }
+        # A probe that could not run proves nothing: never report it as blocked.
+        if ($blocked -eq 0) {
+            Add-Check 'dns_leak' 'skip' 'bound_probe_error'
             return
         }
         try {
@@ -309,7 +488,7 @@ function Test-DnsLeak {
             Add-Check 'dns_leak' 'fail' 'tunnel_dns_failed'
             return
         }
-        Add-Check 'dns_leak' 'pass' 'ok'
+        Add-Check 'dns_leak' 'pass' 'bound_probe_ok'
     } catch {
         Add-Check 'dns_leak' 'fail' 'check_error'
     }
@@ -327,16 +506,54 @@ function Test-Ipv6Egress {
     }
     try {
         $v6addrs = Get-NetIPAddress -InterfaceIndex $beamIf -AddressFamily IPv6 -ErrorAction SilentlyContinue
-        foreach ($a in $v6addrs) {
-            $ip = $a.IPAddress
-            if ([string]::IsNullOrWhiteSpace($ip)) { continue }
-            if ($ip -eq '::1') { continue }
-            if ($ip.ToLowerInvariant().StartsWith('fe80:')) { continue }
-            Add-Check 'ipv6_egress' 'fail' 'ipv6_on_beam'
+        $list = @($v6addrs)
+        if (($null -eq $v6addrs) -or ($list.Count -eq 0)) {
+            Add-Check 'ipv6_egress' 'skip' 'ipv6_disabled_on_beam'
             return
         }
-        # AAAA suppression is a client policy (`dns.ipv4_only`), not a leak
-        # signal, so this check asserts only that no IPv6 address or path exists.
+        # The client assigns fd00:be:a::1/126 (inside fd00:be:a::/126) to the
+        # tunnel itself, so that ULA is expected and is not a leak.
+        $tunNet = ([System.Net.IPAddress]::Parse('fd00:be:a::')).GetAddressBytes()
+        $hasTunUla = $false
+        $hasGlobal = $false
+        $hasUnexpected = $false
+        foreach ($a in $list) {
+            $ip = ''
+            try { $ip = [string]$a.IPAddress } catch { continue }
+            if ([string]::IsNullOrWhiteSpace($ip)) { continue }
+            $pct = $ip.IndexOf('%')
+            if ($pct -ge 0) { $ip = $ip.Substring(0, $pct) }
+            $low = $ip.ToLowerInvariant()
+            if (($low -eq '::1') -or ($low -eq '::')) { continue }
+            if ($low.StartsWith('ff')) { continue }
+            $first = ($low -split ':')[0]
+            $firstVal = -1
+            try { $firstVal = [System.Convert]::ToInt32($first, 16) } catch { $firstVal = -1 }
+            if (($firstVal -ge 0xfe80) -and ($firstVal -le 0xfebf)) { continue }
+            $bytes = $null
+            try { $bytes = ([System.Net.IPAddress]::Parse($ip)).GetAddressBytes() } catch { $hasUnexpected = $true; break }
+            if (($null -eq $bytes) -or ($bytes.Length -ne 16)) { $hasUnexpected = $true; break }
+            $inTun = $true
+            for ($i = 0; $i -lt 15; $i++) {
+                if ($bytes[$i] -ne $tunNet[$i]) { $inTun = $false; break }
+            }
+            if ($inTun) {
+                if ((($bytes[15] -band 0xFC) -ne (($tunNet[15]) -band 0xFC))) { $inTun = $false }
+            }
+            if ($inTun) { $hasTunUla = $true; continue }
+            $b0 = [int]$bytes[0]
+            if ((($b0 -band 0xE0) -eq 0x20)) { $hasGlobal = $true; break }
+            $hasUnexpected = $true
+            break
+        }
+        if ($hasGlobal) {
+            Add-Check 'ipv6_egress' 'fail' 'ipv6_global_on_beam'
+            return
+        }
+        if ($hasUnexpected) {
+            Add-Check 'ipv6_egress' 'fail' 'ipv6_unexpected_addr'
+            return
+        }
         if ($null -eq (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
             Add-Check 'ipv6_egress' 'skip' 'no_curl'
             return
@@ -347,6 +564,10 @@ function Test-Ipv6Egress {
         }
         if ($LASTEXITCODE -eq 0) {
             Add-Check 'ipv6_egress' 'fail' 'ipv6_egress_open'
+            return
+        }
+        if ($hasTunUla) {
+            Add-Check 'ipv6_egress' 'pass' 'ula_only'
             return
         }
         Add-Check 'ipv6_egress' 'pass' 'ok'
