@@ -997,6 +997,22 @@ impl RelayIdle {
     }
 }
 
+/// Sends one bounded upstream half-close, even when several relay exits race.
+#[derive(Default)]
+struct UpstreamShutdown {
+    done: bool,
+}
+
+impl UpstreamShutdown {
+    async fn once<W: AsyncWriteExt + Unpin>(&mut self, up_w: &mut W) {
+        if self.done {
+            return;
+        }
+        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
+        self.done = true;
+    }
+}
+
 fn touch_relay(clock: Option<&RelayIdle>) {
     if let Some(clock) = clock {
         clock.touch();
@@ -1326,6 +1342,7 @@ fn spawn_tcp_relay(
         // write timeout), so a normal client EOF still drains the download
         // direction and keeps TCP half-close working.
         let c2s_aborted = Notify::new();
+        let mut upstream_shutdown = UpstreamShutdown::default();
 
         let c2s = async {
             // Reused across iterations so coalescing never grows a fresh Vec per
@@ -1335,14 +1352,14 @@ fn spawn_tcp_relay(
                 let chunk = match relay_read(relay_activity.as_ref(), tun_r.recv_chunk()).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => {
-                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
+                        upstream_shutdown.once(&mut up_w).await;
                         break;
                     }
                     Err(_) => {
                         if let Some(budget) = relay_idle {
                             warn_relay_timeout(conn.dst, "read", budget);
                         }
-                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
+                        upstream_shutdown.once(&mut up_w).await;
                         break;
                     }
                 };
@@ -1361,13 +1378,13 @@ fn spawn_tcp_relay(
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "write", &err);
                         c2s_aborted.notify_one();
-                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
+                        upstream_shutdown.once(&mut up_w).await;
                         break;
                     }
                     Err(_) => {
                         warn_relay_timeout(conn.dst, "write", write_idle);
                         c2s_aborted.notify_one();
-                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
+                        upstream_shutdown.once(&mut up_w).await;
                         break;
                     }
                 }
@@ -1387,13 +1404,13 @@ fn spawn_tcp_relay(
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "flush", &err);
                         c2s_aborted.notify_one();
-                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
+                        upstream_shutdown.once(&mut up_w).await;
                         break;
                     }
                     Err(_) => {
                         warn_relay_timeout(conn.dst, "flush", write_idle);
                         c2s_aborted.notify_one();
-                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
+                        upstream_shutdown.once(&mut up_w).await;
                         break;
                     }
                 }
@@ -1466,10 +1483,8 @@ fn spawn_tcp_relay(
         tokio::select! {
             biased;
             () = wait_shutdown(&mut shutdown) => {
-                // `c2s` and `s2c` own the split stream halves, so leaving this
-                // block closes both sockets and lets the stack emit a FIN. That
-                // matches the network-reset path and never waits for
-                // `up_w.shutdown()` on a shrinking pool.
+                // The common shutdown below still half-closes upstream before
+                // the split halves are dropped on this shrinking pool.
             }
             Ok(()) = async {
                 match network_reset.as_mut() {
@@ -1479,6 +1494,7 @@ fn spawn_tcp_relay(
             } => {}
             _ = async { tokio::join!(c2s, s2c) } => {}
         }
+        upstream_shutdown.once(&mut up_w).await;
     });
 }
 
@@ -2010,6 +2026,47 @@ mod tests {
         assert_eq!(activity.active_tcp_flows(), 0);
         assert_eq!(activity.bytes_tx(), 1_500);
         assert_eq!(activity.bytes_rx(), 4_096);
+    }
+
+    #[tokio::test]
+    async fn upstream_half_close_runs_once_on_relay_exit() {
+        struct ShutdownRecorder(Arc<AtomicU64>);
+
+        impl tokio::io::AsyncWrite for ShutdownRecorder {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut sink = ShutdownRecorder(Arc::clone(&calls));
+        let mut shutdown = UpstreamShutdown::default();
+        shutdown.once(&mut sink).await;
+        shutdown.once(&mut sink).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "an EOF half-close must not be repeated at the common exit"
+        );
     }
 
     #[tokio::test]
