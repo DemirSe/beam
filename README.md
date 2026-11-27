@@ -591,11 +591,14 @@ VLESS with `xtls-rprx-vision` is expected to work.
   (`seq = rcv_nxt - 1` in the peer's receive sequence space) instead gets one
   ACK as soon as the window is above zero, so a single freed 64 KiB chunk does
   not leave the peer stalled.
-- The local TCP handshake can finish before the upstream dial. Early
-  application bytes may be ACKed and queued before the tunnel is up; that ACK
-  is not an upstream delivery acknowledgment. A failed or timed-out dial
-  resets the flow with RST and discards those bytes. Keeping the receive window
-  closed until the dial succeeds is therefore not part of this proxy semantic.
+- The local TCP handshake can finish before the upstream dial. An app then sees
+  a successful `connect()` even when the upstream dial has not succeeded. This
+  result stops Happy Eyeballs and connect-timeout code from trying another
+  address. A doomed dial can also buffer early bytes up to the receive window.
+  The local ACK is not an upstream delivery acknowledgment. A failed or
+  timed-out dial resets the flow with RST and discards those bytes. Keeping the
+  receive window closed until the dial succeeds is therefore not part of this
+  proxy semantic.
 - IPv4-compatible IPv6 destinations (`::a.b.c.d`, RFC 4291) follow IPv4 policy:
   they are mapped to the embedded IPv4 for the exclude, bypass, and
   private-destination checks, as `::ffff:a.b.c.d` already is. `::1`, `::`, and

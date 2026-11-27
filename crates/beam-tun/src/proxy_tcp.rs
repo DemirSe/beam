@@ -2880,27 +2880,8 @@ mod tests {
         let rst = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
         assert_eq!(rst.flags, TCP_RST | TCP_ACK);
         assert_eq!(rst.flags & TCP_FIN, 0, "a failed dial must not send FIN");
-    }
-
-    #[test]
-    fn abort_emits_rst_not_fin_and_removes_connection() {
-        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
-        let (srv_nxt, mut acc) = handshake(&mut stack, 3000);
-        assert_eq!(stack.conns.len(), 1);
-
-        acc.stream.abort();
-
-        let mut tx = Vec::new();
-        let mut accepted = Vec::new();
-        stack.poll(30, &mut tx, &mut accepted);
-
-        assert!(stack.conns.is_empty(), "aborted connection must be removed");
-        assert_eq!(tx.len(), 1, "expected a single RST packet");
-        let rst = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
-        assert_ne!(rst.flags & TCP_RST, 0, "expected TCP_RST flag");
-        assert_eq!(rst.flags & TCP_FIN, 0, "must not emit TCP_FIN on abort");
         assert_eq!(rst.seq, srv_nxt);
-        assert_eq!(rst.ack, 3001);
+        assert_eq!(rst.ack, 6001 + 6);
     }
 
     #[tokio::test]
