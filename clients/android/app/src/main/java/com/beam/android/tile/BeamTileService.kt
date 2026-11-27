@@ -212,6 +212,10 @@ class BeamTileService : TileService() {
                                 serviceConnection,
                                 Context.BIND_AUTO_CREATE,
                             )
+                            if (!isBound) {
+                                pendingToggle = false
+                                updateTile(VpnState.DISCONNECTED, hasProfile = true)
+                            }
                         }
                     }
                 }
@@ -220,6 +224,7 @@ class BeamTileService : TileService() {
         }
 
         // Optimistic: the panel must react before the binder round trip ends.
+        val previousState = lastState
         updateTile(
             if (connected) VpnState.DISCONNECTING else VpnState.CONNECTING,
             hasProfile = cachedHasProfile,
@@ -233,6 +238,10 @@ class BeamTileService : TileService() {
                     serviceConnection,
                     Context.BIND_AUTO_CREATE,
                 )
+                if (!isBound) {
+                    pendingToggle = false
+                    updateTile(previousState, hasProfile = cachedHasProfile)
+                }
             }
             return
         }

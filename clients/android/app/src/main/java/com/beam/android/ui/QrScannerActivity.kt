@@ -108,7 +108,12 @@ class QrScannerActivity : AppCompatActivity() {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             if (isFinishing || isDestroyed) return@addListener
-            val provider = runCatching { future.get() }.getOrNull() ?: return@addListener
+            val provider = runCatching { future.get() }.getOrNull()
+            if (provider == null) {
+                Toast.makeText(this, R.string.qr_error, Toast.LENGTH_LONG).show()
+                finish()
+                return@addListener
+            }
             val preview = Preview.Builder().build()
             preview.setSurfaceProvider(binding.previewView.surfaceProvider)
             val resolutionSelector = ResolutionSelector.Builder()

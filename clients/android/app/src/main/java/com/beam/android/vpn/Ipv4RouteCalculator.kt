@@ -97,7 +97,9 @@ object Ipv4RouteCalculator {
         val slash = cidr.lastIndexOf('/')
         if (slash <= 0) return null
         val address = parseIpv4(cidr.substring(0, slash).trim()) ?: return null
-        val prefix = cidr.substring(slash + 1).trim().toIntOrNull() ?: return null
+        val prefixText = cidr.substring(slash + 1).trim()
+        if (prefixText.isEmpty() || prefixText.any { it !in '0'..'9' }) return null
+        val prefix = prefixText.toIntOrNull() ?: return null
         if (prefix !in 0..32) return null
         val mask = if (prefix == 0) 0L else (0xFFFF_FFFFL shl (32 - prefix)) and 0xFFFF_FFFFL
         val start = address and mask
@@ -111,6 +113,7 @@ object Ipv4RouteCalculator {
         for (part in parts) {
             if (part.isEmpty() || part.length > 3) return null
             if (part.length > 1 && part[0] == '0') return null
+            if (part.any { it !in '0'..'9' }) return null
             val octet = part.toIntOrNull() ?: return null
             if (octet !in 0..255) return null
             value = (value shl 8) or octet.toLong()
