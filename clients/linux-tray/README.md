@@ -13,7 +13,8 @@ The output is `beam-tray` and `beam-helper` in this directory.
 ## Install
 
 `./install.sh` needs root. Run it with sudo from the desktop user, or set
-`INSTALL_USER`. It checks these inputs before it changes live files:
+`INSTALL_USER`. The user name must resolve on the host. The installer checks
+these inputs before it changes live files:
 
 - `CONFIG_SRC`: client profile. Default: `/etc/beam/config.json`.
 - `CORE_DIR`: pinned core directory. Default: `/tmp/beam-core`.

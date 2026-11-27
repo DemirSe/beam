@@ -82,6 +82,18 @@ grep -q 'systemd-resolved is not active; the DNS switch needs it' "$INSTALL" || 
   exit 1
 }
 
+# An unresolved INSTALL_USER leaves the tray unable to call the helper. The
+# check must run before any directory creation, backup, or service change.
+user_line=$(grep -n 'id -u -- "$INSTALL_USER"' "$INSTALL" | cut -d: -f1 || true)
+[ -n "$user_line" ] && [ "$user_line" -lt "$dir_line" ] || {
+  echo "install.sh: INSTALL_USER is not resolved before side effects" >&2
+  exit 1
+}
+grep -qF 'does not resolve to a user' "$INSTALL" || {
+  echo "install.sh: unresolved INSTALL_USER has no named error" >&2
+  exit 1
+}
+
 # Unit ordering: the client reloads systemd-resolved and moves the ctrld
 # drop-in, so it must follow both units. The boot reset must run first.
 unit_body() {
