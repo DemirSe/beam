@@ -9,7 +9,10 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1953,7 +1956,10 @@ async fn resolve_local_udp(
             // The Android protector runs here: after `bind`, before `connect`,
             // so a protector error fails the query before any packet is sent.
             if let Some(protect) = protector.as_ref() {
+                #[cfg(unix)]
                 protect(sock.as_raw_fd())?;
+                #[cfg(windows)]
+                protect(sock.as_raw_socket())?;
             }
             sock.connect(local_upstream).await?;
             sock

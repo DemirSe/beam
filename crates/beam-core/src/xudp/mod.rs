@@ -1,11 +1,14 @@
 //! XUDP mux framing and UDP relay used for UDP over a VLESS stream.
 //!
+//! [`frame`] (the wire format) builds on every target; the session and mux
+//! handler below are server-side and build on Linux and Android only.
+//!
 //! XUDP carries one frame per mux chunk. A frame is decoded with
 //! [`parse_frame`] and replies are encoded with [`encode_frame`]. Parsing is
 //! stateless: a relay keeps a byte buffer, consumes every complete frame, and
 //! retains the remainder for the next read.
 //!
-//! [`handle_mux_stream`] is the session layer. It creates one unconnected
+//! `handle_mux_stream` is the session layer. It creates one unconnected
 //! [`tokio::net::UdpSocket`] per session, relays datagrams with `send_to`, and
 //! stamps every reply with the actual source address. One writer task
 //! serializes frames from all reply tasks behind a bounded queue.
@@ -22,7 +25,7 @@
 //!   matching stock Xray. A future option could restrict replies to contacted
 //!   destinations, but v1 deliberately does not.
 //! - A GlobalID is accepted and stored, and a cleanly closed session keeps its
-//!   socket for [`XudpConfig::close_expiry`] so a later `New` in the *same mux
+//!   socket for `XudpConfig::close_expiry` so a later `New` in the *same mux
 //!   stream* can reattach. The table is not shared between mux streams, so
 //!   cross-connection (full-cone) continuity is out of scope for v1.
 //! - A `New` for a non-UDP network is rejected with `End + Error`; this module
@@ -36,7 +39,9 @@
 //!   the TLS adapter pass a Vision-decoded or prefix-replayed VLESS body.
 
 pub mod frame;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod server;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod session;
 
 pub use frame::{
@@ -44,9 +49,11 @@ pub use frame::{
     METADATA_PREFIX_LEN, MIN_METADATA_LEN, SessionStatus, TargetNetwork, XudpError, encode_frame,
     parse_frame,
 };
-#[cfg(feature = "fuzz")]
+#[cfg(all(feature = "fuzz", any(target_os = "linux", target_os = "android")))]
 pub use server::fuzz_frame_sequence;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use server::{MuxError, handle_mux_stream};
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use session::{
     DEFAULT_MAX_GLOBAL_SESSIONS, XudpConfig, XudpConfigError, XudpSessionLimiter, XudpStats,
 };

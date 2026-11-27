@@ -956,6 +956,28 @@ fn is_fatal_tun_send_error(err: &io::Error) -> bool {
             return true;
         }
     }
+    #[cfg(windows)]
+    {
+        // A WinTun session handle that closed or detached surfaces as one of
+        // these codes; nothing but a new adapter recovers from them.
+        // `ERROR_NO_MORE_ITEMS` (259) is deliberately excluded: WinTun returns
+        // it when the TX ring is transiently full (backpressure, like ENOBUFS).
+        const ERROR_INVALID_HANDLE: i32 = 6;
+        const ERROR_HANDLE_EOF: i32 = 38;
+        const ERROR_BROKEN_PIPE: i32 = 109;
+        const ERROR_DEVICE_NOT_CONNECTED: i32 = 1167;
+        if matches!(
+            err.raw_os_error(),
+            Some(
+                ERROR_INVALID_HANDLE
+                    | ERROR_HANDLE_EOF
+                    | ERROR_BROKEN_PIPE
+                    | ERROR_DEVICE_NOT_CONNECTED
+            )
+        ) {
+            return true;
+        }
+    }
     false
 }
 
@@ -1717,6 +1739,18 @@ mod tests {
             assert!(is_fatal_tun_send_error(&io::Error::from_raw_os_error(9))); // EBADF
             assert!(is_fatal_tun_send_error(&io::Error::from_raw_os_error(19))); // ENODEV
             assert!(!is_fatal_tun_send_error(&io::Error::from_raw_os_error(12))); // ENOMEM
+        }
+        #[cfg(windows)]
+        {
+            // Fatal: ERROR_INVALID_HANDLE, ERROR_HANDLE_EOF, ERROR_BROKEN_PIPE,
+            // ERROR_DEVICE_NOT_CONNECTED. Transient: ERROR_NOT_ENOUGH_MEMORY (8)
+            // and ERROR_NO_MORE_ITEMS (259, WinTun full ring backpressure).
+            assert!(is_fatal_tun_send_error(&io::Error::from_raw_os_error(6)));
+            assert!(is_fatal_tun_send_error(&io::Error::from_raw_os_error(38)));
+            assert!(is_fatal_tun_send_error(&io::Error::from_raw_os_error(109)));
+            assert!(is_fatal_tun_send_error(&io::Error::from_raw_os_error(1167)));
+            assert!(!is_fatal_tun_send_error(&io::Error::from_raw_os_error(8)));
+            assert!(!is_fatal_tun_send_error(&io::Error::from_raw_os_error(259)));
         }
     }
 

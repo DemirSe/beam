@@ -7,6 +7,7 @@
 
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -635,6 +636,7 @@ impl RawTlsHandoff for TlsStream {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for TlsStream {
     fn as_raw_fd(&self) -> RawFd {
         self.socket.as_raw_fd()

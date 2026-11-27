@@ -1,6 +1,8 @@
 //! End-to-end loopback tests for `beam_core::client` directly against
 //! `beam_core::tls::server::handle_connection`.
 
+#![cfg(any(target_os = "linux", target_os = "android"))]
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;

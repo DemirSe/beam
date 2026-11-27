@@ -5,6 +5,9 @@
 //! anything. REALITY decides what to do with a parsed ClientHello.
 
 pub mod client_hello;
+// The TLS server terminates beam connections and is Linux/Android only: it
+// relies on the `splice` relay. The client stack builds on every target.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod server;
 pub mod stream;
 
@@ -18,6 +21,7 @@ pub use client_hello::{
     MAX_SESSION_ID_LEN, TLS_HANDSHAKE_HEADER_LEN, TLS_RECORD_HEADER_LEN, TLS13_VERSION, U16List,
     U16ListIter, client_hello_message_len,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use server::{
     ConnectionOutcome, ReplayStats, ReplayStream, TlsServerConfig, TlsServerError,
     handle_connection, handle_connection_admitted,

@@ -1,14 +1,17 @@
 #![allow(unsafe_code)]
 
-//! Isolated Linux and Android syscall layer for beam.
+//! Isolated platform syscall layer for beam.
 //!
-//! Android shares the Linux kernel ABI, so most modules build for both
-//! targets. `netlink` stays Linux-only. Every `unsafe` block in this
+//! Android shares the Linux kernel ABI, so most modules build for Linux and
+//! Android alike. `netlink` stays Linux-only, and Windows builds the `windows`
+//! module instead of the Linux primitive modules. Every `unsafe` block in this
 //! crate must carry a safety comment that explains the invariants the caller
 //! must uphold.
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-compile_error!("beam-sys supports only Linux and Android targets; both share the Linux kernel ABI");
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
+compile_error!(
+    "beam-sys supports only Linux, Android and Windows targets; other platforms have no syscall layer"
+);
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::io;
@@ -31,6 +34,8 @@ pub mod socket;
 pub mod splice;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod tun;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use eventfd::EventFd;
@@ -49,6 +54,12 @@ pub use socket::{
 pub use splice::{SpliceFlags, pipe, splice};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use tun::{LinuxTun, MAX_IFNAME_LEN, validate_ifname};
+#[cfg(target_os = "windows")]
+pub use windows::{
+    MAX_IFNAME_LEN, bind_socket_to_interface_v4, bind_socket_to_interface_v6, boottime_offset,
+    set_tcp_keepalive, set_tcp_keepcnt, set_tcp_maxseg, set_tcp_nodelay, set_tcp_user_timeout,
+    validate_ifname,
+};
 
 /// Resizes the kernel buffer of a pipe.
 ///

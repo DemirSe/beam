@@ -1,0 +1,80 @@
+name: windows-build
+
+# Windows/MSVC build, clippy, and unit-test gate for the cross-platform core
+# crates (`beam-sys`, `beam-core`, `beam-tun`). `beam-client` and `windows-tray`
+# will be added in later phases once their Windows backends land.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/beam-sys/**'
+      - 'crates/beam-core/**'
+      - 'crates/beam-tun/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'clippy.toml'
+      - '.github/workflows/windows-build.yml'
+  pull_request:
+    paths:
+      - 'crates/beam-sys/**'
+      - 'crates/beam-core/**'
+      - 'crates/beam-tun/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'clippy.toml'
+      - '.github/workflows/windows-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Rust fmt, clippy, unit tests (Windows MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+
+      - name: Ensure nasm and cmake (aws-lc-sys)
+        shell: pwsh
+        run: |
+          $nasmDir = 'C:\Program Files\NASM'
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress
+            if (Test-Path (Join-Path $nasmDir 'nasm.exe')) {
+              Add-Content -Path $env:GITHUB_PATH -Value $nasmDir
+            }
+          }
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            choco install cmake -y --no-progress
+          }
+          $env:PATH = "$nasmDir;C:\ProgramData\chocolatey\bin;$env:PATH"
+          nasm --version
+          cmake --version
+
+      - name: Rust fmt
+        run: cargo fmt --all -- --check
+
+      - name: Rust clippy (Windows MSVC)
+        run: cargo clippy -p beam-sys -p beam-core -p beam-tun --all-targets -- -D warnings
+
+      - name: Rust tests (Windows MSVC)
+        run: cargo test -p beam-sys -p beam-core -p beam-tun -- -q

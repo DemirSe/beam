@@ -11,6 +11,8 @@ pub mod identity;
 pub mod metrics;
 pub mod prepend_stream;
 pub mod reality;
+// `relay` is the server-side `splice(2)`/`io_uring` copy path (Linux/Android only).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod relay;
 pub mod tls;
 pub mod udp;

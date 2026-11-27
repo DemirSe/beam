@@ -1,5 +1,7 @@
 //! Integration tests for the REALITY TLS server adapter.
 
+#![cfg(any(target_os = "linux", target_os = "android"))]
+
 use std::io;
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};

@@ -8,6 +8,7 @@
 //! have drained.
 
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -389,6 +390,8 @@ where
     }
 }
 
+/// Socket descriptor access for the server-side relay, so it is Unix only.
+#[cfg(unix)]
 impl<S, R> VisionStream<S, R>
 where
     S: AsRawFd,

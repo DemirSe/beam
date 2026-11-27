@@ -4,6 +4,8 @@
 //! -> `beam_core::tls::server::handle_connection`
 //! -> loopback TCP / UDP target.
 
+#![cfg(any(target_os = "linux", target_os = "android"))]
+
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;

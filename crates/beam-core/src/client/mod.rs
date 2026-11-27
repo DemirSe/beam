@@ -11,7 +11,10 @@ pub mod xudp;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -39,7 +42,26 @@ pub use xudp::{XudpClient, XudpClientConfig, XudpClientError, XudpReply, XudpSes
 /// loops back into the tunnel. The hook receives the raw descriptor of the
 /// unconnected socket, so it can run `VpnService.protect` through JNI. Other
 /// targets leave [`BeamClientConfig::socket_protector`] as `None`.
-pub type SocketProtector = Arc<dyn Fn(RawFd) -> io::Result<()> + Send + Sync>;
+#[cfg(unix)]
+pub type SocketProtector = Arc<dyn Fn(std::os::fd::RawFd) -> io::Result<()> + Send + Sync>;
+/// Same hook on Windows, where a socket is identified by a `SOCKET` handle.
+#[cfg(windows)]
+pub type SocketProtector =
+    Arc<dyn Fn(std::os::windows::io::RawSocket) -> io::Result<()> + Send + Sync>;
+
+/// Returns the platform handle of `socket` for the protector and the socket
+/// tuning calls in [`dial_vless`].
+#[cfg(unix)]
+fn raw_socket<S: AsRawFd>(socket: &S) -> RawFd {
+    socket.as_raw_fd()
+}
+
+/// Returns the platform handle of `socket` for the protector and the socket
+/// tuning calls in [`dial_vless`].
+#[cfg(windows)]
+fn raw_socket<S: AsRawSocket>(socket: &S) -> RawSocket {
+    socket.as_raw_socket()
+}
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -199,13 +221,13 @@ pub(crate) async fn dial_vless(
         stage: STAGE_TCP_CONNECT,
         source: err,
     })?;
-    if let Err(err) = beam_sys::set_tcp_maxseg(tcp_socket.as_raw_fd(), UPSTREAM_TCP_MSS) {
+    if let Err(err) = beam_sys::set_tcp_maxseg(raw_socket(&tcp_socket), UPSTREAM_TCP_MSS) {
         tracing::debug!(error = %err, mss = UPSTREAM_TCP_MSS, "failed to set upstream TCP_MAXSEG");
     }
     // The protector must run before `connect`, or the connect leaves the VPN
     // through the tunnel it is meant to serve.
     if let Some(protector) = &config.socket_protector {
-        protector(tcp_socket.as_raw_fd()).map_err(|err| ClientError::Io {
+        protector(raw_socket(&tcp_socket)).map_err(|err| ClientError::Io {
             stage: STAGE_TCP_CONNECT,
             source: err,
         })?;
@@ -223,7 +245,7 @@ pub(crate) async fn dial_vless(
     if let Err(err) = socket.set_nodelay(true) {
         tracing::debug!(error = %err, "failed to set upstream TCP_NODELAY");
     }
-    let fd = socket.as_raw_fd();
+    let fd = raw_socket(&socket);
     if let Some(count) = config.keepalive_count
         && let Err(err) = beam_sys::set_tcp_keepcnt(fd, count)
     {
@@ -314,6 +336,7 @@ impl<S> VlessClientStream<S> {
     }
 }
 
+#[cfg(unix)]
 impl<S: AsRawFd> AsRawFd for VlessClientStream<S> {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
@@ -457,8 +480,11 @@ mod tests {
     };
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr};
+    #[cfg(unix)]
     use std::os::fd::AsRawFd;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio::time::timeout;
@@ -481,6 +507,9 @@ mod tests {
             .expect("bind loopback listener")
     }
 
+    // Asserting on a Unix descriptor number is Unix only; the hook itself is
+    // exercised on every target by the tests below.
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_protector_runs_before_connect_with_a_valid_fd() {
         let listener = loopback_listener().await;
