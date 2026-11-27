@@ -18,6 +18,7 @@ pub mod packet;
 pub mod proxy_tcp;
 pub mod ratelimit;
 pub mod router;
+pub mod rx_batch;
 pub mod stack;
 pub mod stats;
 pub mod udp;
@@ -33,6 +34,10 @@ pub use engine::{
 pub use proxy_tcp::ProxyTcpStack;
 pub use ratelimit::RateLimiter;
 pub use router::{BypassCidrs, ExcludeIps, IpNet, RouteDecision, RoutePolicy, TUN_V6_NET};
+pub use rx_batch::{
+    BatchDecoder, RX_BATCH_FRAME_LEN, RX_BATCH_MAX_BYTES, RX_BATCH_MAX_PACKET_LEN,
+    RX_BATCH_MAX_PACKETS, pop_frame, push_frame, push_frame_forced,
+};
 pub use stack::{AcceptedTcpStream, NetStack, TcpStackConfig, TunTcpStream};
 pub use stats::{DnsCounters, DnsSnapshot, DropCounters, DropSnapshot};
 pub use udp::{UdpBridgeConfig, UdpNatBridge};

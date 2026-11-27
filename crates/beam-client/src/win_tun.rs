@@ -15,6 +15,9 @@ use beam_sys::windows::wintun::{
     WinTunSession, WinTunShutdown, decode_sha256_hex,
 };
 use beam_tun::TunDevice;
+use beam_tun::rx_batch::{
+    BatchDecoder, RX_BATCH_MAX_BYTES, RX_BATCH_MAX_PACKETS, push_frame, push_frame_forced,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -22,6 +25,11 @@ use tracing::{debug, warn};
 const TUNNEL_TYPE: &str = "Beam";
 
 /// Packets queued between the reader thread and the async receiver.
+///
+/// Each queued item is one length-prefixed batch of up to 32 packets / 64 KiB
+/// (see `beam_tun::rx_batch`), so the worst-case queue footprint is
+/// `256 * 64 KiB = 16 MiB` plus framing, the same order as one max-size
+/// packet per slot before batching.
 const RX_QUEUE_CAPACITY: usize = 256;
 
 /// Async handle to a WinTun adapter and its Layer 3 session.
@@ -32,6 +40,8 @@ pub struct AsyncWinTun {
     mtu: usize,
     /// `None` once [`Drop`] closed the queue to release a blocked reader.
     rx: Option<mpsc::Receiver<Vec<u8>>>,
+    /// Batch currently being decoded; empty once fully consumed.
+    decoder: BatchDecoder,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -64,6 +74,7 @@ impl AsyncWinTun {
             name: name.to_owned(),
             mtu,
             rx: Some(rx),
+            decoder: BatchDecoder::new(),
             reader: Some(reader),
         })
     }
@@ -85,21 +96,45 @@ impl TunDevice for AsyncWinTun {
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let Some(queue) = self.rx.as_mut() else {
-            return Err(closed());
-        };
-        let Some(packet) = queue.recv().await else {
-            return Err(closed());
-        };
-        copy_packet(&packet, buf)
+        loop {
+            if let Some(packet) = self.decoder.next_packet() {
+                let len = copy_packet(packet, buf)?;
+                self.decoder.release_if_empty();
+                return Ok(len);
+            }
+            let Some(queue) = self.rx.as_mut() else {
+                return Err(closed());
+            };
+            let Some(batch) = queue.recv().await else {
+                return Err(closed());
+            };
+            self.decoder.push_batch(batch);
+        }
     }
 
     fn try_recv_into(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        if let Some(packet) = self.decoder.next_packet() {
+            let len = copy_packet(packet, buf)?;
+            self.decoder.release_if_empty();
+            return Ok(Some(len));
+        }
         let Some(queue) = self.rx.as_mut() else {
             return Ok(None);
         };
         match queue.try_recv() {
-            Ok(packet) => copy_packet(&packet, buf).map(Some),
+            Ok(batch) => {
+                self.decoder.push_batch(batch);
+                match self.decoder.next_packet() {
+                    Some(packet) => {
+                        let len = copy_packet(packet, buf)?;
+                        self.decoder.release_if_empty();
+                        Ok(Some(len))
+                    }
+                    // Only our own encoder produces batches, so an empty one
+                    // just means the next wakeup carries the packets.
+                    None => Ok(None),
+                }
+            }
             Err(_) => Ok(None),
         }
     }
@@ -145,28 +180,61 @@ fn copy_packet(packet: &[u8], buf: &mut [u8]) -> io::Result<usize> {
     Ok(packet.len())
 }
 
-/// Forwards packets from the WinTun ring into the bounded async queue.
+/// Forwards packets from the WinTun ring into the bounded async queue, one
+/// length-prefixed batch per channel message (see `beam_tun::rx_batch`).
+///
+/// The thread blocks only for the first packet of a batch, then drains up to
+/// 32 already-queued packets (or 64 KiB) without waiting, so one allocation
+/// and one wakeup carry the whole burst. A packet that does not fit the batch
+/// under construction rides in the next batch instead of being dropped.
 ///
 /// The thread exits on shutdown, on a closed queue, or on the first receive
 /// error; a dead session cannot recover, and `recv` then reports end of file.
 fn receive_loop(session: &WinTunSession, tx: mpsc::Sender<Vec<u8>>) {
     let mut scratch = vec![0u8; MAX_PACKET_LEN];
+    // Ring packet drained while the previous batch was full; sent first next.
+    let mut carried: Option<usize> = None;
     loop {
-        match session.recv_blocking(&mut scratch) {
-            Ok(len) => {
-                if tx.blocking_send(scratch[..len].to_vec()).is_err() {
-                    debug!("WinTun receive queue closed; reader thread exiting");
+        let mut batch = Vec::with_capacity(RX_BATCH_MAX_BYTES.min(8 * 1024));
+        let mut count = 0;
+        if let Some(len) = carried.take() {
+            push_frame_forced(&mut batch, &scratch[..len]);
+            count += 1;
+        } else {
+            match session.recv_blocking(&mut scratch) {
+                Ok(len) => {
+                    push_frame_forced(&mut batch, &scratch[..len]);
+                    count += 1;
+                }
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                    debug!(error = %err, "WinTun session shut down; reader thread exiting");
+                    return;
+                }
+                Err(err) => {
+                    warn!(error = %err, "WinTun receive failed; reader thread exiting");
                     return;
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                debug!(error = %err, "WinTun session shut down; reader thread exiting");
-                return;
+        }
+        while count < RX_BATCH_MAX_PACKETS {
+            match session.try_recv_into(&mut scratch) {
+                Ok(Some(len)) => {
+                    if !push_frame(&mut batch, &scratch[..len]) {
+                        carried = Some(len);
+                        break;
+                    }
+                    count += 1;
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    warn!(error = %err, "WinTun receive failed; reader thread exiting");
+                    return;
+                }
             }
-            Err(err) => {
-                warn!(error = %err, "WinTun receive failed; reader thread exiting");
-                return;
-            }
+        }
+        if tx.blocking_send(batch).is_err() {
+            debug!("WinTun receive queue closed; reader thread exiting");
+            return;
         }
     }
 }
