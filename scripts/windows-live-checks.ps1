@@ -45,6 +45,8 @@ $HttpsProbeUrl = 'https://example.com'
 
 $script:VpsIpv4 = ''
 $script:CheckTimeoutSec = $CheckTimeoutSec
+# Positive control for the DNS leak check, measured before the tunnel is up.
+$script:ControlAnswered = $false
 
 $checkLines = New-Object System.Collections.Generic.List[string]
 $script:checksFailed = 0
@@ -415,6 +417,30 @@ function Test-RouteFailClosed {
     }
 }
 
+function Get-PhysicalProbeTarget {
+    # First Up non-Beam adapter with an IPv4 address, as a probe endpoint.
+    param([int]$BeamIf = -1)
+    try {
+        foreach ($na in @(Get-NetAdapter -ErrorAction SilentlyContinue)) {
+            if ($na.Name -like 'Beam*') { continue }
+            if ($na.Status -ne 'Up') { continue }
+            $idx = -1
+            try { $idx = [int]$na.ifIndex } catch { continue }
+            if ($idx -lt 0) { continue }
+            if ($idx -eq $BeamIf) { continue }
+            $localIp = ''
+            foreach ($a in @(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+                if (-not [string]::IsNullOrWhiteSpace($a.IPAddress)) { $localIp = [string]$a.IPAddress; break }
+            }
+            if ($localIp -eq '') { continue }
+            return @{ IfIndex = $idx; LocalIp = $localIp }
+        }
+    } catch {
+        return $null
+    }
+    return $null
+}
+
 function Test-DnsLeak {
     if (-not (Test-ConnectedState)) {
         Add-Check 'dns_leak' 'skip' 'not_connected'
@@ -468,26 +494,44 @@ function Test-DnsLeak {
             return
         }
         Ensure-BoundDnsType
+        # The client deliberately permits plaintext DNS to the pre-VPN resolver
+        # (`permit_cidrs` includes `local_dns_ip`) so bypass suffixes still
+        # resolve, so that server is not a leak signal. Any *other* port-53
+        # destination must be blocked, which is what this check asserts.
+        $publicTargets = @('1.1.1.1', '8.8.8.8')
         $deadline = [DateTime]::UtcNow.AddSeconds($script:CheckTimeoutSec)
         $leaked = $false
         $unpinned = $false
         $blocked = 0
         $probeErrors = 0
+        $localPermitAnswered = $false
         foreach ($entry in $physProbes) {
             if ([DateTime]::UtcNow -ge $deadline) { break }
             try {
-                # Strictly interface-bound UDP: IP_UNICAST_IF (31) pins the
-                # query to the physical NIC so WinTun split routes cannot answer.
-                $rc = [BeamBoundDns]::TryBoundQuery([string]$entry['Server'], [int]$entry['IfIndex'], [string]$entry['LocalIp'], $DualStackName, 3000)
-                if ($rc -eq 1) { $leaked = $true; break }
-                if ($rc -eq 2) { $unpinned = $true; break }
-                if ($rc -eq 0) { $blocked = $blocked + 1 } else { $probeErrors = $probeErrors + 1 }
+                # Informational: the permitted resolver should still answer.
+                $rcPermit = [BeamBoundDns]::TryBoundQuery([string]$entry['Server'], [int]$entry['IfIndex'], [string]$entry['LocalIp'], $DualStackName, 3000)
+                if ($rcPermit -eq 1) { $localPermitAnswered = $true }
             } catch {
-                $probeErrors = $probeErrors + 1
             }
+            foreach ($target in $publicTargets) {
+                if ([DateTime]::UtcNow -ge $deadline) { break }
+                try {
+                    # Strictly interface-bound UDP: IP_UNICAST_IF (31) pins the
+                    # query to the physical NIC so WinTun split routes cannot
+                    # answer it from inside the tunnel.
+                    $rc = [BeamBoundDns]::TryBoundQuery($target, [int]$entry['IfIndex'], [string]$entry['LocalIp'], $DualStackName, 3000)
+                    if ($rc -eq 1) { $leaked = $true; break }
+                    if ($rc -eq 2) { $unpinned = $true; break }
+                    if ($rc -eq 0) { $blocked = $blocked + 1 } else { $probeErrors = $probeErrors + 1 }
+                } catch {
+                    $probeErrors = $probeErrors + 1
+                }
+            }
+            if ($leaked -or $unpinned) { break }
         }
+        Write-Host ('local_dns_permit_answered=' + $localPermitAnswered.ToString().ToLowerInvariant())
         if ($leaked) {
-            Add-Check 'dns_leak' 'fail' 'plaintext_dns_answered_bound_probe'
+            Add-Check 'dns_leak' 'fail' 'public_dns_answered'
             return
         }
         if ($unpinned) {
@@ -497,6 +541,11 @@ function Test-DnsLeak {
         # A probe that could not run proves nothing: never report it as blocked.
         if ($blocked -eq 0) {
             Add-Check 'dns_leak' 'skip' 'bound_probe_error'
+            return
+        }
+        # Without a working control the "blocked" result may just be a dead probe.
+        if (-not $script:ControlAnswered) {
+            Add-Check 'dns_leak' 'skip' 'control_probe_failed'
             return
         }
         try {
@@ -509,7 +558,7 @@ function Test-DnsLeak {
             Add-Check 'dns_leak' 'fail' 'tunnel_dns_failed'
             return
         }
-        Add-Check 'dns_leak' 'pass' 'bound_probe_ok'
+        Add-Check 'dns_leak' 'pass' 'public_dns_blocked'
     } catch {
         Add-Check 'dns_leak' 'fail' 'check_error'
     }
@@ -795,6 +844,23 @@ try {
     $importReply = Invoke-Ipc -Line ("IMPORT_LINK " + $link)
     if (-not $importReply.StartsWith('OK ')) { throw 'import_failed' }
     Write-Host 'import_ok=true'
+
+    # Positive control: before CONNECT nothing blocks plaintext DNS, so the same
+    # bound probe must reach a public resolver. Without this, a "blocked" result
+    # later could just mean the probe never worked.
+    try {
+        Ensure-BoundDnsType
+        $ctl = Get-PhysicalProbeTarget -BeamIf (Get-BeamIfIndex)
+        if ($null -ne $ctl) {
+            $rcCtl = [BeamBoundDns]::TryBoundQuery('1.1.1.1', [int]$ctl['IfIndex'], [string]$ctl['LocalIp'], $DualStackName, 3000)
+            if ($rcCtl -eq 1) { $script:ControlAnswered = $true }
+            Write-Host ('dns_control_probe=' + [string]$rcCtl)
+        } else {
+            Write-Host 'dns_control_probe=no_physical_if'
+        }
+    } catch {
+        Write-Host 'dns_control_probe=error'
+    }
 
     $connectReply = Invoke-Ipc -Line 'CONNECT'
     if (-not $connectReply.StartsWith('OK ')) { throw 'connect_rejected' }
