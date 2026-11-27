@@ -28,10 +28,16 @@ int beam_test_rename(const char *from, const char *to);
 /* Test doubles for the early reject paths. No syslog daemon or root is
  * needed: the calls are counted and the formatted text is inspected. */
 void beam_test_syslog(int priority, const char *fmt, ...);
+void beam_test_openlog(const char *ident, int option, int facility);
 uid_t beam_test_geteuid(void);
 
 static int syslog_calls;
 static char syslog_last[512];
+static int openlog_calls;
+static char openlog_ident[64];
+static int openlog_option;
+static int openlog_facility;
+static int syslog_before_openlog;
 static int fake_euid;
 
 void beam_test_syslog(int priority, const char *fmt, ...)
@@ -39,10 +45,20 @@ void beam_test_syslog(int priority, const char *fmt, ...)
     va_list ap;
 
     (void)priority;
+    if (openlog_calls == 0)
+        syslog_before_openlog++;
     syslog_calls++;
     va_start(ap, fmt);
     vsnprintf(syslog_last, sizeof(syslog_last), fmt, ap);
     va_end(ap);
+}
+
+void beam_test_openlog(const char *ident, int option, int facility)
+{
+    openlog_calls++;
+    snprintf(openlog_ident, sizeof(openlog_ident), "%s", ident ? ident : "");
+    openlog_option = option;
+    openlog_facility = facility;
 }
 
 uid_t beam_test_geteuid(void)
@@ -153,6 +169,7 @@ static void reset_state(void)
 
 static void check_rejects(void)
 {
+    char *spoof[] = { "spoofed-tag", "up", NULL };
     char *up[] = { "beam-helper", "up", NULL };
     char *bad[] = { "beam-helper", "bad\nsecret", NULL };
     char *dns[] = { "beam-helper", "dns-off", NULL };
@@ -162,7 +179,14 @@ static void check_rejects(void)
     unlink(ALLOWED_USER);
     fake_euid = 1;
     syslog_calls = 0;
-    CHECK(beam_helper_main(2, up) == 1);
+    openlog_calls = 0;
+    syslog_before_openlog = 0;
+    CHECK(beam_helper_main(2, spoof) == 1);
+    CHECK(openlog_calls == 1);
+    CHECK(strcmp(openlog_ident, "beam-helper") == 0);
+    CHECK(openlog_option == LOG_PID);
+    CHECK(openlog_facility == LOG_AUTHPRIV);
+    CHECK(syslog_before_openlog == 0);
     CHECK(syslog_calls == 1);
     CHECK(strstr(syslog_last, "effective uid is not root") != NULL);
     CHECK(strstr(syslog_last, "uid=") != NULL);

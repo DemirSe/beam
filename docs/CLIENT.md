@@ -287,7 +287,8 @@ The helper only accepts fixed commands, checks that its real user matches
 `/etc/beam/allowed-user`, clears its environment, redirects stdio, closes
 inherited descriptors, and executes
 absolute `systemctl` paths. For each rejected call the helper writes one
-warning to the system log. The warning names the reason, the invoking uid and
+warning to the system log. It uses the fixed tag `beam-helper`, so argv[0]
+cannot change the tag. The warning names the reason, the invoking uid and
 user, and a printable form of the command. The TUN profile excludes the VLESS
 server from the TUN route, and uses `auto_redirect: true` for TCP.
 

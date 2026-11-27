@@ -617,6 +617,8 @@ int main(int argc, char **argv)
 {
     const char *command;
 
+    /* Set a fixed tag before any reject log; argv[0] is caller-controlled. */
+    openlog("beam-helper", LOG_PID, LOG_AUTHPRIV);
     if (geteuid() != 0) {
         log_reject("effective uid is not root", argc > 1 ? argv[1] : "");
         return 1;

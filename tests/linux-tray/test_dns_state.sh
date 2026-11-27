@@ -450,6 +450,7 @@ CC="${CC:-cc}"
   -DTUN_IFACE='"lo"' \
   -DALLOWED_USER="\"$TMP/allowed-user\"" \
   -Dsyslog=beam_test_syslog \
+  -Dopenlog=beam_test_openlog \
   -Dgeteuid=beam_test_geteuid \
   -DUNLINK=beam_test_unlink \
   -DRENAME=beam_test_rename \
