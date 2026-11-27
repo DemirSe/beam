@@ -78,16 +78,29 @@ def ensure_ipv4_only(config: dict) -> None:
     route["rules"] = [{"ip_version": 6, "action": "reject"}, *rules]
 
 
+def _is_unscoped_private_direct(rule: object) -> bool:
+    if not isinstance(rule, dict):
+        return False
+    allowed = {
+        "ip_is_private", "outbound", "ip_version", "action",
+        "invert", "comment", "tag",
+    }
+    if not set(rule) <= allowed:
+        return False
+    return (
+        rule.get("ip_is_private") is True
+        and rule.get("outbound") == "direct"
+        and rule.get("invert", False) is False
+        and rule.get("action", "route") == "route"
+        and rule.get("ip_version", 4) == 4
+    )
+
+
 def normalize(config: dict) -> None:
     route = config.setdefault("route", {})
     rules = route.setdefault("rules", [])
     private = next(
-        (
-            r for r in rules
-            if isinstance(r, dict)
-            and r.get("ip_is_private") is True
-            and r.get("outbound") == "direct"
-        ),
+        (r for r in rules if _is_unscoped_private_direct(r)),
         None,
     )
     reject = {

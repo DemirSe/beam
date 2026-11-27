@@ -200,6 +200,76 @@ class IPv4OnlyNormalizerTests(unittest.TestCase):
         self.assertEqual(config["route"]["rules"][1], private)
         self.assertTrue(self.policy.is_udp443_reject(config["route"]["rules"][2]))
 
+    def test_scoped_or_inverted_private_rules_are_not_hoisted(self):
+        inverted = {
+            "ip_is_private": True,
+            "invert": True,
+            "outbound": "direct",
+        }
+        scoped = {
+            "ip_is_private": True,
+            "outbound": "direct",
+            "port": 443,
+            "protocol": "http",
+        }
+        domain_scoped = {
+            "ip_is_private": True,
+            "outbound": "direct",
+            "domain_suffix": ["corp.example"],
+        }
+        private = {"ip_is_private": True, "outbound": "direct"}
+        config = _config("172.19.0.1/30", "192.0.2.53")
+        config["route"]["rules"] = [
+            inverted, scoped, {"action": "sniff"}, domain_scoped, private
+        ]
+        self.policy.normalize(config)
+        rules = config["route"]["rules"]
+        reject = {
+            "action": "reject",
+            "network": "udp",
+            "port": [443],
+            "method": "default",
+            "no_drop": True,
+        }
+        reject_at = rules.index(reject)
+        self.assertEqual(rules[:reject_at], [
+            {"ip_version": 6, "action": "reject"},
+            private,
+        ])
+        for rule in (inverted, scoped, domain_scoped):
+            self.assertIn(rule, rules)
+            self.assertGreater(rules.index(rule), reject_at)
+        snapshot = copy.deepcopy(config)
+        self.policy.normalize(config)
+        self.assertEqual(config, snapshot)
+
+    def test_private_rule_action_and_ip_version_are_checked(self):
+        private = {
+            "ip_is_private": True,
+            "outbound": "direct",
+            "action": "route",
+            "ip_version": 4,
+        }
+        hijack = {
+            "ip_is_private": True,
+            "outbound": "direct",
+            "action": "hijack-dns",
+        }
+        ipv6 = {
+            "ip_is_private": True,
+            "outbound": "direct",
+            "ip_version": 6,
+        }
+        config = _config("172.19.0.1/30", "192.0.2.53")
+        config["route"]["rules"] = [hijack, ipv6, {"action": "sniff"}, private]
+        self.policy.normalize(config)
+        rules = config["route"]["rules"]
+        self.assertEqual(rules[1], private)
+        self.assertEqual(rules.count(hijack), 1)
+        self.assertEqual(rules.count(ipv6), 1)
+        self.assertGreater(rules.index(hijack), 2)
+        self.assertGreater(rules.index(ipv6), 2)
+
     def test_private_rule_with_extra_keys_precedes_udp_reject(self):
         private = {
             "ip_is_private": True,
