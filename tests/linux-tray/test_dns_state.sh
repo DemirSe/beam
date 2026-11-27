@@ -124,6 +124,28 @@ for core in sing-box libcronet.so LICENSE; do
   }
 done
 
+# A user-owned core directory with a symlinked LICENSE can publish secret
+# bytes. Both ownership checks must run before the staging copies.
+stage_line=$(grep -n '^STAGE_DIR=\$(mktemp' "$INSTALL" | cut -d: -f1 || true)
+core_owner_line=$(grep -n 'CORE_DIR must be owned by root' "$INSTALL" | cut -d: -f1 || true)
+license_line=$(grep -n 'LICENSE must be a root-owned regular file' "$INSTALL" | cut -d: -f1 || true)
+[ -n "$stage_line" ] && [ -n "$core_owner_line" ] && [ -n "$license_line" ] || {
+  echo "install.sh: missing CORE_DIR or LICENSE ownership check" >&2
+  exit 1
+}
+[ "$core_owner_line" -lt "$stage_line" ] && [ "$license_line" -lt "$stage_line" ] || {
+  echo "install.sh: core ownership checks run after staging" >&2
+  exit 1
+}
+grep -qF '[ -L "$CORE_DIR/LICENSE" ]' "$INSTALL" || {
+  echo "install.sh: LICENSE symlinks are not rejected" >&2
+  exit 1
+}
+grep -qF 'stat -Lc %u "$CORE_DIR"' "$INSTALL" || {
+  echo "install.sh: CORE_DIR owner is not checked" >&2
+  exit 1
+}
+
 # reload_resolved() execs this absolute path. The marker makes a reload fail.
 cat > "$BIN_DIR/systemctl" <<EOF
 #!/bin/sh

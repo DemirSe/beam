@@ -18,6 +18,8 @@ The output is `beam-tray` and `beam-helper` in this directory.
 - `CONFIG_SRC`: client profile. Default: `/etc/beam/config.json`.
 - `CORE_DIR`: pinned core directory. Default: `/tmp/beam-core`.
   It must hold `sing-box`, `libcronet.so`, and `LICENSE`.
+  Root must own the directory and the `LICENSE` file.
+  `LICENSE` must be a regular file, not a symlink.
   Two SHA-256 hashes are checked. The script does not download the core.
 - An active `systemd-resolved` unit and `systemctl`.
 

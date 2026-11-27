@@ -35,6 +35,18 @@ for core_file in sing-box libcronet.so LICENSE; do
     }
 done
 [ -x "$CORE_DIR/sing-box" ] || { echo "missing $CORE_DIR/sing-box" >&2; exit 1; }
+# A user-owned core directory can hold genuine pinned binaries plus a LICENSE
+# symlink to a secret. Refuse it before staging publishes those bytes.
+[ -d "$CORE_DIR" ] || { echo "CORE_DIR is not a directory: $CORE_DIR" >&2; exit 1; }
+[ "$(stat -Lc %u "$CORE_DIR")" = 0 ] || {
+    echo "CORE_DIR must be owned by root: $CORE_DIR" >&2
+    exit 1
+}
+if [ -L "$CORE_DIR/LICENSE" ] || [ ! -f "$CORE_DIR/LICENSE" ] ||
+   [ "$(stat -c %u "$CORE_DIR/LICENSE")" != 0 ]; then
+    echo "LICENSE must be a root-owned regular file, not a symlink: $CORE_DIR/LICENSE" >&2
+    exit 1
+fi
 [ -x "$HERE/beam-tray" ] || { echo "build first: $HERE/build.sh" >&2; exit 1; }
 [ -x "$HERE/beam-helper" ] || { echo "build first: $HERE/build.sh" >&2; exit 1; }
 [ -r "$HERE/99-beam-client-bbr.conf" ] || { echo "missing $HERE/99-beam-client-bbr.conf" >&2; exit 1; }

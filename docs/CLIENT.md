@@ -207,10 +207,10 @@ before it stages, stops, or replaces anything when one is missing:
 |---|---|
 | `CONFIG_SRC` | Path to the client profile (sing-box JSON). Required when `/etc/beam/config.json` does not exist; a reinstall reuses that file when `CONFIG_SRC` is unset. It is the client profile, not the server `beam.toml`. |
 | `python3` | Normalizes the QUIC policy and validates the normalized profile. |
-| `CORE_DIR` | Directory that holds the pinned core. Default `/tmp/beam-core`; it is not a download cache. |
+| `CORE_DIR` | Root-owned directory that holds the pinned core. Default `/tmp/beam-core`; it is not a download cache. |
 | `$CORE_DIR/sing-box` | Executable core. SHA-256 `1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a`. |
 | `$CORE_DIR/libcronet.so` | Shared library next to the core. SHA-256 `23109c55b08829bb1a68682a61a64852b1bbf243753b153cbd8f6e4ea2c05294`. |
-| `$CORE_DIR/LICENSE` | Copied to `/usr/local/lib/beam/LICENSE`; not hash-pinned. |
+| `$CORE_DIR/LICENSE` | Root-owned regular file, not a symlink. Copied to `/usr/local/lib/beam/LICENSE` with mode 0644; not hash-pinned. |
 | `INSTALL_USER` | Desktop user that may run the tray. Taken from `SUDO_USER` when the installer runs under `sudo`; set it explicitly otherwise. |
 | `beam-tray`, `beam-helper` | Built in `clients/linux-tray` by `./build.sh`. |
 | `systemd-resolved` | Active before the install. The DNS switch writes its drop-ins and reloads this unit. The installer stops with a named error when the unit is not active, because a missing resolver would surface only as a failed `ExecStartPost`. |
