@@ -67,10 +67,17 @@ const IDLE_BUF_SHRINK_AFTER_MS: i64 = 5_000;
 /// Minimum age before a half-open `SynReceived` flow can be evicted under table pressure.
 const SOFT_EVICT_SYN_MIN_AGE_MS: i64 = 3_000;
 /// Minimum idle duration before a quiescent `Established` flow can be evicted as a last resort.
-const SOFT_EVICT_ESTABLISHED_IDLE_MS: i64 = 60_000;
+const SOFT_EVICT_ESTABLISHED_IDLE_MS: i64 = 180_000;
 /// Mobile adaptive buffer threshold: flows admitted above 128 on high-RAM mobile
 /// profiles use half the per-socket buffer (64 KiB) to preserve the native RAM ceiling.
 const ADAPTIVE_BUF_HALVE_FLOW_THRESHOLD: usize = 128;
+
+/// Well-known mobile push / messaging ports exempt from Tier-3 idle eviction so
+/// Google Play Services FCM (`5228..=5230`), WhatsApp/XMPP (`5222`/`5223`), and
+/// MQTT TLS (`8883`) never receive spurious RSTs or enter reconnect backoff.
+const fn is_protected_push_port(dst_port: u16) -> bool {
+    matches!(dst_port, 5222 | 5223 | 5228 | 5229 | 5230 | 8883)
+}
 
 type FlowKey = (IpAddr, u16, IpAddr, u16);
 
@@ -1125,6 +1132,7 @@ impl ProxyTcpStack {
                 }
                 TcpState::Established
                     if age_ms >= SOFT_EVICT_ESTABLISHED_IDLE_MS
+                        && !is_protected_push_port(flow.3)
                         && conn.tx_buf.is_empty()
                         && conn.pending_to_relay.is_empty()
                         && conn.ooo.is_empty()
@@ -3294,5 +3302,108 @@ mod tests {
         let overflow = stack.conns.get(&(client, 30129, server, 443)).unwrap();
         assert_eq!(first.max_rcv_buf, 128 * 1024);
         assert_eq!(overflow.max_rcv_buf, 64 * 1024);
+    }
+
+    #[test]
+    fn soft_eviction_never_evicts_protected_push_ports_and_respects_3m_idle_threshold() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig {
+            max_connections: 2,
+            ..TcpStackConfig::mobile()
+        });
+        let drops = Arc::new(DropCounters::default());
+        stack.set_drop_counters(Arc::clone(&drops));
+
+        let client = IpAddr::V4(Ipv4Addr::new(198, 19, 0, 1));
+        let server = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+
+        // Establish one FCM push socket (port 5228) at t=100 and one HTTPS socket (443) at t=200.
+        for (sport, dport, t, seq) in [
+            (42001u16, 5228u16, 100i64, 1000u32),
+            (42002, 443, 200, 2000),
+        ] {
+            let syn = build_ip_tcp_packet_slices(
+                client,
+                sport,
+                server,
+                dport,
+                seq,
+                0,
+                TCP_SYN,
+                65535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("syn");
+            stack.push_ip_tcp(&syn);
+            stack.poll(t, &mut tx, &mut accepted);
+            let syn_ack_pkt = tx.pop().expect("synack");
+            let syn_ack = parse_tcp(parse_ip(&syn_ack_pkt).unwrap().payload).unwrap();
+            let ack = build_ip_tcp_packet_slices(
+                client,
+                sport,
+                server,
+                dport,
+                seq + 1,
+                syn_ack.seq + 1,
+                TCP_ACK,
+                65535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("ack");
+            stack.push_ip_tcp(&ack);
+            stack.poll(t, &mut tx, &mut accepted);
+        }
+
+        let push_flow: FlowKey = (client, 42001, server, 5228);
+        let https_flow: FlowKey = (client, 42002, server, 443);
+
+        // At t = 200 + 180_000 - 1: push_flow is past 180 s idle but protected;
+        // https_flow is 1 ms short of 180 s -> neither may be evicted.
+        let syn3 = build_ip_tcp_packet_slices(
+            client,
+            42003,
+            server,
+            443,
+            3000,
+            0,
+            TCP_SYN,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("syn3");
+        stack.push_ip_tcp(&syn3);
+        stack.poll(
+            200 + SOFT_EVICT_ESTABLISHED_IDLE_MS - 1,
+            &mut tx,
+            &mut accepted,
+        );
+        assert!(
+            stack.conns.contains_key(&push_flow),
+            "FCM port 5228 must be exempt"
+        );
+        assert!(stack.conns.contains_key(&https_flow));
+        assert_eq!(drops.tcp_limit.get(), 1);
+        tx.clear();
+
+        // At t = 200 + 180_000: https_flow reaches 180 s idle and yields its slot,
+        // while the older FCM push_flow (5228) stays untouched.
+        stack.push_ip_tcp(&syn3);
+        stack.poll(200 + SOFT_EVICT_ESTABLISHED_IDLE_MS, &mut tx, &mut accepted);
+        assert!(
+            stack.conns.contains_key(&push_flow),
+            "FCM port 5228 must survive"
+        );
+        assert!(
+            !stack.conns.contains_key(&https_flow),
+            "idle 443 flow should be evicted"
+        );
+        assert!(stack.conns.contains_key(&(client, 42003, server, 443)));
     }
 }
