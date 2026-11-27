@@ -1,6 +1,8 @@
 //! Async Linux `/dev/net/tun` adapter implementing `beam_tun::TunDevice`,
 //! plus rollback-safe Linux IPv4/IPv6 route management (`LinuxRouteGuard`).
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -37,6 +39,11 @@ static ROUTE_CHECK_LOG: LazyLock<RateLimiter> =
 /// Resolved `ip` (iproute2) path, cached only on success so a package installed
 /// after startup is still picked up on the next call.
 static IP_BINARY: OnceLock<&'static str> = OnceLock::new();
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_IP_BINARY: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
 
 /// Returns `true` when the cap warning is due, so it fires once per interval.
 fn cap_warn_due(last: Option<Instant>, now: Instant) -> bool {
@@ -342,15 +349,21 @@ impl LinuxRouteGuard {
         self.tun_v4_net.is_some_and(|net| net.contains(ip)) || TUN_V6_NET.contains(ip)
     }
 
-    /// Returns `true` if all required bypass routes (server and active
-    /// non-loopback local DNS when a matching gateway exists) are installed
-    /// (or preserved as pre-existing host routes) and present in the kernel
+    /// Returns `true` if every tracked bypass route is installed (or
+    /// preserved as a pre-existing host route) and present in the kernel
     /// routing table.
     ///
     /// A lookup that cannot be completed ([`RouteCheck::Error`]) counts as
     /// missing (fail-closed): the monitor keeps retrying, while the rate-limited
-    /// warning from `has_host_route` carries the reason once per window.
+    /// warning from `has_exact_route` carries the reason once per window.
     pub fn bypass_routes_installed(&self) -> bool {
+        self.bypass_routes_installed_with(has_exact_route)
+    }
+
+    fn bypass_routes_installed_with<F>(&self, mut check: F) -> bool
+    where
+        F: FnMut(&str, &str) -> RouteCheck,
+    {
         if !self.auto_route {
             return true;
         }
@@ -360,7 +373,8 @@ impl LinuxRouteGuard {
             if self.server_bypass_route.is_none() && !self.server_bypass_preexisting {
                 return false;
             }
-            if !has_host_route(self.server_ip).is_present() {
+            let (flag, prefix) = host_route_args(self.server_ip);
+            if !check(flag, &prefix).is_present() {
                 return false;
             }
         }
@@ -373,11 +387,46 @@ impl LinuxRouteGuard {
             if self.local_dns_bypass_route.is_none() && !self.local_dns_bypass_preexisting {
                 return false;
             }
-            if !has_host_route(dns_ip).is_present() {
+            let (flag, prefix) = host_route_args(dns_ip);
+            if !check(flag, &prefix).is_present() {
                 return false;
             }
         }
+        if self.current_gw.v4.is_some() {
+            for cidr in &self.configured_bypass_v4 {
+                if !check("-4", cidr).is_present() {
+                    return false;
+                }
+            }
+            for &(ip, _) in &self.dynamic_bypass_v4 {
+                let prefix = format!("{ip}/32");
+                if !check("-4", &prefix).is_present() {
+                    return false;
+                }
+            }
+        }
+        if self.current_gw.v6.is_some() {
+            for cidr in &self.configured_bypass_v6 {
+                if !check("-6", cidr).is_present() {
+                    return false;
+                }
+            }
+            for &(ip, _) in &self.dynamic_bypass_v6 {
+                let prefix = format!("{ip}/128");
+                if !check("-6", &prefix).is_present() {
+                    return false;
+                }
+            }
+        }
         true
+    }
+
+    /// Expires tracked dynamic bypass routes on a quiet host. DNS hits still
+    /// re-stamp their timestamp; this only applies the same bounded TTL eviction.
+    pub fn sweep_expired_dynamic_bypass(&mut self) {
+        let now = Instant::now();
+        self.evict_v4_if_needed(now);
+        self.evict_v6_if_needed(now);
     }
 
     /// Migrates server, local-DNS, and bypass CIDR/domain routes to `new_gw`
@@ -986,6 +1035,10 @@ fn find_ip_binary(candidates: &[&'static str]) -> io::Result<&'static str> {
 }
 
 fn ip_binary() -> io::Result<&'static str> {
+    #[cfg(test)]
+    if let Some(bin) = TEST_IP_BINARY.get() {
+        return Ok(bin);
+    }
     resolve_ip_binary(&IP_BINARY, &IP_BINARY_CANDIDATES)
 }
 
@@ -1028,11 +1081,15 @@ fn run_ip(args: &[&str]) -> io::Result<()> {
     }
 }
 
-fn has_host_route(ip: IpAddr) -> RouteCheck {
-    let (flag, prefix) = match ip {
+fn host_route_args(ip: IpAddr) -> (&'static str, String) {
+    match ip {
         IpAddr::V4(v4) => ("-4", format!("{v4}/32")),
         IpAddr::V6(v6) => ("-6", format!("{v6}/128")),
-    };
+    }
+}
+
+fn has_host_route(ip: IpAddr) -> RouteCheck {
+    let (flag, prefix) = host_route_args(ip);
     has_exact_route(flag, &prefix)
 }
 
@@ -1213,6 +1270,91 @@ fn parse_default_route_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct FakeIp {
+        dir: PathBuf,
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "beam-fake-ip-{}-{}-{}",
+            std::process::id(),
+            name,
+            TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    impl FakeIp {
+        fn new_in(dir: PathBuf, script: &str) -> Self {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("fake ip dir");
+            let path = dir.join("ip");
+            std::fs::write(&path, script).expect("write fake ip");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("make fake ip executable");
+            let leaked = Box::leak(path.to_string_lossy().into_owned().into_boxed_str());
+            TEST_IP_BINARY.set(Some(leaked));
+            Self { dir }
+        }
+
+        fn log_path(&self) -> PathBuf {
+            self.dir.join("ip.log")
+        }
+    }
+
+    impl Drop for FakeIp {
+        fn drop(&mut self) {
+            TEST_IP_BINARY.set(None);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn read_fake_ip_log(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                return text;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::read_to_string(path).expect("read fake ip log")
+    }
+
+    fn route_guard_for_tests() -> LinuxRouteGuard {
+        LinuxRouteGuard {
+            ifname: "beamtun0".to_owned(),
+            auto_route: true,
+            routes_state_path: PathBuf::from("/nonexistent/routes.state"),
+            tun_v4_net: IpNet::parse_cidr("172.19.0.1/30"),
+            server_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_dns_ip: None,
+            configured_bypass_v4: Vec::new(),
+            configured_bypass_v6: Vec::new(),
+            dynamic_bypass_v4: VecDeque::new(),
+            dynamic_bypass_v6: VecDeque::new(),
+            current_gw: PhysicalGateways {
+                v4: Some((Some("192.168.1.1".to_owned()), "eth0".to_owned())),
+                v6: None,
+            },
+            installed_v4_low: false,
+            installed_v4_high: false,
+            installed_v6_low: false,
+            installed_v6_high: false,
+            server_bypass_route: None,
+            server_bypass_preexisting: false,
+            local_dns_bypass_route: None,
+            local_dns_bypass_preexisting: false,
+            extra_bypass_v4: Vec::new(),
+            extra_bypass_v6: Vec::new(),
+        }
+    }
 
     #[test]
     fn skips_linkdown_and_tun_default_routes() {
@@ -1372,6 +1514,113 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
         assert!(guard.dynamic_bypass_v4.is_empty());
         assert_eq!(guard.extra_bypass_v4.len(), 1);
         assert_eq!(guard.extra_bypass_v4[0].0, "198.51.100.1/32");
+    }
+
+    #[test]
+    fn failed_cidr_install_is_reported_missing_and_retried_on_the_next_tick() {
+        let dir = test_dir("cidr");
+        let log = dir.join("ip.log");
+        let present = dir.join("present");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$*\" in\n\
+                   *\"route show exact 198.51.100.0/24\"*) [ -f \"{}\" ] || exit 2; echo \"198.51.100.0/24 dev eth0\" ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log.display(),
+                present.display(),
+            ),
+        );
+        let mut guard = route_guard_for_tests();
+        guard
+            .configured_bypass_v4
+            .push("198.51.100.0/24".to_owned());
+        assert!(
+            !guard.bypass_routes_installed(),
+            "a failed exact-route lookup must stay missing for retry"
+        );
+
+        let gw = guard.current_gw.clone();
+        assert!(guard.update_bypass_gateway(&gw, None));
+        std::fs::write(&present, b"1").expect("mark retried route present");
+        let next_tick_ok = guard.bypass_routes_installed();
+        let log = read_fake_ip_log(&fake.log_path());
+        assert!(
+            next_tick_ok,
+            "the next health tick must see the retried CIDR: {log}"
+        );
+        assert!(
+            log.contains("route replace 198.51.100.0/24"),
+            "the reconcile must retry the failed CIDR: {log}"
+        );
+    }
+
+    #[test]
+    fn quiet_sweep_removes_only_expired_daemon_dynamic_routes() {
+        let dir = test_dir("sweep");
+        let log = dir.join("ip.log");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+                log.display()
+            ),
+        );
+        let mut guard = route_guard_for_tests();
+        let now = Instant::now();
+        let old = now
+            .checked_sub(DYNAMIC_BYPASS_TTL + Duration::from_secs(10))
+            .unwrap_or(now);
+        let expired = Ipv4Addr::new(198, 51, 100, 9);
+        let fresh = Ipv4Addr::new(198, 51, 100, 10);
+        let configured = "203.0.113.0/24".to_owned();
+        guard.configured_bypass_v4.push(configured.clone());
+        guard.dynamic_bypass_v4.push_back((expired, old));
+        guard.dynamic_bypass_v4.push_back((fresh, now));
+        guard.extra_bypass_v4 = vec![
+            ("198.51.100.9/32".to_owned(), None, "eth0".to_owned()),
+            (
+                configured.clone(),
+                Some("192.168.1.1".to_owned()),
+                "eth0".to_owned(),
+            ),
+        ];
+        guard.server_bypass_route = Some((
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            Some("192.168.1.1".to_owned()),
+            "eth0".to_owned(),
+        ));
+        assert!(
+            ip_binary().expect("fake ip").contains("beam-fake-ip"),
+            "test must use the fake ip binary"
+        );
+
+        guard.sweep_expired_dynamic_bypass();
+
+        assert_eq!(
+            guard
+                .dynamic_bypass_v4
+                .iter()
+                .map(|(ip, _)| *ip)
+                .collect::<Vec<_>>(),
+            vec![fresh]
+        );
+        assert_eq!(
+            guard
+                .extra_bypass_v4
+                .iter()
+                .map(|(prefix, _, _)| prefix.as_str())
+                .collect::<Vec<_>>(),
+            vec![configured.as_str()]
+        );
+        let log = read_fake_ip_log(&fake.log_path());
+        assert!(log.contains("route del 198.51.100.9/32"), "{log}");
+        assert!(!log.contains("route del 203.0.113.0/24"), "{log}");
+        assert!(!log.contains("route del 198.51.100.10/32"), "{log}");
+        assert!(!log.contains("route del 203.0.113.1/32"), "{log}");
     }
 
     #[test]

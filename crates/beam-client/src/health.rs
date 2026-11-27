@@ -203,10 +203,13 @@ pub fn spawn_network_monitor(
                         .unwrap_or_default();
                 let routes_chk = Arc::clone(&routes);
                 let missing = tokio::task::spawn_blocking(move || {
-                    routes_chk
-                        .lock()
-                        .map(|g| !g.bypass_routes_installed())
-                        .unwrap_or(false)
+                    let Ok(mut guard) = routes_chk.lock() else {
+                        return false;
+                    };
+                    if route_periodic_due {
+                        guard.sweep_expired_dynamic_bypass();
+                    }
+                    !guard.bypass_routes_installed()
                 })
                 .await
                 .unwrap_or(false);
