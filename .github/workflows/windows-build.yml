@@ -1,9 +1,9 @@
 name: windows-build
 
 # Windows/MSVC build, clippy, and unit-test gate for `beam-sys`, `beam-core`,
-# `beam-tun`, and `beam-client`. `windows-tray` will be added in phase 4 once its
-# Win32 sources land. The release build step proves MSVC release linking, which
-# the debug-only clippy and test steps do not cover.
+# `beam-tun`, `beam-client`, and the unelevated `beam-tray` Win32 client. The
+# release build step proves MSVC release linking, which the debug-only clippy
+# and test steps do not cover.
 
 on:
   push:
@@ -13,6 +13,8 @@ on:
       - 'crates/beam-core/**'
       - 'crates/beam-tun/**'
       - 'crates/beam-client/**'
+      - 'clients/windows-tray/**'
+      - 'tests/windows-tray/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -24,6 +26,8 @@ on:
       - 'crates/beam-core/**'
       - 'crates/beam-tun/**'
       - 'crates/beam-client/**'
+      - 'clients/windows-tray/**'
+      - 'tests/windows-tray/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -84,3 +88,27 @@ jobs:
 
       - name: Rust release build (Windows MSVC release linking)
         run: cargo build --release -p beam-client
+
+  windows-tray:
+    name: Windows tray (MSVC C11)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build beam-tray.exe (rc + cl /W4 /WX)
+        shell: cmd
+        working-directory: clients\windows-tray
+        run: |
+          rc /nologo /fo app.res app.rc
+          cl /nologo /std:c11 /W4 /WX /O2 /DUNICODE /D_UNICODE main.c app.res /Fe:beam-tray.exe /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib gdi32.lib
+
+      - name: Tray logic unit tests (MSVC C11)
+        shell: cmd
+        run: |
+          cl /nologo /std:c11 /W4 /WX /O2 tests\windows-tray\test_tray_logic.c /Fe:test_tray_logic.exe
+          .\test_tray_logic.exe

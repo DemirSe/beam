@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
-# Cross-compile the tiny Windows tray launcher.
+# Cross-compile the unelevated beam Windows tray client.
 #
 # A MinGW-w64 compiler is required. With LLVM-MinGW:
 #   CC=x86_64-w64-mingw32-clang \
 #   WINDRES=x86_64-w64-mingw32-windres ./build.sh
+#
+# The tray needs no administrator rights: it only talks to the BeamClient
+# service over the \\.\pipe\beam-client-ipc named pipe.
+#
+# MSVC equivalent, from a "x64 Native Tools Command Prompt":
+#   rc /nologo /fo app.res app.rc
+#   cl /nologo /std:c11 /W4 /WX /O2 /DUNICODE /D_UNICODE main.c app.res \
+#      /Fe:beam-tray.exe /link /SUBSYSTEM:WINDOWS \
+#      user32.lib shell32.lib gdi32.lib
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -27,7 +36,7 @@ rm -f beam-tray.exe app-res.o
     -Wall -Wextra -Werror -mwindows \
     -Wl,--gc-sections,--nxcompat,--dynamicbase -static -static-libgcc \
     -o beam-tray.exe main.c app-res.o \
-    -liphlpapi -lws2_32 -lshell32 -luser32 -ladvapi32
+    -lshell32 -luser32 -lgdi32
 
 rm -f app-res.o
 echo "built: $(pwd)/beam-tray.exe"

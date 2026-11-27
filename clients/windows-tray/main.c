@@ -1,18 +1,19 @@
 /*
- * beam-tray: lightweight, event-driven Windows tray launcher for sing-box.
+ * beam-tray: unelevated Windows tray client for the beam-client service.
  *
- * It owns one process:
+ * The tray owns no tunnel process and needs no administrator rights. It talks
+ * to the running BeamClient service over the named pipe
+ * \\.\pipe\beam-client-ipc from one background worker thread, so the Win32
+ * message loop never blocks on pipe I/O.
  *
- *     sing-box.exe run -c config.json
+ * Request and reply lines, the status parser, and the menu text live in
+ * tray_logic.h, which is host-testable and shared with the unit tests under
+ * tests/windows-tray/.
  *
- * TUN, DNS (e.g. sing-box 1.15+ built-in sing-tun stack + dns_mode/strict_route),
- * and routing stay in config.json. The tray reports real tunnel status by
- * combining process liveness with Windows IP Helper TUN adapter status
- * (IfOperStatusUp), using distinct multi-resolution icons for Disconnected,
- * Connecting/Stopping, Connected, and Error states.
+ * Requests:  STATUS, CONNECT, DISCONNECT, RESTART, IMPORT_LINK <link>
+ * Replies:   OK state=... ... | OK ... | ERR code=... msg=...
  *
- * Build with clients/windows-tray/build.sh. The executable carries a
- * requireAdministrator manifest because the TUN inbound needs elevation.
+ * Build with build.sh (MinGW-w64) or the MSVC command documented there.
  */
 
 #define UNICODE
@@ -20,231 +21,171 @@
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0601
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
-#include <iphlpapi.h>
 #include <shellapi.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <strsafe.h>
+#include <stdbool.h>
 #include <string.h>
-#include <wchar.h>
 
 #include "tray_logic.h"
 
 #define APP_TITLE              L"beam"
-#define CORE_EXE               L"sing-box.exe"
-#define CONFIG_JSON            L"config.json"
-#define LOG_FILE               L"sing-box.log"
-#define LOG_FILE_PREV          L"sing-box.log.1"
-#define MUTEX_NAME             L"Global\\beam-sing-box-tray"
+#define TRAY_CLASS             L"BeamTrayWindow"
+#define TRAY_MUTEX             L"Local\\beam-native-tray"
+#define IPC_PIPE_NAME          L"\\\\.\\pipe\\beam-client-ipc"
 
 #define IDI_ICON_APP           1
-#define IDI_TRAY_DISCONNECTED  101
-#define IDI_TRAY_CONNECTING    102
-#define IDI_TRAY_CONNECTED     103
-#define IDI_TRAY_ERROR         104
+#define IDI_TRAY_GRAY          101
+#define IDI_TRAY_AMBER         102
+#define IDI_TRAY_GREEN         103
+#define IDI_TRAY_RED           104
+
+#define IDD_IMPORT_LINK        200
+#define IDC_LINK_EDIT          201
+
+#define IDM_TRAY               1u
+#define IDM_STATUS             2001u
+#define IDM_SERVER             2002u
+#define IDM_DROPS              2003u
+#define IDM_CONNECT            2004u
+#define IDM_DISCONNECT         2005u
+#define IDM_RESTART            2006u
+#define IDM_IMPORT             2007u
+#define IDM_CONFIG             2008u
+#define IDM_LOG                2009u
+#define IDM_EXIT               2010u
 
 #define WM_TRAY_MSG            (WM_APP + 1)
-#define WM_CORE_EXITED         (WM_APP + 2)
-#define WM_IFACE_CHANGED       (WM_APP + 3)
+#define WM_IPC_STATUS          (WM_APP + 2)
+#define WM_IPC_CMD_DONE        (WM_APP + 3)
 
-#define TIMER_CONNECT_WATCH    1
-#define TIMER_STOP_GRACE       2
-#define TIMER_COOLDOWN         3
+/* One status poll every two seconds, and immediately after a command. */
+#define IPC_POLL_MS            2000
+/* Bound for WaitNamedPipeW when another client holds the single instance. */
+#define IPC_PIPE_WAIT_MS       2000
+/* Bound for a whole request round trip, so a stuck service cannot block us. */
+#define IPC_IO_TIMEOUT_MS      4000
+#define IPC_POLL_STEP_MS       10
+/* Bound for joining the worker at exit. */
+#define IPC_JOIN_TIMEOUT_MS    6000
+#define IPC_READ_MAX           4096
+/* "IMPORT_LINK " plus a link must fit the service's 4095 byte line limit. */
+#define IPC_CMD_MAX            4001
+#define IPC_QUEUE_LEN          4
+#define IMPORT_MAX_WIDE        4096
+#define IMPORT_MAX_UTF8        8192
+#define BALLOON_TIMEOUT_MS     10000
 
-#define CONNECT_POLL_MS        1000
-#define CONNECT_TIMEOUT_MS     15000
-#define STOP_GRACE_MS          5000
-#define SHUTDOWN_GRACE_MS      4000
-#define COOLDOWN_MS            1500
-#define CONFIG_CHECK_TIMEOUT   5000
-#define MAX_LOG_BYTES          (2UL * 1024UL * 1024UL)
-#define MAX_CONFIG_READ_BYTES  (256UL * 1024UL)
+typedef enum {
+    CMD_NONE = 0,
+    CMD_CONNECT,
+    CMD_DISCONNECT,
+    CMD_RESTART,
+    CMD_IMPORT
+} CommandKind;
 
-#define IDM_STATUS             1000
-#define IDM_START              1001
-#define IDM_STOP               1002
-#define IDM_RESTART            1003
-#define IDM_CONFIG             1004
-#define IDM_LOG                1005
-#define IDM_EXIT               1006
-#define IDM_TRAY               1
-
+static HINSTANCE g_instance;
 static HWND      g_window;
-static HICON     g_icon_app;
-static HICON     g_icon_disconnected;
-static HICON     g_icon_connecting;
-static HICON     g_icon_connected;
-static HICON     g_icon_error;
-static UINT      g_taskbar_created;
+static UINT      g_msg_taskbar_created;
 static BOOL      g_tray_added;
 
-static HANDLE    g_process;
-static HANDLE    g_process_wait;
-static HANDLE    g_job;
-static HANDLE    g_iface_notify;
+static HICON     g_icon_app;
+static HICON     g_icon_gray;
+static HICON     g_icon_amber;
+static HICON     g_icon_green;
+static HICON     g_icon_red;
 
-static TrayState g_state = TRAY_STATE_DISCONNECTED;
-static DWORD     g_last_exit_code;
-static wchar_t   g_error_detail[128];
-static ULONGLONG g_connect_started_ms;
-static BOOL      g_stopping;
-static BOOL      g_restart_pending;
-static BOOL      g_exit_pending;
-static BOOL      g_cooldown;
+static wchar_t   g_config_path[MAX_PATH * 2];
+static wchar_t   g_log_path[MAX_PATH * 2];
 
-static wchar_t   g_dir[MAX_PATH];
-static wchar_t   g_core[MAX_PATH];
-static wchar_t   g_config[MAX_PATH];
-static wchar_t   g_log[MAX_PATH];
-static wchar_t   g_log_prev[MAX_PATH];
-static wchar_t   g_tun_name[128];
+/* IPC snapshot, command queue, and the last command result share one lock. */
+static CRITICAL_SECTION g_lock;
+static BeamIpcStatus    g_status;
+static BOOL             g_reachable;
+static char             g_queue[IPC_QUEUE_LEN][IPC_CMD_MAX];
+static int              g_queue_kind[IPC_QUEUE_LEN];
+static int              g_queue_head;
+static int              g_queue_count;
+static char             g_cmd_err[256];
 
-static void show_error(const wchar_t *what)
+static volatile LONG g_worker_stop;
+static HANDLE        g_worker_wake;
+static HANDLE        g_worker_thread;
+
+/* Tray state is owned by the UI thread. */
+static TrayState g_tray_state = TRAY_STATE_UNAVAILABLE;
+
+static BOOL utf8_to_wide(const char *src, wchar_t *dst, size_t dst_cap)
 {
-    wchar_t text[1024];
-    DWORD error = GetLastError();
-    wchar_t *system_text = NULL;
+    int needed;
+    int written;
 
-    FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-                       FORMAT_MESSAGE_IGNORE_INSERTS,
-                   NULL, error, 0, (LPWSTR)&system_text, 0, NULL);
+    if (!dst || dst_cap == 0)
+        return FALSE;
+    dst[0] = L'\0';
+    if (!src || src[0] == '\0')
+        return TRUE;
 
-    _snwprintf(text, ARRAYSIZE(text), L"%s\n\n%s (error %lu)",
-               what, system_text ? system_text : L"unknown error",
-               (unsigned long)error);
-    text[ARRAYSIZE(text) - 1] = L'\0';
-
-    if (system_text)
-        LocalFree(system_text);
-
-    MessageBoxW(NULL, text, APP_TITLE, MB_OK | MB_ICONERROR);
+    needed = MultiByteToWideChar(CP_UTF8, 0, src, -1, NULL, 0);
+    if (needed <= 0 || (size_t)needed > dst_cap)
+        return FALSE;
+    written = MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, (int)dst_cap);
+    if (written != needed)
+        return FALSE;
+    dst[dst_cap - 1] = L'\0';
+    return TRUE;
 }
 
-static BOOL file_exists(const wchar_t *path)
+static BOOL wide_to_utf8(const wchar_t *src, char *dst, size_t dst_cap)
 {
-    DWORD attrs = GetFileAttributesW(path);
-    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+    int needed;
+    int written;
+
+    if (!dst || dst_cap == 0)
+        return FALSE;
+    dst[0] = '\0';
+    if (!src || src[0] == L'\0')
+        return TRUE;
+
+    needed = WideCharToMultiByte(CP_UTF8, 0, src, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0 || (size_t)needed > dst_cap)
+        return FALSE;
+    written = WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, (int)dst_cap, NULL, NULL);
+    if (written != needed)
+        return FALSE;
+    dst[dst_cap - 1] = '\0';
+    return TRUE;
 }
 
 static void resolve_paths(void)
 {
-    DWORD length = GetModuleFileNameW(NULL, g_dir, ARRAYSIZE(g_dir));
+    wchar_t base[MAX_PATH];
+    DWORD length = GetEnvironmentVariableW(L"ProgramData", base, (DWORD)ARRAYSIZE(base));
 
-    if (length == 0 || length >= ARRAYSIZE(g_dir)) {
-        g_dir[0] = L'\0';
-    } else {
-        while (length > 0 && g_dir[length - 1] != L'\\' &&
-               g_dir[length - 1] != L'/') {
-            --length;
-        }
-        g_dir[length] = L'\0';
-    }
+    if (length == 0 || (size_t)length >= ARRAYSIZE(base))
+        StringCchCopyW(base, ARRAYSIZE(base), L"C:\\ProgramData");
 
-    _snwprintf(g_core, ARRAYSIZE(g_core), L"%s%s", g_dir, CORE_EXE);
-    _snwprintf(g_config, ARRAYSIZE(g_config), L"%s%s", g_dir, CONFIG_JSON);
-    _snwprintf(g_log, ARRAYSIZE(g_log), L"%s%s", g_dir, LOG_FILE);
-    _snwprintf(g_log_prev, ARRAYSIZE(g_log_prev), L"%s%s", g_dir, LOG_FILE_PREV);
-
-    g_core[ARRAYSIZE(g_core) - 1] = L'\0';
-    g_config[ARRAYSIZE(g_config) - 1] = L'\0';
-    g_log[ARRAYSIZE(g_log) - 1] = L'\0';
-    g_log_prev[ARRAYSIZE(g_log_prev) - 1] = L'\0';
+    if (FAILED(StringCchPrintfW(g_config_path, ARRAYSIZE(g_config_path),
+                                L"%s\\beam\\client.toml", base)))
+        g_config_path[0] = L'\0';
+    if (FAILED(StringCchPrintfW(g_log_path, ARRAYSIZE(g_log_path),
+                                L"%s\\beam\\beam-client.log", base)))
+        g_log_path[0] = L'\0';
 }
 
-static BOOL wcs_contains_ascii_ci(const wchar_t *haystack, const wchar_t *needle)
+static HICON load_icon(HINSTANCE instance, UINT id)
 {
-    size_t nlen = wcslen(needle);
-    if (nlen == 0)
-        return TRUE;
-    for (; *haystack != L'\0'; ++haystack) {
-        if (_wcsnicmp(haystack, needle, nlen) == 0)
-            return TRUE;
-    }
-    return FALSE;
-}
+    int cx = GetSystemMetrics(SM_CXSMICON);
+    int cy = GetSystemMetrics(SM_CYSMICON);
+    HICON icon;
 
-static void load_tun_name_from_config(void)
-{
-    HANDLE file;
-    LARGE_INTEGER size;
-    char *buf;
-    DWORD read_bytes = 0;
-    char utf8_name[128];
+    if (cx <= 0)
+        cx = 16;
+    if (cy <= 0)
+        cy = 16;
 
-    g_tun_name[0] = L'\0';
-
-    file = CreateFileW(g_config, GENERIC_READ,
-                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-        return;
-
-    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
-        (ULONGLONG)size.QuadPart > MAX_CONFIG_READ_BYTES) {
-        CloseHandle(file);
-        return;
-    }
-
-    buf = (char *)malloc((size_t)size.QuadPart);
-    if (!buf) {
-        CloseHandle(file);
-        return;
-    }
-
-    if (ReadFile(file, buf, (DWORD)size.QuadPart, &read_bytes, NULL) &&
-        read_bytes > 0) {
-        if (extract_tun_interface_name(buf, (size_t)read_bytes,
-                                       utf8_name, sizeof(utf8_name))) {
-            int written = MultiByteToWideChar(CP_UTF8, 0, utf8_name, -1,
-                                              g_tun_name, ARRAYSIZE(g_tun_name));
-            if (written <= 0)
-                g_tun_name[0] = L'\0';
-        }
-    }
-
-    free(buf);
-    CloseHandle(file);
-}
-
-static BOOL is_tun_interface_up(void)
-{
-    PMIB_IF_TABLE2 table = NULL;
-    BOOL found = FALSE;
-    ULONG i;
-
-    if (GetIfTable2(&table) != NO_ERROR || !table)
-        return FALSE;
-
-    for (i = 0; i < table->NumEntries; ++i) {
-        const MIB_IF_ROW2 *row = &table->Table[i];
-        if (row->OperStatus != IfOperStatusUp)
-            continue;
-
-        if (g_tun_name[0] != L'\0') {
-            if (_wcsicmp(row->Alias, g_tun_name) == 0) {
-                found = TRUE;
-                break;
-            }
-        } else {
-            if (wcs_contains_ascii_ci(row->Description, L"Wintun") ||
-                wcs_contains_ascii_ci(row->Alias, L"sing-tun") ||
-                wcs_contains_ascii_ci(row->Alias, L"beam-tun")) {
-                found = TRUE;
-                break;
-            }
-        }
-    }
-
-    FreeMibTable(table);
-    return found;
-}
-
-static HICON load_tray_icon_resource(HINSTANCE instance, UINT id, int cx, int cy)
-{
-    HICON icon = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(id), IMAGE_ICON,
-                                   cx, cy, LR_DEFAULTCOLOR);
+    icon = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(id), IMAGE_ICON, cx, cy,
+                             LR_DEFAULTCOLOR);
     if (!icon)
         icon = LoadIconW(instance, MAKEINTRESOURCEW(id));
     return icon;
@@ -252,141 +193,97 @@ static HICON load_tray_icon_resource(HINSTANCE instance, UINT id, int cx, int cy
 
 static void load_icons(HINSTANCE instance)
 {
-    int cx = GetSystemMetrics(SM_CXSMICON);
-    int cy = GetSystemMetrics(SM_CYSMICON);
-    if (cx <= 0)
-        cx = 16;
-    if (cy <= 0)
-        cy = 16;
-
     g_icon_app = LoadIconW(instance, MAKEINTRESOURCEW(IDI_ICON_APP));
     if (!g_icon_app)
         g_icon_app = LoadIconW(NULL, IDI_APPLICATION);
 
-    g_icon_disconnected = load_tray_icon_resource(instance, IDI_TRAY_DISCONNECTED, cx, cy);
-    g_icon_connecting   = load_tray_icon_resource(instance, IDI_TRAY_CONNECTING, cx, cy);
-    g_icon_connected    = load_tray_icon_resource(instance, IDI_TRAY_CONNECTED, cx, cy);
-    g_icon_error        = load_tray_icon_resource(instance, IDI_TRAY_ERROR, cx, cy);
-}
-
-static void destroy_icons(void)
-{
-    if (g_icon_disconnected) { DestroyIcon(g_icon_disconnected); g_icon_disconnected = NULL; }
-    if (g_icon_connecting)   { DestroyIcon(g_icon_connecting);   g_icon_connecting = NULL; }
-    if (g_icon_connected)    { DestroyIcon(g_icon_connected);    g_icon_connected = NULL; }
-    if (g_icon_error)        { DestroyIcon(g_icon_error);        g_icon_error = NULL; }
+    g_icon_gray = load_icon(instance, IDI_TRAY_GRAY);
+    g_icon_amber = load_icon(instance, IDI_TRAY_AMBER);
+    g_icon_green = load_icon(instance, IDI_TRAY_GREEN);
+    g_icon_red = load_icon(instance, IDI_TRAY_RED);
 }
 
 static HICON icon_for_state(TrayState state)
 {
     HICON icon = NULL;
+
     switch (state) {
     case TRAY_STATE_CONNECTED:
-        icon = g_icon_connected;
+        icon = g_icon_green;
         break;
     case TRAY_STATE_CONNECTING:
+    case TRAY_STATE_RECONNECTING:
+    case TRAY_STATE_WAITING_NETWORK:
     case TRAY_STATE_STOPPING:
-        icon = g_icon_connecting;
+    case TRAY_STATE_DEGRADED:
+        icon = g_icon_amber;
         break;
     case TRAY_STATE_ERROR:
-        icon = g_icon_error;
+        icon = g_icon_red;
         break;
     case TRAY_STATE_DISCONNECTED:
+    case TRAY_STATE_UNAVAILABLE:
     default:
-        icon = g_icon_disconnected;
+        icon = g_icon_gray;
         break;
     }
-    return icon ? icon : g_icon_app;
+
+    if (!icon)
+        icon = g_icon_app;
+    return icon;
 }
 
-static void tray_text(wchar_t *tip, size_t count)
+static void tray_text(const BeamIpcStatus *st, TrayState state, wchar_t *buf,
+                      size_t cap)
 {
-    switch (g_state) {
-    case TRAY_STATE_CONNECTED:
-        if (g_tun_name[0] != L'\0')
-            _snwprintf(tip, count, L"%s: Connected (%s up)", APP_TITLE, g_tun_name);
-        else
-            _snwprintf(tip, count, L"%s: Connected (TUN up)", APP_TITLE);
-        break;
-    case TRAY_STATE_CONNECTING:
-        _snwprintf(tip, count, L"%s: Connecting (waiting for TUN)...", APP_TITLE);
-        break;
-    case TRAY_STATE_STOPPING:
-        _snwprintf(tip, count, L"%s: Disconnecting...", APP_TITLE);
-        break;
-    case TRAY_STATE_ERROR:
-        if (g_error_detail[0] != L'\0')
-            _snwprintf(tip, count, L"%s: Error (%s)", APP_TITLE, g_error_detail);
-        else
-            _snwprintf(tip, count, L"%s: Error (exit %lu)", APP_TITLE,
-                       (unsigned long)g_last_exit_code);
-        break;
-    case TRAY_STATE_DISCONNECTED:
-    default:
-        _snwprintf(tip, count, L"%s: Disconnected", APP_TITLE);
-        break;
+    char text[1024];
+    wchar_t full[1024];
+
+    if (!buf || cap == 0)
+        return;
+    buf[0] = L'\0';
+
+    text[0] = '\0';
+    (void)beam_ipc_format_status_text(st, state, text, sizeof text);
+    text[ARRAYSIZE(text) - 1] = '\0';
+
+    full[0] = L'\0';
+    if (text[0] != '\0' && utf8_to_wide(text, full, ARRAYSIZE(full)) &&
+        full[0] != L'\0') {
+        StringCchCopyN(buf, cap, full, cap - 1);
+        return;
     }
-    tip[count - 1] = L'\0';
+
+    StringCchCopyN(buf, cap, L"beam: service unavailable", cap - 1);
 }
 
-static void tray_add(void)
+static void tray_notify(DWORD action, const BeamIpcStatus *st, TrayState state)
 {
     NOTIFYICONDATAW nid;
-    wchar_t tip[128];
+    wchar_t tip[256];
 
-    ZeroMemory(&nid, sizeof(nid));
-    nid.cbSize = sizeof(nid);
+    ZeroMemory(&nid, sizeof nid);
+    nid.cbSize = sizeof nid;
     nid.hWnd = g_window;
     nid.uID = IDM_TRAY;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY_MSG;
-    nid.hIcon = icon_for_state(g_state);
+    nid.hIcon = icon_for_state(state);
 
-    tray_text(tip, ARRAYSIZE(tip));
-    lstrcpynW(nid.szTip, tip, ARRAYSIZE(nid.szTip));
+    tray_text(st, state, tip, ARRAYSIZE(tip));
+    StringCchCopyN(nid.szTip, ARRAYSIZE(nid.szTip), tip,
+                   ARRAYSIZE(nid.szTip) - 1);
 
-    if (Shell_NotifyIconW(NIM_ADD, &nid))
-        g_tray_added = TRUE;
+    if (Shell_NotifyIconW(action, &nid))
+        g_tray_added = (action != NIM_DELETE);
 }
 
-static void tray_update(void)
+static void tray_add(void)
 {
-    NOTIFYICONDATAW nid;
-    wchar_t tip[128];
+    BeamIpcStatus status;
 
-    if (!g_tray_added)
-        return;
-
-    ZeroMemory(&nid, sizeof(nid));
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_window;
-    nid.uID = IDM_TRAY;
-    nid.uFlags = NIF_ICON | NIF_TIP;
-    nid.hIcon = icon_for_state(g_state);
-
-    tray_text(tip, ARRAYSIZE(tip));
-    lstrcpynW(nid.szTip, tip, ARRAYSIZE(nid.szTip));
-
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
-}
-
-static void tray_notify_error(const wchar_t *body)
-{
-    NOTIFYICONDATAW nid;
-
-    if (!g_tray_added || !body)
-        return;
-
-    ZeroMemory(&nid, sizeof(nid));
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_window;
-    nid.uID = IDM_TRAY;
-    nid.uFlags = NIF_INFO;
-    nid.dwInfoFlags = NIIF_ERROR;
-    lstrcpynW(nid.szInfoTitle, L"beam disconnected", ARRAYSIZE(nid.szInfoTitle));
-    lstrcpynW(nid.szInfo, body, ARRAYSIZE(nid.szInfo));
-
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    ZeroMemory(&status, sizeof status);
+    tray_notify(NIM_ADD, &status, g_tray_state);
 }
 
 static void tray_remove(void)
@@ -396,701 +293,815 @@ static void tray_remove(void)
     if (!g_tray_added)
         return;
 
-    ZeroMemory(&nid, sizeof(nid));
-    nid.cbSize = sizeof(nid);
+    ZeroMemory(&nid, sizeof nid);
+    nid.cbSize = sizeof nid;
     nid.hWnd = g_window;
     nid.uID = IDM_TRAY;
-
     Shell_NotifyIconW(NIM_DELETE, &nid);
     g_tray_added = FALSE;
 }
 
-static void set_state(TrayState next)
+static void tray_balloon(const BeamIpcStatus *st, TrayState state)
 {
-    if (g_state != next) {
-        g_state = next;
-        tray_update();
-    }
-}
+    NOTIFYICONDATAW nid;
+    wchar_t text[1024];
+    BOOL have_text = FALSE;
 
-static void start_cooldown(void)
-{
-    g_cooldown = TRUE;
-    SetTimer(g_window, TIMER_COOLDOWN, COOLDOWN_MS, NULL);
-}
-
-static void rotate_log_if_needed(void)
-{
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    ULONGLONG size;
-
-    if (!GetFileAttributesExW(g_log, GetFileExInfoStandard, &fad))
+    if (!g_tray_added)
         return;
+    text[0] = L'\0';
 
-    size = ((ULONGLONG)fad.nFileSizeHigh << 32) | (ULONGLONG)fad.nFileSizeLow;
-    if (size >= MAX_LOG_BYTES)
-        MoveFileExW(g_log, g_log_prev, MOVEFILE_REPLACE_EXISTING);
+    if (state == TRAY_STATE_ERROR && st->err_msg[0] != '\0')
+        have_text = utf8_to_wide(st->err_msg, text, ARRAYSIZE(text));
+    if (!have_text || text[0] == L'\0')
+        tray_text(st, state, text, ARRAYSIZE(text));
+
+    ZeroMemory(&nid, sizeof nid);
+    nid.cbSize = sizeof nid;
+    nid.hWnd = g_window;
+    nid.uID = IDM_TRAY;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = (state == TRAY_STATE_ERROR) ? NIIF_ERROR : NIIF_WARNING;
+    nid.uTimeout = BALLOON_TIMEOUT_MS;
+    StringCchCopyW(nid.szInfoTitle, ARRAYSIZE(nid.szInfoTitle), L"beam");
+    StringCchCopyN(nid.szInfo, ARRAYSIZE(nid.szInfo), text,
+                   ARRAYSIZE(nid.szInfo) - 1);
+
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-static BOOL check_config_valid(void)
+static void apply_state(TrayState state, const BeamIpcStatus *st)
 {
-    wchar_t command[2 * MAX_PATH + 64];
-    STARTUPINFOW startup;
-    PROCESS_INFORMATION process;
-    DWORD wait_res;
-    DWORD exit_code = 1;
+    TrayState previous = g_tray_state;
 
-    if (!file_exists(g_core) || !file_exists(g_config))
+    g_tray_state = state;
+    if (g_tray_added)
+        tray_notify(NIM_MODIFY, st, state);
+    if (state != previous &&
+        (state == TRAY_STATE_ERROR || state == TRAY_STATE_DEGRADED))
+        tray_balloon(st, state);
+}
+
+static void snapshot_status(BeamIpcStatus *st, BOOL *reachable)
+{
+    EnterCriticalSection(&g_lock);
+    *st = g_status;
+    *reachable = g_reachable;
+    LeaveCriticalSection(&g_lock);
+}
+
+/* --- Command queue ------------------------------------------------------ */
+
+static BOOL queue_push(CommandKind kind, const char *line)
+{
+    size_t length;
+    BOOL pushed = FALSE;
+
+    if (!line)
+        return FALSE;
+    length = strlen(line);
+    if (length == 0 || length >= IPC_CMD_MAX)
         return FALSE;
 
-    _snwprintf(command, ARRAYSIZE(command), L"\"%s\" check -c \"%s\"",
-               g_core, g_config);
-    command[ARRAYSIZE(command) - 1] = L'\0';
-
-    ZeroMemory(&startup, sizeof(startup));
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESHOWWINDOW;
-    startup.wShowWindow = SW_HIDE;
-
-    ZeroMemory(&process, sizeof(process));
-    if (!CreateProcessW(g_core, command, NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, g_dir, &startup, &process)) {
-        return FALSE;
+    EnterCriticalSection(&g_lock);
+    if (g_queue_count < IPC_QUEUE_LEN) {
+        int index = (g_queue_head + g_queue_count) % IPC_QUEUE_LEN;
+        memcpy(g_queue[index], line, length + 1);
+        g_queue_kind[index] = (int)kind;
+        g_queue_count++;
+        pushed = TRUE;
     }
+    LeaveCriticalSection(&g_lock);
 
-    wait_res = WaitForSingleObject(process.hProcess, CONFIG_CHECK_TIMEOUT);
-    if (wait_res == WAIT_OBJECT_0) {
-        GetExitCodeProcess(process.hProcess, &exit_code);
-    } else {
-        TerminateProcess(process.hProcess, 1);
-        WaitForSingleObject(process.hProcess, 1000);
-        exit_code = 1;
-    }
-
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    return exit_code == 0;
+    return pushed;
 }
 
-static void CALLBACK on_process_exit_cb(PVOID param, BOOLEAN timed_out)
+static BOOL queue_pop(CommandKind *kind, char *out)
 {
-    (void)param;
-    (void)timed_out;
-    if (g_window)
-        PostMessageW(g_window, WM_CORE_EXITED, 0, 0);
+    size_t length;
+    BOOL popped = FALSE;
+
+    EnterCriticalSection(&g_lock);
+    if (g_queue_count > 0) {
+        length = strlen(g_queue[g_queue_head]);
+        memcpy(out, g_queue[g_queue_head], length + 1);
+        *kind = (CommandKind)g_queue_kind[g_queue_head];
+        SecureZeroMemory(g_queue[g_queue_head], IPC_CMD_MAX);
+        g_queue_head = (g_queue_head + 1) % IPC_QUEUE_LEN;
+        g_queue_count--;
+        popped = TRUE;
+    }
+    LeaveCriticalSection(&g_lock);
+
+    return popped;
 }
 
-static void NETIOAPI_API_ on_ip_interface_change_cb(
-    PVOID caller_context, PMIB_IPINTERFACE_ROW row,
-    MIB_NOTIFICATION_TYPE notification_type)
+static void queue_clear(void)
 {
-    (void)caller_context;
-    (void)row;
-    (void)notification_type;
-    if (g_window)
-        PostMessageW(g_window, WM_IFACE_CHANGED, 0, 0);
+    int i;
+
+    EnterCriticalSection(&g_lock);
+    for (i = 0; i < IPC_QUEUE_LEN; ++i)
+        SecureZeroMemory(g_queue[i], IPC_CMD_MAX);
+    g_queue_head = 0;
+    g_queue_count = 0;
+    LeaveCriticalSection(&g_lock);
 }
 
-static void unregister_process_wait(BOOL blocking)
+/* --- Named pipe transport ----------------------------------------------- */
+
+/*
+ * Opens one pipe instance. The service serves one request per connection, so
+ * every round trip opens, writes, reads, and closes. SECURITY_SQOS_PRESENT with
+ * SECURITY_IDENTIFICATION lets the server identify this process but never
+ * impersonate it.
+ */
+static HANDLE ipc_connect(void)
 {
-    if (g_process_wait) {
-        UnregisterWaitEx(g_process_wait, blocking ? INVALID_HANDLE_VALUE : NULL);
-        g_process_wait = NULL;
-    }
-}
+    DWORD flags = SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+    HANDLE pipe;
 
-static void release_process_handles(void)
-{
-    unregister_process_wait(FALSE);
+    pipe = CreateFileW(IPC_PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                       OPEN_EXISTING, flags, NULL);
+    if (pipe != INVALID_HANDLE_VALUE)
+        return pipe;
+    if (GetLastError() != ERROR_PIPE_BUSY)
+        return INVALID_HANDLE_VALUE;
+    if (!WaitNamedPipeW(IPC_PIPE_NAME, IPC_PIPE_WAIT_MS))
+        return INVALID_HANDLE_VALUE;
 
-    if (g_process) {
-        CloseHandle(g_process);
-        g_process = NULL;
-    }
-
-    if (g_job) {
-        CloseHandle(g_job);
-        g_job = NULL;
-    }
-}
-
-static BOOL WINAPI ignore_ctrl_handler(DWORD ctrl_type)
-{
-    (void)ctrl_type;
-    return TRUE;
-}
-
-static BOOL send_graceful_stop_signal(HANDLE process)
-{
-    DWORD pid = GetProcessId(process);
-    BOOL signalled = FALSE;
-
-    if (pid == 0)
-        return FALSE;
-
-    FreeConsole();
-    if (AttachConsole(pid)) {
-        SetConsoleCtrlHandler(ignore_ctrl_handler, TRUE);
-        signalled = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) != 0;
-        if (!signalled)
-            signalled = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) != 0;
-        if (signalled)
-            Sleep(50);
-        FreeConsole();
-        SetConsoleCtrlHandler(ignore_ctrl_handler, FALSE);
-    }
-    return signalled;
-}
-
-static BOOL start_core(void)
-{
-    wchar_t command[2 * MAX_PATH + 64];
-    STARTUPINFOW startup;
-    PROCESS_INFORMATION process;
-    SECURITY_ATTRIBUTES security;
-    HANDLE log_file = INVALID_HANDLE_VALUE;
-    HANDLE nul_file = INVALID_HANDLE_VALUE;
-    BOOL inherit_handles = FALSE;
-
-    if (g_process) {
-        tray_update();
-        return TRUE;
-    }
-
-    if (!file_exists(g_core)) {
-        SetLastError(ERROR_FILE_NOT_FOUND);
-        lstrcpynW(g_error_detail, L"sing-box.exe missing", ARRAYSIZE(g_error_detail));
-        set_state(TRAY_STATE_ERROR);
-        show_error(L"sing-box.exe was not found next to beam-tray.exe.");
-        return FALSE;
-    }
-
-    if (!file_exists(g_config)) {
-        SetLastError(ERROR_FILE_NOT_FOUND);
-        lstrcpynW(g_error_detail, L"config.json missing", ARRAYSIZE(g_error_detail));
-        set_state(TRAY_STATE_ERROR);
-        show_error(L"config.json was not found next to beam-tray.exe.");
-        return FALSE;
-    }
-
-    load_tun_name_from_config();
-    rotate_log_if_needed();
-
-    _snwprintf(command, ARRAYSIZE(command), L"\"%s\" run -c \"%s\"",
-               g_core, g_config);
-    command[ARRAYSIZE(command) - 1] = L'\0';
-
-    ZeroMemory(&security, sizeof(security));
-    security.nLength = sizeof(security);
-    security.bInheritHandle = TRUE;
-
-    log_file = CreateFileW(g_log, FILE_APPEND_DATA,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-
-    nul_file = CreateFileW(L"NUL", GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
-                           OPEN_EXISTING, 0, NULL);
-
-    ZeroMemory(&startup, sizeof(startup));
-    startup.cb = sizeof(startup);
-
-    if (log_file != INVALID_HANDLE_VALUE && nul_file != INVALID_HANDLE_VALUE) {
-        SetFilePointer(log_file, 0, NULL, FILE_END);
-        startup.dwFlags = STARTF_USESTDHANDLES;
-        startup.hStdInput = nul_file;
-        startup.hStdOutput = log_file;
-        startup.hStdError = log_file;
-        inherit_handles = TRUE;
-    }
-
-    ZeroMemory(&process, sizeof(process));
-
-    startup.dwFlags |= STARTF_USESHOWWINDOW;
-    startup.wShowWindow = SW_HIDE;
-
-    if (!CreateProcessW(g_core, command, NULL, NULL, inherit_handles,
-                        CREATE_NEW_CONSOLE | CREATE_SUSPENDED,
-                        NULL, g_dir, &startup, &process)) {
-        DWORD error = GetLastError();
-
-        if (log_file != INVALID_HANDLE_VALUE)
-            CloseHandle(log_file);
-        if (nul_file != INVALID_HANDLE_VALUE)
-            CloseHandle(nul_file);
-
-        lstrcpynW(g_error_detail, L"launch failed", ARRAYSIZE(g_error_detail));
-        set_state(TRAY_STATE_ERROR);
-        SetLastError(error);
-        show_error(L"Could not start sing-box.exe.");
-        return FALSE;
-    }
-
-    g_job = CreateJobObjectW(NULL, NULL);
-    if (g_job) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
-
-        ZeroMemory(&limits, sizeof(limits));
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
-        if (!SetInformationJobObject(g_job, JobObjectExtendedLimitInformation,
-                                     &limits, sizeof(limits)) ||
-            !AssignProcessToJobObject(g_job, process.hProcess)) {
-            CloseHandle(g_job);
-            g_job = NULL;
-        }
-    }
-
-    if (ResumeThread(process.hThread) == (DWORD)-1) {
-        DWORD error = GetLastError();
-        TerminateProcess(process.hProcess, 1);
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
-        if (g_job) {
-            CloseHandle(g_job);
-            g_job = NULL;
-        }
-        if (log_file != INVALID_HANDLE_VALUE)
-            CloseHandle(log_file);
-        if (nul_file != INVALID_HANDLE_VALUE)
-            CloseHandle(nul_file);
-        lstrcpynW(g_error_detail, L"resume failed", ARRAYSIZE(g_error_detail));
-        set_state(TRAY_STATE_ERROR);
-        SetLastError(error);
-        show_error(L"Could not resume sing-box.exe.");
-        return FALSE;
-    }
-    CloseHandle(process.hThread);
-
-    if (log_file != INVALID_HANDLE_VALUE)
-        CloseHandle(log_file);
-    if (nul_file != INVALID_HANDLE_VALUE)
-        CloseHandle(nul_file);
-
-    g_process = process.hProcess;
-    g_stopping = FALSE;
-    g_restart_pending = FALSE;
-    g_exit_pending = FALSE;
-    g_last_exit_code = 0;
-    g_error_detail[0] = L'\0';
-    g_connect_started_ms = GetTickCount64();
-
-    if (!RegisterWaitForSingleObject(&g_process_wait, g_process,
-                                     on_process_exit_cb, NULL, INFINITE,
-                                     WT_EXECUTEONLYONCE)) {
-        g_process_wait = NULL;
-    }
-
-    start_cooldown();
-    if (is_tun_interface_up()) {
-        set_state(TRAY_STATE_CONNECTED);
-    } else {
-        set_state(TRAY_STATE_CONNECTING);
-        SetTimer(g_window, TIMER_CONNECT_WATCH, CONNECT_POLL_MS, NULL);
-    }
-    return TRUE;
-}
-
-static void begin_stop_core(BOOL restart_after, BOOL exit_after)
-{
-    if (!g_process) {
-        g_stopping = FALSE;
-        g_restart_pending = FALSE;
-        if (exit_after) {
-            DestroyWindow(g_window);
-        } else if (restart_after) {
-            start_core();
-        } else {
-            set_state(TRAY_STATE_DISCONNECTED);
-        }
-        return;
-    }
-
-    KillTimer(g_window, TIMER_CONNECT_WATCH);
-    g_stopping = TRUE;
-    g_restart_pending = restart_after;
-    g_exit_pending = exit_after;
-    set_state(TRAY_STATE_STOPPING);
-    start_cooldown();
-
-    if (!send_graceful_stop_signal(g_process)) {
-        TerminateProcess(g_process, 0);
-    }
-
-    SetTimer(g_window, TIMER_STOP_GRACE, STOP_GRACE_MS, NULL);
+    return CreateFileW(IPC_PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                       OPEN_EXISTING, flags, NULL);
 }
 
 /*
- * Synchronous graceful stop used only on WM_ENDSESSION / WM_DESTROY so
- * sing-box has a bounded window to remove WFP filters and TUN DNS settings
- * before Windows terminates the process.
+ * Reads one reply line with a deadline. The pipe is blocking byte mode, so wait
+ * for the first byte with a bounded PeekNamedPipe poll, then keep reading until
+ * the line terminator arrives; both the wait and the buffer are bounded.
  */
-static void stop_core_sync(DWORD grace_ms)
+static BOOL ipc_read_line(HANDLE pipe, char *buf, size_t cap, size_t *out_len)
 {
-    KillTimer(g_window, TIMER_CONNECT_WATCH);
-    KillTimer(g_window, TIMER_STOP_GRACE);
+    ULONGLONG deadline = GetTickCount64() + IPC_IO_TIMEOUT_MS;
+    size_t used = 0;
 
-    if (g_process) {
-        BOOL signalled;
+    if (!buf || cap < 2)
+        return FALSE;
 
-        g_stopping = TRUE;
-        unregister_process_wait(TRUE);
+    for (;;) {
+        DWORD available = 0;
 
-        signalled = send_graceful_stop_signal(g_process);
-        if (!signalled || WaitForSingleObject(g_process, grace_ms) != WAIT_OBJECT_0) {
-            TerminateProcess(g_process, 0);
-            WaitForSingleObject(g_process, 2000);
+        if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL))
+            return FALSE;
+
+        if (available > 0) {
+            DWORD want = (DWORD)(cap - 1 - used);
+            DWORD read = 0;
+
+            if (want == 0)
+                return FALSE;
+            if (want > available)
+                want = available;
+            if (!ReadFile(pipe, buf + used, want, &read, NULL))
+                return FALSE;
+            if (read == 0)
+                return FALSE;
+            used += (size_t)read;
+            if (buf[used - 1] == '\n')
+                break;
+            continue;
         }
 
-        CloseHandle(g_process);
-        g_process = NULL;
+        if (GetTickCount64() >= deadline)
+            return FALSE;
+        Sleep(IPC_POLL_STEP_MS);
     }
 
-    if (g_job) {
-        CloseHandle(g_job);
-        g_job = NULL;
-    }
-
-    g_stopping = FALSE;
-    g_restart_pending = FALSE;
-    g_state = TRAY_STATE_DISCONNECTED;
+    buf[used] = '\0';
+    *out_len = used;
+    return TRUE;
 }
 
-static void refresh_tunnel_state(void)
+static BOOL ipc_request(const char *line, char *reply, size_t reply_cap,
+                        size_t *reply_len)
 {
-    BOOL tun_up;
-    TrayState next;
+    char request[IPC_CMD_MAX + 2];
+    size_t line_len;
+    DWORD written = 0;
+    HANDLE pipe;
+    BOOL ok = FALSE;
 
-    if (!g_process || g_stopping)
-        return;
+    if (!line || !reply || reply_cap < 2)
+        return FALSE;
+    line_len = strlen(line);
+    /* The importer already ends its command with '\n'; send exactly one. */
+    while (line_len > 0 &&
+           (line[line_len - 1] == '\n' || line[line_len - 1] == '\r'))
+        line_len--;
+    if (line_len == 0 || line_len + 2 > ARRAYSIZE(request))
+        return FALSE;
 
-    /* Fallback liveness check in case RegisterWaitForSingleObject failed. */
-    if (WaitForSingleObject(g_process, 0) == WAIT_OBJECT_0) {
-        PostMessageW(g_window, WM_CORE_EXITED, 0, 0);
-        return;
+    memcpy(request, line, line_len);
+    request[line_len] = '\n';
+
+    pipe = ipc_connect();
+    if (pipe == INVALID_HANDLE_VALUE) {
+        SecureZeroMemory(request, sizeof request);
+        return FALSE;
     }
 
-    tun_up = is_tun_interface_up();
-    next = tray_state_on_tun_status(g_state, tun_up, g_process != NULL);
+    if (WriteFile(pipe, request, (DWORD)(line_len + 1), &written, NULL) &&
+        written == (DWORD)(line_len + 1) &&
+        ipc_read_line(pipe, reply, reply_cap, reply_len))
+        ok = TRUE;
 
-    if (next == TRAY_STATE_CONNECTED) {
-        KillTimer(g_window, TIMER_CONNECT_WATCH);
-        g_error_detail[0] = L'\0';
-        set_state(TRAY_STATE_CONNECTED);
-        return;
-    }
+    CloseHandle(pipe);
+    SecureZeroMemory(request, sizeof request);
 
-    if (next == TRAY_STATE_CONNECTING) {
-        if (g_state == TRAY_STATE_CONNECTED) {
-            g_connect_started_ms = GetTickCount64();
-            SetTimer(g_window, TIMER_CONNECT_WATCH, CONNECT_POLL_MS, NULL);
+    if (ok) {
+        while (*reply_len > 0 &&
+               (reply[*reply_len - 1] == '\n' || reply[*reply_len - 1] == '\r')) {
+            reply[*reply_len - 1] = '\0';
+            (*reply_len)--;
         }
-        set_state(TRAY_STATE_CONNECTING);
+    }
 
-        if (GetTickCount64() - g_connect_started_ms >= CONNECT_TIMEOUT_MS) {
-            KillTimer(g_window, TIMER_CONNECT_WATCH);
-            lstrcpynW(g_error_detail, L"TUN did not come up",
-                      ARRAYSIZE(g_error_detail));
-            set_state(TRAY_STATE_ERROR);
-            tray_notify_error(L"TUN interface did not come up. Check sing-box.log.");
+    return ok;
+}
+
+/* --- IPC worker --------------------------------------------------------- */
+
+static void drain_commands(void)
+{
+    CommandKind kind = CMD_NONE;
+    char command[IPC_CMD_MAX];
+
+    while (queue_pop(&kind, command)) {
+        char reply[IPC_READ_MAX + 1];
+        char value[256];
+        char error[256];
+        size_t reply_len = 0;
+        BOOL ok = FALSE;
+        bool is_ok = false;
+
+        reply[0] = '\0';
+        value[0] = '\0';
+        error[0] = '\0';
+
+        if (ipc_request(command, reply, sizeof reply, &reply_len)) {
+            if (beam_ipc_parse_command_reply(reply, reply_len, &is_ok, value,
+                                             sizeof value, error,
+                                             sizeof error)) {
+                ok = is_ok ? TRUE : FALSE;
+            } else {
+                StringCchCopyA(error, ARRAYSIZE(error),
+                               "unexpected reply from the service");
+            }
+        } else {
+            StringCchCopyA(error, ARRAYSIZE(error),
+                           "cannot reach the beam service");
         }
+        if (ok)
+            error[0] = '\0';
+
+        SecureZeroMemory(command, sizeof command);
+
+        EnterCriticalSection(&g_lock);
+        StringCchCopyA(g_cmd_err, ARRAYSIZE(g_cmd_err), error);
+        LeaveCriticalSection(&g_lock);
+
+        PostMessageW(g_window, WM_IPC_CMD_DONE, (WPARAM)kind,
+                     (LPARAM)(ok ? 1 : 0));
     }
 }
 
-static void handle_core_exited(void)
+static void poll_status(void)
 {
-    DWORD exit_code = 0;
-    BOOL was_stopping = g_stopping;
-    BOOL restart_after = g_restart_pending;
-    BOOL exit_after = g_exit_pending;
-    TrayState next;
+    char reply[IPC_READ_MAX + 1];
+    BeamIpcStatus status;
+    size_t reply_len = 0;
+    BOOL reachable = FALSE;
 
-    if (!g_process)
-        return;
+    ZeroMemory(&status, sizeof status);
+    reply[0] = '\0';
 
-    /* Guard against spurious messages if the process is still running. */
-    if (WaitForSingleObject(g_process, 0) != WAIT_OBJECT_0)
-        return;
+    if (ipc_request("STATUS", reply, sizeof reply, &reply_len) &&
+        beam_ipc_parse_status(reply, reply_len, &status))
+        reachable = TRUE;
 
-    GetExitCodeProcess(g_process, &exit_code);
-    KillTimer(g_window, TIMER_CONNECT_WATCH);
-    KillTimer(g_window, TIMER_STOP_GRACE);
+    EnterCriticalSection(&g_lock);
+    g_reachable = reachable;
+    if (reachable)
+        g_status = status;
+    LeaveCriticalSection(&g_lock);
 
-    release_process_handles();
-
-    g_stopping = FALSE;
-    g_restart_pending = FALSE;
-    g_exit_pending = FALSE;
-
-    next = tray_state_on_process_exit(g_state, was_stopping);
-    if (next == TRAY_STATE_ERROR) {
-        wchar_t msg[128];
-        g_last_exit_code = exit_code;
-        _snwprintf(g_error_detail, ARRAYSIZE(g_error_detail),
-                   L"sing-box exited (%lu)", (unsigned long)exit_code);
-        g_error_detail[ARRAYSIZE(g_error_detail) - 1] = L'\0';
-        set_state(TRAY_STATE_ERROR);
-
-        _snwprintf(msg, ARRAYSIZE(msg),
-                   L"sing-box exited unexpectedly (code %lu). Open sing-box.log for details.",
-                   (unsigned long)exit_code);
-        msg[ARRAYSIZE(msg) - 1] = L'\0';
-        tray_notify_error(msg);
-        return;
-    }
-
-    set_state(TRAY_STATE_DISCONNECTED);
-
-    if (exit_after) {
-        DestroyWindow(g_window);
-    } else if (restart_after) {
-        start_core();
-    }
+    PostMessageW(g_window, WM_IPC_STATUS, 0, 0);
 }
 
-static void open_text_file(const wchar_t *path)
+static DWORD WINAPI ipc_worker(LPVOID param)
 {
-    wchar_t system_dir[MAX_PATH];
-    wchar_t notepad[MAX_PATH];
-    UINT length = GetSystemDirectoryW(system_dir, ARRAYSIZE(system_dir));
+    BOOL first = TRUE;
+
+    UNREFERENCED_PARAMETER(param);
+
+    for (;;) {
+        if (InterlockedCompareExchange(&g_worker_stop, 0, 0) != 0)
+            break;
+
+        if (!first)
+            WaitForSingleObject(g_worker_wake, IPC_POLL_MS);
+        first = FALSE;
+
+        if (InterlockedCompareExchange(&g_worker_stop, 0, 0) != 0)
+            break;
+
+        drain_commands();
+        poll_status();
+    }
+
+    return 0;
+}
+
+/* --- User actions ------------------------------------------------------- */
+
+static void send_command(CommandKind kind, const char *line)
+{
+    if (!queue_push(kind, line)) {
+        MessageBoxW(g_window, L"The tray is busy. Try again.", APP_TITLE,
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (g_worker_wake)
+        SetEvent(g_worker_wake);
+}
+
+static void open_config_admin(void)
+{
+    SHELLEXECUTEINFOW info;
+    wchar_t parameters[MAX_PATH * 2 + 2];
+
+    if (g_config_path[0] == L'\0' ||
+        GetFileAttributesW(g_config_path) == INVALID_FILE_ATTRIBUTES) {
+        MessageBoxW(g_window,
+                    L"No config file yet. Use \"Import vless:// link...\" first.",
+                    APP_TITLE, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    if (FAILED(StringCchPrintfW(parameters, ARRAYSIZE(parameters), L"\"%s\"",
+                                g_config_path))) {
+        MessageBoxW(g_window, L"Cannot build the config path.", APP_TITLE,
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    ZeroMemory(&info, sizeof info);
+    info.cbSize = sizeof info;
+    info.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+    info.hwnd = g_window;
+    info.lpVerb = L"runas";
+    info.lpFile = L"notepad.exe";
+    info.lpParameters = parameters;
+    info.nShow = SW_SHOWNORMAL;
+
+    if (!ShellExecuteExW(&info) && GetLastError() != ERROR_CANCELLED)
+        MessageBoxW(g_window, L"Cannot open the config file.", APP_TITLE,
+                    MB_OK | MB_ICONERROR);
+}
+
+static void open_log(void)
+{
     HINSTANCE result;
 
-    if (length == 0 || length >= ARRAYSIZE(system_dir)) {
-        show_error(L"Could not locate the Windows system directory.");
+    if (g_log_path[0] == L'\0' ||
+        GetFileAttributesW(g_log_path) == INVALID_FILE_ATTRIBUTES) {
+        MessageBoxW(g_window, L"No log file yet.", APP_TITLE,
+                    MB_OK | MB_ICONINFORMATION);
         return;
     }
 
-    _snwprintf(notepad, ARRAYSIZE(notepad), L"%s\\notepad.exe", system_dir);
-    notepad[ARRAYSIZE(notepad) - 1] = L'\0';
-
-    result = ShellExecuteW(NULL, L"open", notepad, path, NULL, SW_SHOWNORMAL);
-
+    result = ShellExecuteW(g_window, L"open", g_log_path, NULL, NULL,
+                           SW_SHOWNORMAL);
     if ((INT_PTR)result <= 32)
-        show_error(L"Could not open the file with Notepad.");
+        MessageBoxW(g_window, L"Cannot open the log file.", APP_TITLE,
+                    MB_OK | MB_ICONERROR);
 }
 
 static void show_menu(void)
 {
+    BeamIpcStatus status;
+    BOOL reachable = FALSE;
     HMENU menu;
     POINT point;
-    int command;
-    wchar_t status_label[128];
-    BOOL alive     = g_process != NULL;
-    BOOL can_start = !g_cooldown && tray_state_can_start(g_state, alive);
-    BOOL can_stop  = !g_cooldown && tray_state_can_stop(g_state, alive);
+    wchar_t text[1024];
+    wchar_t detail[256];
+    TrayState state = g_tray_state;
+    BOOL restart;
+
+    if (!g_window)
+        return;
+
+    snapshot_status(&status, &reachable);
 
     menu = CreatePopupMenu();
     if (!menu)
         return;
 
-    tray_text(status_label, ARRAYSIZE(status_label));
-    AppendMenuW(menu, MF_STRING | MF_GRAYED, IDM_STATUS, status_label);
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    tray_text(&status, state, text, ARRAYSIZE(text));
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, IDM_STATUS, text);
 
-    AppendMenuW(menu, MF_STRING | (can_start ? 0 : MF_GRAYED),
-                IDM_START, L"Connect");
-    AppendMenuW(menu, MF_STRING | (can_stop ? 0 : MF_GRAYED),
-                IDM_STOP, L"Disconnect");
-    AppendMenuW(menu, MF_STRING | (can_stop ? 0 : MF_GRAYED),
+    if (status.server[0] != '\0' &&
+        utf8_to_wide(status.server, detail, ARRAYSIZE(detail)) &&
+        detail[0] != L'\0') {
+        StringCchPrintfW(text, ARRAYSIZE(text), L"Server: %s", detail);
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, IDM_SERVER, text);
+    }
+
+    if (status.drops[0] != '\0' &&
+        utf8_to_wide(status.drops, detail, ARRAYSIZE(detail)) &&
+        detail[0] != L'\0') {
+        StringCchPrintfW(text, ARRAYSIZE(text), L"Drops: %s", detail);
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, IDM_DROPS, text);
+    }
+
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu,
+                MF_STRING | (beam_tray_can_connect(state) ? MF_ENABLED
+                                                          : MF_GRAYED),
+                IDM_CONNECT, L"Connect");
+    AppendMenuW(menu,
+                MF_STRING | (beam_tray_can_disconnect(state) ? MF_ENABLED
+                                                             : MF_GRAYED),
+                IDM_DISCONNECT, L"Disconnect");
+
+    restart = reachable && state != TRAY_STATE_STOPPING;
+    AppendMenuW(menu, MF_STRING | (restart ? MF_ENABLED : MF_GRAYED),
                 IDM_RESTART, L"Restart");
+
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, IDM_CONFIG, L"Open config.json");
-    AppendMenuW(menu, MF_STRING, IDM_LOG, L"Open sing-box.log");
+    AppendMenuW(menu, MF_STRING, IDM_IMPORT, L"Import vless:// link...");
+    AppendMenuW(menu, MF_STRING, IDM_CONFIG, L"Open Config (Admin)...");
+    AppendMenuW(menu, MF_STRING, IDM_LOG, L"Open Log");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
+    AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit Tray");
 
     GetCursorPos(&point);
     SetForegroundWindow(g_window);
-
-    command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-                             point.x, point.y, 0, g_window, NULL);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
+                   point.x, point.y, 0, g_window, NULL);
+    PostMessageW(g_window, WM_NULL, 0, 0);
 
     DestroyMenu(menu);
+}
 
-    switch (command) {
-    case IDM_START:
-        start_core();
+/* --- Import dialog ------------------------------------------------------ */
+
+static BOOL import_link_from_dialog(HWND dialog)
+{
+    wchar_t wide[IMPORT_MAX_WIDE];
+    char utf8[IMPORT_MAX_UTF8];
+    char command[IPC_CMD_MAX];
+    BOOL queued = FALSE;
+
+    wide[0] = L'\0';
+    utf8[0] = '\0';
+    command[0] = '\0';
+
+    if (GetDlgItemTextW(dialog, IDC_LINK_EDIT, wide, ARRAYSIZE(wide)) <= 0) {
+        MessageBoxW(dialog, L"Paste a vless:// link first.", APP_TITLE,
+                    MB_OK | MB_ICONINFORMATION);
+        return FALSE;
+    }
+
+    if (!wide_to_utf8(wide, utf8, sizeof utf8)) {
+        MessageBoxW(dialog, L"That link is too long.", APP_TITLE,
+                    MB_OK | MB_ICONWARNING);
+    } else if (!beam_ipc_prepare_import_link(utf8, command, sizeof command)) {
+        MessageBoxW(dialog, L"That is not a valid vless:// link.", APP_TITLE,
+                    MB_OK | MB_ICONWARNING);
+    } else if (!queue_push(CMD_IMPORT, command)) {
+        MessageBoxW(dialog, L"The tray is busy. Try again.", APP_TITLE,
+                    MB_OK | MB_ICONWARNING);
+    } else {
+        queued = TRUE;
+    }
+
+    /* The link may carry a UUID and keys; drop it from our stack at once. */
+    SetDlgItemTextW(dialog, IDC_LINK_EDIT, L"");
+    SecureZeroMemory(wide, sizeof wide);
+    SecureZeroMemory(utf8, sizeof utf8);
+    SecureZeroMemory(command, sizeof command);
+
+    if (queued && g_worker_wake)
+        SetEvent(g_worker_wake);
+
+    return queued;
+}
+
+static INT_PTR CALLBACK import_dialog_proc(HWND dialog, UINT msg,
+                                           WPARAM wparam, LPARAM lparam)
+{
+    UNREFERENCED_PARAMETER(lparam);
+
+    switch (msg) {
+    case WM_INITDIALOG: {
+        HWND edit = GetDlgItem(dialog, IDC_LINK_EDIT);
+        if (edit) {
+            SendMessageW(edit, EM_SETLIMITTEXT, (WPARAM)(IMPORT_MAX_WIDE - 1), 0);
+            SetFocus(edit);
+        }
+        return FALSE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wparam)) {
+        case IDOK:
+            if (import_link_from_dialog(dialog))
+                EndDialog(dialog, IDOK);
+            return TRUE;
+        case IDCANCEL:
+            SetDlgItemTextW(dialog, IDC_LINK_EDIT, L"");
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        default:
+            return FALSE;
+        }
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL g_import_open = FALSE;
+
+static void open_import_dialog(void)
+{
+    if (g_import_open)
+        return;
+    g_import_open = TRUE;
+    DialogBoxW(g_instance, MAKEINTRESOURCEW(IDD_IMPORT_LINK), g_window,
+               import_dialog_proc);
+    g_import_open = FALSE;
+}
+
+/* --- UI messages -------------------------------------------------------- */
+
+static void on_ipc_status(void)
+{
+    BeamIpcStatus status;
+    BOOL reachable = FALSE;
+    TrayState state;
+
+    snapshot_status(&status, &reachable);
+    state = reachable ? beam_ipc_derive_tray_state(&status)
+                      : TRAY_STATE_UNAVAILABLE;
+    apply_state(state, &status);
+}
+
+static void on_command_done(CommandKind kind, BOOL ok)
+{
+    char error[256];
+    wchar_t detail[512];
+    wchar_t text[768];
+
+    if (ok) {
+        if (kind == CMD_IMPORT)
+            MessageBoxW(g_window,
+                        L"vless:// link imported. Use Connect if the tunnel is stopped.",
+                        APP_TITLE, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    EnterCriticalSection(&g_lock);
+    StringCchCopyA(error, ARRAYSIZE(error), g_cmd_err);
+    LeaveCriticalSection(&g_lock);
+    error[ARRAYSIZE(error) - 1] = '\0';
+
+    detail[0] = L'\0';
+    if (error[0] != '\0')
+        (void)utf8_to_wide(error, detail, ARRAYSIZE(detail));
+    if (detail[0] == L'\0')
+        StringCchCopyW(detail, ARRAYSIZE(detail), L"the service returned an error");
+
+    if (kind == CMD_IMPORT) {
+        StringCchPrintfW(text, ARRAYSIZE(text), L"Import failed.\n\n%s", detail);
+    } else {
+        StringCchPrintfW(text, ARRAYSIZE(text), L"Command failed.\n\n%s", detail);
+    }
+    MessageBoxW(g_window, text, APP_TITLE, MB_OK | MB_ICONWARNING);
+}
+
+static void handle_command(int id)
+{
+    switch (id) {
+    case IDM_CONNECT:
+        send_command(CMD_CONNECT, "CONNECT");
         break;
-    case IDM_STOP:
-        begin_stop_core(FALSE, FALSE);
+    case IDM_DISCONNECT:
+        send_command(CMD_DISCONNECT, "DISCONNECT");
         break;
     case IDM_RESTART:
-        if (!check_config_valid()) {
-            MessageBoxW(NULL,
-                        L"config.json failed validation (`sing-box check`).\n\n"
-                        L"Keeping the current connection running. Fix config.json and try again.",
-                        APP_TITLE, MB_OK | MB_ICONWARNING);
-            break;
-        }
-        begin_stop_core(TRUE, FALSE);
+        send_command(CMD_RESTART, "RESTART");
+        break;
+    case IDM_IMPORT:
+        open_import_dialog();
         break;
     case IDM_CONFIG:
-        open_text_file(g_config);
+        open_config_admin();
         break;
     case IDM_LOG:
-        open_text_file(g_log);
+        open_log();
         break;
     case IDM_EXIT:
-        begin_stop_core(FALSE, TRUE);
+        DestroyWindow(g_window);
         break;
     default:
         break;
     }
-
-    PostMessageW(g_window, WM_NULL, 0, 0);
 }
 
-static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
+static void shutdown_tray(void)
+{
+    tray_remove();
+
+    InterlockedExchange(&g_worker_stop, 1);
+    if (g_worker_wake)
+        SetEvent(g_worker_wake);
+    if (g_worker_thread) {
+        /* Wait until the bounded IPC worker exits so DeleteCriticalSection in
+         * WinMain can never race with a live thread. */
+        WaitForSingleObject(g_worker_thread, INFINITE);
+        CloseHandle(g_worker_thread);
+        g_worker_thread = NULL;
+    }
+
+    queue_clear();
+}
+
+static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam,
                                     LPARAM lparam)
 {
-    if (message == g_taskbar_created) {
+    if (g_msg_taskbar_created != 0 && msg == g_msg_taskbar_created) {
         g_tray_added = FALSE;
         tray_add();
         return 0;
     }
 
-    switch (message) {
+    switch (msg) {
+    case WM_CREATE:
+        tray_add();
+        g_worker_thread = CreateThread(NULL, 0, ipc_worker, NULL, 0, NULL);
+        if (!g_worker_thread)
+            MessageBoxW(hwnd, L"Cannot start the IPC worker thread.",
+                        APP_TITLE, MB_OK | MB_ICONERROR);
+        return 0;
+
     case WM_TRAY_MSG:
-        if (lparam == WM_LBUTTONUP || lparam == WM_RBUTTONUP ||
-            lparam == WM_CONTEXTMENU) {
+        if (g_import_open)
+            return 0;
+        switch (LOWORD(lparam)) {
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU:
+        case WM_LBUTTONDBLCLK:
             show_menu();
+            break;
+        default:
+            break;
         }
         return 0;
 
-    case WM_CORE_EXITED:
-        handle_core_exited();
+    case WM_COMMAND:
+        handle_command((int)LOWORD(wparam));
         return 0;
 
-    case WM_IFACE_CHANGED:
-        refresh_tunnel_state();
+    case WM_IPC_STATUS:
+        on_ipc_status();
+        return 0;
+
+    case WM_IPC_CMD_DONE:
+        on_command_done((CommandKind)wparam, lparam != 0 ? TRUE : FALSE);
         return 0;
 
     case WM_POWERBROADCAST:
-        if (wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND)
-            refresh_tunnel_state();
-        return TRUE;
-
-    case WM_TIMER:
-        if (wparam == TIMER_CONNECT_WATCH) {
-            refresh_tunnel_state();
-        } else if (wparam == TIMER_STOP_GRACE) {
-            KillTimer(window, TIMER_STOP_GRACE);
-            if (g_process && g_stopping)
-                TerminateProcess(g_process, 1);
-        } else if (wparam == TIMER_COOLDOWN) {
-            KillTimer(window, TIMER_COOLDOWN);
-            g_cooldown = FALSE;
+        if (wparam == PBT_APMRESUMEAUTOMATIC ||
+            wparam == PBT_APMRESUMESUSPEND ||
+            wparam == PBT_APMRESUMECRITICAL) {
+            if (g_worker_wake)
+                SetEvent(g_worker_wake);
         }
-        return 0;
-
-    case WM_QUERYENDSESSION:
         return TRUE;
 
     case WM_ENDSESSION:
         if (wparam) {
-            stop_core_sync(SHUTDOWN_GRACE_MS);
+            /* Do not block logoff/shutdown waiting on the worker thread;
+             * remove the tray icon and let Windows tear down the process. */
             tray_remove();
         }
         return 0;
 
     case WM_CLOSE:
-        begin_stop_core(FALSE, TRUE);
+        DestroyWindow(hwnd);
         return 0;
 
     case WM_DESTROY:
-        KillTimer(window, TIMER_CONNECT_WATCH);
-        KillTimer(window, TIMER_STOP_GRACE);
-        KillTimer(window, TIMER_COOLDOWN);
-        if (g_iface_notify) {
-            CancelMibChangeNotify2(g_iface_notify);
-            g_iface_notify = NULL;
-        }
-        stop_core_sync(SHUTDOWN_GRACE_MS);
-        tray_remove();
-        destroy_icons();
+        shutdown_tray();
         PostQuitMessage(0);
         return 0;
 
     default:
-        return DefWindowProcW(window, message, wparam, lparam);
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
 }
 
+static BOOL has_stop_flag(void)
+{
+    int argc = 0;
+    int i;
+    LPWSTR *argv;
+    BOOL found = FALSE;
+
+    argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv)
+        return FALSE;
+
+    for (i = 1; i < argc; ++i) {
+        if (lstrcmpiW(argv[i], L"--stop") == 0) {
+            found = TRUE;
+            break;
+        }
+    }
+
+    LocalFree(argv);
+    return found;
+}
+
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line,
-                   int show_command)
+                   int show)
 {
     WNDCLASSEXW window_class;
-    MSG message;
+    MSG msg;
     HANDLE mutex;
-    (void)previous;
-    (void)command_line;
-    (void)show_command;
 
-    g_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    UNREFERENCED_PARAMETER(previous);
+    UNREFERENCED_PARAMETER(command_line);
+    UNREFERENCED_PARAMETER(show);
 
-    if (command_line && strstr(command_line, "--stop") != NULL) {
-        HWND existing = FindWindowW(L"BeamTrayWindow", NULL);
+    if (has_stop_flag()) {
+        HWND existing = FindWindowW(TRAY_CLASS, NULL);
         if (existing)
             PostMessageW(existing, WM_CLOSE, 0, 0);
         return 0;
     }
 
-    mutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
-    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+    mutex = CreateMutexW(NULL, FALSE, TRAY_MUTEX);
+    if (!mutex)
+        return 1;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(mutex);
         return 0;
     }
 
-    load_icons(instance);
+    InitializeCriticalSection(&g_lock);
     resolve_paths();
+    g_instance = instance;
+    load_icons(instance);
 
-    ZeroMemory(&window_class, sizeof(window_class));
-    window_class.cbSize = sizeof(window_class);
+    g_worker_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_worker_wake)
+        goto fail;
+
+    g_msg_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+
+    ZeroMemory(&window_class, sizeof window_class);
+    window_class.cbSize = sizeof window_class;
     window_class.lpfnWndProc = window_proc;
     window_class.hInstance = instance;
-    window_class.hIcon = g_icon_app;
     window_class.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    window_class.lpszClassName = L"BeamTrayWindow";
+    window_class.hIcon = g_icon_app;
+    window_class.lpszClassName = TRAY_CLASS;
+    if (!RegisterClassExW(&window_class))
+        goto fail;
 
-    if (!RegisterClassExW(&window_class)) {
-        show_error(L"Could not register the tray window class.");
-        destroy_icons();
-        if (mutex)
-            CloseHandle(mutex);
-        return 1;
+    g_window = CreateWindowExW(0, TRAY_CLASS, APP_TITLE, WS_OVERLAPPED,
+                               0, 0, 0, 0, NULL, NULL, instance, NULL);
+    if (!g_window)
+        goto fail;
+
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
 
-    g_window = CreateWindowExW(0, window_class.lpszClassName, APP_TITLE,
-                               WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, instance,
-                               NULL);
-    if (!g_window) {
-        show_error(L"Could not create the tray window.");
-        destroy_icons();
-        if (mutex)
-            CloseHandle(mutex);
-        return 1;
+    CloseHandle(g_worker_wake);
+    g_worker_wake = NULL;
+    DeleteCriticalSection(&g_lock);
+    CloseHandle(mutex);
+    return 0;
+
+fail:
+    if (g_worker_wake) {
+        CloseHandle(g_worker_wake);
+        g_worker_wake = NULL;
     }
-
-    /* Explorer is medium-integrity; allow its callback and TaskbarCreated. */
-    ChangeWindowMessageFilterEx(g_window, WM_TRAY_MSG, MSGFLT_ALLOW, NULL);
-    if (g_taskbar_created)
-        ChangeWindowMessageFilterEx(g_window, g_taskbar_created, MSGFLT_ALLOW, NULL);
-
-    if (NotifyIpInterfaceChange(AF_INET, on_ip_interface_change_cb, NULL,
-                                FALSE, &g_iface_notify) != NO_ERROR) {
-        g_iface_notify = NULL;
-    }
-
-    tray_add();
-    start_core();
-
-    while (GetMessageW(&message, NULL, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-    }
-
-    if (mutex)
-        CloseHandle(mutex);
-
-    return (int)message.wParam;
+    DeleteCriticalSection(&g_lock);
+    CloseHandle(mutex);
+    return 1;
 }

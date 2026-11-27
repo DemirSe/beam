@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Rootless host tests for clients/windows-tray:
-# - Compiles and runs tray_logic.h unit tests (state machine + JSON parser)
+# - Compiles and runs tray_logic.h unit tests (named-pipe IPC parsing, tray state
+#   mapping, vless:// import request)
 # - Validates the 4 multi-resolution .ico resources
-# - Validates config.example.json (sing-box 1.15+ built-in TUN stack, IPv4-only, placeholders)
+# - Validates config.example.json and the installer scripts (Phase 4 transition:
+#   Phase 5 replaces both with the native client config and installer)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
