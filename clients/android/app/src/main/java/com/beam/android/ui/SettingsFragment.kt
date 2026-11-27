@@ -17,7 +17,10 @@ import com.beam.android.storage.AppSettings
 import com.beam.android.storage.SettingsStore
 import com.beam.android.storage.SettingsValidator
 import com.beam.android.vpn.Ipv4RouteCalculator
+import com.beam.android.vpn.VpnConfigBuilder
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -28,6 +31,10 @@ class SettingsFragment : Fragment() {
     private val binding get() = _binding!!
 
     private lateinit var store: SettingsStore
+
+    /** True once the stored values are in the views; Save stays off until then. */
+    private var settingsLoaded = false
+    private var saving = false
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -42,13 +49,31 @@ class SettingsFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
         store = SettingsStore(requireContext())
         binding.buttonSave.isEnabled = false
-        viewLifecycleOwner.lifecycleScope.launch {
-            val settings = withContext(Dispatchers.IO) {
-                runCatching { store.load() }.getOrDefault(AppSettings())
-            }
-            if (_binding != null) {
-                bind(settings)
-                binding.buttonSave.isEnabled = true
+        // A restored view already holds the stored values plus the user's edits;
+        // binding again would discard them, so only re-enable Save.
+        if (savedInstanceState?.getBoolean(KEY_SETTINGS_LOADED, false) == true) {
+            settingsLoaded = true
+            binding.buttonSave.isEnabled = !saving
+        } else {
+            viewLifecycleOwner.lifecycleScope.launch {
+                val settings = withContext(Dispatchers.IO) {
+                    try {
+                        store.loadOrNull()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                if (_binding == null) return@launch
+                if (settings == null) {
+                    // Never overwrite a file we could not read with defaults.
+                    toast(R.string.settings_load_failed)
+                } else {
+                    settingsLoaded = true
+                    bind(settings)
+                    binding.buttonSave.isEnabled = true
+                }
             }
         }
 
@@ -64,6 +89,18 @@ class SettingsFragment : Fragment() {
         binding.batteryRow.setOnClickListener {
             openSystemSettings(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
         }
+    }
+
+    override fun onViewStateRestored(savedInstanceState: Bundle?) {
+        super.onViewStateRestored(savedInstanceState)
+        if (_binding != null && savedInstanceState?.getBoolean(KEY_SETTINGS_LOADED, false) == true) {
+            updateDohCustomVisibility()
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_SETTINGS_LOADED, settingsLoaded)
     }
 
     override fun onDestroyView() {
@@ -140,6 +177,16 @@ class SettingsFragment : Fragment() {
             binding.bypassLayout.error = getString(R.string.settings_bypass_default_route, defaultRoute)
             return
         }
+        // A prefix that covers the TUN /30 would bypass the TUN DNS server.
+        val tunOverlap = cidrs.firstOrNull { Ipv4RouteCalculator.overlapsTunSubnet(it) }
+        if (tunOverlap != null) {
+            binding.bypassLayout.error = getString(
+                R.string.settings_bypass_tun_overlap,
+                tunOverlap,
+                VpnConfigBuilder.TUN_NETWORK_CIDR,
+            )
+            return
+        }
         val normalizedCidrs = cidrs.map { cidr ->
             val host = cidr.substringBefore('/')
             val prefix = cidr.substringAfter('/').toInt()
@@ -155,9 +202,18 @@ class SettingsFragment : Fragment() {
             startOnBoot = binding.switchStartOnBoot.isChecked,
             treatAsUnmetered = binding.switchUnmetered.isChecked,
         )
+        if (saving) return
+        saving = true
+        binding.buttonSave.isEnabled = false
         viewLifecycleOwner.lifecycleScope.launch {
-            val saved = withContext(Dispatchers.IO) {
-                runCatching { store.save(settings) }.isSuccess
+            val saved = try {
+                // NonCancellable: a torn-down fragment must not cut a rename short.
+                withContext(Dispatchers.IO + NonCancellable) {
+                    runCatching { store.save(settings) }.isSuccess
+                }
+            } finally {
+                saving = false
+                if (_binding != null) binding.buttonSave.isEnabled = true
             }
             if (saved) {
                 val main = activity as? MainActivity
@@ -185,5 +241,9 @@ class SettingsFragment : Fragment() {
 
     private fun toast(resId: Int) {
         context?.let { Toast.makeText(it, resId, Toast.LENGTH_SHORT).show() }
+    }
+
+    private companion object {
+        const val KEY_SETTINGS_LOADED = "settings_loaded"
     }
 }

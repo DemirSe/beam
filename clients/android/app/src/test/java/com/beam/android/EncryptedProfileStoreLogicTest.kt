@@ -1,9 +1,10 @@
 package com.beam.android.storage
 
 import java.io.IOException
+import java.security.InvalidKeyException
 import java.security.KeyStoreException
 import java.security.ProviderException
-import javax.crypto.AEADBadTagException
+import javax.crypto.BadPaddingException
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -19,11 +20,15 @@ class EncryptedProfileStoreLogicTest {
         assertFalse(EncryptedProfileStore.isPermanentCorruption(KeyStoreException("TEE busy")))
         assertFalse(EncryptedProfileStore.isPermanentCorruption(ProviderException("KeyMint transient")))
         assertFalse(EncryptedProfileStore.isPermanentCorruption(IOException("disk busy")))
+        // InvalidKeyException also covers permanent invalidation, which is
+        // matched by type before this fallback.
+        assertFalse(EncryptedProfileStore.isPermanentCorruption(InvalidKeyException("key busy")))
     }
 
     @Test
     fun `corrupt ciphertext and JSON errors are classified as permanent corruption`() {
-        assertTrue(EncryptedProfileStore.isPermanentCorruption(AEADBadTagException("bad tag")))
+        // BadPaddingException also covers its AEADBadTagException subclass.
+        assertTrue(EncryptedProfileStore.isPermanentCorruption(BadPaddingException("bad tag")))
         assertTrue(EncryptedProfileStore.isPermanentCorruption(IllegalArgumentException("ciphertext too short")))
         assertTrue(EncryptedProfileStore.isPermanentCorruption(JSONException("malformed json")))
     }
@@ -68,8 +73,22 @@ class EncryptedProfileStoreLogicTest {
 
     @Test
     fun `resolveActiveIdAfterSave activates saved profile only when none is active`() {
-        assertEquals("p1", EncryptedProfileStore.resolveActiveIdAfterSave(null, "p1"))
-        assertEquals("p1", EncryptedProfileStore.resolveActiveIdAfterSave("   ", "p1"))
-        assertEquals("existing", EncryptedProfileStore.resolveActiveIdAfterSave("existing", "p2"))
+        val ids = setOf("existing", "p1", "p2")
+        assertEquals("p1", EncryptedProfileStore.resolveActiveIdAfterSave(null, "p1", ids))
+        assertEquals("p1", EncryptedProfileStore.resolveActiveIdAfterSave("   ", "p1", ids))
+        assertEquals(
+            "existing",
+            EncryptedProfileStore.resolveActiveIdAfterSave("existing", "p2", ids),
+        )
+    }
+
+    @Test
+    fun `resolveActiveIdAfterSave replaces a dangling active id`() {
+        // The stored active id pointed at a profile that is already gone; the
+        // freshly saved profile must become active instead of leaving a hole.
+        assertEquals(
+            "p2",
+            EncryptedProfileStore.resolveActiveIdAfterSave("deleted", "p2", setOf("p2")),
+        )
     }
 }

@@ -1,5 +1,7 @@
 package com.beam.android.vpn
 
+import com.beam.android.storage.AppSettings
+import com.beam.android.storage.SettingsValidator
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -60,6 +62,57 @@ class VpnConfigBuilderTest {
         )
         assertEquals(false, o.getBoolean("ipv4_only"))
         assertEquals(false, o.getBoolean("reject_ipv6"))
+    }
+
+    @Test
+    fun `invalid stored doh url falls back to the default`() {
+        assertEquals(
+            AppSettings.DEFAULT_DOH_URL to true,
+            VpnConfigBuilder.sanitizeDohUrl("http://not-https.example/dns-query"),
+        )
+        assertEquals(
+            AppSettings.DEFAULT_DOH_URL to true,
+            VpnConfigBuilder.sanitizeDohUrl("sentinel.invalid"),
+        )
+    }
+
+    @Test
+    fun `blank doh url stays blank so dns interception stays off`() {
+        assertEquals("" to false, VpnConfigBuilder.sanitizeDohUrl(""))
+        assertEquals("" to false, VpnConfigBuilder.sanitizeDohUrl("   "))
+        assertEquals(
+            AppSettings.DOH_NEXTDNS to false,
+            VpnConfigBuilder.sanitizeDohUrl("  ${AppSettings.DOH_NEXTDNS}  "),
+        )
+    }
+
+    @Test
+    fun `sanitize drops invalid tun overlapping and default routes`() {
+        val input = listOf(
+            "10.0.0.0/8",
+            " 192.168.0.0/16 ",
+            "not-a-cidr",
+            "10.0.0.0/33",
+            "198.19.0.2/32",
+            "0.0.0.0/0",
+            "::/0",
+            "::/00",
+            "fd00:be:a::/0",
+            "",
+        )
+        assertEquals(
+            listOf("10.0.0.0/8", "192.168.0.0/16"),
+            VpnConfigBuilder.sanitizeBypassCidrs(input),
+        )
+    }
+
+    @Test
+    fun `sanitize caps bypass entries at the engine limit`() {
+        val many = List(SettingsValidator.MAX_BYPASS_CIDRS + 5) { "10.0.0.0/8" }
+        assertEquals(
+            SettingsValidator.MAX_BYPASS_CIDRS,
+            VpnConfigBuilder.sanitizeBypassCidrs(many).size,
+        )
     }
 }
 

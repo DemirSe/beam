@@ -71,7 +71,7 @@ internal object ProfileCrypto {
     }
 
     fun decrypt(blob: ByteArray): ByteArray {
-        require(blob.size > IV_BYTES) { "ciphertext too short" }
+        require(blob.size >= IV_BYTES + GCM_TAG_BITS / 8) { "ciphertext too short" }
         val cipher = Cipher.getInstance(TRANSFORMATION)
         try {
             cipher.init(

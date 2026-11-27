@@ -84,6 +84,7 @@
     <string name="settings_bypass_invalid">Invalid CIDR: %1$s</string>
     <string name="settings_bypass_ipv6_unsupported">IPv6 bypass (%1$s) needs Android 13 or newer. Use IPv4 CIDRs on this device.</string>
     <string name="settings_bypass_default_route">Bypassing %1$s would leak all traffic outside the tunnel.</string>
+    <string name="settings_bypass_tun_overlap">Bypassing %1$s overlaps the VPN subnet (%2$s).</string>
     <string name="settings_bypass_too_many">At most %1$d bypass CIDRs are supported.</string>
     <string name="settings_bypass_reset">Reset to LAN defaults</string>
     <string name="settings_startup_title">Startup</string>
@@ -98,6 +99,7 @@
     <string name="settings_save">Save settings</string>
     <string name="settings_saved">Settings saved.</string>
     <string name="settings_save_failed">Could not save settings.</string>
+    <string name="settings_load_failed">Could not load settings. Reopen to retry.</string>
     <string name="settings_open_failed">The system settings screen could not be opened.</string>
 
     <string name="action_cancel">Cancel</string>
