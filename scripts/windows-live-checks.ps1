@@ -826,13 +826,16 @@ function Test-HangRecovery {
             return
         }
         $baseDial = [uint64]0
+        $baseGen = ''
         try {
             $baseSt = Read-Status
             if ($null -ne $baseSt['dial_failures']) {
                 $baseDial = [uint64]([string]$baseSt['dial_failures'])
             }
+            $baseGen = [string]$baseSt['generation']
         } catch {
             $baseDial = [uint64]0
+            $baseGen = ''
         }
         # Hang: the client starts, dials TEST-NET-1, and can never finish.
         # `IMPORT_LINK` deliberately keeps an active tunnel running (a mistyped
@@ -848,8 +851,21 @@ function Test-HangRecovery {
             Add-Check 'hang_recovery' 'skip' 'synthetic_connect_rejected'
             return
         }
-        if (-not (Wait-Connected -TimeoutSec $ConnectTimeoutSec)) {
-            Add-Check 'hang_recovery' 'skip' 'not_connected'
+        # An unreachable server is the point, so wait for the restart itself
+        # (generation bump or a state change), never for `connected`.
+        $restartSeen = $false
+        $restartDeadline = [DateTime]::UtcNow.AddSeconds($ConnectTimeoutSec)
+        while ([DateTime]::UtcNow -lt $restartDeadline) {
+            Start-Sleep -Seconds 2
+            try {
+                $stRestart = Read-Status
+                if ([string]$stRestart['generation'] -ne $baseGen) { $restartSeen = $true; break }
+                if ([string]$stRestart['state'] -ne 'connected') { $restartSeen = $true }
+            } catch {
+            }
+        }
+        if (-not $restartSeen) {
+            Add-Check 'hang_recovery' 'skip' 'restart_not_observed'
             return
         }
         $cpuBefore = 0.0
@@ -887,15 +903,15 @@ function Test-HangRecovery {
                 if (($r -eq 'dial_failures') -or ($r -eq 'probe_failed') -or ($r -eq 'no_gateway')) {
                     $failReason = $r
                 }
-                if ($leftConnected -and (($failReason -ne '') -or ($dialAfter -gt $baseDial))) { break }
+                if (($failReason -ne '') -or ($dialAfter -gt $baseDial)) { break }
             } catch {
             }
         }
         $hangFail = ''
-        if (-not $leftConnected) {
-            $hangFail = 'stayed_connected'
-        } elseif (($failReason -eq '') -and ($dialAfter -eq $baseDial)) {
-            # No failure reason and a motionless counter prove nothing.
+        # The client may legitimately keep the tunnel up (TUN present, upstream
+        # dialed per flow); what must appear is a failure signal: a state change,
+        # a reason token, or a rising dial-failure counter.
+        if ((-not $leftConnected) -and ($failReason -eq '') -and ($dialAfter -eq $baseDial)) {
             $hangFail = 'no_failure_signal'
         } else {
             $aliveProcs = @(Get-Process -Name 'beam-client' -ErrorAction SilentlyContinue)
