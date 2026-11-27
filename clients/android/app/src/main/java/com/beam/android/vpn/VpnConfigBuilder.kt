@@ -18,6 +18,21 @@ object VpnConfigBuilder {
     const val TUN_DNS_IPV4 = "198.19.0.2"
     const val TUN_PREFIX = 30
     const val TUN_NETWORK_CIDR = "198.19.0.0/30"
+    const val HIGH_RAM_THRESHOLD_BYTES = 6L * 1024 * 1024 * 1024
+    const val DEFAULT_MAX_TCP_CONNECTIONS = 128
+    const val HIGH_RAM_MAX_TCP_CONNECTIONS = 256
+
+    /**
+     * Scales the concurrent TCP flow cap to device RAM: devices with 6 GiB+
+     * get 256 flows (with halved buffers above 128 in Rust) while smaller-RAM
+     * devices keep the conservative 128-flow LMK ceiling.
+     */
+    fun recommendedMaxTcpConnections(totalRamBytes: Long): Int =
+        if (totalRamBytes >= HIGH_RAM_THRESHOLD_BYTES) {
+            HIGH_RAM_MAX_TCP_CONNECTIONS
+        } else {
+            DEFAULT_MAX_TCP_CONNECTIONS
+        }
 
     /**
      * Returns the DoH URL to hand to the engine and whether it was replaced by
@@ -60,6 +75,7 @@ object VpnConfigBuilder {
         bypassCidrs: List<String>,
         serverIp: String? = null,
         logLevel: String = "info",
+        maxTcpConnections: Int? = null,
     ): String {
         val json = JSONObject()
             .put("vless_uri", vlessUri)
@@ -75,6 +91,7 @@ object VpnConfigBuilder {
             .put("log_level", logLevel)
         // Pre-resolved before the TUN exists; omitted when resolution failed.
         if (serverIp != null) json.put("server_ip", serverIp)
+        if (maxTcpConnections != null) json.put("max_tcp_connections", maxTcpConnections)
         return json.toString()
     }
 }

@@ -60,6 +60,17 @@ const INCOMING_BUF_SHRINK_TARGET: usize = 64 * 1024;
 /// Same for the per-packet length list (`incoming_lens`).
 const INCOMING_LENS_SHRINK_THRESHOLD: usize = 256;
 const INCOMING_LENS_SHRINK_TARGET: usize = 64;
+/// Shrink an empty `TcpConn::tx_buf` once it has been idle for this long so
+/// long-lived keep-alive/push sockets release burst capacity with zero timers.
+const IDLE_TX_BUF_SHRINK_THRESHOLD: usize = 16 * 1024;
+const IDLE_BUF_SHRINK_AFTER_MS: i64 = 5_000;
+/// Minimum age before a half-open `SynReceived` flow can be evicted under table pressure.
+const SOFT_EVICT_SYN_MIN_AGE_MS: i64 = 3_000;
+/// Minimum idle duration before a quiescent `Established` flow can be evicted as a last resort.
+const SOFT_EVICT_ESTABLISHED_IDLE_MS: i64 = 60_000;
+/// Mobile adaptive buffer threshold: flows admitted above 128 on high-RAM mobile
+/// profiles use half the per-socket buffer (64 KiB) to preserve the native RAM ceiling.
+const ADAPTIVE_BUF_HALVE_FLOW_THRESHOLD: usize = 128;
 
 type FlowKey = (IpAddr, u16, IpAddr, u16);
 
@@ -382,6 +393,21 @@ impl TcpConn {
         }
         self.snd_nxt = self.snd_una.wrapping_add(1);
         self.rto_deadline_ms = Some(now_ms + self.rto_ms);
+    }
+
+    /// Releases oversized empty per-flow buffers once the connection has been
+    /// quiet past `IDLE_BUF_SHRINK_AFTER_MS`. Opportunistic only — never arms a
+    /// timer or causes a Doze wakeup.
+    fn shrink_idle_bufs(&mut self, now_ms: i64) {
+        if self.tx_buf.is_empty()
+            && self.tx_buf.capacity() > IDLE_TX_BUF_SHRINK_THRESHOLD
+            && now_ms.saturating_sub(self.last_activity_ms) >= IDLE_BUF_SHRINK_AFTER_MS
+        {
+            self.tx_buf.shrink_to(0);
+        }
+        if self.pending_to_relay.is_empty() && self.pending_to_relay.capacity() > 16 {
+            self.pending_to_relay.shrink_to(0);
+        }
     }
 
     fn send_rst(&mut self, seq: u32, tx_out: &mut Vec<Vec<u8>>) {
@@ -1062,12 +1088,76 @@ impl ProxyTcpStack {
         }
     }
 
+    /// Tiered soft eviction when the TCP table is full so closing/stale flows
+    /// yield their slot before a new SYN is rejected with `tcp_limit`:
+    /// 1. Oldest closing flow (`FinWait1`/`FinWait2`/`Closing`/`LastAck`/`CloseWait`).
+    /// 2. Oldest half-open `SynReceived` flow idle for at least `SOFT_EVICT_SYN_MIN_AGE_MS`.
+    /// 3. Oldest quiescent `Established` flow with empty buffers idle for at least
+    ///    `SOFT_EVICT_ESTABLISHED_IDLE_MS`.
+    ///
+    /// Active flows with buffered data or recent activity are never evicted.
+    fn evict_one_stale_conn(
+        conns: &mut HashMap<FlowKey, TcpConn>,
+        poll_batch: &mut Vec<FlowKey>,
+        now_ms: i64,
+        tx_out: &mut Vec<Vec<u8>>,
+    ) -> bool {
+        let mut best_closing: Option<(i64, FlowKey)> = None;
+        let mut best_syn: Option<(i64, FlowKey)> = None;
+        let mut best_idle: Option<(i64, FlowKey)> = None;
+
+        for (&flow, conn) in conns.iter() {
+            let age_ms = now_ms.saturating_sub(conn.last_activity_ms);
+            match conn.state {
+                TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::Closing
+                | TcpState::LastAck
+                | TcpState::CloseWait => {
+                    if best_closing.is_none_or(|(ts, _)| conn.last_activity_ms < ts) {
+                        best_closing = Some((conn.last_activity_ms, flow));
+                    }
+                }
+                TcpState::SynReceived if age_ms >= SOFT_EVICT_SYN_MIN_AGE_MS => {
+                    if best_syn.is_none_or(|(ts, _)| conn.last_activity_ms < ts) {
+                        best_syn = Some((conn.last_activity_ms, flow));
+                    }
+                }
+                TcpState::Established
+                    if age_ms >= SOFT_EVICT_ESTABLISHED_IDLE_MS
+                        && conn.tx_buf.is_empty()
+                        && conn.pending_to_relay.is_empty()
+                        && conn.ooo.is_empty()
+                        && best_idle.is_none_or(|(ts, _)| conn.last_activity_ms < ts) =>
+                {
+                    best_idle = Some((conn.last_activity_ms, flow));
+                }
+                _ => {}
+            }
+        }
+
+        let Some((_, victim_flow)) = best_closing.or(best_syn).or(best_idle) else {
+            return false;
+        };
+        if let Some(mut victim) = conns.remove(&victim_flow) {
+            victim.aborted.store(true, Ordering::Release);
+            victim.send_rst(victim.snd_nxt, tx_out);
+            poll_batch.retain(|queued| *queued != victim_flow);
+            // Dropping `victim` closes `to_relay`/`from_relay`, waking and
+            // tearing down any attached Tokio relay task and upstream socket.
+            drop(victim);
+            return true;
+        }
+        false
+    }
+
     /// Creates a socket for a pure SYN, or answers `RST|ACK` when the connection
     /// table is full. Returns `true` when a socket was inserted.
     #[allow(clippy::too_many_arguments)]
     fn insert_new_conn(
         config: &TcpStackConfig,
         conns: &mut HashMap<FlowKey, TcpConn>,
+        poll_batch: &mut Vec<FlowKey>,
         flow: FlowKey,
         ip: &crate::packet::IpPacketView<'_>,
         seg: &crate::packet::TcpSegmentView<'_>,
@@ -1075,7 +1165,9 @@ impl ProxyTcpStack {
         tx_out: &mut Vec<Vec<u8>>,
         drops: Option<&DropCounters>,
     ) -> bool {
-        if conns.len() >= config.max_connections {
+        if conns.len() >= config.max_connections
+            && !Self::evict_one_stale_conn(conns, poll_batch, now_ms, tx_out)
+        {
             if let Some(drops) = drops {
                 drops.tcp_limit.incr();
             }
@@ -1110,7 +1202,18 @@ impl ProxyTcpStack {
             None => (0, 0),
         };
         let iss = next_iss();
-        let max_buf = config.socket_buffer_bytes.clamp(MIN_TCP_BUF, MAX_TCP_BUF);
+        let base_buf = config.socket_buffer_bytes.clamp(MIN_TCP_BUF, MAX_TCP_BUF);
+        // On high-RAM mobile profiles (>128 flows, <=128 KiB base buffer), halve
+        // the per-flow buffer above 128 concurrent flows so worst-case native RSS
+        // stays tightly bounded without sacrificing local-TUN throughput (~1 Gbps).
+        let max_buf = if conns.len() >= ADAPTIVE_BUF_HALVE_FLOW_THRESHOLD
+            && config.max_connections > ADAPTIVE_BUF_HALVE_FLOW_THRESHOLD
+            && config.socket_buffer_bytes <= 128 * 1024
+        {
+            (base_buf / 2).max(MIN_TCP_BUF)
+        } else {
+            base_buf
+        };
         let mut conn = TcpConn {
             flow,
             state: TcpState::SynReceived,
@@ -1244,6 +1347,7 @@ impl NetStack for ProxyTcpStack {
                 if Self::insert_new_conn(
                     &self.config,
                     &mut self.conns,
+                    &mut self.poll_batch,
                     flow,
                     &ip,
                     &seg,
@@ -1438,6 +1542,7 @@ impl NetStack for ProxyTcpStack {
                     conn.check_timers(now_ms, idle_timeout_ms, tx_out, &mut self.tx_buf_pool);
                     keep = conn.state != TcpState::Closed;
                     if keep {
+                        conn.shrink_idle_bufs(now_ms);
                         Self::schedule_conn_timer(&mut self.timers, flow, conn, idle_timeout_ms);
                     }
                 }
@@ -2960,5 +3065,234 @@ mod tests {
         )
         .expect("fresh ipv6 packet");
         assert_eq!(dirty6, fresh6);
+    }
+
+    #[test]
+    fn soft_eviction_prefers_closing_then_stale_syn_then_idle_established_and_never_active() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig {
+            max_connections: 2,
+            ..TcpStackConfig::mobile()
+        });
+        let drops = Arc::new(DropCounters::default());
+        stack.set_drop_counters(Arc::clone(&drops));
+
+        let client = IpAddr::V4(Ipv4Addr::new(198, 19, 0, 1));
+        let server = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+
+        // Admit two active Established flows (ports 40001 and 40002).
+        for (port, seq) in [(40001u16, 1000u32), (40002u16, 2000u32)] {
+            let syn = build_ip_tcp_packet_slices(
+                client,
+                port,
+                server,
+                443,
+                seq,
+                0,
+                TCP_SYN,
+                65535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("syn");
+            stack.push_ip_tcp(&syn);
+            stack.poll(100, &mut tx, &mut accepted);
+            let syn_ack_pkt = tx.pop().expect("synack");
+            let syn_ack = parse_tcp(parse_ip(&syn_ack_pkt).unwrap().payload).unwrap();
+            let ack = build_ip_tcp_packet_slices(
+                client,
+                port,
+                server,
+                443,
+                seq + 1,
+                syn_ack.seq + 1,
+                TCP_ACK,
+                65535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("ack");
+            stack.push_ip_tcp(&ack);
+            stack.poll(100, &mut tx, &mut accepted);
+        }
+        assert_eq!(stack.conns.len(), 2);
+
+        // Both flows are fresh (<60 s idle): a 3rd SYN must NOT evict them.
+        let syn3 = build_ip_tcp_packet_slices(
+            client,
+            40003,
+            server,
+            443,
+            3000,
+            0,
+            TCP_SYN,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("syn3");
+        stack.push_ip_tcp(&syn3);
+        stack.poll(200, &mut tx, &mut accepted);
+        assert_eq!(stack.conns.len(), 2);
+        assert_eq!(drops.tcp_limit.get(), 1);
+        tx.clear();
+
+        // Mark flow 40001 as Closing (FinWait2) and keep 40002 active with queued tx_buf.
+        let flow1: FlowKey = (client, 40001, server, 443);
+        let flow2: FlowKey = (client, 40002, server, 443);
+        let aborted1 = Arc::clone(&stack.conns.get(&flow1).unwrap().aborted);
+        stack.conns.get_mut(&flow1).unwrap().state = TcpState::FinWait2;
+        stack
+            .conns
+            .get_mut(&flow2)
+            .unwrap()
+            .tx_buf
+            .extend(b"active");
+
+        // Now a 3rd SYN evicts the Closing flow1, sends RST, sets aborted, and admits 40003.
+        stack.push_ip_tcp(&syn3);
+        stack.poll(300, &mut tx, &mut accepted);
+        assert!(
+            aborted1.load(Ordering::Acquire),
+            "evicted flow must be marked aborted"
+        );
+        assert!(
+            !stack.conns.contains_key(&flow1),
+            "closing flow must be evicted first"
+        );
+        assert!(stack.conns.contains_key(&flow2), "active flow must survive");
+        assert!(stack.conns.contains_key(&(client, 40003, server, 443)));
+        assert_eq!(drops.tcp_limit.get(), 1, "eviction avoids tcp_limit drop");
+        assert!(
+            tx.iter()
+                .any(|p| (parse_tcp(parse_ip(p).unwrap().payload).unwrap().flags & TCP_RST) != 0),
+            "evicted flow must emit RST"
+        );
+        tx.clear();
+
+        // Flow 40003 is SynReceived; after >=3 s it becomes Tier-2 evictable while
+        // active flow2 (with buffered data) still cannot be evicted.
+        let syn4 = build_ip_tcp_packet_slices(
+            client,
+            40004,
+            server,
+            443,
+            4000,
+            0,
+            TCP_SYN,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("syn4");
+        stack.push_ip_tcp(&syn4);
+        stack.poll(300 + SOFT_EVICT_SYN_MIN_AGE_MS, &mut tx, &mut accepted);
+        assert!(!stack.conns.contains_key(&(client, 40003, server, 443)));
+        assert!(stack.conns.contains_key(&flow2));
+        assert!(stack.conns.contains_key(&(client, 40004, server, 443)));
+    }
+
+    #[test]
+    fn idle_buffer_shrink_releases_burst_capacity_without_adding_timers() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::mobile());
+        let client = IpAddr::V4(Ipv4Addr::new(198, 19, 0, 1));
+        let server = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let flow: FlowKey = (client, 41000, server, 443);
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+
+        let syn = build_ip_tcp_packet_slices(
+            client,
+            41000,
+            server,
+            443,
+            1000,
+            0,
+            TCP_SYN,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("syn");
+        stack.push_ip_tcp(&syn);
+        stack.poll(100, &mut tx, &mut accepted);
+        let syn_ack_pkt = tx.pop().expect("synack");
+        let syn_ack = parse_tcp(parse_ip(&syn_ack_pkt).unwrap().payload).unwrap();
+        let ack = build_ip_tcp_packet_slices(
+            client,
+            41000,
+            server,
+            443,
+            1001,
+            syn_ack.seq + 1,
+            TCP_ACK,
+            65535,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("ack");
+        stack.push_ip_tcp(&ack);
+        stack.poll(100, &mut tx, &mut accepted);
+
+        // Simulate a completed burst leaving oversized empty capacity.
+        let conn = stack.conns.get_mut(&flow).expect("flow");
+        conn.tx_buf.reserve(64 * 1024);
+        assert!(conn.tx_buf.capacity() > IDLE_TX_BUF_SHRINK_THRESHOLD);
+
+        // Before IDLE_BUF_SHRINK_AFTER_MS, buffer stays retained (no hot-path churn).
+        conn.shrink_idle_bufs(100 + IDLE_BUF_SHRINK_AFTER_MS - 1);
+        assert!(conn.tx_buf.capacity() > IDLE_TX_BUF_SHRINK_THRESHOLD);
+
+        // After IDLE_BUF_SHRINK_AFTER_MS while empty, capacity shrinks to 0.
+        conn.shrink_idle_bufs(100 + IDLE_BUF_SHRINK_AFTER_MS);
+        assert_eq!(conn.tx_buf.capacity(), 0);
+
+        // Zero extra wakeup timers: next delay is still the 30-minute idle timeout.
+        let delay = stack.poll_delay_ms(100).expect("idle deadline");
+        assert_eq!(delay, TcpStackConfig::mobile().idle_timeout_ms);
+    }
+
+    #[test]
+    fn mobile_high_ram_profile_halves_buffers_above_128_flows() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig {
+            max_connections: 256,
+            ..TcpStackConfig::mobile()
+        });
+        let client = IpAddr::V4(Ipv4Addr::new(198, 19, 0, 1));
+        let server = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+
+        for i in 0..130u16 {
+            let syn = build_ip_tcp_packet_slices(
+                client,
+                30000 + i,
+                server,
+                443,
+                1000 + u32::from(i),
+                0,
+                TCP_SYN,
+                65535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("syn");
+            stack.push_ip_tcp(&syn);
+            stack.poll(100, &mut tx, &mut accepted);
+            tx.clear();
+        }
+        assert_eq!(stack.conns.len(), 130);
+        let first = stack.conns.get(&(client, 30000, server, 443)).unwrap();
+        let overflow = stack.conns.get(&(client, 30129, server, 443)).unwrap();
+        assert_eq!(first.max_rcv_buf, 128 * 1024);
+        assert_eq!(overflow.max_rcv_buf, 64 * 1024);
     }
 }
