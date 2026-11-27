@@ -1539,18 +1539,24 @@ fn route_snapshot_check(output: &str, prefix: &str) -> RouteCheck {
     let Some(wanted) = parse_route_prefix(prefix, family_flag) else {
         return RouteCheck::Absent;
     };
-    let mut present = false;
-    let mut unusable = false;
+    let mut saw_route = false;
+    let mut any_usable = false;
     let mut matches_prefix = false;
+    let mut route_usable = false;
     for line in output.lines() {
         // Indented `nexthop` lines inherit the preceding destination's prefix.
         if line.split_whitespace().next() == Some("nexthop") {
             if matches_prefix && route_line_has_linkdown(line) {
-                unusable = true;
+                route_usable = false;
             }
             continue;
         }
+        if matches_prefix {
+            saw_route = true;
+            any_usable |= route_usable;
+        }
         matches_prefix = false;
+        route_usable = false;
         let Some(destination) = line.split_whitespace().next() else {
             continue;
         };
@@ -1562,17 +1568,17 @@ fn route_snapshot_check(output: &str, prefix: &str) -> RouteCheck {
         }
         if parse_route_prefix(destination, family_flag).is_some_and(|net| net == wanted) {
             matches_prefix = true;
-            if route_line_has_linkdown(line) {
-                unusable = true;
-            } else {
-                present = true;
-            }
+            route_usable = !route_line_has_linkdown(line);
         }
     }
-    if unusable {
-        RouteCheck::Unusable
-    } else if present {
+    if matches_prefix {
+        saw_route = true;
+        any_usable |= route_usable;
+    }
+    if any_usable {
         RouteCheck::Present
+    } else if saw_route {
+        RouteCheck::Unusable
     } else {
         RouteCheck::Absent
     }
@@ -2347,6 +2353,19 @@ broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
     nexthop via 10.0.0.2 dev eth1 weight 1\n\
     nexthop via 10.0.0.3 dev eth2 weight 1 linkdown\n";
         assert!(route_snapshot_check(table, "198.51.100.0/24").is_unusable());
+    }
+
+    #[test]
+    fn one_up_route_makes_linkdown_sibling_prefix_present() {
+        let table = "\
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown\n\
+172.17.0.0/16 via 192.168.1.1 dev eth0 proto static metric 100\n";
+        assert!(route_snapshot_check(table, "172.17.0.0/16").is_present());
+
+        let all_down = "\
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown\n\
+172.17.0.0/16 dev docker1 proto kernel scope link src 172.17.1.1 linkdown\n";
+        assert!(route_snapshot_check(all_down, "172.17.0.0/16").is_unusable());
     }
 
     #[test]
