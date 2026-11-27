@@ -308,7 +308,7 @@ impl LinuxRouteGuard {
             }
             if !guard.update_bypass_gateway(&detected_gw, local_dns_ip) {
                 warn!(
-                    "initial bypass route reconcile skipped due to ip lookup error; monitor will retry"
+                    "initial bypass route reconcile incomplete due to ip lookup error; TUN split routes stay installed and monitor will retry"
                 );
             }
 
@@ -450,10 +450,9 @@ impl LinuxRouteGuard {
     /// not treated as "route absent": the whole reconcile is skipped for this
     /// cycle, so every route keeps its last-known state.
     ///
-    /// Returns `false` if pre-checking existing routes failed with an `ip`
-    /// execution error and the reconcile was skipped for this cycle, so callers
-    /// know not to clear their retry timer based on a stale `current_gw`.
-    /// `has_host_route` logs the rate-limited warning that carries the signal.
+    /// Returns `false` if a pre-check or recheck lookup failed, so callers keep
+    /// their retry timer instead of treating the reconcile as complete.
+    /// `route_check_error` logs the rate-limited warning that carries the signal.
     pub fn update_bypass_gateway(
         &mut self,
         new_gw: &PhysicalGateways,
@@ -496,6 +495,7 @@ impl LinuxRouteGuard {
         self.current_gw = new_gw.clone();
         self.local_dns_ip = new_local_dns;
         let recheck = RouteSnapshot::load(new_gw);
+        let mut recheck_failed = false;
 
         if !self.server_ip.is_loopback()
             && let Some((maybe_gw, dev)) = gateway_for_ip(new_gw, self.server_ip)
@@ -521,8 +521,8 @@ impl LinuxRouteGuard {
                     }
                 }
                 // The lookup is unresolved or the route is linkdown: keep the
-                // last-known route state instead of reinstalling every cycle.
-                RouteCheck::Unusable | RouteCheck::Error(_) => {}
+                // last-known route state and ask the caller to retry.
+                RouteCheck::Unusable | RouteCheck::Error(_) => recheck_failed = true,
             }
         }
 
@@ -548,8 +548,8 @@ impl LinuxRouteGuard {
                     }
                 },
                 // The lookup is unresolved or the route is linkdown: keep the
-                // last-known route state instead of reinstalling every cycle.
-                RouteCheck::Unusable | RouteCheck::Error(_) => {}
+                // last-known route state and ask the caller to retry.
+                RouteCheck::Unusable | RouteCheck::Error(_) => recheck_failed = true,
             }
         }
 
@@ -561,7 +561,10 @@ impl LinuxRouteGuard {
                         continue;
                     }
                     RouteCheck::Absent => {}
-                    RouteCheck::Unusable | RouteCheck::Error(_) => continue,
+                    RouteCheck::Unusable | RouteCheck::Error(_) => {
+                        recheck_failed = true;
+                        continue;
+                    }
                 }
                 if let Err(err) = install_v4_bypass(cidr_entry, maybe_gw.as_deref(), dev) {
                     warn!(cidr = %cidr_entry, error = %err, "failed to install IPv4 bypass CIDR route");
@@ -578,7 +581,10 @@ impl LinuxRouteGuard {
                         continue;
                     }
                     RouteCheck::Absent => {}
-                    RouteCheck::Unusable | RouteCheck::Error(_) => continue,
+                    RouteCheck::Unusable | RouteCheck::Error(_) => {
+                        recheck_failed = true;
+                        continue;
+                    }
                 }
                 if install_v4_bypass(&host, maybe_gw.as_deref(), dev).is_ok() {
                     info!(prefix = %host, via = ?maybe_gw, dev = %dev, "installed dynamic bypass.domains route");
@@ -596,7 +602,10 @@ impl LinuxRouteGuard {
                         continue;
                     }
                     RouteCheck::Absent => {}
-                    RouteCheck::Unusable | RouteCheck::Error(_) => continue,
+                    RouteCheck::Unusable | RouteCheck::Error(_) => {
+                        recheck_failed = true;
+                        continue;
+                    }
                 }
                 if let Err(err) = install_v6_bypass(cidr_entry, maybe_gw.as_deref(), dev) {
                     warn!(cidr = %cidr_entry, error = %err, "failed to install IPv6 bypass CIDR route");
@@ -613,7 +622,10 @@ impl LinuxRouteGuard {
                         continue;
                     }
                     RouteCheck::Absent => {}
-                    RouteCheck::Unusable | RouteCheck::Error(_) => continue,
+                    RouteCheck::Unusable | RouteCheck::Error(_) => {
+                        recheck_failed = true;
+                        continue;
+                    }
                 }
                 if install_v6_bypass(&host, maybe_gw.as_deref(), dev).is_ok() {
                     info!(prefix = %host, via = ?maybe_gw, dev = %dev, "installed dynamic bypass.domains route");
@@ -624,7 +636,7 @@ impl LinuxRouteGuard {
         }
 
         self.persist_routes_state();
-        true
+        !recheck_failed
     }
 
     /// Dynamically installs a `/32` or `/128` bypass route for an IP resolved
@@ -2266,12 +2278,60 @@ broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
         ));
         let gw = guard.current_gw.clone();
 
-        assert!(guard.update_bypass_gateway(&gw, None));
+        assert!(
+            !guard.update_bypass_gateway(&gw, None),
+            "an unresolved recheck must keep the retry pending"
+        );
         let log = read_fake_ip_log(&fake.log_path());
         assert!(
             !log.contains("route replace"),
             "an unresolved recheck must not overwrite a route: {log}"
         );
+    }
+
+    #[test]
+    fn recheck_error_after_drain_returns_false() {
+        let dir = test_dir("recheck-error-after-drain");
+        let log = dir.join("ip.log");
+        let checked = dir.join("checked");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$*\" in\n\
+                   *\"-4 route show\"*) [ -f \"{}\" ] && {{ echo transient >&2; exit 2; }}; : > \"{}\"; exit 0 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log.display(),
+                checked.display(),
+                checked.display(),
+            ),
+        );
+        let mut guard = route_guard_for_tests();
+        let cidr = "198.51.100.0/24".to_owned();
+        guard.configured_bypass_v4.push(cidr.clone());
+        guard.extra_bypass_v4.push((
+            cidr.clone(),
+            Some("192.168.1.1".to_owned()),
+            "eth0".to_owned(),
+        ));
+        let gw = guard.current_gw.clone();
+
+        assert!(
+            !guard.update_bypass_gateway(&gw, None),
+            "a failed recheck after drain must leave the retry pending"
+        );
+        let log = read_fake_ip_log(&fake.log_path());
+        assert!(
+            log.contains(&format!("route del {cidr}")),
+            "the owned route should have been drained: {log}"
+        );
+        assert!(
+            !log.contains(&format!("route replace {cidr}")),
+            "an unresolved recheck must not reinstall: {log}"
+        );
+        assert!(guard.extra_bypass_v4.is_empty());
     }
 
     #[test]
