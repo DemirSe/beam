@@ -620,11 +620,14 @@ platform-independent core shared with the Android `VpnService` backend.
   from a 256 MiB aggregate budget — 512 KiB/direction at the default 256
   connections, clamped to `64 KiB..=4 MiB` to stay under `MemoryMax=512M`), a
   relay reply queue capped at 64 KiB/flow (16 MiB at 256 flows, so 272 MiB
-  total with the socket buffers), zero-copy `VecDeque::as_slices()` TX
+  socket-plus-queue total; a second 64 KiB chunk can also be in flight to the
+  stack, and `tx_buf` keeps capacity slack, so this is not a hard RSS cap),
+  zero-copy `VecDeque::as_slices()` TX
   segmentation, immediate dup-ACKs on
   out-of-order segments, and prompt window updates. The packet parser walks
   IPv6 extension headers (Hop-by-Hop, Routing, Destination Options) and drops
-  fragmented IPv4 and IPv6 packets.
+  fragmented IPv4 and IPv6 packets. No throughput result is claimed for the
+  64 KiB Linux chunk; a paired benchmark comparison is a follow-up.
 - **Destination policy:** unless `drop_private_destinations = false`, the stack
   drops destinations outside global unicast: `0.0.0.0/8`, RFC 1918, CGNAT
   (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`, excluding

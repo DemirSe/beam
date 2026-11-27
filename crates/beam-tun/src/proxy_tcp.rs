@@ -31,9 +31,9 @@ const STREAM_CHANNEL_CAP: usize = 16;
 /// on top of the two socket buffers.
 pub(crate) const S2C_QUEUE_BYTES_PER_FLOW: usize = 64 * 1024;
 /// Relay read chunk size. Keep in sync with `engine::S2C_READ_BUF_BYTES`.
-#[cfg(any(target_os = "android", test))]
+#[cfg(target_os = "android")]
 pub(crate) const S2C_READ_CHUNK_BYTES: usize = 16 * 1024;
-#[cfg(not(any(target_os = "android", test)))]
+#[cfg(not(target_os = "android"))]
 pub(crate) const S2C_READ_CHUNK_BYTES: usize = 64 * 1024;
 /// Depth of the per-flow relay -> stack reply queue, derived from the chunk
 /// size so queued bytes never exceed [`S2C_QUEUE_BYTES_PER_FLOW`].
@@ -215,6 +215,8 @@ struct TcpConn {
     dirty_handle: Option<Arc<FlowDirtyHandle>>,
     to_relay: Option<mpsc::Sender<Vec<u8>>>,
     from_relay: Option<mpsc::Receiver<Vec<u8>>>,
+    /// Relay chunk bytes and offset when only part of a chunk fits `tx_buf`.
+    relay_pending: Option<(Vec<u8>, usize)>,
     relay_eof: bool,
     aborted: Arc<AtomicBool>,
 }
@@ -242,6 +244,7 @@ impl TcpConn {
             || !self.ooo.is_empty()
             || self.in_flight_relay.load(Ordering::Acquire) > 0
             || self.from_relay.as_ref().is_some_and(|rx| !rx.is_empty())
+            || self.relay_pending.is_some()
     }
 
     fn advertised_window(&self) -> u16 {
@@ -447,6 +450,7 @@ impl TcpConn {
         self.state = TcpState::Closed;
         self.to_relay.take();
         self.from_relay.take();
+        self.relay_pending = None;
         self.pending_to_relay.clear();
         self.pending_to_relay_bytes = 0;
     }
@@ -464,6 +468,7 @@ impl TcpConn {
             self.state = TcpState::Closed;
             self.to_relay.take();
             self.from_relay.take();
+            self.relay_pending = None;
             self.pending_to_relay.clear();
             self.pending_to_relay_bytes = 0;
             return;
@@ -836,9 +841,28 @@ impl TcpConn {
             return;
         };
         while self.tx_buf.len() < self.max_snd_buf {
+            if let Some((chunk, offset)) = self.relay_pending.take() {
+                let room = self.max_snd_buf.saturating_sub(self.tx_buf.len());
+                let take = chunk.len().saturating_sub(offset).min(room);
+                self.tx_buf
+                    .extend(&chunk[offset..offset.saturating_add(take)]);
+                let next = offset.saturating_add(take);
+                if next < chunk.len() {
+                    self.relay_pending = Some((chunk, next));
+                    break;
+                }
+                pool.put(chunk);
+                continue;
+            }
+
             match rx.try_recv() {
                 Ok(chunk) => {
                     self.last_activity_ms = now_ms;
+                    let room = self.max_snd_buf.saturating_sub(self.tx_buf.len());
+                    if chunk.len() > room {
+                        self.relay_pending = Some((chunk, 0));
+                        continue;
+                    }
                     // `tx_buf` is a `VecDeque`, so this is the bulk slice form
                     // (`extend_from_slice` exists only on `Vec`).
                     self.tx_buf.extend(chunk.as_slice());
@@ -964,6 +988,7 @@ impl TcpConn {
             self.state = TcpState::Closed;
             self.to_relay.take();
             self.from_relay.take();
+            self.relay_pending = None;
             self.pending_to_relay.clear();
             self.pending_to_relay_bytes = 0;
             return;
@@ -1294,6 +1319,7 @@ impl ProxyTcpStack {
             dirty_handle: None,
             to_relay: None,
             from_relay: None,
+            relay_pending: None,
             relay_eof: false,
             aborted: Arc::new(AtomicBool::new(false)),
         };
@@ -3584,5 +3610,51 @@ mod tests {
             "idle 443 flow should be evicted"
         );
         assert!(stack.conns.contains_key(&(client, 42003, server, 443)));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn relay_read_chunk_matches_linux_production() {
+        assert_eq!(S2C_READ_CHUNK_BYTES, 64 * 1024);
+        assert_eq!(S2C_STREAM_CHANNEL_CAP, 1);
+    }
+
+    #[test]
+    fn relay_drain_bounds_tx_buf_before_extending() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let (_srv_nxt, _acc) = handshake(&mut stack, 500);
+        let (relay_tx, relay_rx) = mpsc::channel(S2C_STREAM_CHANNEL_CAP);
+        let pool = RelayBufPool::new();
+        let max_snd_buf = {
+            let conn = stack.conns.values_mut().next().expect("conn");
+            conn.tx_buf
+                .extend(vec![1u8; conn.max_snd_buf - S2C_READ_CHUNK_BYTES / 2]);
+            conn.from_relay = Some(relay_rx);
+            conn.max_snd_buf
+        };
+        relay_tx
+            .try_send(vec![2u8; S2C_READ_CHUNK_BYTES])
+            .expect("one queued relay chunk");
+
+        let conn = stack.conns.values_mut().next().expect("conn");
+        conn.drain_from_relay(30, &pool);
+        assert_eq!(
+            conn.tx_buf.len(),
+            max_snd_buf,
+            "tx_buf must not grow past the send buffer bound"
+        );
+        assert!(conn.relay_pending.is_some(), "remainder must be retained");
+
+        conn.tx_buf.drain(..S2C_READ_CHUNK_BYTES / 2);
+        conn.drain_from_relay(31, &pool);
+        assert!(conn.relay_pending.is_none(), "remainder must be drained");
+        assert!(
+            conn.tx_buf
+                .iter()
+                .rev()
+                .take(S2C_READ_CHUNK_BYTES)
+                .all(|&byte| byte == 2),
+            "staged bytes must keep their order"
+        );
     }
 }
