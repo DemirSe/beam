@@ -438,8 +438,8 @@ impl LinuxRouteGuard {
     /// re-stamp their timestamp; this only applies the same bounded TTL eviction.
     pub fn sweep_expired_dynamic_bypass(&mut self) {
         let now = Instant::now();
-        self.evict_v4_if_needed(now);
-        self.evict_v6_if_needed(now);
+        self.evict_v4(now, false);
+        self.evict_v6(now, false);
     }
 
     /// Migrates server, local-DNS, and bypass CIDR/domain routes to `new_gw`
@@ -660,11 +660,11 @@ impl LinuxRouteGuard {
                         debug!(%v4, "skipping private dynamic bypass.domains IP without IPv4 gateway");
                         return;
                     }
-                    self.evict_v4_if_needed(now);
+                    self.evict_v4(now, true);
                     self.dynamic_bypass_v4.push_back((v4, now));
                     return;
                 };
-                self.evict_v4_if_needed(now);
+                self.evict_v4(now, true);
                 let host = format!("{v4}/32");
                 if has_exact_route("-4", &host).is_present() {
                     debug!(prefix = %host, "preserving pre-existing exact route for bypass.domains IP");
@@ -696,11 +696,11 @@ impl LinuxRouteGuard {
                         debug!(%v6, "skipping ULA dynamic bypass.domains IP without IPv6 gateway");
                         return;
                     }
-                    self.evict_v6_if_needed(now);
+                    self.evict_v6(now, true);
                     self.dynamic_bypass_v6.push_back((v6, now));
                     return;
                 };
-                self.evict_v6_if_needed(now);
+                self.evict_v6(now, true);
                 let host = format!("{v6}/128");
                 if has_exact_route("-6", &host).is_present() {
                     debug!(prefix = %host, "preserving pre-existing exact route for bypass.domains IP");
@@ -721,14 +721,15 @@ impl LinuxRouteGuard {
         }
     }
 
-    fn evict_v4_if_needed(&mut self, now: Instant) {
+    fn evict_v4(&mut self, now: Instant, enforce_cap: bool) {
         let mut evicted_prefixes = Vec::new();
         while let Some(&(ip, ts)) = self.dynamic_bypass_v4.front() {
-            let at_cap = self.dynamic_bypass_v4.len() >= MAX_DYNAMIC_BYPASS_IPS;
-            if at_cap {
+            let evict_at_cap =
+                enforce_cap && self.dynamic_bypass_v4.len() >= MAX_DYNAMIC_BYPASS_IPS;
+            if evict_at_cap {
                 warn_dynamic_bypass_cap(IpFamily::V4);
             }
-            if now.saturating_duration_since(ts) >= DYNAMIC_BYPASS_TTL || at_cap {
+            if now.saturating_duration_since(ts) >= DYNAMIC_BYPASS_TTL || evict_at_cap {
                 self.dynamic_bypass_v4.pop_front();
                 evicted_prefixes.push(format!("{ip}/32"));
             } else {
@@ -749,14 +750,15 @@ impl LinuxRouteGuard {
         }
     }
 
-    fn evict_v6_if_needed(&mut self, now: Instant) {
+    fn evict_v6(&mut self, now: Instant, enforce_cap: bool) {
         let mut evicted_prefixes = Vec::new();
         while let Some(&(ip, ts)) = self.dynamic_bypass_v6.front() {
-            let at_cap = self.dynamic_bypass_v6.len() >= MAX_DYNAMIC_BYPASS_IPS;
-            if at_cap {
+            let evict_at_cap =
+                enforce_cap && self.dynamic_bypass_v6.len() >= MAX_DYNAMIC_BYPASS_IPS;
+            if evict_at_cap {
                 warn_dynamic_bypass_cap(IpFamily::V6);
             }
-            if now.saturating_duration_since(ts) >= DYNAMIC_BYPASS_TTL || at_cap {
+            if now.saturating_duration_since(ts) >= DYNAMIC_BYPASS_TTL || evict_at_cap {
                 self.dynamic_bypass_v6.pop_front();
                 evicted_prefixes.push(format!("{ip}/128"));
             } else {
@@ -1857,14 +1859,14 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
         assert_eq!(guard.dynamic_bypass_v4.back().map(|(ip, _)| *ip), Some(a));
 
         // Evicting at `now` removes expired `b`, keeps fresh `a`.
-        guard.evict_v4_if_needed(now);
+        guard.evict_v4(now, true);
         assert_eq!(guard.dynamic_bypass_v4.len(), 1);
         assert_eq!(guard.dynamic_bypass_v4.front().map(|(ip, _)| *ip), Some(a));
 
         // Even when `a` expires later, static `configured_bypass_v4` entry in
         // `extra_bypass_v4` is NOT removed by dynamic eviction.
         guard.dynamic_bypass_v4[0].1 = old;
-        guard.evict_v4_if_needed(now);
+        guard.evict_v4(now, true);
         assert!(guard.dynamic_bypass_v4.is_empty());
         assert_eq!(guard.extra_bypass_v4.len(), 1);
         assert_eq!(guard.extra_bypass_v4[0].0, "198.51.100.1/32");
@@ -2151,6 +2153,22 @@ broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
         assert!(
             !log.contains("route replace"),
             "an unresolved recheck must not overwrite a route: {log}"
+        );
+    }
+
+    #[test]
+    fn fresh_route_at_cap_survives_quiet_sweep() {
+        let mut guard = route_guard_for_tests();
+        for i in 0..MAX_DYNAMIC_BYPASS_IPS {
+            guard
+                .dynamic_bypass_v4
+                .push_back((Ipv4Addr::new(198, 18, 0, i as u8), Instant::now()));
+        }
+        guard.sweep_expired_dynamic_bypass();
+        assert_eq!(
+            guard.dynamic_bypass_v4.len(),
+            MAX_DYNAMIC_BYPASS_IPS,
+            "a quiet sweep must not evict a fresh route just because the table is full"
         );
     }
 
