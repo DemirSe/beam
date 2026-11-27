@@ -74,6 +74,31 @@ To remove everything cleanly, double-click **`uninstall.cmd`** (or run
   every adapter's resolver; that time is the Windows resolver, not the tunnel.
   The live comparison reports both `dns_ms` and `dns_direct_ms` for this reason.
 
+## Live verification
+
+`windows-live-e2e` (manual dispatch) installs the packaged client on a Windows
+runner, connects to a real VPS, and proves six checks: `route_fail_closed`,
+`dns_leak`, `ipv6_egress`, `service_restart`, `hang_recovery`, and
+`crash_recovery`. The same run compares `beam-client` with `sing-box` over three
+interleaved rounds of a 100 MiB download.
+
+Last measurement (run 46066033000, median of three rounds):
+
+| Metric | beam-client | sing-box |
+|---|---|---|
+| connect_ms | 2016 | 2813 |
+| ram_mb | 23.7 | 64.8 |
+| download_mbps | 154.8 | 158.8 |
+| dns_ms | 1 | 1 |
+| cpu_s per 100 MiB | 1.1 | 0.8 |
+| sys_core_s per 100 MiB | 18.1 | 12.3 |
+
+Throughput is at parity. Process CPU is higher for `beam-client` because it
+reads and writes every packet in user space; whole-machine core-seconds include
+the kernel stack that `sing-box` does not pay in its own process, and on a
+shared four-vCPU runner those figures overlap between clients, so neither side
+is shown to be cheaper.
+
 ## Build
 
 1. **Rust service (`beam-client.exe`):**
