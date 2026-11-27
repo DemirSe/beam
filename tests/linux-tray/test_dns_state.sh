@@ -84,13 +84,19 @@ grep -q 'systemd-resolved is not active; the DNS switch needs it' "$INSTALL" || 
 
 # An unresolved INSTALL_USER leaves the tray unable to call the helper. The
 # check must run before any directory creation, backup, or service change.
-user_line=$(grep -n 'id -u -- "$INSTALL_USER"' "$INSTALL" | cut -d: -f1 || true)
+user_line=$(grep -n 'id -nu -- "$INSTALL_USER"' "$INSTALL" | cut -d: -f1 || true)
 [ -n "$user_line" ] && [ "$user_line" -lt "$dir_line" ] || {
   echo "install.sh: INSTALL_USER is not resolved before side effects" >&2
   exit 1
 }
 grep -qF 'does not resolve to a user' "$INSTALL" || {
   echo "install.sh: unresolved INSTALL_USER has no named error" >&2
+  exit 1
+}
+# A numeric uid resolves but never matches the helper's name comparison, and
+# "0" must not bypass the root guard after normalization.
+grep -qF 'INSTALL_USER must be the desktop user, not root' "$INSTALL" || {
+  echo "install.sh: normalized INSTALL_USER is not re-checked for root" >&2
   exit 1
 }
 

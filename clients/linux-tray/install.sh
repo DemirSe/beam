@@ -13,12 +13,17 @@ if [ -z "$INSTALL_USER" ] || [ "$INSTALL_USER" = root ]; then
     echo "run via sudo from the desktop user, or set INSTALL_USER=<name>" >&2
     exit 1
 fi
-# The helper compares allowed-user with the invoking name. A typo would
-# install cleanly and leave the tray unable to call the helper.
-id -u -- "$INSTALL_USER" >/dev/null 2>&1 || {
+# The helper compares allowed-user with the invoking name, so a typo or a
+# numeric uid would install cleanly and leave the tray unable to call it.
+# Resolve the input to a name before anything else uses it.
+INSTALL_USER="$(id -nu -- "$INSTALL_USER" 2>/dev/null)" || {
     echo "INSTALL_USER=$INSTALL_USER does not resolve to a user" >&2
     exit 1
 }
+if [ -z "$INSTALL_USER" ] || [ "$INSTALL_USER" = root ]; then
+    echo "INSTALL_USER must be the desktop user, not root" >&2
+    exit 1
+fi
 
 if [ -z "$CONFIG_SRC" ]; then
     if [ -f /etc/beam/config.json ]; then
