@@ -640,9 +640,12 @@ platform-independent core shared with the Android `VpnService` backend.
   (`cidrs` and `domains`) split to the pre-VPN local DNS, and `reject_quic = true`
   by default (immediate ICMP/ICMPv6 Port Unreachable on UDP/443 so browsers
   fall back cleanly to TCP/HTTPS + Vision Direct). The derived TUN DNS peer
-  also serves RFC 1035 DNS-over-TCP on port 53 from the same resolver: each
-  framed query is bounded to 16 KiB, served sequentially, and answered with
-  the full upstream response instead of a UDP `TC=1` reply. Note the LAN DNS trust
+  also serves RFC 1035 DNS-over-TCP on port 53 from the same resolver. It
+  bounds each framed query to 16 KiB and serves queries in order. With a TCP
+  or DoH upstream, it returns the full upstream response and keeps EDNS0 DO
+  for queries up to 16 KiB. A UDP-only upstream accepts queries up to 1232
+  bytes. The resolver returns SERVFAIL for a larger query. It never sends a
+  truncated query to a UDP-only upstream. Note the LAN DNS trust
   boundary for `bypass.domains`: those names are resolved via the unauthenticated
   local LAN resolver (`dns.local_upstream` or auto-detected system DNS), and
   resolved IPs receive temporary, bounded, `info`-logged `/32` or `/128` host

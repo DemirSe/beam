@@ -395,7 +395,7 @@ fn parse_dns_query_bounded(wire: &[u8], max_len: usize) -> Option<DnsQuery> {
         qname,
         qtype,
         qclass,
-        dnssec_ok: query_edns0(wire).is_some_and(|(_, dnssec_ok)| dnssec_ok),
+        dnssec_ok: query_edns0_bounded(wire, max_len).is_some_and(|(_, dnssec_ok)| dnssec_ok),
     })
 }
 
@@ -729,7 +729,11 @@ fn query_edns0_udp_payload_size(query_wire: &[u8]) -> Option<usize> {
 /// Returns `(advertised_udp_payload_size, dnssec_ok)` for the query's first
 /// EDNS0 `OPT` (type 41) pseudo-RR. Strictly bounded and never panics.
 fn query_edns0(query_wire: &[u8]) -> Option<(usize, bool)> {
-    if query_wire.len() < 12 || query_wire.len() > MAX_DNS_QUERY_BYTES {
+    query_edns0_bounded(query_wire, MAX_DNS_QUERY_BYTES)
+}
+
+fn query_edns0_bounded(query_wire: &[u8], max_len: usize) -> Option<(usize, bool)> {
+    if query_wire.len() < 12 || query_wire.len() > max_len {
         return None;
     }
     let qdcount = usize::from(u16::from_be_bytes([query_wire[4], query_wire[5]])).min(MAX_RR_COUNT);
@@ -1704,6 +1708,10 @@ impl DnsInterceptor {
             ) {
                 return;
             }
+            if parse_dns_query_bounded(&wire, MAX_DOH_RESPONSE_BYTES).is_none() {
+                self.counters.dropped_malformed.incr();
+                return;
+            }
 
             let (reply_tx, reply_rx) = oneshot::channel();
             self.answer_query(
@@ -2251,6 +2259,12 @@ async fn resolve_tunneled(
     query_timeout: Duration,
     doh_prefix: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
+    if matches!(upstream, DnsUpstream::PlainUdp(_)) && query.len() > MAX_DNS_QUERY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DNS query too large for a UDP-only upstream",
+        ));
+    }
     timeout(query_timeout, async {
         match upstream {
             DnsUpstream::Doh { host, port, path } => {
@@ -3127,6 +3141,25 @@ mod tests {
     }
 
     #[test]
+    fn tcp_query_bound_keeps_edns0_do_above_the_udp_limit() {
+        let mut wire = build_query_with_edns0_do(0xbeef, "large.example", 1, true);
+        let rdata = 1300u16;
+        let len_pos = wire.len() - 2;
+        wire[len_pos..].copy_from_slice(&rdata.to_be_bytes());
+        wire.extend(vec![0u8; usize::from(rdata)]);
+        assert!(wire.len() > MAX_DNS_QUERY_BYTES);
+        assert!(wire.len() < MAX_DOH_RESPONSE_BYTES);
+
+        let parsed =
+            parse_dns_query_bounded(&wire, MAX_DOH_RESPONSE_BYTES).expect("large TCP query");
+        assert!(
+            parsed.dnssec_ok,
+            "the EDNS0 DO bit must enter the cache key"
+        );
+        assert!(parse_dns_query(&wire).is_none(), "UDP stays at 1232 bytes");
+    }
+
+    #[test]
     fn rejects_response_question_mismatch() {
         let query = parse_dns_query(&build_query(0x1111, "good.example", 1)).expect("query");
 
@@ -3338,6 +3371,41 @@ mod tests {
         assert!(DnsUpstream::parse("http://1.1.1.1/dns-query").is_err());
         assert!(DnsUpstream::parse("tcp://1.1.1.1:0").is_err());
         assert!(DnsUpstream::parse("udp://1.1.1.1:0").is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_query_is_rejected_before_a_udp_only_upstream_dial() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tunnel listener");
+        let server_addr = listener.local_addr().expect("listener address");
+        let (interceptor, _) = test_interceptor_with_server(server_addr, None);
+        let udp = DnsUpstream::PlainUdp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53));
+        let mut oversized = build_query(0x4321, "big.example", 1);
+        oversized.extend(vec![0u8; 1300]);
+        assert!(oversized.len() > MAX_DNS_QUERY_BYTES);
+
+        let err = resolve_tunneled(
+            &interceptor.client_config,
+            &udp,
+            &interceptor.tls_config,
+            &interceptor.doh_pool,
+            &interceptor.tcp_pool,
+            &interceptor.udp_mux_pool,
+            interceptor.counters.as_ref(),
+            &oversized,
+            Duration::from_millis(200),
+            None,
+        )
+        .await
+        .expect_err("a UDP-only upstream must reject an oversized query");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "an oversized query must not dial the tunnel"
+        );
     }
 
     #[test]
@@ -3648,6 +3716,16 @@ mod tests {
     fn test_interceptor(
         local_upstream: Option<SocketAddr>,
     ) -> (DnsInterceptor, mpsc::Receiver<Vec<u8>>) {
+        test_interceptor_with_server(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
+            local_upstream,
+        )
+    }
+
+    fn test_interceptor_with_server(
+        server_addr: SocketAddr,
+        local_upstream: Option<SocketAddr>,
+    ) -> (DnsInterceptor, mpsc::Receiver<Vec<u8>>) {
         let (tun_tx, tun_rx) = mpsc::channel(8);
         let dummy_reality = beam_core::reality::RealityClientConfig::new(
             [1u8; 32],
@@ -3655,11 +3733,7 @@ mod tests {
             "whatsapp.net",
         )
         .expect("reality");
-        let client_cfg = BeamClientConfig::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
-            dummy_reality,
-            [2u8; 16],
-        );
+        let client_cfg = BeamClientConfig::new(server_addr, dummy_reality, [2u8; 16]);
         let mut dns_cfg = DnsConfig::new(
             DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
             local_upstream,
@@ -3783,6 +3857,36 @@ mod tests {
                 .expect("bad prefix closes the stream")
                 .expect("stream task joined");
             assert!(out_rx.try_recv().is_err(), "bad prefix must get no reply");
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_dns_drops_malformed_queries_without_a_reply() {
+        let mut qr = build_query(0x5101, "answer.example", 1);
+        qr[2] |= 0x80;
+        let mut qdcount = build_query(0x5102, "empty.example", 1);
+        qdcount[4..6].copy_from_slice(&0u16.to_be_bytes());
+
+        for wire in [qr, qdcount] {
+            let (interceptor, _tun_rx) = test_interceptor(None);
+            let counters = Arc::clone(&interceptor.counters);
+            let (stream, in_tx, mut out_rx) = tcp_stream_pair();
+            let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_006);
+            let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+            in_tx.send(tcp_frame(&wire)).await.expect("queue query");
+
+            let serve = tokio::spawn(async move {
+                interceptor.serve_tcp_stream(src, dst, stream).await;
+            });
+            timeout(Duration::from_secs(2), serve)
+                .await
+                .expect("malformed query closes the stream")
+                .expect("stream task joined");
+            assert!(
+                out_rx.try_recv().is_err(),
+                "malformed query must get no reply"
+            );
+            assert_eq!(counters.snapshot().dropped_malformed, 1);
         }
     }
 
