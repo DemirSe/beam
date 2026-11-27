@@ -19,8 +19,9 @@ these inputs before it changes live files:
 - `CONFIG_SRC`: client profile. Default: `/etc/beam/config.json`.
 - `CORE_DIR`: pinned core directory. Default: `/tmp/beam-core`.
   It must hold `sing-box`, `libcronet.so`, and `LICENSE`.
-  Root must own the directory and the `LICENSE` file.
-  `LICENSE` must be a regular file, not a symlink.
+  It must not be a symlink. Root must own it.
+  Group and other users must not be able to write to it.
+  `LICENSE` must be a root-owned regular file, not a symlink.
   Two SHA-256 hashes are checked. The script does not download the core.
 - An active `systemd-resolved` unit and `systemctl`.
 

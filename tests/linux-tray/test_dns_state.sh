@@ -170,25 +170,73 @@ for core in sing-box libcronet.so LICENSE; do
   }
 done
 
-# A user-owned core directory with a symlinked LICENSE can publish secret
-# bytes. Both ownership checks must run before the staging copies.
+# A user-owned core directory or a symlinked directory can publish secret
+# bytes. Exercise the installer's validator in a subshell with injected stat
+# output, then check that the call sits before the staging copies.
+validator=$(sed -n '/^validate_core_dir() {/,/^}/p' "$INSTALL")
+[ -n "$validator" ] || {
+  echo "install.sh: missing validate_core_dir" >&2
+  exit 1
+}
+check_core_dir() {
+  local want="$1" core_uid="$2" dir_mode="$3"
+  shift 3
+  local rc
+  (
+    stat() {
+      local fmt path
+      [ "${1:-}" = -c ] && shift
+      fmt="$1"
+      shift
+      [ "${1:-}" = -- ] && shift
+      path="$1"
+      case "$path" in
+        */LICENSE) printf '%s\n' "$core_uid" ;;
+        *) [ "$fmt" = '%A' ] && printf '%s\n' "$dir_mode" || printf '%s\n' "$core_uid" ;;
+      esac
+    }
+    eval "$validator"
+    validate_core_dir "$CORE_TEST_DIR"
+  ) >"$TMP/core.out" 2>&1 && rc=0 || rc=$?
+  if [ "$rc" -ne "$want" ]; then
+    echo "install.sh: core validator returned $rc, expected $want" >&2
+    cat "$TMP/core.out" >&2
+    exit 1
+  fi
+  if [ $# -gt 0 ]; then
+    grep -qF "$1" "$TMP/core.out" || {
+      echo "install.sh: core validator missed: $1" >&2
+      cat "$TMP/core.out" >&2
+      exit 1
+    }
+  fi
+}
+
+mkdir -p "$TMP/core-dir"
+printf 'license\n' > "$TMP/core-dir/LICENSE"
+CORE_TEST_DIR="$TMP/core-dir"
+check_core_dir 0 0 '-rwxr-xr-x'
+check_core_dir 1 1000 '-rwxr-xr-x' 'must be owned by root'
+check_core_dir 1 0 '-rwxrwxr-x' 'group or world writable'
+check_core_dir 1 0 '-rwxr-xrwx' 'group or world writable'
+ln -s "$TMP/core-dir" "$TMP/core-link"
+CORE_TEST_DIR="$TMP/core-link"
+check_core_dir 1 0 '-rwxr-xr-x' 'must not be a symlink'
+CORE_TEST_DIR="$TMP/core-dir"
+ln -s "$TMP/core-dir/LICENSE" "$TMP/core-dir/LICENSE.link"
+mv -f "$TMP/core-dir/LICENSE.link" "$TMP/core-dir/LICENSE.symlink"
+rm -f "$TMP/core-dir/LICENSE"
+ln -s LICENSE.symlink "$TMP/core-dir/LICENSE"
+check_core_dir 1 0 '-rwxr-xr-x' 'not a symlink'
+
 stage_line=$(grep -n '^STAGE_DIR=\$(mktemp' "$INSTALL" | cut -d: -f1 || true)
-core_owner_line=$(grep -n 'CORE_DIR must be owned by root' "$INSTALL" | cut -d: -f1 || true)
-license_line=$(grep -n 'LICENSE must be a root-owned regular file' "$INSTALL" | cut -d: -f1 || true)
-[ -n "$stage_line" ] && [ -n "$core_owner_line" ] && [ -n "$license_line" ] || {
-  echo "install.sh: missing CORE_DIR or LICENSE ownership check" >&2
+validate_line=$(grep -n '^validate_core_dir "\$CORE_DIR"' "$INSTALL" | cut -d: -f1 || true)
+[ -n "$stage_line" ] && [ -n "$validate_line" ] || {
+  echo "install.sh: missing core validation call or staging" >&2
   exit 1
 }
-[ "$core_owner_line" -lt "$stage_line" ] && [ "$license_line" -lt "$stage_line" ] || {
-  echo "install.sh: core ownership checks run after staging" >&2
-  exit 1
-}
-grep -qF '[ -L "$CORE_DIR/LICENSE" ]' "$INSTALL" || {
-  echo "install.sh: LICENSE symlinks are not rejected" >&2
-  exit 1
-}
-grep -qF 'stat -Lc %u "$CORE_DIR"' "$INSTALL" || {
-  echo "install.sh: CORE_DIR owner is not checked" >&2
+[ "$validate_line" -lt "$stage_line" ] || {
+  echo "install.sh: core validation runs after staging" >&2
   exit 1
 }
 

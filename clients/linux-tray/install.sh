@@ -37,6 +37,75 @@ fi
 [ -f "$HERE/config-policy.py" ] || { echo "missing $HERE/config-policy.py" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required to normalize the client policy" >&2; exit 1; }
 
+STAGE_DIR=
+NORMALIZED_CONFIG=
+BACKUP_DIR=
+BACKUP_READY=0
+INSTALL_COMMITTED=0
+SERVICE_WAS_ACTIVE=0
+DNS_RESET_ENABLED=0
+CLIENT_ENABLED=0
+CONFIG_BAK_KEEP=3
+
+cleanup() {
+    local status=$? keep_backup=0
+    if [ "$BACKUP_READY" = "1" ] && [ "$INSTALL_COMMITTED" = "0" ]; then
+        if ! rollback_live; then
+            keep_backup=1
+            status=1
+            printf 'installer: rollback incomplete; backup kept at %s\n' "$BACKUP_DIR" >&2
+        fi
+    fi
+    if [ -n "$STAGE_DIR" ]; then
+        rm -rf "$STAGE_DIR"
+    fi
+    if [ -n "$NORMALIZED_CONFIG" ]; then
+        rm -f "$NORMALIZED_CONFIG"
+    fi
+    prune_config_backups || true
+    if [ "$keep_backup" = "0" ] && [ -n "$BACKUP_DIR" ]; then
+        rm -rf "$BACKUP_DIR"
+    fi
+    return "$status"
+}
+trap cleanup EXIT
+
+# An untrusted core tree can hold genuine pinned binaries plus a LICENSE
+# symlink to a secret. Resolve no symlink and accept only a root-owned,
+# non-writable directory and a root-owned regular LICENSE.
+validate_core_dir() {
+    local dir="$1" owner perms
+    if [ -L "$dir" ]; then
+        echo "CORE_DIR must not be a symlink: $dir" >&2
+        return 1
+    fi
+    if [ ! -d "$dir" ]; then
+        echo "CORE_DIR is not a directory: $dir" >&2
+        return 1
+    fi
+    owner=$(stat -c %u -- "$dir") || return 1
+    if [ "$owner" != 0 ]; then
+        echo "CORE_DIR must be owned by root: $dir" >&2
+        return 1
+    fi
+    perms=$(stat -c %A -- "$dir") || return 1
+    case "${perms:5:1}${perms:8:1}" in
+        *w*)
+            echo "CORE_DIR must not be group or world writable: $dir" >&2
+            return 1
+            ;;
+    esac
+    if [ -L "$dir/LICENSE" ] || [ ! -f "$dir/LICENSE" ]; then
+        echo "LICENSE must be a root-owned regular file, not a symlink: $dir/LICENSE" >&2
+        return 1
+    fi
+    owner=$(stat -c %u -- "$dir/LICENSE") || return 1
+    if [ "$owner" != 0 ]; then
+        echo "LICENSE must be a root-owned regular file, not a symlink: $dir/LICENSE" >&2
+        return 1
+    fi
+}
+
 # The pinned sing-box core is not downloaded: a fresh install must point
 # CORE_DIR at the pinned release pair. A mismatch stops before any live file.
 for core_file in sing-box libcronet.so LICENSE; do
@@ -46,18 +115,15 @@ for core_file in sing-box libcronet.so LICENSE; do
     }
 done
 [ -x "$CORE_DIR/sing-box" ] || { echo "missing $CORE_DIR/sing-box" >&2; exit 1; }
-# A user-owned core directory can hold genuine pinned binaries plus a LICENSE
-# symlink to a secret. Refuse it before staging publishes those bytes.
-[ -d "$CORE_DIR" ] || { echo "CORE_DIR is not a directory: $CORE_DIR" >&2; exit 1; }
-[ "$(stat -Lc %u "$CORE_DIR")" = 0 ] || {
-    echo "CORE_DIR must be owned by root: $CORE_DIR" >&2
-    exit 1
-}
-if [ -L "$CORE_DIR/LICENSE" ] || [ ! -f "$CORE_DIR/LICENSE" ] ||
-   [ "$(stat -c %u "$CORE_DIR/LICENSE")" != 0 ]; then
-    echo "LICENSE must be a root-owned regular file, not a symlink: $CORE_DIR/LICENSE" >&2
-    exit 1
-fi
+validate_core_dir "$CORE_DIR"
+
+# Freeze the validated copies before another check can replace the source.
+install -d -m 0755 /usr/local/lib
+STAGE_DIR=$(mktemp -d /usr/local/lib/.beam-stage.XXXXXX)
+install -m 0755 "$CORE_DIR/sing-box" "$STAGE_DIR/sing-box"
+install -m 0644 "$CORE_DIR/libcronet.so" "$STAGE_DIR/libcronet.so"
+install -m 0644 "$CORE_DIR/LICENSE" "$STAGE_DIR/LICENSE"
+
 [ -x "$HERE/beam-tray" ] || { echo "build first: $HERE/build.sh" >&2; exit 1; }
 [ -x "$HERE/beam-helper" ] || { echo "build first: $HERE/build.sh" >&2; exit 1; }
 [ -r "$HERE/99-beam-client-bbr.conf" ] || { echo "missing $HERE/99-beam-client-bbr.conf" >&2; exit 1; }
@@ -86,15 +152,6 @@ for dir in /etc/systemd/resolved.conf.d /etc/sysctl.d; do
 done
 
 install -d -m 0755 /usr/local/lib /usr/local/libexec /etc/beam
-STAGE_DIR=
-NORMALIZED_CONFIG=
-BACKUP_DIR=
-BACKUP_READY=0
-INSTALL_COMMITTED=0
-SERVICE_WAS_ACTIVE=0
-DNS_RESET_ENABLED=0
-CLIENT_ENABLED=0
-CONFIG_BAK_KEEP=3
 MANAGED_PATHS=(
     /etc/beam/config.json
     /etc/beam/allowed-user
@@ -175,39 +232,11 @@ rollback_live() {
     return "$failed"
 }
 
-cleanup() {
-    local status=$? keep_backup=0
-    if [ "$BACKUP_READY" = "1" ] && [ "$INSTALL_COMMITTED" = "0" ]; then
-        if ! rollback_live; then
-            keep_backup=1
-            status=1
-            printf 'installer: rollback incomplete; backup kept at %s\n' "$BACKUP_DIR" >&2
-        fi
-    fi
-    if [ -n "$STAGE_DIR" ]; then
-        rm -rf "$STAGE_DIR"
-    fi
-    if [ -n "$NORMALIZED_CONFIG" ]; then
-        rm -f "$NORMALIZED_CONFIG"
-    fi
-    prune_config_backups || true
-    if [ "$keep_backup" = "0" ] && [ -n "$BACKUP_DIR" ]; then
-        rm -rf "$BACKUP_DIR"
-    fi
-    return "$status"
-}
-trap cleanup EXIT
-
-STAGE_DIR=$(mktemp -d /usr/local/lib/.beam-stage.XXXXXX)
 NORMALIZED_CONFIG=$(mktemp)
 chmod 0600 "$NORMALIZED_CONFIG"
 
-# Copy into a private staging directory, then hash and validate the copies.
-# The live core and config are touched only after every check passes.
-install -m 0755 "$CORE_DIR/sing-box" "$STAGE_DIR/sing-box"
-install -m 0644 "$CORE_DIR/libcronet.so" "$STAGE_DIR/libcronet.so"
-install -m 0644 "$CORE_DIR/LICENSE" "$STAGE_DIR/LICENSE"
-
+# Hash and validate the staged copies. The live core and config are touched
+# only after every check passes.
 actual_sing=$(sha256sum "$STAGE_DIR/sing-box" | awk '{print $1}')
 actual_lib=$(sha256sum "$STAGE_DIR/libcronet.so" | awk '{print $1}')
 [ "$actual_sing" = "$CORE_SING_SHA" ] || { echo "core sing-box hash mismatch" >&2; exit 1; }
