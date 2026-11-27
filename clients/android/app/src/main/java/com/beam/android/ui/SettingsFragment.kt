@@ -139,6 +139,8 @@ class SettingsFragment : Fragment() {
         val dohUrl = SettingsValidator.normalizeAndValidateDohUrl(rawDohUrl)
         if (dohUrl == null) {
             binding.dohCustomLayout.error = getString(R.string.settings_doh_invalid)
+            // Focus the field so the ScrollView scrolls the error into view.
+            binding.inputDohCustom.requestFocus()
             return
         }
         binding.dohCustomLayout.error = null
@@ -151,6 +153,7 @@ class SettingsFragment : Fragment() {
         if (cidrs.size > SettingsValidator.MAX_BYPASS_CIDRS) {
             binding.bypassLayout.error =
                 getString(R.string.settings_bypass_too_many, SettingsValidator.MAX_BYPASS_CIDRS)
+            binding.inputBypass.requestFocus()
             return
         }
         val allowIpv6 = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
@@ -168,6 +171,7 @@ class SettingsFragment : Fragment() {
                 },
                 invalid,
             )
+            binding.inputBypass.requestFocus()
             return
         }
         val defaultRoute = cidrs.firstOrNull {
@@ -175,6 +179,7 @@ class SettingsFragment : Fragment() {
         }
         if (defaultRoute != null) {
             binding.bypassLayout.error = getString(R.string.settings_bypass_default_route, defaultRoute)
+            binding.inputBypass.requestFocus()
             return
         }
         // A prefix that covers the TUN /30 would bypass the TUN DNS server.
@@ -185,6 +190,7 @@ class SettingsFragment : Fragment() {
                 tunOverlap,
                 VpnConfigBuilder.TUN_NETWORK_CIDR,
             )
+            binding.inputBypass.requestFocus()
             return
         }
         val normalizedCidrs = cidrs.map { cidr ->

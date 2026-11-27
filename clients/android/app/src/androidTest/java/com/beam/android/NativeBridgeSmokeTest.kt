@@ -58,6 +58,7 @@ class NativeBridgeSmokeTest {
     @Test
     fun encryptedProfileStoreRoundTripsThroughKeystore() {
         val store = EncryptedProfileStore(context)
+        val previousActiveId = store.getActiveProfileId()
         val profile = VlessProfile(
             id = "smoke-$UUID",
             name = "smoke",
@@ -74,8 +75,38 @@ class NativeBridgeSmokeTest {
             assertEquals(profile, store.getActiveProfile())
         } finally {
             store.deleteProfile(profile.id)
+            // A real device may already have an active profile: put it back so
+            // the smoke test never leaves the VPN pointed at another target.
+            store.setActiveProfileId(previousActiveId)
         }
         assertFalse(store.listProfiles().any { it.id == profile.id })
+    }
+
+    @Test
+    fun nativeBridgeIgnoresUnknownHandle() {
+        // The service may lose the engine across a restart and keep calling
+        // with a stale handle; every entry point must tolerate handle 0.
+        BeamNativeBridge.nativeStop(0L)
+        BeamNativeBridge.nativeNotifyNetworkChange(0L)
+        BeamNativeBridge.nativeNotifyNetworkChangeWithServerIp(0L, null)
+        BeamNativeBridge.nativeNotifyNetworkChangeWithServerIp(0L, "203.0.113.10")
+
+        val telemetry = BeamNativeBridge.nativePollTelemetry(0L)
+        assertNotNull("nativePollTelemetry returned null for an unknown handle", telemetry)
+        assertEquals(0, JSONObject(telemetry!!).optInt("state", -1))
+    }
+
+    @Test
+    fun nativeParseVlessLinkRejectsEmptyAndOversizedHost() {
+        for (link in listOf(
+            "",
+            "vless://$UUID@" + "a".repeat(8192) + ":443",
+        )) {
+            val json = BeamNativeBridge.nativeParseVlessLink(link)
+            assertNotNull("nativeParseVlessLink returned null for a reject case", json)
+            assertFalse("parse must fail: $json", JSONObject(json!!).optBoolean("ok", true))
+            assertFalse("the bridge must not echo the UUID", json.contains(UUID))
+        }
     }
 
     @Test

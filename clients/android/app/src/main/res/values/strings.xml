@@ -33,7 +33,7 @@
     <string name="telemetry_tx">Upload</string>
     <string name="telemetry_rx">Download</string>
     <string name="telemetry_dial_failures">Dial failures</string>
-    <string name="telemetry_drops">Drops</string>
+    <string name="telemetry_drops">Dropped packets</string>
     <string name="telemetry_none">—</string>
     <string name="telemetry_idle_hint">Live counters appear only while connected.</string>
 
@@ -74,11 +74,11 @@
     <string name="settings_doh_invalid">Enter a valid https:// DNS over HTTPS URL.</string>
     <string name="settings_leak_title">Leak protection</string>
     <string name="settings_ipv4_title">IPv4 only</string>
-    <string name="settings_ipv4_summary">Captures IPv6 and rejects it, so IPv6 never leaks in clear. Recommended.</string>
+    <string name="settings_ipv4_summary">Blocks IPv6 traffic so it cannot leak outside the tunnel. Recommended.</string>
     <string name="settings_quic_title">Reject QUIC (UDP/443)</string>
     <string name="settings_quic_summary">Forces browsers to fall back to TCP inside the tunnel. Recommended on mobile networks.</string>
     <string name="settings_unmetered_title">Treat VPN as unmetered</string>
-    <string name="settings_unmetered_summary">Off by default so Android respects mobile data limits on 5G/LTE. Enable only if you want apps to treat cellular VPN as Wi-Fi.</string>
+    <string name="settings_unmetered_summary">Off by default so Android respects mobile data limits. Enable to let apps treat cellular VPN as Wi-Fi.</string>
     <string name="settings_bypass_title">Bypass CIDRs</string>
     <string name="settings_bypass_summary">Traffic to these networks stays outside the tunnel. One CIDR per line.</string>
     <string name="settings_bypass_invalid">Invalid CIDR: %1$s</string>
@@ -95,7 +95,7 @@
     <string name="settings_alwayson_summary">Android settings: enable Always-on VPN and Block connections without VPN.</string>
     <string name="settings_battery_title">Unrestricted battery</string>
     <string name="settings_battery_summary">Stops Doze from pausing the tunnel in the background.</string>
-    <string name="settings_samsung_hint">Samsung One UI: open Settings, then Battery, then Background usage limits, then Never sleeping apps. Add beam and set it to Unrestricted.</string>
+    <string name="settings_samsung_hint">Samsung One UI: Settings → Battery → Background usage limits → Never sleeping apps → add beam (Unrestricted).</string>
     <string name="settings_save">Save settings</string>
     <string name="settings_saved">Settings saved.</string>
     <string name="settings_save_failed">Could not save settings.</string>
