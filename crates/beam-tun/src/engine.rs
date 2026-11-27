@@ -753,10 +753,11 @@ where
         let tcp_delay = stack.poll_delay_ms(start.elapsed().as_millis() as i64);
         // Sweep due NAT entries before the biased select: a continuously ready
         // device branch would otherwise starve the timer branch below it.
-        udp_bridge.sweep_if_due();
-        let udp_delay = update_udp_sweep_deadline(
+        let (swept, udp_delay_ms) = udp_bridge.sweep_if_due();
+        let udp_delay = update_udp_sweep_after_scan(
             &mut next_udp_sweep_at,
-            udp_bridge.next_sweep_delay_ms(),
+            swept,
+            udp_delay_ms,
             Instant::now(),
         );
         let next_timer_ms = match (tcp_delay, udp_delay) {
@@ -1657,6 +1658,19 @@ fn rearm_deadline(armed: Option<Instant>, now: Instant, delay_ms: Option<u64>) -
     }
 }
 
+/// Applies one UDP scan result to the sticky sweep deadline.
+fn update_udp_sweep_after_scan(
+    next_udp_sweep_at: &mut Option<Instant>,
+    swept: bool,
+    interval_ms: Option<u64>,
+    now: Instant,
+) -> Option<u64> {
+    if swept {
+        *next_udp_sweep_at = None;
+    }
+    update_udp_sweep_deadline(next_udp_sweep_at, interval_ms, now)
+}
+
 /// Updates the sticky UDP sweep deadline, shortening it whenever a more urgent
 /// wakeup interval (such as an XUDP reconnect backoff retry) is requested.
 fn update_udp_sweep_deadline(
@@ -2000,6 +2014,19 @@ mod tests {
         // Clearing when idle resets the sticky deadline.
         assert_eq!(update_udp_sweep_deadline(&mut deadline, None, t2), None);
         assert_eq!(deadline, None);
+    }
+
+    #[test]
+    fn udp_sweep_deadline_is_not_stale_after_a_sweep() {
+        let now = Instant::now();
+        let mut deadline = Some(now - Duration::from_secs(1));
+
+        assert_eq!(
+            update_udp_sweep_after_scan(&mut deadline, true, Some(5_000), now),
+            Some(5_000),
+            "a swept flow must not re-arm the old deadline every tick"
+        );
+        assert_eq!(deadline, Some(now + Duration::from_secs(5)));
     }
 
     #[test]

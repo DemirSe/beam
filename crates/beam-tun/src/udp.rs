@@ -455,12 +455,13 @@ impl UdpNatBridge {
     /// Runs one bounded idle sweep when a session is already finished or
     /// expired. The engine calls this once per tick before its biased select,
     /// so continuous TUN traffic cannot starve NAT cleanup.
-    pub fn sweep_if_due(&mut self) -> bool {
-        if self.next_sweep_delay_ms() == Some(0) {
+    pub fn sweep_if_due(&mut self) -> (bool, Option<u64>) {
+        let delay_ms = self.next_sweep_delay_ms();
+        if delay_ms == Some(0) {
             self.sweep_idle();
-            return true;
+            return (true, self.next_sweep_delay_ms());
         }
-        false
+        (false, delay_ms)
     }
 
     /// Returns the next timer delay needed for idle UDP session sweeping or
@@ -692,8 +693,10 @@ mod tests {
 
         let mut sweeps = 0;
         for _ in 0..3 {
-            if bridge.sweep_if_due() {
+            let (swept, delay) = bridge.sweep_if_due();
+            if swept {
                 sweeps += 1;
+                assert_eq!(delay, None, "empty bridge has no next sweep");
             }
             // A continuously ready device branch wins this biased select, as
             // it does on a busy tunnel; cleanup already ran before it.
