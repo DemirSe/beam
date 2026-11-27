@@ -5,6 +5,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 
 /**
  * Debounced (300 ms) default-network callback. On switch: updates
@@ -21,6 +22,7 @@ class NetworkMonitor(
 
     companion object {
         const val DEBOUNCE_MS = 300L
+        private const val TAG = "NetworkMonitor"
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -28,6 +30,7 @@ class NetworkMonitor(
     private var pending: Runnable? = null
     private var pendingLoss: Runnable? = null
     @Volatile private var stopped: Boolean = false
+    @Volatile private var registered: Boolean = false
     @Volatile private var lastNetworkHandle: Long? = null
     @Volatile private var lastValidated: Boolean = false
 
@@ -45,7 +48,9 @@ class NetworkMonitor(
             }.getOrDefault(false)
             onInitialNetwork(active)
         }
-        connectivityManager.registerDefaultNetworkCallback(this)
+        runCatching { connectivityManager.registerDefaultNetworkCallback(this) }
+            .onSuccess { registered = true }
+            .onFailure { Log.w(TAG, "registerDefaultNetworkCallback failed", it) }
     }
 
     fun markStopped() {
@@ -61,6 +66,8 @@ class NetworkMonitor(
     }
 
     fun unregister() {
+        if (!registered) return
+        registered = false
         try {
             connectivityManager.unregisterNetworkCallback(this)
         } catch (_: Exception) {
@@ -91,10 +98,10 @@ class NetworkMonitor(
     }
 
     override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-        synchronized(callbackLock) {
+        val handle = network.networkHandle
+        val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val needsDefaultCheck = synchronized(callbackLock) {
             if (stopped) return
-            val handle = network.networkHandle
-            val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
             val sameNetwork = (lastNetworkHandle == handle)
             if (sameNetwork) {
                 // Track validation loss so subsequent captive-portal revalidation triggers a reset.
@@ -108,6 +115,23 @@ class NetworkMonitor(
                 debounceLocked(network)
                 return
             }
+            if (lastNetworkHandle == null) {
+                lastNetworkHandle = handle
+                lastValidated = validated
+                debounceLocked(network)
+                return
+            }
+            true
+        }
+        if (!needsDefaultCheck) return
+        // Read activeNetwork outside callbackLock so a system_server IPC never blocks markStopped().
+        val currentDefault = runCatching {
+            connectivityManager.activeNetwork?.networkHandle
+        }.getOrNull()
+        if (currentDefault != null && currentDefault != handle) return
+        synchronized(callbackLock) {
+            if (stopped) return
+            if (lastNetworkHandle == handle) return
             lastNetworkHandle = handle
             lastValidated = validated
             debounceLocked(network)

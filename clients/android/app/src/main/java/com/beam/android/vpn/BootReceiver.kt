@@ -29,6 +29,10 @@ class BootReceiver : BroadcastReceiver() {
                 if (!settings.startOnBoot) return@Thread
                 val hasProfile = runCatching {
                     EncryptedProfileStore(appContext).getActiveProfileId() != null
+                }.onFailure {
+                    // A locked or corrupt Keystore must not fail the boot start silently.
+                    Log.w(TAG, "profile store unreadable at boot", it)
+                    maybeNotifyBootStartFailed(appContext)
                 }.getOrDefault(false)
                 if (!hasProfile) return@Thread
                 val start = Intent(appContext, BeamVpnService::class.java)
@@ -37,19 +41,22 @@ class BootReceiver : BroadcastReceiver() {
                 runCatching { appContext.startForegroundService(start) }
                     .onFailure { err ->
                         Log.w(TAG, "startForegroundService failed", err)
-                        val canNotify = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-                            ContextCompat.checkSelfPermission(
-                                appContext,
-                                Manifest.permission.POST_NOTIFICATIONS,
-                            ) == PackageManager.PERMISSION_GRANTED
-                        if (canNotify) {
-                            runCatching { VpnNotificationManager(appContext).notifyBootStartFailed() }
-                        }
+                        maybeNotifyBootStartFailed(appContext)
                     }
             } finally {
                 pendingResult.finish()
             }
         }.start()
+    }
+
+    private fun maybeNotifyBootStartFailed(appContext: Context) {
+        val canNotify = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(
+                appContext,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+        if (!canNotify) return
+        runCatching { VpnNotificationManager(appContext).notifyBootStartFailed() }
     }
 
     private companion object {
