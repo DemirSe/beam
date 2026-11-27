@@ -82,21 +82,63 @@ grep -q 'systemd-resolved is not active; the DNS switch needs it' "$INSTALL" || 
   exit 1
 }
 
-# An unresolved INSTALL_USER leaves the tray unable to call the helper. The
-# check must run before any directory creation, backup, or service change.
-user_line=$(grep -n 'id -nu -- "$INSTALL_USER"' "$INSTALL" | cut -d: -f1 || true)
+# An unresolved INSTALL_USER leaves the tray unable to call the helper. Test
+# the installer's resolver with fake id output: the error must keep the raw
+# input, and a second account with uid 0 must still be rejected.
+user_body=$(sed -n '/^resolve_install_user() {/,/^}/p' "$INSTALL")
+[ -n "$user_body" ] || {
+  echo "install.sh: missing resolve_install_user" >&2
+  exit 1
+}
+check_install_user() {
+  local raw="$1" want_rc="$2" want_out="$3" want_err="$4" rc
+  (
+    id() {
+      [ "${2:-}" = -- ] || return 1
+      case "$1" in
+        -nu)
+          [ -n "${FAKE_NAME_FAIL:-}" ] && return 1
+          printf '%s\n' "$FAKE_NAME" ;;
+        -u) printf '%s\n' "$FAKE_UID" ;;
+        *) return 1 ;;
+      esac
+    }
+    eval "$user_body"
+    resolve_install_user "$raw"
+  ) >"$TMP/user.out" 2>"$TMP/user.err" && rc=0 || rc=$?
+  [ "$rc" -eq "$want_rc" ] || {
+    echo "install.sh: user '$raw' returned $rc, expected $want_rc" >&2
+    exit 1
+  }
+  [ "$(cat "$TMP/user.out")" = "$want_out" ] || {
+    echo "install.sh: user '$raw' resolved to '$(cat "$TMP/user.out")'" >&2
+    exit 1
+  }
+  if [ -n "$want_err" ]; then
+    grep -qF "$want_err" "$TMP/user.err" || {
+      echo "install.sh: user '$raw' has no clear error" >&2
+      cat "$TMP/user.err" >&2
+      exit 1
+    }
+  fi
+}
+FAKE_NAME=demir
+FAKE_UID=1000
+FAKE_NAME_FAIL=1
+check_install_user 'bad?name' 1 '' 'INSTALL_USER=bad?name does not resolve'
+unset FAKE_NAME_FAIL
+FAKE_NAME=root
+FAKE_UID=0
+check_install_user root 1 '' 'not root'
+FAKE_NAME=toor
+FAKE_UID=0
+check_install_user toor 1 '' 'uid 0'
+FAKE_NAME=demir
+FAKE_UID=1000
+check_install_user demir 0 demir ''
+user_line=$(grep -n '^INSTALL_USER=\$(resolve_install_user' "$INSTALL" | cut -d: -f1 || true)
 [ -n "$user_line" ] && [ "$user_line" -lt "$dir_line" ] || {
   echo "install.sh: INSTALL_USER is not resolved before side effects" >&2
-  exit 1
-}
-grep -qF 'does not resolve to a user' "$INSTALL" || {
-  echo "install.sh: unresolved INSTALL_USER has no named error" >&2
-  exit 1
-}
-# A numeric uid resolves but never matches the helper's name comparison, and
-# "0" must not bypass the root guard after normalization.
-grep -qF 'INSTALL_USER must be the desktop user, not root' "$INSTALL" || {
-  echo "install.sh: normalized INSTALL_USER is not re-checked for root" >&2
   exit 1
 }
 

@@ -9,21 +9,40 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CORE_DIR="${CORE_DIR:-/tmp/beam-core}"
 CONFIG_SRC="${CONFIG_SRC:-}"
 INSTALL_USER="${INSTALL_USER:-${SUDO_USER:-}}"
+
+# The helper compares allowed-user with the invoking name, so a typo or a
+# numeric uid would install cleanly and leave the tray unable to call it.
+# Keep the raw input for errors and reject any account with uid 0.
+resolve_install_user() {
+    local raw="$1" name uid
+    name=$(id -nu -- "$raw" 2>/dev/null) || {
+        echo "INSTALL_USER=$raw does not resolve to a user" >&2
+        return 1
+    }
+    if [ -z "$name" ]; then
+        echo "INSTALL_USER=$raw does not resolve to a user" >&2
+        return 1
+    fi
+    if [ "$name" = root ]; then
+        echo "INSTALL_USER must be the desktop user, not root" >&2
+        return 1
+    fi
+    uid=$(id -u -- "$name" 2>/dev/null) || {
+        echo "INSTALL_USER=$raw does not resolve to a uid" >&2
+        return 1
+    }
+    if [ "$uid" = 0 ]; then
+        echo "INSTALL_USER=$raw resolves to uid 0; use the desktop user" >&2
+        return 1
+    fi
+    printf '%s\n' "$name"
+}
+
 if [ -z "$INSTALL_USER" ] || [ "$INSTALL_USER" = root ]; then
     echo "run via sudo from the desktop user, or set INSTALL_USER=<name>" >&2
     exit 1
 fi
-# The helper compares allowed-user with the invoking name, so a typo or a
-# numeric uid would install cleanly and leave the tray unable to call it.
-# Resolve the input to a name before anything else uses it.
-INSTALL_USER="$(id -nu -- "$INSTALL_USER" 2>/dev/null)" || {
-    echo "INSTALL_USER=$INSTALL_USER does not resolve to a user" >&2
-    exit 1
-}
-if [ -z "$INSTALL_USER" ] || [ "$INSTALL_USER" = root ]; then
-    echo "INSTALL_USER must be the desktop user, not root" >&2
-    exit 1
-fi
+INSTALL_USER=$(resolve_install_user "$INSTALL_USER") || exit 1
 
 if [ -z "$CONFIG_SRC" ]; then
     if [ -f /etc/beam/config.json ]; then
