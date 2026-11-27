@@ -345,12 +345,39 @@ function Measure-Multi4DownloadMbps {
     }
 }
 
+function Get-TunDnsServer {
+    # DNS server the client configured on its own adapter, so the direct probe
+    # bypasses the Windows resolver's server selection and racing.
+    param([string]$AdapterName = 'Beam*')
+    try {
+        foreach ($na in @(Get-NetAdapter -ErrorAction SilentlyContinue)) {
+            if ($na.Name -notlike $AdapterName) { continue }
+            $idx = [int]$na.ifIndex
+            foreach ($o in @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+                foreach ($s in @($o.ServerAddresses)) {
+                    if (-not [string]::IsNullOrWhiteSpace($s)) { return [string]$s }
+                }
+            }
+        }
+    } catch {
+        return ''
+    }
+    return ''
+}
+
 function Measure-DnsMs {
+    param([string]$Server = '')
     $samples = New-Object System.Collections.Generic.List[double]
     for ($i = 0; $i -lt 3; $i++) {
         try {
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $null = Resolve-DnsName -Name 'example.com' -ErrorAction Stop
+            if ($Server -eq '') {
+                $null = Resolve-DnsName -Name 'example.com' -ErrorAction Stop
+            } else {
+                # Pinned server: isolates the client's own DNS path from Windows'
+                # multi-server selection, which is what the plain probe measures.
+                $null = Resolve-DnsName -Name 'example.com' -Server $Server -DnsOnly -ErrorAction Stop
+            }
             $sw.Stop()
             $samples.Add($sw.Elapsed.TotalMilliseconds)
         } catch {
@@ -363,7 +390,7 @@ function Measure-DnsMs {
 # Shared by both runs so the comparison stays strictly fair: same warm-up,
 # same URL and same curl.exe flags for beam-client and sing-box.
 function Measure-ConnectedMetrics {
-    param([string]$VpsIpv4, [int]$RamPid = 0, [string]$RamName = '')
+    param([string]$VpsIpv4, [int]$RamPid = 0, [string]$RamName = '', [string]$DnsServer = '')
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $ram = Get-ProcessRamMb -ProcessId $RamPid -ProcessName $RamName
     $ttfb = Measure-HttpsTtfbMs
@@ -381,19 +408,22 @@ function Measure-ConnectedMetrics {
     $multi4Exit = [string]$script:LastMulti4CurlExit
     $multi4Http = [string]$script:LastMulti4HttpCode
     $dns = Measure-DnsMs
+    $dnsDirect = Measure-DnsMs -Server $DnsServer
     $egress = Get-PublicIpv4
     $via = (($egress -ne '') -and ($VpsIpv4 -ne '') -and ($egress -eq $VpsIpv4))
     return @{
         ram_mb = $ram; https_ttfb_ms = $ttfb; download_mbps = $down
         multi4_mbps = $multi4; multi4_curl_exit = $multi4Exit; multi4_http_code = $multi4Http
-        dns_ms = $dns; cpu_s = $cpu; egress_via_vps = $via.ToString().ToLowerInvariant()
+        dns_ms = $dns; dns_direct_ms = $dnsDirect; cpu_s = $cpu
+        egress_via_vps = $via.ToString().ToLowerInvariant()
     }
 }
 
 function New-RoundRow {
     return @{
         connect_ms = 'fail'; ram_mb = 'n/a'; https_ttfb_ms = 'fail'
-        download_mbps = 'fail'; multi4_mbps = 'fail'; dns_ms = 'fail'; egress_via_vps = 'false'
+        download_mbps = 'fail'; multi4_mbps = 'fail'; dns_ms = 'fail'; dns_direct_ms = 'fail'
+        egress_via_vps = 'false'
         cpu_s = 'n/a'; drops = 'none'; curl_exit = 'n/a'; http_code = 'n/a'
         multi4_curl_exit = 'n/a'; multi4_http_code = 'n/a'
         rtt_ms = 'n/a'; error = ''
@@ -409,6 +439,7 @@ function Format-RoundLine {
         ' down_mbps=' + $Round['download_mbps'] +
         ' multi4_mbps=' + $Round['multi4_mbps'] +
         ' dns_ms=' + $Round['dns_ms'] +
+        ' dns_direct_ms=' + $Round['dns_direct_ms'] +
         ' cpu_s=' + $Round['cpu_s'] +
         ' drops=' + $Round['drops'] +
         ' rtt_ms=' + $Round['rtt_ms'] +
@@ -585,7 +616,7 @@ function Run-BeamRound {
         if (-not $connected) { throw 'never_connected' }
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
         $Round['connect_ms'] = ([math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 0)).ToString('F0', $inv)
-        $metrics = Measure-ConnectedMetrics -VpsIpv4 $VpsIpv4 -RamName 'beam-client'
+        $metrics = Measure-ConnectedMetrics -VpsIpv4 $VpsIpv4 -RamName 'beam-client' -DnsServer (Get-TunDnsServer -AdapterName 'Beam*')
         foreach ($k in $metrics.Keys) { $Round[$k] = $metrics[$k] }
         $Round['curl_exit'] = [string]$script:LastCurlExit
         $Round['http_code'] = [string]$script:LastHttpCode
@@ -684,7 +715,7 @@ function Run-SingboxRound {
         if (-not $connected) { throw 'singbox_never_connected' }
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
         $Round['connect_ms'] = ([math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 0)).ToString('F0', $inv)
-        $metrics = Measure-ConnectedMetrics -VpsIpv4 $VpsIpv4 -RamPid $proc.Id
+        $metrics = Measure-ConnectedMetrics -VpsIpv4 $VpsIpv4 -RamPid $proc.Id -DnsServer (Get-TunDnsServer -AdapterName 'sbtun')
         foreach ($k in $metrics.Keys) { $Round[$k] = $metrics[$k] }
         $Round['curl_exit'] = [string]$script:LastCurlExit
         $Round['http_code'] = [string]$script:LastHttpCode
@@ -815,6 +846,7 @@ try {
         ('| download_mbps | ' + (Format-AggCell -Rows $beamRounds -Key 'download_mbps' -Decimals 1) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'download_mbps' -Decimals 1) + ' |'),
         ('| multi4_mbps | ' + (Format-AggCell -Rows $beamRounds -Key 'multi4_mbps' -Decimals 1) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'multi4_mbps' -Decimals 1) + ' |'),
         ('| dns_ms | ' + (Format-AggCell -Rows $beamRounds -Key 'dns_ms' -Decimals 0) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'dns_ms' -Decimals 0) + ' |'),
+        ('| dns_direct_ms | ' + (Format-AggCell -Rows $beamRounds -Key 'dns_direct_ms' -Decimals 0) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'dns_direct_ms' -Decimals 0) + ' |'),
         ('| cpu_s | ' + (Format-AggCell -Rows $beamRounds -Key 'cpu_s' -Decimals 1) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'cpu_s' -Decimals 1) + ' |'),
         ('| drops | ' + (Format-JoinCell -Rows $beamRounds -Key 'drops') + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'drops') + ' |'),
         ('| rtt_ms | ' + (Format-AggCell -Rows $beamRounds -Key 'rtt_ms' -Decimals 0) + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'rtt_ms') + ' |'),
