@@ -167,9 +167,12 @@ impl Default for TcpStackConfig {
 impl TcpStackConfig {
     /// Low-RAM always-on profile for Android `VpnService`.
     ///
-    /// Worst case is 128 flows times 128 KiB times two directions, which is
-    /// 32 MiB. The 30-minute idle timeout keeps 15-minute FCM/MTalk push
-    /// sockets alive with zero relay wakeups while idle.
+    /// Worst case is 128 flows times 128 KiB times two directions (32 MiB),
+    /// plus the bounded relay reply queue of `ANDROID_S2C_STREAM_CHANNEL_CAP`
+    /// queued 16 KiB read buffers per flow (64 KiB per flow, 8 MiB in total),
+    /// plus up to 64 KiB of retained bulk-upload coalesce capacity per flow
+    /// (8 MiB in total). The 30-minute idle timeout keeps 15-minute FCM/MTalk
+    /// push sockets alive with zero relay wakeups while idle.
     pub fn mobile() -> Self {
         Self {
             mtu: 1500,
@@ -184,15 +187,34 @@ impl TcpStackConfig {
 #[cfg(test)]
 mod mobile_tests {
     use super::*;
+    use crate::proxy_tcp::ANDROID_S2C_STREAM_CHANNEL_CAP;
+
+    /// Android relay read buffers are 16 KiB, so a queued reply costs that much.
+    const S2C_CHUNK_BYTES: u64 = 16 * 1024;
 
     #[test]
     fn mobile_profile_fits_android_ram_and_keeps_push_sockets_alive() {
         let cfg = TcpStackConfig::mobile();
         // Worst case counts both directions per flow.
-        let worst_case = cfg.max_connections as u64 * cfg.socket_buffer_bytes as u64 * 2;
+        let socket_budget = cfg.max_connections as u64 * cfg.socket_buffer_bytes as u64 * 2;
         assert!(
-            worst_case <= 32 * 1024 * 1024,
-            "mobile buffer budget {worst_case} bytes exceeds 32 MiB"
+            socket_budget <= 32 * 1024 * 1024,
+            "mobile buffer budget {socket_budget} bytes exceeds 32 MiB"
+        );
+        // The bounded reply queue adds at most `ANDROID_S2C_STREAM_CHANNEL_CAP`
+        // queued 16 KiB read buffers per flow on top of the socket buffers.
+        let reply_budget =
+            cfg.max_connections as u64 * ANDROID_S2C_STREAM_CHANNEL_CAP as u64 * S2C_CHUNK_BYTES;
+        assert!(
+            reply_budget <= 8 * 1024 * 1024,
+            "mobile relay reply queue budget {reply_budget} bytes exceeds 8 MiB"
+        );
+        // Bulk-upload flows can retain one 64 KiB coalesce window after a full flush.
+        let coalesce_budget = cfg.max_connections as u64 * (64 * 1024);
+        assert!(
+            socket_budget + reply_budget + coalesce_budget <= 48 * 1024 * 1024,
+            "mobile total budget {} bytes exceeds 48 MiB",
+            socket_budget + reply_budget + coalesce_budget
         );
         assert!(
             cfg.idle_timeout_ms >= 1_800_000,

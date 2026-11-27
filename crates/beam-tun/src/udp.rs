@@ -410,8 +410,18 @@ impl UdpNatBridge {
         // Drop the shared XUDP mux as soon as all NAT sessions have expired
         // and nothing is queued so its reader/writer tasks and upstream socket
         // close at the NAT idle boundary instead of holding an idle timer.
-        if self.sessions.is_empty() && self.pending_initial.is_empty() {
-            self.mux = None;
+        // A graceful close flushes queued frames and sends `close_notify` with
+        // its own timeout; if another task still holds the Arc or no Tokio
+        // runtime is active, dropping our ref falls back cleanly.
+        if self.sessions.is_empty()
+            && self.pending_initial.is_empty()
+            && let Some(mux) = self.mux.take()
+            && let Ok(client) = Arc::try_unwrap(mux)
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                client.close().await;
+            });
         }
     }
 

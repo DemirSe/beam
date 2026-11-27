@@ -28,6 +28,9 @@ use crate::udp::{UdpBridgeConfig, UdpNatBridge};
 const MAX_PACKET_BUF: usize = 65_536;
 const TUN_TX_CHANNEL_CAP: usize = 512;
 const RX_BATCH_MAX: usize = 128;
+/// Pending UDP/DNS/ICMP replies drained per loop iteration before the engine
+/// returns to `device.recv`, so a busy reply queue can never starve TUN reads.
+const TUN_RX_DRAIN_MAX: usize = 64;
 const C2S_COALESCE_TARGET: usize = 64 * 1024;
 // Android uses 16 KiB (one max TLS 1.3 record) to cut worst-case 128-flow
 // transient RSS by 4x without hurting TLS throughput.
@@ -715,11 +718,16 @@ where
                 activity.clone(),
                 Arc::clone(&drops),
                 config.tcp_relay_idle_timeout,
+                shutdown.clone(),
             );
         }
 
-        // Drain any pending UDP/ICMP reply packets immediately.
-        while let Ok(pkt) = tun_rx.try_recv() {
+        // Drain any pending UDP/ICMP reply packets immediately, bounded so a
+        // sustained reply stream cannot postpone TUN reads.
+        for _ in 0..TUN_RX_DRAIN_MAX {
+            let Ok(pkt) = tun_rx.try_recv() else {
+                break;
+            };
             send_tun_packet(&mut device, &pkt, &drops).await?;
         }
 
@@ -774,9 +782,6 @@ where
                 if let Some(dns) = dns_interceptor.as_ref() {
                     dns.on_network_change();
                 }
-            }
-            Some(reply_pkt) = tun_rx.recv() => {
-                send_tun_packet(&mut device, &reply_pkt, &drops).await?;
             }
             read_res = device.recv(&mut recv_buf) => {
                 let mut n = read_res?;
@@ -839,6 +844,10 @@ where
                         Err(err) => return Err(EngineError::Device(err)),
                     }
                 }
+            }
+            // Kept below `device.recv` so queued replies never starve TUN reads.
+            Some(reply_pkt) = tun_rx.recv() => {
+                send_tun_packet(&mut device, &reply_pkt, &drops).await?;
             }
             () = stack_waker.notified() => {}
             () = async {
@@ -1038,6 +1047,20 @@ impl DialGate {
     }
 }
 
+/// Resolves when the engine shuts down, or when its shutdown channel is gone
+/// (nothing can ever signal a graceful stop then), so a detached relay task
+/// never outlives the engine that spawned it.
+async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_tcp_relay(
     mut conn: AcceptedTcpStream,
@@ -1048,6 +1071,7 @@ fn spawn_tcp_relay(
     activity: Option<Arc<TunnelActivity>>,
     drops: Arc<DropCounters>,
     relay_idle: Option<Duration>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let Ok(permit) = permits.try_acquire_owned() else {
         debug!(dst = %conn.dst, "TCP connection limit reached; aborting with RST");
@@ -1065,8 +1089,18 @@ fn spawn_tcp_relay(
 
     tokio::spawn(async move {
         let _permit = permit;
+        // The engine can stop between the spawn and this first poll; abort the
+        // local flow instead of leaving a detached task behind.
+        if *shutdown.borrow() {
+            conn.stream.abort();
+            return;
+        }
         let dial_permit = tokio::select! {
             biased;
+            () = wait_shutdown(&mut shutdown) => {
+                conn.stream.abort();
+                return;
+            }
             Ok(()) = async {
                 match network_reset.as_mut() {
                     Some(rx) => rx.changed().await,
@@ -1102,6 +1136,11 @@ fn spawn_tcp_relay(
         let dial_start = Instant::now();
         let upstream = tokio::select! {
             biased;
+            () = wait_shutdown(&mut shutdown) => {
+                drop(dial_permit);
+                conn.stream.abort();
+                return;
+            }
             Ok(()) = async {
                 match network_reset.as_mut() {
                     Some(rx) => rx.changed().await,
@@ -1281,6 +1320,12 @@ fn spawn_tcp_relay(
 
         tokio::select! {
             biased;
+            () = wait_shutdown(&mut shutdown) => {
+                // `c2s` and `s2c` own the split stream halves, so leaving this
+                // block closes both sockets and lets the stack emit a FIN. That
+                // matches the network-reset path and never waits for
+                // `up_w.shutdown()` on a shrinking pool.
+            }
             Ok(()) = async {
                 match network_reset.as_mut() {
                     Some(rx) => rx.changed().await,
@@ -1749,5 +1794,44 @@ mod tests {
         assert_eq!(activity.active_tcp_flows(), 0);
         assert_eq!(activity.bytes_tx(), 1_500);
         assert_eq!(activity.bytes_rx(), 4_096);
+    }
+
+    #[tokio::test]
+    async fn relay_shutdown_wakes_promptly_without_waiting_for_an_idle_timeout() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let relay = tokio::spawn(async move {
+            // Stands in for a relay parked on a 30-minute idle timeout.
+            tokio::select! {
+                biased;
+                () = wait_shutdown(&mut shutdown_rx) => "shutdown",
+                () = tokio::time::sleep(Duration::from_secs(1_800)) => "idle",
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !relay.is_finished(),
+            "shutdown must not fire while the engine is running"
+        );
+        let _ = shutdown_tx.send(true);
+        let won = timeout(Duration::from_millis(200), relay)
+            .await
+            .expect("relay must observe shutdown at once")
+            .expect("relay task");
+        assert_eq!(won, "shutdown");
+    }
+
+    #[tokio::test]
+    async fn wait_shutdown_returns_for_an_already_stopped_engine_or_a_dropped_sender() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(true);
+        timeout(Duration::from_millis(50), wait_shutdown(&mut shutdown_rx))
+            .await
+            .expect("an already-true flag returns at once");
+        drop(shutdown_tx);
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        drop(shutdown_tx);
+        timeout(Duration::from_millis(50), wait_shutdown(&mut shutdown_rx))
+            .await
+            .expect("a dropped shutdown sender must not hang the relay task");
     }
 }
