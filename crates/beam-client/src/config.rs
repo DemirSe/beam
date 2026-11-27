@@ -707,15 +707,14 @@ mod tests {
 
     #[test]
     fn single_label_local_defaults_true_and_validates_escape_hatch() {
-        let cfg = ClientFileConfig::parse_and_validate(EXAMPLE).expect("example config valid");
-        assert!(cfg.engine.dns.as_ref().expect("dns").single_label_local);
-
-        // The example may document the key, so drop it before adding a value.
+        // The example documents the key, so strip it to test `serde(default)`.
         let base: String = EXAMPLE
             .lines()
             .filter(|line| !line.trim_start().starts_with("single_label_local"))
             .collect::<Vec<_>>()
             .join("\n");
+        let cfg = ClientFileConfig::parse_and_validate(&base).expect("stripped example valid");
+        assert!(cfg.engine.dns.as_ref().expect("dns").single_label_local);
 
         let raw = base.replace(
             "ipv4_only = false",
