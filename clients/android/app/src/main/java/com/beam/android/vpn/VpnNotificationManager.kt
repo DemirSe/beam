@@ -26,11 +26,16 @@ class VpnNotificationManager(private val context: Context) {
         context.getSystemService(NotificationManager::class.java)
 
     init {
+        // The channel id is stable forever: changing it would orphan user settings.
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Beam VPN",
+            context.getString(R.string.notification_channel_name),
             NotificationManager.IMPORTANCE_LOW,
-        )
+        ).apply {
+            setShowBadge(false)
+            setSound(null, null)
+            enableVibration(false)
+        }
         manager.createNotificationChannel(channel)
     }
 
@@ -58,6 +63,11 @@ class VpnNotificationManager(private val context: Context) {
             .setContentIntent(pending)
             .setOngoing(state != VpnState.DISCONNECTED)
             .setOnlyAlertOnce(true)
+            // Background status only: never sounds, vibrates, or shows on the lock screen.
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
 
         if (state == VpnState.CONNECTED || state == VpnState.DEGRADED || state == VpnState.CONNECTING) {
             val stopIntent = Intent(context, BeamVpnService::class.java).apply {

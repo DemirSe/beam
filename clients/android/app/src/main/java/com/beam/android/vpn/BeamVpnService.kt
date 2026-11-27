@@ -1,6 +1,9 @@
 package com.beam.android.vpn
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.IpPrefix
 import android.net.Network
@@ -8,8 +11,11 @@ import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.RemoteCallbackList
+import android.os.SystemClock
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.beam.android.R
 import com.beam.android.ipc.IBeamStateCallback
 import com.beam.android.ipc.IBeamVpnService
@@ -51,6 +57,15 @@ class BeamVpnService : VpnService() {
 
         /** Backoff delays between hostname re-resolution retries on network switch. */
         private val NETWORK_SWITCH_RESOLVE_BACKOFF_MS = longArrayOf(1_500L, 3_000L)
+
+        /** Backoff delays for restarting an engine that exited without a user disconnect. */
+        private val ENGINE_RETRY_BACKOFF_MS = longArrayOf(2_000L, 5_000L)
+
+        /** A tunnel that stayed up this long earns a fresh engine retry budget. */
+        private const val ENGINE_RETRY_RESET_AFTER_MS = 30_000L
+
+        /** Doze freezes monotonic clocks; a longer gap means the flows are stale. */
+        private const val DOZE_RECOVERY_MIN_SLEEP_MS = 120_000L
     }
 
     private data class ActiveEngine(val handle: Long, val generation: Long)
@@ -67,16 +82,22 @@ class BeamVpnService : VpnService() {
     private var lastPublishedDetail: String = ""
     /** Guarded by [callbackLock]; tracks the last state posted to NotificationManager. */
     private var lastNotifiedState: Int = VpnState.DISCONNECTED
-    /** Guarded by [callbackLock]; prevents broadcasting after [onDestroy] calls `callbacks.kill()`. */
-    private var destroyed: Boolean = false
+    /** Set under [callbackLock]; volatile so [stateLock] holders can also read it. */
+    @Volatile private var destroyed: Boolean = false
     @Volatile private var activeProfileId: String? = null
     @Volatile private var pendingProfileId: String? = null
     @Volatile private var activeServerHost: String? = null
+    /** Resolved address the engine currently dials, compared on network switch. */
+    @Volatile private var activeServerIp: String? = null
     @Volatile private var activeIpv4Only: Boolean = true
     @Volatile private var activeEngine: ActiveEngine? = null
+    /** Grows while the device sleeps; a long gap means the engine's flows are stale. */
+    @Volatile private var lastSleepOffsetMs: Long = currentSleepOffset()
 
     private var tun: ParcelFileDescriptor? = null
     private var monitor: NetworkMonitor? = null
+    /** Guarded by [stateLock]; the doze-exit receiver while the tunnel is up. */
+    private var idleReceiver: BroadcastReceiver? = null
     private lateinit var notifications: VpnNotificationManager
     private val callbacks = RemoteCallbackList<IBeamStateCallback>()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -96,6 +117,10 @@ class BeamVpnService : VpnService() {
 
     /** Bumped by every connect()/disconnect()/onRevoke()/onDestroy(); stale attempts abort. */
     private val connectGeneration = AtomicLong(0L)
+    /** Guarded by [stateLock]; bounded restart budget for an engine that exits on its own. */
+    private var engineRetryCount = 0
+    /** Guarded by [stateLock]; [SystemClock.elapsedRealtime] when the engine became active. */
+    private var connectedSinceMs = 0L
     /** Monotonic counter ordering concurrent network-switch re-resolutions. */
     private val networkSwitchGeneration = AtomicLong(0L)
     private var connectJob: Job? = null
@@ -161,12 +186,27 @@ class BeamVpnService : VpnService() {
                 // startForegroundService() callers are killed when the foreground
                 // notification is late, so post it before the profile lookup.
                 if (state == VpnState.DISCONNECTED || state == VpnState.DISCONNECTING) {
-                    startForeground(
-                        VpnNotificationManager.NOTIFICATION_ID,
-                        notifications.build(VpnState.CONNECTING, ""),
-                    )
-                    synchronized(callbackLock) {
-                        lastNotifiedState = VpnState.CONNECTING
+                    // Serialised with releaseResources() under callbackLock so a
+                    // concurrent teardown cannot remove the notification we just posted.
+                    val promoted = synchronized(callbackLock) {
+                        runCatching {
+                            startForeground(
+                                VpnNotificationManager.NOTIFICATION_ID,
+                                notifications.build(VpnState.CONNECTING, ""),
+                            )
+                        }.onSuccess { lastNotifiedState = VpnState.CONNECTING }
+                    }
+                    if (promoted.isFailure) {
+                        Log.e(TAG, "startForeground failed", promoted.exceptionOrNull())
+                        val failedChanged = synchronized(stateLock) {
+                            updateStateLocked(
+                                VpnState.DISCONNECTED,
+                                getString(R.string.vpn_error_generic),
+                            )
+                        }
+                        if (failedChanged) publishCurrentState()
+                        stopSelfResult(startId)
+                        return START_NOT_STICKY
                     }
                 }
                 val startGen = connectGeneration.get()
@@ -215,14 +255,22 @@ class BeamVpnService : VpnService() {
      * (Keystore, DNS, establish, JNI) runs on [serviceScope] so a quick
      * disconnect() can cancel it.
      */
-    private fun connect(profileId: String) {
+    private fun connect(profileId: String, retryGen: Long? = null) {
         val myGen: Long
         val previous: ReleasedResources
         synchronized(stateLock) {
-            if ((state == VpnState.CONNECTING || state == VpnState.CONNECTED) &&
-                (activeProfileId == profileId || pendingProfileId == profileId)
-            ) {
-                return
+            if (retryGen != null) {
+                // Bounded engine restart: only disconnect(), onRevoke(), onDestroy()
+                // or a newer connect() can have bumped the generation since.
+                if (connectGeneration.get() != retryGen) return
+            } else {
+                if ((state == VpnState.CONNECTING || state == VpnState.CONNECTED) &&
+                    (activeProfileId == profileId || pendingProfileId == profileId)
+                ) {
+                    return
+                }
+                // A user or external connect starts with a full restart budget.
+                engineRetryCount = 0
             }
             myGen = connectGeneration.incrementAndGet()
             connectJob?.cancel()
@@ -247,12 +295,15 @@ class BeamVpnService : VpnService() {
             )
         }
         // Android 12+ kills the service if the foreground notification is late,
-        // so it goes up before any DNS or Keystore work (outside stateLock).
-        val promoted = runCatching {
-            startForeground(
-                VpnNotificationManager.NOTIFICATION_ID,
-                notifications.build(VpnState.CONNECTING, ""),
-            )
+        // so it goes up before any DNS or Keystore work (outside stateLock) and
+        // under callbackLock so a concurrent teardown cannot stop it first.
+        val promoted = synchronized(callbackLock) {
+            runCatching {
+                startForeground(
+                    VpnNotificationManager.NOTIFICATION_ID,
+                    notifications.build(VpnState.CONNECTING, ""),
+                )
+            }.onSuccess { lastNotifiedState = VpnState.CONNECTING }
         }
         // Always release any detached previous engine/TUN on the dedicated
         // cleanup executor so cancelling connectJob or serviceScope can never
@@ -278,9 +329,6 @@ class BeamVpnService : VpnService() {
                 }
             }
             return
-        }
-        synchronized(callbackLock) {
-            lastNotifiedState = VpnState.CONNECTING
         }
         publishCurrentState()
         synchronized(stateLock) {
@@ -358,14 +406,11 @@ class BeamVpnService : VpnService() {
                                     return@synchronized false
                                 }
                                 // Reserve stateDetail for user-facing errors, not raw state labels.
-                                updateStateLocked(
-                                    s,
-                                    if (s == VpnState.DEGRADED) "degraded" else "",
-                                )
+                                updateStateLocked(s, "")
                             }
                             if (shouldDisconnect) {
-                                // Unexpected engine exit (e.g. fatal TUN error): tear down FGS cleanly.
-                                serviceScope.launch { disconnect(expectedGen = myGen) }
+                                // Unexpected engine exit (e.g. fatal TUN error).
+                                serviceScope.launch { handleUnexpectedEngineExit(myGen) }
                                 return
                             }
                             if (changed) publishCurrentState()
@@ -395,7 +440,9 @@ class BeamVpnService : VpnService() {
                     activeEngine = ActiveEngine(handle, myGen)
                     activeProfileId = profileId
                     activeServerHost = profile.serverHost
+                    activeServerIp = serverIp
                     activeIpv4Only = settings.ipv4Only
+                    connectedSinceMs = SystemClock.elapsedRealtime()
                     pendingProfileId = null
                 }
             }
@@ -416,10 +463,7 @@ class BeamVpnService : VpnService() {
             var liveChanged = false
             val stillOwner = synchronized(stateLock) {
                 if (connectGeneration.get() == myGen && activeEngine?.handle == handle) {
-                    liveChanged = updateStateLocked(
-                        liveState,
-                        if (liveState == VpnState.DEGRADED) "degraded" else "",
-                    )
+                    liveChanged = updateStateLocked(liveState, "")
                     true
                 } else {
                     false
@@ -478,6 +522,7 @@ class BeamVpnService : VpnService() {
                 newMonitor.stop()
                 return
             }
+            registerIdleExitReceiver(myGen)
 
             // Only persist active profile if this attempt still owns the tunnel and
             // the profile was not deleted during connect. Transient Keystore/I/O
@@ -603,6 +648,55 @@ class BeamVpnService : VpnService() {
         return (preferred ?: addresses.first()).hostAddress
     }
 
+    /**
+     * Doze freezes every flow without telling the engine. On leaving idle mode
+     * after a long sleep, or when the tunnel is already degraded, reset the
+     * engine's flows once. A fresh instance per connect keeps an old release
+     * from unregistering the newer registration.
+     */
+    private fun newIdleExitReceiver(): BroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED) return
+            val power = getSystemService(PowerManager::class.java) ?: return
+            if (power.isDeviceIdleMode) return
+            val nowOffset = currentSleepOffset()
+            val sleepDelta = nowOffset - lastSleepOffsetMs
+            lastSleepOffsetMs = nowOffset
+            if (sleepDelta < DOZE_RECOVERY_MIN_SLEEP_MS && state != VpnState.DEGRADED) return
+            // Native call with its own locks: never run it on the main thread.
+            serviceScope.launch { notifyNativeNetworkChange(null) }
+        }
+    }
+
+    private fun registerIdleExitReceiver(expectedGen: Long) {
+        val receiver = newIdleExitReceiver()
+        lastSleepOffsetMs = currentSleepOffset()
+        val registered = runCatching {
+            ContextCompat.registerReceiver(
+                this,
+                receiver,
+                IntentFilter(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+        }.onFailure { Log.w(TAG, "idle receiver registration failed", it) }
+            .isSuccess
+        if (!registered) return
+        val keep = synchronized(stateLock) {
+            if (connectGeneration.get() == expectedGen && activeEngine != null && idleReceiver == null) {
+                idleReceiver = receiver
+                true
+            } else {
+                false
+            }
+        }
+        // A teardown or newer connect that raced this registration already owns the cleanup.
+        if (!keep) runCatching { unregisterReceiver(receiver) }
+    }
+
+    /** Grows while the device sleeps: [SystemClock.elapsedRealtime] keeps counting in Doze. */
+    private fun currentSleepOffset(): Long =
+        SystemClock.elapsedRealtime() - SystemClock.uptimeMillis()
+
     private suspend fun handleNetworkSwitch(
         network: Network,
         expectedGen: Long,
@@ -613,11 +707,11 @@ class BeamVpnService : VpnService() {
         }
         runCatching { setUnderlyingNetworks(arrayOf(network)) }
             .onFailure { Log.w(TAG, "setUnderlyingNetworks failed", it) }
+        // Reset stale TCP flows from the old network now instead of leaving them
+        // stalled until DNS resolves; server_ip is refreshed below when it changed.
+        notifyNativeNetworkChange(null)
         val host = activeServerHost
-        if (host == null || SettingsValidator.isIpLiteral(host)) {
-            notifyNativeNetworkChange(null)
-            return
-        }
+        if (host == null || SettingsValidator.isIpLiteral(host)) return
         val firstIp = withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
             resolveServerHostOnNetwork(network, host, activeIpv4Only)
         }
@@ -625,12 +719,9 @@ class BeamVpnService : VpnService() {
             return
         }
         if (firstIp != null) {
-            notifyNativeNetworkChange(firstIp)
+            applyResolvedServerIp(firstIp)
             return
         }
-        // Reset stale flows from the previous network immediately instead of
-        // waiting through the full retry budget, then update server_ip once DNS recovers.
-        notifyNativeNetworkChange(null)
         for (backoffMs in NETWORK_SWITCH_RESOLVE_BACKOFF_MS) {
             delay(backoffMs)
             if (connectGeneration.get() != expectedGen ||
@@ -647,18 +738,34 @@ class BeamVpnService : VpnService() {
                 return
             }
             if (retriedIp != null) {
-                notifyNativeNetworkChange(retriedIp)
+                applyResolvedServerIp(retriedIp)
                 return
             }
         }
+    }
+
+    /** Pokes the engine with a new server address only when it actually changed. */
+    private fun applyResolvedServerIp(serverIp: String) {
+        if (serverIp == activeServerIp) return
+        notifyNativeNetworkChange(serverIp)
+        activeServerIp = serverIp
     }
 
     private data class ReleasedResources(
         val handle: Long,
         val tun: ParcelFileDescriptor?,
         val monitor: NetworkMonitor? = null,
+        val idleReceiver: BroadcastReceiver? = null,
         val stopForeground: Boolean,
         val generation: Long,
+    )
+
+    /** Bounded engine restart after the native engine exited on its own. */
+    private data class EngineRetry(
+        val profileId: String,
+        val attempt: Int,
+        val backoffMs: Long,
+        val released: ReleasedResources,
     )
 
     private fun stopSelfIfIdle(expectedGen: Long, startId: Int) {
@@ -693,7 +800,9 @@ class BeamVpnService : VpnService() {
         if (disconnectingChanged) publishCurrentState()
         // Release native engine (up to 2 s shutdown) and TUN off the caller's
         // binder thread so UI/tile toggles never stall behind nativeStop().
-        if (released.handle == 0L && released.tun == null && released.monitor == null && !released.stopForeground) {
+        if (released.handle == 0L && released.tun == null && released.monitor == null &&
+            released.idleReceiver == null && !released.stopForeground
+        ) {
             finalizeDisconnect(myGen)
         } else {
             scheduleRelease(released) { finalizeDisconnect(myGen) }
@@ -749,7 +858,9 @@ class BeamVpnService : VpnService() {
         released: ReleasedResources,
         onDone: (() -> Unit)? = null,
     ) {
-        if (released.handle == 0L && released.tun == null && released.monitor == null && !released.stopForeground) {
+        if (released.handle == 0L && released.tun == null && released.monitor == null &&
+            released.idleReceiver == null && !released.stopForeground
+        ) {
             onDone?.invoke()
             return
         }
@@ -785,9 +896,13 @@ class BeamVpnService : VpnService() {
         val oldMonitor = monitor
         monitor = null
         oldMonitor?.markStopped()
+        val oldIdleReceiver = idleReceiver
+        idleReceiver = null
         pendingProfileId = null
         activeProfileId = null
         activeServerHost = null
+        activeServerIp = null
+        connectedSinceMs = 0L
         val h = activeEngine?.handle ?: 0L
         activeEngine = null
         val pfd = tun
@@ -796,6 +911,7 @@ class BeamVpnService : VpnService() {
             handle = h,
             tun = pfd,
             monitor = oldMonitor,
+            idleReceiver = oldIdleReceiver,
             stopForeground = !keepForeground,
             generation = connectGeneration.get(),
         )
@@ -803,6 +919,9 @@ class BeamVpnService : VpnService() {
 
     private fun releaseResources(released: ReleasedResources) {
         released.monitor?.unregister()
+        released.idleReceiver?.let { receiver ->
+            runCatching { unregisterReceiver(receiver) }
+        }
         if (released.handle != 0L) {
             try {
                 BeamNativeBridge.nativeStop(released.handle)
@@ -814,15 +933,55 @@ class BeamVpnService : VpnService() {
             released.tun?.close()
         } catch (_: Throwable) {
         }
-        // Only remove the foreground notification if no newer connect() superseded this teardown.
-        if (released.stopForeground && connectGeneration.get() == released.generation) {
-            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-                .onSuccess {
-                    synchronized(callbackLock) {
-                        lastNotifiedState = VpnState.DISCONNECTED
-                    }
+        // Only remove the foreground notification if no newer connect() superseded
+        // this teardown; callbackLock orders this against startForeground().
+        if (released.stopForeground) {
+            synchronized(callbackLock) {
+                if (connectGeneration.get() == released.generation) {
+                    runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+                        .onSuccess { lastNotifiedState = VpnState.DISCONNECTED }
                 }
+            }
         }
+    }
+
+    /**
+     * The native engine exited without a user disconnect. Restart it a bounded
+     * number of times with a short backoff while the foreground service stays
+     * up, then fall back to a full teardown.
+     */
+    private suspend fun handleUnexpectedEngineExit(myGen: Long) {
+        val retry = synchronized(stateLock) {
+            if (connectGeneration.get() != myGen || destroyed) return
+            val profileId = activeProfileId ?: return
+            // A tunnel that stayed up long enough earns a fresh retry budget.
+            if (connectedSinceMs != 0L &&
+                SystemClock.elapsedRealtime() - connectedSinceMs >= ENGINE_RETRY_RESET_AFTER_MS
+            ) {
+                engineRetryCount = 0
+            }
+            if (engineRetryCount >= ENGINE_RETRY_BACKOFF_MS.size) {
+                null
+            } else {
+                val backoffMs = ENGINE_RETRY_BACKOFF_MS[engineRetryCount]
+                engineRetryCount += 1
+                val attempt = engineRetryCount
+                // Release the dead engine and TUN, but keep the notification up.
+                val released = detachResources(keepForeground = true)
+                updateStateLocked(VpnState.CONNECTING, "")
+                EngineRetry(profileId, attempt, backoffMs, released)
+            }
+        } ?: run {
+            disconnect(expectedGen = myGen)
+            return
+        }
+        Log.i(TAG, "engine exited; retry ${retry.attempt} in ${retry.backoffMs} ms")
+        publishCurrentState()
+        scheduleRelease(retry.released)
+        delay(retry.backoffMs)
+        // connect() re-checks myGen under stateLock, so a user disconnect(),
+        // onRevoke(), onDestroy() or a newer connect() cancels this retry.
+        connect(retry.profileId, retryGen = myGen)
     }
 
     private fun refreshNativeState() {
@@ -857,17 +1016,14 @@ class BeamVpnService : VpnService() {
             } else {
                 if (reported != state) {
                     // Telemetry owns the state, not the detail: never forward a stale one.
-                    changed = updateStateLocked(
-                        reported,
-                        if (reported == VpnState.DEGRADED) "degraded" else "",
-                    )
+                    changed = updateStateLocked(reported, "")
                 }
                 false
             }
         }
         if (changed) publishCurrentState()
         if (shouldDisconnect) {
-            serviceScope.launch { disconnect(expectedGen = gen) }
+            serviceScope.launch { handleUnexpectedEngineExit(gen) }
         }
     }
 
