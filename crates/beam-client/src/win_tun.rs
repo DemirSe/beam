@@ -27,10 +27,10 @@ const TUNNEL_TYPE: &str = "Beam";
 /// Packets queued between the reader thread and the async receiver.
 ///
 /// Each queued item is one length-prefixed batch of up to 32 packets / 64 KiB
-/// (see `beam_tun::rx_batch`), so the worst-case queue footprint is
-/// `256 * 64 KiB = 16 MiB` plus framing, the same order as one max-size
-/// packet per slot before batching.
-const RX_QUEUE_CAPACITY: usize = 256;
+/// (see `beam_tun::rx_batch`). Eight slots keep the same 256-packet slack the
+/// pre-batching queue had (about 30 ms at 8.6k packets/s) instead of growing
+/// queueing delay 32x, and cap the footprint at 8 * 64 KiB.
+const RX_QUEUE_CAPACITY: usize = 8;
 
 /// Async handle to a WinTun adapter and its Layer 3 session.
 pub struct AsyncWinTun {
@@ -99,7 +99,7 @@ impl TunDevice for AsyncWinTun {
         loop {
             if let Some(packet) = self.decoder.next_packet() {
                 let len = copy_packet(packet, buf)?;
-                self.decoder.release_if_empty();
+                self.decoder.release_if_drained();
                 return Ok(len);
             }
             let Some(queue) = self.rx.as_mut() else {
@@ -115,27 +115,22 @@ impl TunDevice for AsyncWinTun {
     fn try_recv_into(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
         if let Some(packet) = self.decoder.next_packet() {
             let len = copy_packet(packet, buf)?;
-            self.decoder.release_if_empty();
+            self.decoder.release_if_drained();
             return Ok(Some(len));
         }
         let Some(queue) = self.rx.as_mut() else {
             return Ok(None);
         };
-        match queue.try_recv() {
-            Ok(batch) => {
-                self.decoder.push_batch(batch);
-                match self.decoder.next_packet() {
-                    Some(packet) => {
-                        let len = copy_packet(packet, buf)?;
-                        self.decoder.release_if_empty();
-                        Ok(Some(len))
-                    }
-                    // Only our own encoder produces batches, so an empty one
-                    // just means the next wakeup carries the packets.
-                    None => Ok(None),
-                }
-            }
-            Err(_) => Ok(None),
+        loop {
+            self.decoder.push_batch(queue.try_recv().ok()?);
+            let Some(packet) = self.decoder.next_packet() else {
+                // Only our own encoder produces batches, so an empty one just
+                // means the packets ride in a later message; keep draining.
+                continue;
+            };
+            let len = copy_packet(packet, buf)?;
+            self.decoder.release_if_drained();
+            return Ok(Some(len));
         }
     }
 

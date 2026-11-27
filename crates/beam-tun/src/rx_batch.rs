@@ -89,7 +89,7 @@ fn frame_count(batch: &[u8]) -> usize {
 /// The Windows adapter owns one of these: its reader thread pushes whole
 /// batches (`push_batch`) and the async side pops one packet at a time
 /// (`next_packet`). A fully consumed batch releases its buffer
-/// (`release_if_empty`), so steady state holds at most one batch (~64 KiB)
+/// (`release_if_drained`), so steady state holds at most one batch (~64 KiB)
 /// outside the bounded queue.
 #[derive(Debug, Default)]
 pub struct BatchDecoder {
@@ -104,10 +104,15 @@ impl BatchDecoder {
         Self::default()
     }
 
-    /// Replaces the batch under decode, dropping any undecoded remainder
-    /// (only our own encoder produces batches, so a remainder means the
-    /// previous batch ended in a corrupt tail).
+    /// Replaces the batch under decode. Any undecoded remainder means the
+    /// previous batch ended in a corrupt tail: only our own encoder produces
+    /// batches, so this is unreachable outside memory corruption.
     pub fn push_batch(&mut self, batch: Vec<u8>) {
+        debug_assert!(
+            self.batch.is_empty() || self.off >= self.batch.len(),
+            "replacing a half-consumed batch drops {} undecoded bytes",
+            self.batch.len().saturating_sub(self.off)
+        );
         self.batch = batch;
         self.off = 0;
     }
@@ -118,12 +123,21 @@ impl BatchDecoder {
         pop_frame(&self.batch, &mut self.off)
     }
 
-    /// Frees the batch buffer once fully consumed.
-    pub fn release_if_empty(&mut self) {
-        if self.off >= self.batch.len() {
+    /// Frees the batch buffer once it holds no complete frame.
+    ///
+    /// A corrupt tail can never become a frame, so it is released here too
+    /// instead of pinning up to [`RX_BATCH_MAX_BYTES`] until the next batch.
+    pub fn release_if_drained(&mut self) {
+        if self.off >= self.batch.len() || !self.has_complete_frame() {
             self.batch = Vec::new();
             self.off = 0;
         }
+    }
+
+    /// True when a whole frame remains at the current offset.
+    fn has_complete_frame(&self) -> bool {
+        let mut probe = self.off;
+        pop_frame(&self.batch, &mut probe).is_some()
     }
 }
 
@@ -219,10 +233,31 @@ mod tests {
         assert_eq!(dec.next_packet(), Some(first[0].as_slice()));
         assert_eq!(dec.next_packet(), Some(first[1].as_slice()));
         assert_eq!(dec.next_packet(), None);
-        dec.release_if_empty();
+        dec.release_if_drained();
         dec.push_batch(second);
         assert_eq!(dec.next_packet(), Some([9, 9, 9, 9].as_slice()));
-        dec.release_if_empty();
+        dec.release_if_drained();
+        assert_eq!(dec.next_packet(), None);
+    }
+
+    #[test]
+    fn corrupt_tail_is_released_instead_of_pinned() {
+        // A truncated tail can never become a frame, so the decoder must drop
+        // the buffer instead of pinning it until the next batch arrives.
+        let mut enc = Vec::new();
+        assert!(push_frame(&mut enc, &[1, 2, 3]));
+        enc.push(0x00); // length byte with no payload behind it
+        let mut dec = BatchDecoder::new();
+        dec.push_batch(enc);
+        assert_eq!(dec.next_packet(), Some([1u8, 2, 3].as_slice()));
+        assert_eq!(dec.next_packet(), None);
+        dec.release_if_drained();
+        // `push_batch` debug-asserts that no half-consumed batch is replaced,
+        // so reaching the next line proves the release reset the offset.
+        let mut next = Vec::new();
+        assert!(push_frame(&mut next, &[7, 7]));
+        dec.push_batch(next);
+        assert_eq!(dec.next_packet(), Some([7u8, 7].as_slice()));
         assert_eq!(dec.next_packet(), None);
     }
 
