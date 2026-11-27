@@ -13,6 +13,11 @@ on:
         required: false
         default: false
         type: boolean
+      compare_singbox:
+        description: 'Run head-to-head comparison against sing-box.exe'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -129,13 +134,46 @@ jobs:
           }
           Write-Host 'Live secret is present; starting the live end-to-end run.'
 
+      - name: Download and verify sing-box 1.14.4 (Windows amd64)
+        if: inputs.compare_singbox
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Pinned to the same sing-box version as interop.yml / lab-hosted.yml.
+          $version = '1.14.4'
+          $expectedZipSha256 = '99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df'
+          $sbZip = Join-Path $env:RUNNER_TEMP 'sing-box-windows-amd64.zip'
+          $sbDir = Join-Path $env:RUNNER_TEMP 'sing-box-extracted'
+          Invoke-WebRequest -Uri "https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-windows-amd64.zip" -OutFile $sbZip
+          $actual = (Get-FileHash -Path $sbZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expectedZipSha256) {
+            throw "sing-box zip SHA-256 mismatch: got $actual, expected $expectedZipSha256"
+          }
+          Write-Host "Verified sing-box zip SHA-256: $actual"
+          if (Test-Path $sbDir) { Remove-Item -Recurse -Force $sbDir }
+          Expand-Archive -Path $sbZip -DestinationPath $sbDir -Force
+          $exe = Get-ChildItem -Path $sbDir -Filter 'sing-box.exe' -Recurse |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { throw 'sing-box.exe not found in the release zip' }
+          Add-Content -Path $env:GITHUB_ENV -Value "SINGBOX_EXE=$exe"
+
       - name: Live end-to-end run (disconnects and uninstalls even on failure)
+        if: ${{ !inputs.compare_singbox }}
         shell: pwsh
         env:
           BEAM_LIVE_VLESS_LINK: ${{ secrets.BEAM_LIVE_VLESS_LINK }}
         run: |
           $extracted = Join-Path $env:RUNNER_TEMP 'windows-live-e2e\extracted'
           pwsh -NoProfile -File scripts/windows-live-e2e.ps1 -PackageDir $extracted
+
+      - name: Live head-to-head run (beam-client vs sing-box, sequential)
+        if: inputs.compare_singbox
+        shell: pwsh
+        env:
+          BEAM_LIVE_VLESS_LINK: ${{ secrets.BEAM_LIVE_VLESS_LINK }}
+        run: |
+          $extracted = Join-Path $env:RUNNER_TEMP 'windows-live-e2e\extracted'
+          pwsh -NoProfile -File scripts/windows-vs-singbox.ps1 -PackageDir $extracted -SingboxExe $env:SINGBOX_EXE -CompareSingbox
 
       - name: Upload client logs on failure
         if: failure() && inputs.keep_logs_on_failure
