@@ -274,8 +274,10 @@ installer exits nonzero and keeps the snapshot under
 service installed but neither enabled nor started. The installer parses the
 `systemctl is-enabled` state before it takes the pre-install snapshot. It
 refuses a masked unit before the backup, so the abort changes no live file or
-unit state. On rollback it restores only `enabled` and `enabled-runtime`. It
-does not enable a `static` unit. It disables an inherited unit on success.
+unit state. On rollback it restores only `enabled` and `enabled-runtime`; an
+`enabled-runtime` unit is re-enabled with `systemctl enable --runtime`, not
+persistently. It does not enable a `static` unit. It disables an inherited
+unit on success.
 Before it replaces the profile, the installer keeps a
 timestamped copy at `/etc/beam/config.json.bak-<time>` with mode 0600. After the
 install succeeds, it keeps the three newest generated copies. It does not prune

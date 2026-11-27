@@ -227,7 +227,7 @@ check_restore_state() {
   local state="$1" want="$2" rc
   : > "$TMP/enable.log"
   (
-    systemctl() { printf '%s %s\n' "$1" "$2" >> "$TMP/enable.log"; }
+    systemctl() { printf '%s\n' "$*" >> "$TMP/enable.log"; }
     eval "$restore_body"
     restore_unit_enablement beam-client.service "$state"
   ) >/dev/null 2>&1 && rc=0 || rc=$?
@@ -256,7 +256,7 @@ check_restore_state() {
   esac
 }
 check_restore_state enabled 'enable beam-client.service'
-check_restore_state enabled-runtime 'enable beam-client.service'
+check_restore_state enabled-runtime 'enable --runtime beam-client.service'
 check_restore_state static 'disable beam-client.service'
 check_restore_state disabled 'disable beam-client.service'
 

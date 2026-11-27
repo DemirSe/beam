@@ -237,9 +237,15 @@ unit_enable_state() {
 restore_unit_enablement() {
     local unit="$1" state="$2"
     case "$state" in
-        enabled|enabled-runtime)
+        enabled)
             if ! systemctl enable "$unit" >/dev/null 2>&1; then
                 echo "installer: could not restore $unit enablement" >&2
+                return 1
+            fi
+            ;;
+        enabled-runtime)
+            if ! systemctl enable --runtime "$unit" >/dev/null 2>&1; then
+                echo "installer: could not restore $unit runtime enablement" >&2
                 return 1
             fi
             ;;
