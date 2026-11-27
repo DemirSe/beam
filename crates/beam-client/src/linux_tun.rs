@@ -360,70 +360,73 @@ impl LinuxRouteGuard {
     ///
     /// A lookup that cannot be completed ([`RouteCheck::Error`]) counts as
     /// missing (fail-closed): the monitor keeps retrying, while the rate-limited
-    /// warning from `has_exact_route` carries the reason once per window.
+    /// warning from the route snapshot carries the reason once per window.
     pub fn bypass_routes_installed(&self) -> bool {
-        self.bypass_routes_installed_with(has_exact_route)
+        let snapshot = RouteSnapshot::load();
+        self.bypass_routes_installed_with(&self.current_gw, self.local_dns_ip, |flag, prefix| {
+            snapshot.check(flag, prefix)
+        })
+        .is_installed()
     }
 
-    fn bypass_routes_installed_with<F>(&self, mut check: F) -> bool
+    fn bypass_routes_installed_with<F>(
+        &self,
+        gw: &PhysicalGateways,
+        local_dns: Option<IpAddr>,
+        mut check: F,
+    ) -> BypassRouteState
     where
         F: FnMut(&str, &str) -> RouteCheck,
     {
         if !self.auto_route {
-            return true;
+            return BypassRouteState::Installed;
         }
-        if !self.server_ip.is_loopback()
-            && gateway_for_ip(&self.current_gw, self.server_ip).is_some()
-        {
+        let mut state = BypassRouteState::Installed;
+        let mut checked = |flag: &str, prefix: &str| {
+            let result = check(flag, prefix);
+            if let Some(err) = result.error() {
+                debug!(prefix = %prefix, error = %err, "bypass route lookup unresolved");
+            }
+            result
+        };
+        if !self.server_ip.is_loopback() && gateway_for_ip(gw, self.server_ip).is_some() {
             if self.server_bypass_route.is_none() && !self.server_bypass_preexisting {
-                return false;
+                return BypassRouteState::Absent;
             }
             let (flag, prefix) = host_route_args(self.server_ip);
-            if !check(flag, &prefix).is_present() {
-                return false;
-            }
+            state = state.merge(checked(flag, &prefix).into());
         }
-        if let Some(dns_ip) = self.local_dns_ip
+        if let Some(dns_ip) = local_dns
             && !dns_ip.is_loopback()
             && dns_ip != self.server_ip
             && !self.is_in_tun_subnet(dns_ip)
-            && gateway_for_ip(&self.current_gw, dns_ip).is_some()
+            && gateway_for_ip(gw, dns_ip).is_some()
         {
             if self.local_dns_bypass_route.is_none() && !self.local_dns_bypass_preexisting {
-                return false;
+                return BypassRouteState::Absent;
             }
             let (flag, prefix) = host_route_args(dns_ip);
-            if !check(flag, &prefix).is_present() {
-                return false;
-            }
+            state = state.merge(checked(flag, &prefix).into());
         }
-        if self.current_gw.v4.is_some() {
+        if gw.v4.is_some() {
             for cidr in &self.configured_bypass_v4 {
-                if !check("-4", cidr).is_present() {
-                    return false;
-                }
+                state = state.merge(checked("-4", cidr).into());
             }
             for &(ip, _) in &self.dynamic_bypass_v4 {
                 let prefix = format!("{ip}/32");
-                if !check("-4", &prefix).is_present() {
-                    return false;
-                }
+                state = state.merge(checked("-4", &prefix).into());
             }
         }
-        if self.current_gw.v6.is_some() {
+        if gw.v6.is_some() {
             for cidr in &self.configured_bypass_v6 {
-                if !check("-6", cidr).is_present() {
-                    return false;
-                }
+                state = state.merge(checked("-6", cidr).into());
             }
             for &(ip, _) in &self.dynamic_bypass_v6 {
                 let prefix = format!("{ip}/128");
-                if !check("-6", &prefix).is_present() {
-                    return false;
-                }
+                state = state.merge(checked("-6", &prefix).into());
             }
         }
-        true
+        state
     }
 
     /// Expires tracked dynamic bypass routes on a quiet host. DNS hits still
@@ -454,13 +457,13 @@ impl LinuxRouteGuard {
         if !self.auto_route {
             return true;
         }
-        let server_check = (!self.server_ip.is_loopback()).then(|| has_host_route(self.server_ip));
-        let dns_check = new_local_dns
-            .filter(|ip| Some(*ip) == self.local_dns_ip)
-            .map(has_host_route);
-        let lookup_failed = server_check.as_ref().is_some_and(|c| c.error().is_some())
-            || dns_check.as_ref().is_some_and(|c| c.error().is_some());
-        if lookup_failed {
+        let snapshot = RouteSnapshot::load();
+        let state = self.bypass_routes_installed_with(new_gw, new_local_dns, |flag, prefix| {
+            snapshot.check(flag, prefix)
+        });
+        // A genuine miss authorizes the reinstall. When every unresolved route
+        // is an error, keep the last-known routes and let the caller retry.
+        if state == BypassRouteState::Error {
             return false;
         }
 
@@ -487,13 +490,15 @@ impl LinuxRouteGuard {
 
         self.current_gw = new_gw.clone();
         self.local_dns_ip = new_local_dns;
+        let recheck = RouteSnapshot::load();
 
         if !self.server_ip.is_loopback()
             && let Some((maybe_gw, dev)) = gateway_for_ip(new_gw, self.server_ip)
         {
             // Re-check after removing our own route: only a route that is still
             // present here was pre-existing and must be preserved.
-            match has_host_route(self.server_ip) {
+            let (flag, prefix) = host_route_args(self.server_ip);
+            match recheck.check(flag, &prefix) {
                 RouteCheck::Present => {
                     info!(ip = %self.server_ip, "preserving pre-existing exact route for beam server");
                     self.server_bypass_preexisting = true;
@@ -522,7 +527,8 @@ impl LinuxRouteGuard {
             && !self.is_in_tun_subnet(dns_ip)
             && let Some((maybe_gw, dev)) = gateway_for_ip(new_gw, dns_ip)
         {
-            match has_host_route(dns_ip) {
+            let (flag, prefix) = host_route_args(dns_ip);
+            match recheck.check(flag, &prefix) {
                 RouteCheck::Present => {
                     debug!(ip = %dns_ip, "preserving pre-existing exact route for local DNS");
                     self.local_dns_bypass_preexisting = true;
@@ -544,7 +550,7 @@ impl LinuxRouteGuard {
 
         if let Some((maybe_gw, dev)) = new_gw.v4.as_ref() {
             for cidr_entry in &self.configured_bypass_v4 {
-                if has_exact_route("-4", cidr_entry).is_present() {
+                if recheck.check("-4", cidr_entry).is_present() {
                     debug!(cidr = %cidr_entry, "preserving pre-existing exact IPv4 route");
                     continue;
                 }
@@ -557,7 +563,7 @@ impl LinuxRouteGuard {
             }
             for &(ip, _) in &self.dynamic_bypass_v4 {
                 let host = format!("{ip}/32");
-                if has_exact_route("-4", &host).is_present() {
+                if recheck.check("-4", &host).is_present() {
                     debug!(prefix = %host, "preserving pre-existing exact IPv4 route");
                     continue;
                 }
@@ -571,7 +577,7 @@ impl LinuxRouteGuard {
 
         if let Some((maybe_gw, dev)) = new_gw.v6.as_ref() {
             for cidr_entry in &self.configured_bypass_v6 {
-                if has_exact_route("-6", cidr_entry).is_present() {
+                if recheck.check("-6", cidr_entry).is_present() {
                     debug!(cidr = %cidr_entry, "preserving pre-existing exact IPv6 route");
                     continue;
                 }
@@ -584,7 +590,7 @@ impl LinuxRouteGuard {
             }
             for &(ip, _) in &self.dynamic_bypass_v6 {
                 let host = format!("{ip}/128");
-                if has_exact_route("-6", &host).is_present() {
+                if recheck.check("-6", &host).is_present() {
                     debug!(prefix = %host, "preserving pre-existing exact IPv6 route");
                     continue;
                 }
@@ -1268,9 +1274,100 @@ fn host_route_args(ip: IpAddr) -> (&'static str, String) {
     }
 }
 
-fn has_host_route(ip: IpAddr) -> RouteCheck {
-    let (flag, prefix) = host_route_args(ip);
-    has_exact_route(flag, &prefix)
+/// Distinguishes a known missing bypass route from an unresolved lookup, so a
+/// transient `ip` failure cannot be mistaken for a real miss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BypassRouteState {
+    Installed,
+    Absent,
+    Error,
+}
+
+impl BypassRouteState {
+    fn is_installed(self) -> bool {
+        matches!(self, Self::Installed)
+    }
+
+    /// A known miss wins over an unknown lookup; otherwise any error wins.
+    fn merge(self, other: Self) -> Self {
+        use BypassRouteState as State;
+        match (self, other) {
+            (State::Absent, _) | (_, State::Absent) => State::Absent,
+            (State::Error, _) | (_, State::Error) => State::Error,
+            _ => State::Installed,
+        }
+    }
+}
+
+impl From<RouteCheck> for BypassRouteState {
+    fn from(check: RouteCheck) -> Self {
+        match check {
+            RouteCheck::Present => Self::Installed,
+            RouteCheck::Absent => Self::Absent,
+            RouteCheck::Error(_) => Self::Error,
+        }
+    }
+}
+
+/// One `ip route show` snapshot per family, used for all bypass checks in a
+/// reconcile pass so the number of `ip` calls does not grow with table size.
+struct RouteSnapshot {
+    v4: Result<String, String>,
+    v6: Result<String, String>,
+}
+
+impl RouteSnapshot {
+    fn load() -> Self {
+        Self {
+            v4: Self::load_family("-4"),
+            v6: Self::load_family("-6"),
+        }
+    }
+
+    fn load_family(family_flag: &str) -> Result<String, String> {
+        let bin = ip_binary().map_err(|err| err.to_string())?;
+        let output = spawn_ip_child(
+            bin,
+            &[family_flag, "route", "show"],
+            Instant::now() + IP_CHILD_DEADLINE,
+        )
+        .map_err(|err| err.to_string())?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        if detail.is_empty() {
+            Err(format!(
+                "`ip {family_flag} route show` exited with {}",
+                output.status
+            ))
+        } else {
+            Err(format!(
+                "`ip {family_flag} route show` exited with {}: {detail}",
+                output.status
+            ))
+        }
+    }
+
+    fn check(&self, family_flag: &str, prefix: &str) -> RouteCheck {
+        let table = if family_flag == "-4" {
+            &self.v4
+        } else {
+            &self.v6
+        };
+        match table {
+            Ok(output) if route_snapshot_has_prefix(output, prefix) => RouteCheck::Present,
+            Ok(_) => RouteCheck::Absent,
+            Err(err) => route_check_error(prefix, io::Error::other(err.clone())),
+        }
+    }
+}
+
+fn route_snapshot_has_prefix(output: &str, prefix: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.split_whitespace().any(|word| word == prefix))
 }
 
 /// Result of an exact-route lookup, distinguishing a missing route from a
@@ -1351,7 +1448,7 @@ fn route_check_error(prefix: &str, err: io::Error) -> RouteCheck {
             error = %err,
             kind = ?err.kind(),
             suppressed,
-            "exact route lookup failed; treating the route as absent"
+            "exact route lookup failed; route state is unknown"
         );
     }
     RouteCheck::Error(err)
@@ -1694,45 +1791,108 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
     }
 
     #[test]
-    fn failed_cidr_install_is_reported_missing_and_retried_on_the_next_tick() {
-        let dir = test_dir("cidr");
+    fn all_error_tick_skips_drain_and_a_real_miss_reinstalls() {
+        let dir = test_dir("route-snapshot");
         let log = dir.join("ip.log");
-        let present = dir.join("present");
+        let error = dir.join("error");
         let fake = FakeIp::new_in(
             dir,
             &format!(
                 "#!/bin/sh\n\
                  printf '%s\\n' \"$*\" >> \"{}\"\n\
                  case \"$*\" in\n\
-                   *\"route show exact 198.51.100.0/24\"*) [ -f \"{}\" ] || exit 2; echo \"198.51.100.0/24 dev eth0\" ;;\n\
+                   *\"route show\"*) [ -f \"{}\" ] && exit 2 ;;\n\
                  esac\n\
                  exit 0\n",
                 log.display(),
-                present.display(),
+                error.display(),
+            ),
+        );
+        std::fs::write(&error, b"1").expect("mark lookup errors");
+
+        let cidr = "198.51.100.0/24";
+        let mut guard = route_guard_for_tests();
+        guard.configured_bypass_v4.push(cidr.to_owned());
+        guard.extra_bypass_v4.push((
+            cidr.to_owned(),
+            Some("192.168.1.1".to_owned()),
+            "eth0".to_owned(),
+        ));
+        guard.server_bypass_route = Some((
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Some("192.168.1.1".to_owned()),
+            "eth0".to_owned(),
+        ));
+        let gw = guard.current_gw.clone();
+
+        assert!(!guard.bypass_routes_installed(), "error is not a real miss");
+        assert!(
+            !guard.update_bypass_gateway(&gw, None),
+            "an all-error tick must leave the retry pending"
+        );
+        let first = read_fake_ip_log(&fake.log_path());
+        assert!(
+            !first.contains("route del"),
+            "all-error tick drained: {first}"
+        );
+        assert!(
+            !first.contains("route replace 198.51.100.0/24"),
+            "all-error tick reinstalled: {first}"
+        );
+        assert_eq!(guard.extra_bypass_v4.len(), 1);
+        assert!(guard.server_bypass_route.is_some());
+
+        std::fs::remove_file(&error).expect("clear lookup error");
+        assert!(
+            !guard.bypass_routes_installed(),
+            "an empty snapshot is a real miss"
+        );
+        assert!(guard.update_bypass_gateway(&gw, None));
+        let all = read_fake_ip_log(&fake.log_path());
+        let reinstall = &all[first.len().min(all.len())..];
+        assert!(
+            reinstall.contains("route del 198.51.100.0/24"),
+            "a real miss must drain the tracked route: {reinstall}"
+        );
+        assert!(
+            reinstall.contains("route replace 198.51.100.0/24"),
+            "a real miss must reinstall: {reinstall}"
+        );
+        assert!(
+            guard
+                .extra_bypass_v4
+                .iter()
+                .any(|(prefix, _, _)| prefix == cidr)
+        );
+    }
+
+    #[test]
+    fn route_snapshot_bounds_ip_calls_for_large_tables() {
+        let dir = test_dir("snapshot-bound");
+        let log = dir.join("ip.log");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+                log.display()
             ),
         );
         let mut guard = route_guard_for_tests();
-        guard
-            .configured_bypass_v4
-            .push("198.51.100.0/24".to_owned());
-        assert!(
-            !guard.bypass_routes_installed(),
-            "a failed exact-route lookup must stay missing for retry"
-        );
+        guard.current_gw.v6 = Some((Some("fe80::1".to_owned()), "eth0".to_owned()));
+        for i in 0..256 {
+            guard.configured_bypass_v4.push(format!("198.18.{i}.0/24"));
+            guard
+                .configured_bypass_v6
+                .push(format!("2001:db8:{i:x}::/64"));
+        }
 
-        let gw = guard.current_gw.clone();
-        assert!(guard.update_bypass_gateway(&gw, None));
-        std::fs::write(&present, b"1").expect("mark retried route present");
-        let next_tick_ok = guard.bypass_routes_installed();
+        assert!(!guard.bypass_routes_installed());
         let log = read_fake_ip_log(&fake.log_path());
-        assert!(
-            next_tick_ok,
-            "the next health tick must see the retried CIDR: {log}"
-        );
-        assert!(
-            log.contains("route replace 198.51.100.0/24"),
-            "the reconcile must retry the failed CIDR: {log}"
-        );
+        let shows = log
+            .lines()
+            .filter(|line| line.contains("route show"))
+            .count();
+        assert_eq!(shows, 2, "one snapshot per family, not per CIDR: {log}");
     }
 
     #[test]
