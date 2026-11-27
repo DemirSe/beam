@@ -116,7 +116,8 @@
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/connectButton"
                     android:layout_width="match_parent"
-                    android:layout_height="56dp"
+                    android:layout_height="wrap_content"
+                    android:minHeight="56dp"
                     android:layout_marginTop="16dp"
                     android:text="@string/action_connect"
                     app:icon="@drawable/ic_vpn_key"

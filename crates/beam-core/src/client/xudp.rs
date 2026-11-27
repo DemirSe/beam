@@ -109,6 +109,8 @@ struct SessionTable {
     sessions: HashMap<u16, SessionEntry>,
     max_sessions: usize,
     closed: bool,
+    /// Shared with [`XudpClient`] so `is_open` needs no table lock.
+    closed_flag: Arc<AtomicBool>,
 }
 
 /// One registered session: its reply queue and the drops the mux reader charged
@@ -120,12 +122,13 @@ struct SessionEntry {
 }
 
 impl SessionTable {
-    fn new(max_sessions: usize) -> Self {
+    fn new(max_sessions: usize, closed_flag: Arc<AtomicBool>) -> Self {
         Self {
             next_id: 1,
             sessions: HashMap::new(),
             max_sessions: max_sessions.max(1),
             closed: false,
+            closed_flag,
         }
     }
 
@@ -194,6 +197,9 @@ impl SessionTable {
 
     fn close_all(&mut self) {
         self.closed = true;
+        // Publish first: once any close path starts, `is_open` must report a
+        // closed mux even while this lock is still held.
+        self.closed_flag.store(true, Ordering::Release);
         for (_, entry) in self.sessions.drain() {
             entry.live.store(false, Ordering::Release);
         }
@@ -286,6 +292,9 @@ pub async fn run_writer<W: AsyncWriteExt + Unpin>(
 /// Multiplexed XUDP client running over one VLESS `Command::Mux` stream.
 pub struct XudpClient {
     table: Arc<Mutex<SessionTable>>,
+    /// Set by [`SessionTable::close_all`], the single close path, so `is_open`
+    /// never waits for the session-table mutex.
+    closed: Arc<AtomicBool>,
     outbound_tx: Option<mpsc::Sender<Vec<u8>>>,
     reply_queue: usize,
     reader_task: JoinHandle<()>,
@@ -301,7 +310,11 @@ impl XudpClient {
         let stream = dial_vless(config, Command::Mux, Addons::empty(), None).await?;
         let (mut read_half, mut write_half) = tokio::io::split(stream);
 
-        let table = Arc::new(Mutex::new(SessionTable::new(xudp_config.max_sessions)));
+        let closed = Arc::new(AtomicBool::new(false));
+        let table = Arc::new(Mutex::new(SessionTable::new(
+            xudp_config.max_sessions,
+            Arc::clone(&closed),
+        )));
         let (outbound_tx, mut outbound_rx) =
             mpsc::channel::<Vec<u8>>(xudp_config.outbound_queue.max(1));
         let (closed_tx, mut writer_closed_rx) = watch::channel(false);
@@ -367,15 +380,19 @@ impl XudpClient {
                                             .ok()
                                             .and_then(|t| t.reply_target(frame.session_id));
                                         if let Some((tx, dropped_replies)) = target {
-                                            match tx.try_send(XudpReply {
-                                                source: frame.destination,
-                                                payload: frame.payload.to_vec(),
-                                            }) {
-                                                Ok(()) => {}
-                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                            // Reserve first: a full or closed reply
+                                            // queue must not allocate a payload.
+                                            match tx.try_reserve() {
+                                                Ok(permit) => {
+                                                    permit.send(XudpReply {
+                                                        source: frame.destination,
+                                                        payload: frame.payload.to_vec(),
+                                                    });
+                                                }
+                                                Err(mpsc::error::TrySendError::Full(())) => {
                                                     dropped_replies.fetch_add(1, Ordering::Relaxed);
                                                 }
-                                                Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                                Err(mpsc::error::TrySendError::Closed(())) => {}
                                             }
                                         }
                                     }
@@ -413,6 +430,7 @@ impl XudpClient {
 
         Ok(Self {
             table,
+            closed,
             outbound_tx: Some(outbound_tx),
             reply_queue: xudp_config.reply_queue.max(1),
             reader_task,
@@ -421,9 +439,12 @@ impl XudpClient {
     }
 
     /// Returns `true` if the underlying mux stream is still open.
+    ///
+    /// Lock-free on purpose: the TUN and DNS fast paths call this per datagram,
+    /// and a poisoned, contended table mutex must not turn into a false close.
     pub fn is_open(&self) -> bool {
         self.outbound_tx.as_ref().is_some_and(|tx| !tx.is_closed())
-            && self.table.lock().map(|t| !t.closed).unwrap_or(false)
+            && !self.closed.load(Ordering::Acquire)
     }
 
     /// Opens a new UDP session targeting `destination`.
@@ -447,6 +468,7 @@ impl XudpClient {
             reply_rx,
             dropped_replies,
             live,
+            header_buf: Vec::with_capacity(FRAME_HEADER_RESERVE),
         })
     }
 
@@ -500,6 +522,8 @@ pub struct XudpSession {
     dropped_replies: Arc<AtomicU64>,
     /// Cleared by the mux when the session is removed, so liveness needs no lock.
     live: Arc<AtomicBool>,
+    /// Reused by every owned send so a frame header never allocates.
+    header_buf: Vec<u8>,
 }
 
 impl XudpSession {
@@ -571,8 +595,15 @@ impl XudpSession {
             }
             Err(mpsc::error::TrySendError::Closed(())) => return Err(XudpClientError::Closed),
         };
+        let status = self.next_status();
         // A dropped permit returns the reserved slot to the queue.
-        let frame = self.encode_frame_owned(destination, payload)?;
+        let frame = Self::encode_frame_owned(
+            &mut self.header_buf,
+            self.session_id,
+            status,
+            destination,
+            payload,
+        )?;
         permit.send(frame);
         self.sent_new = true;
         Ok(())
@@ -580,7 +611,7 @@ impl XudpSession {
 
     /// Encodes one owned payload into a mux frame without queueing it.
     fn encode_owned(
-        &self,
+        &mut self,
         destination: NetLocation,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, XudpClientError> {
@@ -593,22 +624,38 @@ impl XudpSession {
                 max: MAX_PAYLOAD_LEN,
             });
         }
-        self.encode_frame_owned(destination, payload)
+        let status = self.next_status();
+        Self::encode_frame_owned(
+            &mut self.header_buf,
+            self.session_id,
+            status,
+            destination,
+            payload,
+        )
     }
 
-    /// Prepends the frame header to an already validated owned payload.
-    fn encode_frame_owned(
-        &self,
-        destination: NetLocation,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>, XudpClientError> {
-        let status = if self.sent_new {
+    fn next_status(&self) -> SessionStatus {
+        if self.sent_new {
             SessionStatus::Keep
         } else {
             SessionStatus::New
-        };
+        }
+    }
+
+    /// Prepends the frame header to an already validated owned payload.
+    ///
+    /// Takes its pieces instead of `&mut self` so [`Self::try_send_owned`] can
+    /// hold a reserved outbound queue permit while it encodes, and so the
+    /// session's header buffer is borrowed without touching the sender.
+    fn encode_frame_owned(
+        header_buf: &mut Vec<u8>,
+        session_id: u16,
+        status: SessionStatus,
+        destination: NetLocation,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, XudpClientError> {
         let spec = FrameSpec {
-            session_id: self.session_id,
+            session_id,
             status,
             option: FrameOption::DATA,
             network: Some(TargetNetwork::Udp),
@@ -616,14 +663,15 @@ impl XudpSession {
             global_id: None,
             payload: &[],
         };
-        let mut header = Vec::with_capacity(FRAME_HEADER_RESERVE);
-        encode_frame_header(&mut header, spec, payload.len())?;
+        header_buf.clear();
+        encode_frame_header(header_buf, spec, payload.len())?;
+        let header_len = header_buf.len();
         let mut frame = payload;
         let body_len = frame.len();
-        frame.reserve(header.len());
-        frame.resize(body_len + header.len(), 0);
-        frame.copy_within(0..body_len, header.len());
-        frame[..header.len()].copy_from_slice(&header);
+        frame.reserve(header_len);
+        frame.resize(body_len + header_len, 0);
+        frame.copy_within(0..body_len, header_len);
+        frame[..header_len].copy_from_slice(header_buf);
         Ok(frame)
     }
 
@@ -658,11 +706,7 @@ impl XudpSession {
                 max: MAX_PAYLOAD_LEN,
             });
         }
-        let status = if self.sent_new {
-            SessionStatus::Keep
-        } else {
-            SessionStatus::New
-        };
+        let status = self.next_status();
         let network = destination.as_ref().map(|_| TargetNetwork::Udp);
         let spec = FrameSpec {
             session_id: self.session_id,
@@ -802,7 +846,10 @@ mod tests {
         mpsc::Receiver<Vec<u8>>,
         Arc<Mutex<SessionTable>>,
     ) {
-        let table = Arc::new(Mutex::new(SessionTable::new(4)));
+        let table = Arc::new(Mutex::new(SessionTable::new(
+            4,
+            Arc::new(AtomicBool::new(false)),
+        )));
         let (reply_tx, reply_rx) = mpsc::channel(4);
         let (session_id, dropped_replies, live) = table
             .lock()
@@ -820,6 +867,7 @@ mod tests {
                 reply_rx,
                 dropped_replies,
                 live,
+                header_buf: Vec::with_capacity(FRAME_HEADER_RESERVE),
             },
             outbound_rx,
             table,
@@ -930,7 +978,10 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_replies_flow_while_the_outbound_queue_is_full() {
-        let table = Arc::new(Mutex::new(SessionTable::new(4)));
+        let table = Arc::new(Mutex::new(SessionTable::new(
+            4,
+            Arc::new(AtomicBool::new(false)),
+        )));
         let (reply_tx, reply_rx) = mpsc::channel(4);
         reply_tx
             .try_send(XudpReply {
@@ -954,6 +1005,7 @@ mod tests {
             reply_rx,
             dropped_replies,
             live,
+            header_buf: Vec::with_capacity(FRAME_HEADER_RESERVE),
         };
 
         // The full mux queue must fail fast instead of stalling the caller, so
@@ -1100,6 +1152,97 @@ mod tests {
     }
 
     #[test]
+    fn encode_owned_reuses_one_header_buffer() {
+        let (mut session, _rx, _table) = new_test_session();
+        let dest4 = test_dest(false);
+        let dest6 = test_dest(true);
+
+        // First frame on the session is `New`; later ones are `Keep`.
+        let new_frame = session
+            .encode_owned(dest4.clone(), alloc_owned(b"new"))
+            .expect("encode New frame");
+        let capacity = session.header_buf.capacity();
+        assert!(
+            (FRAME_HEADER_RESERVE..=FRAME_HEADER_RESERVE * 2).contains(&capacity),
+            "the header buffer must stay within the reserved size, got {capacity}"
+        );
+        // `encode_owned` does not queue, so mark the session opened by hand,
+        // exactly as `send_owned` does after a successful send.
+        session.sent_new = true;
+        let keep_frame = session
+            .encode_owned(dest6.clone(), alloc_owned(b"keep"))
+            .expect("encode Keep frame");
+        assert_eq!(
+            session.header_buf.capacity(),
+            capacity,
+            "a reused header buffer must not reallocate"
+        );
+        assert_eq!(
+            session.header_buf.len(),
+            keep_frame.len() - b"keep".len(),
+            "the buffer holds exactly one frame header per call"
+        );
+
+        assert_eq!(
+            new_frame,
+            expected_data_frame(SessionStatus::New, &dest4, b"new")
+        );
+        assert_eq!(
+            keep_frame,
+            expected_data_frame(SessionStatus::Keep, &dest6, b"keep")
+        );
+        let decoded_new = decode_all_frames(&new_frame);
+        assert_eq!(decoded_new, vec![(session.session_id, b"new".to_vec())]);
+        let decoded_keep = decode_all_frames(&keep_frame);
+        assert_eq!(decoded_keep, vec![(session.session_id, b"keep".to_vec())]);
+
+        // The reserving path shares the same buffer and framing.
+        session
+            .try_send_owned(dest4.clone(), alloc_owned(b"perm"))
+            .expect("encode with a reserved queue slot");
+        assert_eq!(session.header_buf.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn is_open_tracks_shutdown_without_the_table_lock() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let table = Arc::new(Mutex::new(SessionTable::new(1, Arc::clone(&closed))));
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<Vec<u8>>(1);
+        // A real reader task is not needed: exit is signalled through `closed`.
+        let reader_task = tokio::spawn(std::future::pending::<()>());
+        let mut client = XudpClient {
+            table: Arc::clone(&table),
+            closed: Arc::clone(&closed),
+            outbound_tx: Some(outbound_tx),
+            reply_queue: 1,
+            reader_task,
+            writer_task: None,
+        };
+        assert!(client.is_open());
+
+        // Losing the outbound sender closes the mux on its own.
+        let outbound_tx = client.outbound_tx.take();
+        assert!(
+            !client.is_open(),
+            "is_open must be false without an outbound sender"
+        );
+        client.outbound_tx = outbound_tx;
+        assert!(client.is_open());
+
+        // `close_all` is the one close path; it publishes the lock-free flag.
+        table.lock().expect("table").close_all();
+        assert!(closed.load(Ordering::Acquire));
+        assert!(!client.is_open(), "close_all must be visible to is_open");
+        assert!(!client.is_open(), "repeated reads stay closed");
+
+        // A live sender must not resurrect a client whose table is closed.
+        let (live_tx, _live_rx) = mpsc::channel::<Vec<u8>>(1);
+        assert!(!live_tx.is_closed());
+        client.outbound_tx = Some(live_tx);
+        assert!(!client.is_open());
+    }
+
+    #[test]
     fn session_liveness_flips_without_reading_the_table() {
         let (session, _rx, table) = new_test_session();
         assert!(session.is_live());
@@ -1200,7 +1343,8 @@ mod tests {
         let writer_dropped = Arc::new(AtomicBool::new(false));
         let guard = DropFlag(Arc::clone(&writer_dropped));
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
-        let table = Arc::new(Mutex::new(SessionTable::new(1)));
+        let closed = Arc::new(AtomicBool::new(false));
+        let table = Arc::new(Mutex::new(SessionTable::new(1, Arc::clone(&closed))));
 
         let writer_task = tokio::spawn(async move {
             let _guard = guard;
@@ -1210,6 +1354,7 @@ mod tests {
 
         let client = XudpClient {
             table,
+            closed,
             outbound_tx: Some(outbound_tx),
             reply_queue: 1,
             reader_task,
