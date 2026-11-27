@@ -1678,7 +1678,8 @@ fn update_udp_sweep_after_scan(
 }
 
 /// Updates the sticky UDP sweep deadline, shortening it whenever a more urgent
-/// wakeup interval (such as an XUDP reconnect backoff retry) is requested.
+/// wakeup interval (such as an XUDP reconnect backoff retry) is requested. A
+/// deadline already due is replaced, not kept, so it cannot re-arm a 1 ms timer.
 fn update_udp_sweep_deadline(
     next_udp_sweep_at: &mut Option<Instant>,
     interval_ms: Option<u64>,
@@ -1688,8 +1689,10 @@ fn update_udp_sweep_deadline(
         Some(interval_ms) => {
             let candidate = now + Duration::from_millis(interval_ms);
             let deadline = match *next_udp_sweep_at {
-                Some(existing) => existing.min(candidate),
-                None => candidate,
+                // A deadline already due was not swept (for example, an active
+                // session refreshed its idle clock); keep the fresh candidate.
+                Some(existing) if existing > now => existing.min(candidate),
+                _ => candidate,
             };
             *next_udp_sweep_at = Some(deadline);
             Some(deadline.saturating_duration_since(now).as_millis() as u64)
@@ -2033,6 +2036,29 @@ mod tests {
             "a swept flow must not re-arm the old deadline every tick"
         );
         assert_eq!(deadline, Some(now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn udp_sweep_deadline_replaces_a_past_deadline_when_a_session_refreshes() {
+        let now = Instant::now();
+        let mut deadline = None;
+
+        // A session one millisecond from expiry arms a near deadline.
+        assert_eq!(
+            update_udp_sweep_after_scan(&mut deadline, false, Some(1), now),
+            Some(1)
+        );
+
+        // Continuous TUN traffic refreshes the session past that deadline; the
+        // next scan reports the full idle timeout instead of one millisecond.
+        let later = now + Duration::from_millis(5);
+        let delay = update_udp_sweep_after_scan(&mut deadline, false, Some(5_000), later);
+        assert_eq!(
+            delay,
+            Some(5_000),
+            "a stale deadline must not keep re-arming a 1 ms timer"
+        );
+        assert_eq!(deadline, Some(later + Duration::from_secs(5)));
     }
 
     #[test]
