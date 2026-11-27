@@ -310,6 +310,12 @@ impl TunnelActivity {
             .store(elapsed_ms.saturating_add(1), Ordering::Release);
     }
 
+    /// Forgets the last successful dial so a pre-reset success cannot be read
+    /// as a fresh signal after a network change.
+    pub fn clear_dial_success(&self) {
+        self.last_success_ms_plus_one.store(0, Ordering::Release);
+    }
+
     /// Records a failed upstream tunnel dial and its failing stage.
     pub fn record_dial_failure(&self, failure: DialFailure) {
         let elapsed_ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
@@ -2047,6 +2053,15 @@ mod tests {
         let sooner =
             rearm_deadline(Some(armed), now + Duration::from_millis(1), Some(2)).expect("re-armed");
         assert_eq!(sooner, now + Duration::from_millis(3));
+    }
+
+    #[test]
+    fn clearing_dial_success_hides_a_pre_reset_dial() {
+        let activity = TunnelActivity::new();
+        activity.record_dial_success(21);
+        assert_eq!(activity.recent_rtt(Duration::from_secs(1)), Some(21));
+        activity.clear_dial_success();
+        assert_eq!(activity.recent_rtt(Duration::from_secs(1)), None);
     }
 
     #[test]

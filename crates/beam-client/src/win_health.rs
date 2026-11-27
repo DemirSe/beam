@@ -360,6 +360,9 @@ pub fn spawn_windows_network_monitor(
                     generation = generation.wrapping_add(1);
                     let _ = network_reset_tx.send(generation);
                     last_reset_at = Some(Instant::now());
+                    // A dial that completed just before the reset must not be
+                    // read as a fresh signal after it.
+                    activity.clear_dial_success();
                 }
                 offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
                 next_probe_at = Instant::now();

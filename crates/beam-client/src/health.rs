@@ -275,6 +275,9 @@ pub fn spawn_network_monitor(
                     generation = generation.wrapping_add(1);
                     let _ = network_reset_tx.send(generation);
                     last_reset_at = Some(Instant::now());
+                    // A dial that completed just before the reset must not be
+                    // read as a fresh signal after it.
+                    activity.clear_dial_success();
                 }
                 offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
                 next_probe_at = Instant::now();
@@ -883,6 +886,22 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(activity.recent_failure_streak(Duration::from_millis(1)), 0);
         assert_eq!(activity.recent_failure_streak(RECENT_ACTIVITY_WINDOW), 1);
+    }
+
+    #[test]
+    fn a_cleared_dial_does_not_survive_a_network_reset() {
+        let activity = TunnelActivity::new();
+        activity.record_dial_success(21);
+        assert_eq!(
+            activity_tick_decision(false, 0, RECENT_ACTIVITY_WINDOW, &activity)
+                .map(|(state, _, _)| state),
+            Some(LinkState::Connected)
+        );
+        activity.clear_dial_success();
+        assert_eq!(
+            activity_tick_decision(false, 0, RECENT_ACTIVITY_WINDOW, &activity),
+            None
+        );
     }
 
     #[test]
