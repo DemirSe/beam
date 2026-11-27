@@ -590,6 +590,11 @@ VLESS with `xtls-rprx-vision` is expected to work.
   an ACK at the default socket-buffer size. A zero-window peer's persist probe
   (`seq = snd_una - 1`) instead gets one ACK as soon as the window is above
   zero, so a single freed 64 KiB chunk does not leave the peer stalled.
+- The local TCP handshake can finish before the upstream dial. Early
+  application bytes may be ACKed and queued before the tunnel is up; that ACK
+  is not an upstream delivery acknowledgment. A failed or timed-out dial
+  resets the flow with RST and discards those bytes. Keeping the receive window
+  closed until the dial succeeds is therefore not part of this proxy semantic.
 
 ## Client (`beam-client`)
 

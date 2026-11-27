@@ -2820,6 +2820,42 @@ mod tests {
         assert_eq!(rst.ack, syn_seq.wrapping_add(1));
     }
 
+    #[tokio::test]
+    async fn failed_dial_abort_resets_early_acked_bytes() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let (srv_nxt, acc) = handshake(&mut stack, 6000);
+        let (mut reader, mut writer) = acc.stream.into_split();
+
+        // Application data can arrive while the upstream dial is still pending.
+        // The local stack ACKs it and hands it to the relay.
+        stack.push_ip_tcp(&make_seg(
+            6001,
+            srv_nxt,
+            TCP_ACK | TCP_PSH,
+            65535,
+            &[],
+            b"POST /",
+        ));
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+        stack.poll(30, &mut tx, &mut accepted);
+        assert_eq!(tx.len(), 1, "early bytes must be ACKed locally");
+        let ack = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_eq!(ack.flags, TCP_ACK);
+        assert_eq!(ack.ack, 6001 + 6);
+        assert_eq!(reader.recv_chunk().await.expect("early bytes"), b"POST /");
+
+        // The engine calls `abort()` when the upstream dial fails or times out.
+        writer.abort();
+        tx.clear();
+        stack.poll(40, &mut tx, &mut accepted);
+        assert!(stack.conns.is_empty(), "failed dial must not hang the flow");
+        assert_eq!(tx.len(), 1, "failed dial must emit one RST");
+        let rst = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_eq!(rst.flags, TCP_RST | TCP_ACK);
+        assert_eq!(rst.flags & TCP_FIN, 0, "a failed dial must not send FIN");
+    }
+
     #[test]
     fn abort_emits_rst_not_fin_and_removes_connection() {
         let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
