@@ -1557,18 +1557,15 @@ fn route_snapshot_check(output: &str, prefix: &str) -> RouteCheck {
         }
         matches_prefix = false;
         route_usable = false;
-        let Some(destination) = line.split_whitespace().next() else {
+        let mut words = line.split_whitespace();
+        let first = words.next();
+        let blocked_type = first.is_some_and(|word| BLOCKED_ROUTE_TYPES.contains(&word));
+        let Some(destination) = (if blocked_type { words.next() } else { first }) else {
             continue;
         };
-        if matches!(
-            destination,
-            "blackhole" | "unreachable" | "prohibit" | "throw" | "local" | "broadcast"
-        ) {
-            continue;
-        }
         if parse_route_prefix(destination, family_flag).is_some_and(|net| net == wanted) {
             matches_prefix = true;
-            route_usable = !route_line_has_linkdown(line);
+            route_usable = !route_line_is_unusable(line);
         }
     }
     if matches_prefix {
@@ -1584,8 +1581,25 @@ fn route_snapshot_check(output: &str, prefix: &str) -> RouteCheck {
     }
 }
 
+const BLOCKED_ROUTE_TYPES: &[&str] = &[
+    "blackhole",
+    "unreachable",
+    "prohibit",
+    "throw",
+    "local",
+    "broadcast",
+];
+
 fn route_line_has_linkdown(line: &str) -> bool {
     line.split_whitespace().any(|word| word == "linkdown")
+}
+
+/// Non-unicast routes exist but cannot carry bypass traffic.
+fn route_line_is_unusable(line: &str) -> bool {
+    line.split_whitespace()
+        .next()
+        .is_some_and(|word| BLOCKED_ROUTE_TYPES.contains(&word))
+        || route_line_has_linkdown(line)
 }
 
 /// Result of an exact-route lookup, distinguishing a missing route from a
@@ -1686,7 +1700,7 @@ fn parse_exact_route_check(stdout: &str) -> RouteCheck {
             continue;
         }
         present = true;
-        if route_line_has_linkdown(line) {
+        if route_line_is_unusable(line) {
             return RouteCheck::Unusable;
         }
     }
@@ -2288,7 +2302,7 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
     }
 
     #[test]
-    fn route_snapshot_matches_host_routes_and_ignores_non_unicast() {
+    fn route_snapshot_marks_non_unicast_routes_unusable() {
         let table = "\
 default via 192.168.1.1 dev eth0 proto dhcp metric 100\n\
 153.56.184.142 via 10.61.135.13 dev enp0s20f0u5\n\
@@ -2307,12 +2321,12 @@ broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
         assert!(route_snapshot_check(table, "2001:db8:abcd::1/128").is_present());
         assert!(route_snapshot_check(table, "2001:0DB8:ABCD::1/128").is_present());
         assert!(route_snapshot_check(table, "198.51.100.0/24").is_present());
-        assert!(!route_snapshot_check(table, "203.0.113.9/32").is_present());
-        assert!(!route_snapshot_check(table, "203.0.113.8/32").is_present());
-        assert!(!route_snapshot_check(table, "203.0.113.7/32").is_present());
-        assert!(!route_snapshot_check(table, "203.0.113.6/32").is_present());
-        assert!(!route_snapshot_check(table, "127.0.0.1/32").is_present());
-        assert!(!route_snapshot_check(table, "192.168.1.255/32").is_present());
+        assert!(route_snapshot_check(table, "203.0.113.9/32").is_unusable());
+        assert!(route_snapshot_check(table, "203.0.113.8/32").is_unusable());
+        assert!(route_snapshot_check(table, "203.0.113.7/32").is_unusable());
+        assert!(route_snapshot_check(table, "203.0.113.6/32").is_unusable());
+        assert!(route_snapshot_check(table, "127.0.0.1/32").is_unusable());
+        assert!(route_snapshot_check(table, "192.168.1.255/32").is_unusable());
         assert!(route_snapshot_check(table, "198.51.100.1/32").is_unusable());
     }
 
@@ -2366,6 +2380,19 @@ broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
 172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown\n\
 172.17.0.0/16 dev docker1 proto kernel scope link src 172.17.1.1 linkdown\n";
         assert!(route_snapshot_check(all_down, "172.17.0.0/16").is_unusable());
+    }
+
+    #[test]
+    fn blackhole_route_is_unusable_in_both_parsers() {
+        let table = "blackhole 203.0.113.9/32\n";
+        assert!(
+            route_snapshot_check(table, "203.0.113.9/32").is_unusable(),
+            "a blackhole route must not be read as an absent route"
+        );
+        assert!(
+            parse_exact_route_check(table).is_unusable(),
+            "an exact lookup must not read a blackhole route as usable"
+        );
     }
 
     #[test]
