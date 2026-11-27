@@ -507,6 +507,16 @@ static int reload_resolved(void)
     return run(argv);
 }
 
+/* The boot reset or a later restore-dns retries a failed resolver reload. */
+static void record_reload_result(int failed)
+{
+    if (!failed) {
+        (void)unlink(BEAM_RELOAD_PENDING);
+    } else if (write_text(BEAM_RELOAD_PENDING, "reload failed\n", 0600) != 0) {
+        log_errno("could not write", BEAM_RELOAD_PENDING);
+    }
+}
+
 static int wait_tun(int seconds)
 {
     int i;
@@ -522,21 +532,29 @@ static int wait_tun(int seconds)
 static int dns_on(void)
 {
     int lock = state_lock();
+    int reload_failed = 0;
     int rc = -1;
 
     if (lock < 0)
         return 1;
-    if (wait_tun(10) == 0 && switch_dns_on() == 0 &&
-        reload_resolved() == 0 &&
-        access(CTRL_DROPIN, F_OK) != 0 &&
-        access(BEAM_DROPIN, F_OK) == 0 &&
-        beam_file_unchanged()) {
-        rc = 0;
-    } else {
+    if (wait_tun(10) == 0 && switch_dns_on() == 0) {
+        if (reload_resolved() != 0) {
+            reload_failed = 1;
+        } else if (access(CTRL_DROPIN, F_OK) != 0 &&
+                   access(BEAM_DROPIN, F_OK) == 0 &&
+                   beam_file_unchanged()) {
+            rc = 0;
+        }
+    }
+    if (rc != 0) {
         syslog(LOG_ERR, "dns-on did not complete; restoring the previous DNS state");
         (void)restore_dns();
         (void)reload_resolved();
     }
+    if (reload_failed)
+        record_reload_result(1);
+    else if (rc == 0)
+        record_reload_result(0);
     close(lock);
     return rc == 0 ? 0 : 1;
 }
@@ -556,12 +574,9 @@ static int dns_off(void)
     if (reload_resolved() != 0) {
         syslog(LOG_ERR, "could not reload systemd-resolved");
         rc = -1;
-        /* restore_dns() removed its markers. Keep a trigger so the boot
-         * reset or a later restore-dns retries the failed reload. */
-        if (write_text(BEAM_RELOAD_PENDING, "reload failed\n", 0600) != 0)
-            log_errno("could not write", BEAM_RELOAD_PENDING);
+        record_reload_result(1);
     } else {
-        unlink(BEAM_RELOAD_PENDING);
+        record_reload_result(0);
     }
     if (access(CTRL_SAVED, F_OK) == 0 || access(BEAM_SAVED, F_OK) == 0 ||
         access(BEAM_OWNED, F_OK) == 0)
@@ -576,6 +591,7 @@ static int dns_off(void)
 static int ctrld_off(void)
 {
     int lock = state_lock();
+    int reload_failed = 0;
     int rc = 0;
 
     if (lock < 0)
@@ -585,12 +601,17 @@ static int ctrld_off(void)
             log_errno("could not move", CTRL_DROPIN);
             rc = -1;
         } else if (reload_resolved() != 0) {
+            reload_failed = 1;
             syslog(LOG_ERR, "could not reload systemd-resolved after moving ctrld drop-in");
             (void)restore_dns();
             (void)reload_resolved();
             rc = -1;
         }
     }
+    if (reload_failed)
+        record_reload_result(1);
+    else if (rc == 0)
+        record_reload_result(0);
     close(lock);
     return rc == 0 ? 0 : 1;
 }

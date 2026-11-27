@@ -80,7 +80,8 @@ The reset unit orders after ctrld but does not start it.
 Run `/usr/local/libexec/beam-helper restore-dns` by hand.
 The helper marks the live files that it writes.
 It keeps an unmarked file and reports it for manual inspection.
-If `dns-off` logs `could not reload systemd-resolved`, the helper writes
-`99-beam.conf.beam-reload`. The boot reset retries the reload for that file.
-To fix it now, run `sudo systemctl reload systemd-resolved`, then run
+If `dns-on`, `dns-off`, or `ctrld-off` logs `could not reload systemd-resolved`,
+the helper writes `99-beam.conf.beam-reload`. The boot reset retries the reload
+for that file. A later successful switch clears the trigger. To fix it now,
+run `sudo systemctl reload systemd-resolved`, then run
 `sudo /usr/local/libexec/beam-helper restore-dns` to clear the trigger.

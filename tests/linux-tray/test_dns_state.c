@@ -489,7 +489,8 @@ int main(void)
     CHECK(file_is(BEAM_DROPIN, USER_DNS));
     CHECK(!exists(BEAM_OWNED));
 
-    /* Reload failure rolls the host file back and clears the marker. */
+    /* Reload failure rolls the host file back, clears the marker, and
+     * leaves the boot-reset trigger for a later retry. */
     reset_state();
     write_file(BEAM_DROPIN, USER_DNS);
     write_file(RELOAD_FAIL, "");
@@ -497,7 +498,15 @@ int main(void)
     CHECK(file_is(BEAM_DROPIN, USER_DNS));
     CHECK(!exists(BEAM_SAVED));
     CHECK(!exists(BEAM_OWNED));
+    CHECK(file_is(BEAM_RELOAD_PENDING, "reload failed\n"));
     unlink(RELOAD_FAIL);
+
+    /* A successful dns-on clears a trigger left by an earlier failure. */
+    reset_state();
+    write_file(BEAM_RELOAD_PENDING, "reload failed\n");
+    CHECK(dns_on() == 0);
+    CHECK(!exists(BEAM_RELOAD_PENDING));
+    CHECK(dns_off() == 0);
 
     /* Reload failure on the ctrld path restores ctrld. */
     reset_state();
@@ -599,6 +608,26 @@ int main(void)
     CHECK(dns_off() == 1);
     CHECK(file_is(CTRL_SAVED, CTRLD_DNS));
     CHECK(file_is(CTRL_DROPIN, OTHER_DNS));
+
+    /* A ctrld-off reload failure restores ctrld and leaves the same trigger. */
+    reset_state();
+    write_file(CTRL_DROPIN, CTRLD_DNS);
+    write_file(RELOAD_FAIL, "");
+    CHECK(ctrld_off() == 1);
+    CHECK(file_is(CTRL_DROPIN, CTRLD_DNS));
+    CHECK(!exists(CTRL_SAVED));
+    CHECK(file_is(BEAM_RELOAD_PENDING, "reload failed\n"));
+    unlink(RELOAD_FAIL);
+
+    /* A clean ctrld-off clears a stale trigger. */
+    reset_state();
+    write_file(CTRL_DROPIN, CTRLD_DNS);
+    write_file(BEAM_RELOAD_PENDING, "reload failed\n");
+    CHECK(ctrld_off() == 0);
+    CHECK(!exists(BEAM_RELOAD_PENDING));
+    CHECK(!exists(CTRL_DROPIN));
+    CHECK(file_is(CTRL_SAVED, CTRLD_DNS));
+    CHECK(dns_off() == 0);
 
     /* Native beam-client ctrld-off path: moves ctrld aside without writing a
      * competing global 99-beam.conf, and dns-off cleanly restores ctrld. */
