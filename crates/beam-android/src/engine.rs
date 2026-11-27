@@ -239,6 +239,10 @@ impl AndroidEngine {
                 }
             }
         }
+        // A handover is not the old network's fault: clearing the streak lets
+        // the freshly dialed path report a clean state instead of staying put
+        // in `STATE_DEGRADED` until the first successful dial.
+        self.telemetry.activity.reset_failure_streak();
         self.network_reset_tx.send_modify(|generation| {
             *generation = generation.wrapping_add(1);
         });
@@ -426,6 +430,38 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&engine.telemetry_json()).expect("telemetry JSON");
         assert_eq!(value["last_rtt_ms"], 42);
+        engine.stop();
+    }
+
+    #[test]
+    fn network_change_clears_the_degraded_failure_streak() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let callback: StateCallback = Arc::new(move |state, _label| {
+            if let Ok(mut states) = recorder.lock() {
+                states.push(state);
+            }
+        });
+        let (engine, _peer) = test_engine(Some(callback));
+        let failure = DialFailure {
+            stage: DialFailureStage::TcpConnect,
+            kind: DialFailureKind::Timeout,
+        };
+        for _ in 0..DEGRADED_FAILURE_STREAK {
+            engine.telemetry.activity.record_dial_failure(failure);
+        }
+        assert_eq!(engine.refresh_state(), STATE_DEGRADED);
+
+        engine.notify_network_change();
+
+        assert_eq!(engine.state.load(Ordering::Relaxed), STATE_CONNECTED);
+        let states = seen.lock().expect("state log").clone();
+        assert!(
+            states
+                .windows(2)
+                .any(|w| w == [STATE_DEGRADED, STATE_CONNECTED]),
+            "expected DEGRADED -> CONNECTED transition in {states:?}"
+        );
         engine.stop();
     }
 
