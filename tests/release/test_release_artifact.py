@@ -33,23 +33,26 @@ MAKEFILE = ROOT / "Makefile"
 DEPLOY = ROOT / "deploy"
 WIN_CLIENT = ROOT / "clients" / "windows-tray"
 EXAMPLE_CONFIG = ROOT / "config.example.toml"
+CLIENT_EXAMPLE_CONFIG = ROOT / "config.client.example.toml"
 
 VERSION = "9.9.9"
 COMMIT = "abcdef123456"
 TARGET = "x86_64-unknown-linux-gnu"
-WIN_TARGET = "x86_64-pc-windows-gnu"
+WIN_TARGET = "x86_64-pc-windows-msvc"
 NAME = f"beam-{VERSION}-{COMMIT}-{TARGET}"
-WIN_NAME = f"beam-windows-tray-{VERSION}-{COMMIT}-{WIN_TARGET}"
+WIN_NAME = f"beam-windows-client-{VERSION}-{COMMIT}-{WIN_TARGET}"
 FULL_SHA = COMMIT + "0123456789abcdef0123456789abcdef01234567"
 
 WIN_MEMBERS = [
     "README.md",
     "SHA256SUMS",
+    "beam-client.exe",
     "beam-tray.exe",
-    "config.example.json",
+    "config.client.example.toml",
     "install.cmd",
     "install.ps1",
     "uninstall.cmd",
+    "wintun.dll",
 ]
 
 # Every member the archive must carry, with the mode the installer relies on.
@@ -411,14 +414,21 @@ class WindowsTrayReleaseArtifactTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         self.out = self.tmp / "out"
-        self.bin = self.tmp / "beam-tray.exe"
-        self.bin.write_bytes(b"MZstub-beam-tray-binary")
+        self.client_bin = self.tmp / "beam-client.exe"
+        self.client_bin.write_bytes(b"MZstub-beam-client-binary")
+        self.tray_bin = self.tmp / "beam-tray.exe"
+        self.tray_bin.write_bytes(b"MZstub-beam-tray-binary")
+        self.wintun_dll = self.tmp / "wintun.dll"
+        self.wintun_dll.write_bytes(b"MZstub-wintun-dll")
 
     def run_script(self, **env_over):
         env = os.environ.copy()
         env.update(
             {
-                "BEAM_WINDOWS_TRAY_BIN": str(self.bin),
+                "BEAM_WINDOWS_CLIENT_BIN": str(self.client_bin),
+                "BEAM_WINDOWS_TRAY_BIN": str(self.tray_bin),
+                "BEAM_WINDOWS_WINTUN_DLL": str(self.wintun_dll),
+                "BEAM_WINDOWS_SKIP_WINTUN_PIN": "1",
                 "BEAM_RELEASE_VERSION": VERSION,
                 "BEAM_RELEASE_COMMIT": COMMIT,
                 "BEAM_WINDOWS_TARGET": WIN_TARGET,
@@ -440,8 +450,14 @@ class WindowsTrayReleaseArtifactTest(unittest.TestCase):
         self.assertTrue(pin.is_file())
 
         with zipfile.ZipFile(archive) as zf:
-            self.assertEqual(sorted(zf.namelist()), sorted(WIN_MEMBERS))
-            self.assertEqual(zf.read("beam-tray.exe"), self.bin.read_bytes())
+            self.assertEqual(zf.namelist(), WIN_MEMBERS)
+            self.assertEqual(zf.read("beam-client.exe"), self.client_bin.read_bytes())
+            self.assertEqual(zf.read("beam-tray.exe"), self.tray_bin.read_bytes())
+            self.assertEqual(zf.read("wintun.dll"), self.wintun_dll.read_bytes())
+            self.assertEqual(
+                zf.read("config.client.example.toml"),
+                CLIENT_EXAMPLE_CONFIG.read_bytes(),
+            )
             self.assertEqual(
                 zf.read("install.ps1"), (WIN_CLIENT / "install.ps1").read_bytes()
             )
@@ -452,13 +468,14 @@ class WindowsTrayReleaseArtifactTest(unittest.TestCase):
                 zf.read("uninstall.cmd"), (WIN_CLIENT / "uninstall.cmd").read_bytes()
             )
             self.assertEqual(
-                zf.read("config.example.json"),
-                (WIN_CLIENT / "config.example.json").read_bytes(),
+                zf.read("README.md"), (WIN_CLIENT / "README.md").read_bytes()
             )
-            self.assertEqual(
-                zf.read("SHA256SUMS").decode(),
-                f"{sha256(self.bin)}  beam-tray.exe\n",
+            expected_sums = (
+                f"{sha256(self.client_bin)}  beam-client.exe\n"
+                f"{sha256(self.tray_bin)}  beam-tray.exe\n"
+                f"{sha256(self.wintun_dll)}  wintun.dll\n"
             )
+            self.assertEqual(zf.read("SHA256SUMS").decode(), expected_sums)
 
         self.assertEqual(pin.read_text(), f"{sha256(archive)}  {WIN_NAME}.zip\n")
         pin_check = subprocess.run(
@@ -471,12 +488,14 @@ class WindowsTrayReleaseArtifactTest(unittest.TestCase):
         )
         self.assertEqual(reported["win_artifact"], str(archive))
         self.assertEqual(reported["win_artifact_sha256"], sha256(archive))
-        self.assertEqual(reported["win_binary_sha256"], sha256(self.bin))
+        self.assertEqual(reported["win_client_sha256"], sha256(self.client_bin))
+        self.assertEqual(reported["win_tray_sha256"], sha256(self.tray_bin))
+        self.assertEqual(reported["win_wintun_sha256"], sha256(self.wintun_dll))
         self.assertEqual(reported["win_version"], VERSION)
         self.assertEqual(reported["win_commit"], COMMIT)
         self.assertEqual(reported["win_target"], WIN_TARGET)
 
-    def test_refuses_to_replace_and_needs_commit(self):
+    def test_refuses_to_replace_and_needs_commit_and_wintun_pin(self):
         self.assertEqual(self.run_script().returncode, 0)
         second = self.run_script()
         self.assertNotEqual(second.returncode, 0)
@@ -485,6 +504,25 @@ class WindowsTrayReleaseArtifactTest(unittest.TestCase):
         no_commit = self.run_script(BEAM_RELEASE_COMMIT="")
         self.assertNotEqual(no_commit.returncode, 0)
         self.assertIn("BEAM_RELEASE_COMMIT", no_commit.stderr)
+
+        bad_wintun = self.run_script(
+            BEAM_WINDOWS_SKIP_WINTUN_PIN="0",
+            BEAM_RELEASE_OUT=str(self.tmp / "out-pin"),
+        )
+        self.assertNotEqual(bad_wintun.returncode, 0)
+        self.assertIn("wintun.dll SHA-256 mismatch", bad_wintun.stderr)
+
+        for key in (
+            "BEAM_WINDOWS_CLIENT_BIN",
+            "BEAM_WINDOWS_TRAY_BIN",
+            "BEAM_WINDOWS_WINTUN_DLL",
+        ):
+            with self.subTest(missing=key):
+                missing = self.run_script(
+                    **{key: "", "BEAM_RELEASE_OUT": str(self.tmp / f"out-{key}")}
+                )
+                self.assertNotEqual(missing.returncode, 0)
+                self.assertIn(key, missing.stderr)
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
@@ -510,9 +548,10 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def test_publishes_a_github_release_not_an_actions_artifact(self):
         self.assertIn("gh release create", self.code)
         self.assertIn("contents: write", self.code)
-        self.assertIn('"$artifact" "$pin"', self.code)
-        self.assertNotIn("upload-artifact", self.code)
-        self.assertNotIn("retention-days", self.code)
+        self.assertIn('"$artifact" "$pin" "$win_artifact" "$win_pin"', self.code)
+        self.assertIn("needs: [build-windows]", self.code)
+        self.assertNotIn("mingw-w64", self.code)
+        self.assertNotIn("sing-box.exe", self.code)
 
     def test_publishing_needs_a_manual_dispatch(self):
         self.assertIn("workflow_dispatch:", self.code)
@@ -666,8 +705,12 @@ class ReleasePublishStepTest(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.out = self.tmp / "out"
         self.bin = write_stub(self.tmp / "beam")
-        self.win_bin = self.tmp / "beam-tray.exe"
-        self.win_bin.write_bytes(b"MZstub-beam-tray-binary")
+        self.win_client_bin = self.tmp / "beam-client.exe"
+        self.win_client_bin.write_bytes(b"MZstub-beam-client-binary")
+        self.win_tray_bin = self.tmp / "beam-tray.exe"
+        self.win_tray_bin.write_bytes(b"MZstub-beam-tray-binary")
+        self.win_wintun_dll = self.tmp / "wintun.dll"
+        self.win_wintun_dll.write_bytes(b"MZstub-wintun-dll")
         self.archive = self.out / f"{NAME}.tar.gz"
         self.win_archive = self.out / f"{WIN_NAME}.zip"
 
@@ -725,7 +768,10 @@ class ReleasePublishStepTest(unittest.TestCase):
         env = os.environ.copy()
         env.update(
             {
-                "BEAM_WINDOWS_TRAY_BIN": str(self.win_bin),
+                "BEAM_WINDOWS_CLIENT_BIN": str(self.win_client_bin),
+                "BEAM_WINDOWS_TRAY_BIN": str(self.win_tray_bin),
+                "BEAM_WINDOWS_WINTUN_DLL": str(self.win_wintun_dll),
+                "BEAM_WINDOWS_SKIP_WINTUN_PIN": "1",
                 "BEAM_RELEASE_VERSION": VERSION,
                 "BEAM_RELEASE_COMMIT": COMMIT,
                 "BEAM_WINDOWS_TARGET": WIN_TARGET,
@@ -779,7 +825,11 @@ class ReleasePublishStepTest(unittest.TestCase):
         self.assertIn("bash beam-install.sh install", notes)
         self.assertIn("chmod 600 config.example.toml", notes)
         self.assertIn(f"{WIN_NAME}.zip", notes)
+        self.assertIn("beam-client.exe", notes)
+        self.assertIn("beam-tray.exe", notes)
+        self.assertIn("wintun.dll", notes)
         self.assertIn("install.cmd", notes)
+        self.assertNotIn("sing-box.exe", notes)
 
     def test_refuses_an_existing_release(self):
         result = self.run_publish(GH_HAVE_RELEASE="1")

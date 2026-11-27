@@ -326,7 +326,7 @@ process-wide session limiter.
 | `bench/` | The TUN A/B benchmark and soak harness. Its own test is `tests/bench/`. |
 | `tests/` | Rootless suites, plus the TUN harness and its Rust origin in `tests/tun/`. |
 | `fuzz/` | cargo-fuzz targets, kept in a separate workspace. |
-| `clients/` | Optional tray clients for Linux and Windows. Not needed to run the server. |
+| `clients/` | Optional tray clients for Linux and native Windows (`beam-tray.exe`), plus Android. Not needed to run the server. |
 | `docs/` | Server runbook, client setup, and the historical audits. |
 
 ## Compatibility
@@ -587,8 +587,10 @@ VLESS with `xtls-rprx-vision` is expected to work.
 
 `beam-client` is a lightweight, single-purpose Rust TUN client for `beam`
 (`crates/beam-client` + `crates/beam-tun`), designed as a low-CPU, always-on
-replacement for `sing-box` on Linux (with a platform-independent core for
-future Windows `WinTun` and Android `VpnService` backends).
+replacement for `sing-box`. It natively supports both **Linux** (`/dev/net/tun`
++ `iproute2` + `systemd`) and **Windows** (`WinTun` + IP Helper + dynamic WFP +
+`BeamClient` Windows Service + unelevated `beam-tray.exe`), alongside the
+platform-independent core shared with the Android `VpnService` backend.
 
 - **Protocol & cover:** pure-Rust REALITY TLS 1.3 (`rustls` + `aws-lc-rs`,
   default cover SNI `whatsapp.net`), VLESS + Vision Direct handoff, and

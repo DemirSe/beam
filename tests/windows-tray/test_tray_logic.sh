@@ -3,8 +3,9 @@
 # - Compiles and runs tray_logic.h unit tests (named-pipe IPC parsing, tray state
 #   mapping, vless:// import request)
 # - Validates the 4 multi-resolution .ico resources
-# - Validates config.example.json and the installer scripts (Phase 4 transition:
-#   Phase 5 replaces both with the native client config and installer)
+# - Validates app.manifest (asInvoker, no requireAdministrator)
+# - Validates legacy config.example.json is removed
+# - Validates the native Windows installer scripts contract
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -19,7 +20,7 @@ CC="${CC:-cc}"
 "$TMP_BIN"
 
 python3 - <<'PY'
-import json, struct
+import struct
 from pathlib import Path
 
 # 1. Verify all 4 status .ico files have the expected 5 sizes (16, 20, 24, 32, 48).
@@ -39,49 +40,37 @@ for name in ("disconnected", "connecting", "connected", "error"):
         sizes.append(w)
     assert sizes == expected_sizes, f"{path}: sizes {sizes} != {expected_sizes}"
 
-# 2. Verify config.example.json matches sing-box 1.15+ built-in TUN stack & repo policy.
-cfg = json.loads(Path("clients/windows-tray/config.example.json").read_text(encoding="utf-8"))
-assert cfg["dns"]["strategy"] == "ipv4_only"
-tuns = [ib for ib in cfg["inbounds"] if ib.get("type") == "tun"]
-assert len(tuns) == 1
-tun = tuns[0]
-assert "stack" not in tun, "sing-box 1.15+ built-in TUN stack must omit deprecated 'stack'"
-assert tun["interface_name"] == "beam-tun"
-assert tun["mtu"] == 1500
-assert tun["auto_route"] is True
-assert tun["strict_route"] is True
-assert tun["dns_mode"] == "hijack"
-assert tun["address"] == ["172.19.0.1/30"]
+# 2. Verify app.manifest is unelevated (asInvoker) and does not requireAdministrator.
+manifest = Path("clients/windows-tray/app.manifest").read_text(encoding="utf-8")
+assert "asInvoker" in manifest, "app.manifest must specify asInvoker"
+assert "requireAdministrator" not in manifest, "app.manifest must not specify requireAdministrator"
 
-proxy = [ob for ob in cfg["outbounds"] if ob.get("tag") == "proxy"][0]
-assert proxy["type"] == "vless"
-assert proxy["flow"] == "xtls-rprx-vision"
-assert proxy["packet_encoding"] == "xudp"
-assert proxy["tls"]["server_name"] == "whatsapp.net"
-assert proxy["uuid"] == "00000000-0000-0000-0000-000000000000"
+# 3. Verify legacy sing-box config.example.json is removed.
+legacy_cfg = Path("clients/windows-tray/config.example.json")
+assert not legacy_cfg.exists(), "legacy clients/windows-tray/config.example.json must be removed"
 
-rules = cfg["route"]["rules"]
-assert rules[0] == {"ip_version": 6, "action": "reject"}
-assert rules[1] == {"ip_is_private": True, "outbound": "direct"}
-assert rules[2]["network"] == "udp" and rules[2]["port"] == [443] and rules[2]["action"] == "reject"
+print("windows-tray icons, manifest, and legacy cleanup: OK")
 
-print("windows-tray icons and config.example.json: OK")
-
-# 3. Verify Windows installer scripts contract (no secrets, preflight check, ACL lockdown, clean wrappers).
+# 4. Verify native Windows installer scripts contract.
 install_ps1 = Path("clients/windows-tray/install.ps1").read_text(encoding="utf-8")
 for required in (
-    "sing-box",
-    '"check"',
-    "Set-RestrictedConfigAcl",
+    "beam-client.exe",
+    "wintun.dll",
+    "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+    "BeamClient",
+    "allowed-user.sid",
+    "--check",
+    "--cleanup-routes",
     "S-1-5-18",
     "S-1-5-32-544",
-    "Register-ScheduledTask",
-    "Unregister-ScheduledTask",
+    "-Uninstall",
+    "Set-RestrictedFileAcl",
     "Invoke-SelfElevate -BoundParameters $PSBoundParameters",
     '"--stop"',
-    "-Uninstall",
 ):
     assert required in install_ps1, f"install.ps1 missing required contract token: {required}"
+
+assert "sing-box.exe" not in install_ps1, "install.ps1 must not reference or launch sing-box.exe"
 
 install_cmd = Path("clients/windows-tray/install.cmd").read_text(encoding="utf-8")
 assert "install.ps1" in install_cmd and "-ExecutionPolicy Bypass" in install_cmd

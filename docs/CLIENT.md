@@ -306,8 +306,9 @@ The native Android client (`crates/beam-android` + `clients/android`, `:vpn`
 process isolation, Keystore storage, and `VpnService` wiring) is documented in
 [`clients/android/README.md`](../clients/android/README.md).
 
-The Windows profile is `$HOME/.config/beam/windows.json`. The installer is
-`$HOME/.config/beam/beam-install-windows.ps1`.
+The native Windows client (`beam-client.exe` Windows Service + unelevated
+`beam-tray.exe` + `%ProgramData%\beam\client.toml`) is documented in
+[`clients/windows-tray/README.md`](../clients/windows-tray/README.md).
 
 ## beam-client diagnostics
 
