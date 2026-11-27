@@ -187,9 +187,7 @@ impl SecureRandom for ThreadLocalRandom {
         if handled {
             return Ok(());
         }
-        rustls::crypto::aws_lc_rs::default_provider()
-            .secure_random
-            .fill(buf)
+        default_aws_lc_provider().secure_random.fill(buf)
     }
 }
 
@@ -207,7 +205,7 @@ impl SupportedKxGroup for ThreadLocalX25519 {
             Some(bytes) => bytes,
             None => {
                 let mut fresh = Zeroizing::new([0u8; 32]);
-                rustls::crypto::aws_lc_rs::default_provider()
+                default_aws_lc_provider()
                     .secure_random
                     .fill(&mut fresh[..])
                     .map_err(|_| rustls::Error::General("random failed".into()))?;
@@ -250,6 +248,13 @@ impl ActiveKeyExchange for EphemeralX25519 {
     fn group(&self) -> NamedGroup {
         NamedGroup::X25519
     }
+}
+
+/// Returns the process-wide aws-lc-rs provider instead of rebuilding one on
+/// every handshake: `default_provider()` allocates all algorithm lists.
+fn default_aws_lc_provider() -> &'static CryptoProvider {
+    static PROVIDER: OnceLock<CryptoProvider> = OnceLock::new();
+    PROVIDER.get_or_init(rustls::crypto::aws_lc_rs::default_provider)
 }
 
 fn reality_crypto_provider() -> Arc<CryptoProvider> {
@@ -402,7 +407,7 @@ pub fn build_client_connection_at(
     config: &RealityClientConfig,
     timestamp: u32,
 ) -> Result<ClientConnection, RealityClientError> {
-    let rng = rustls::crypto::aws_lc_rs::default_provider().secure_random;
+    let rng = default_aws_lc_provider().secure_random;
     let mut hello_random = [0u8; 32];
     let mut secret = Zeroizing::new([0u8; 32]);
     let mut ext_seed = [0u8; 2];
@@ -484,8 +489,7 @@ pub fn build_client_connection_at(
     // per-connection HMAC-SHA512 certificate verifier.
     let verifier = Arc::new(RealityCertVerifier {
         auth_key,
-        supported_algs: rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms,
+        supported_algs: default_aws_lc_provider().signature_verification_algorithms,
     });
     let client_config = Arc::new(
         ClientConfig::builder_with_provider(reality_crypto_provider())
@@ -663,8 +667,7 @@ mod tests {
 
         let verifier = RealityCertVerifier {
             auth_key: Zeroizing::new(*auth_key),
-            supported_algs: rustls::crypto::aws_lc_rs::default_provider()
-                .signature_verification_algorithms,
+            supported_algs: default_aws_lc_provider().signature_verification_algorithms,
         };
         let sni = ServerName::try_from("whatsapp.net").expect("sni");
         assert!(

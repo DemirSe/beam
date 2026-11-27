@@ -299,6 +299,10 @@ impl UdpNatBridge {
                     self.mux = None;
                     self.start_background_connect();
                     self.queue_pending(src, dst, payload);
+                } else if matches!(err, XudpClientError::OutboundQueueFull) {
+                    self.drops.udp_mux_q.incr();
+                } else {
+                    self.drops.udp_session_table_full.incr();
                 }
                 return;
             }

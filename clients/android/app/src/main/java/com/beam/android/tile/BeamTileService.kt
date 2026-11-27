@@ -86,12 +86,26 @@ class BeamTileService : TileService() {
         }
 
         override fun onBindingDied(name: ComponentName?) {
+            val shouldToggle = pendingToggle
             service = null
-            pendingToggle = false
             if (isBound) {
                 runCatching { unbindService(serviceConnection) }
                 isBound = false
             }
+            // A queued tap survives the death: rebind and let
+            // onServiceConnected() run it instead of dropping the user action.
+            if (isListening && shouldToggle) {
+                isBound = bindService(
+                    Intent(this@BeamTileService, BeamVpnService::class.java),
+                    serviceConnection,
+                    Context.BIND_AUTO_CREATE,
+                )
+                if (isBound) {
+                    pendingToggle = true
+                    return
+                }
+            }
+            pendingToggle = false
             mainHandler.post { if (isListening) updateTile(VpnState.DISCONNECTED, cachedHasProfile) }
         }
     }
