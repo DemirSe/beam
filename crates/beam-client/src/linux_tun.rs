@@ -264,12 +264,12 @@ impl LinuxRouteGuard {
         let configured_bypass_v4: Vec<String> = bypass_cidrs
             .iter()
             .filter(|c| is_ipv4_cidr(c))
-            .cloned()
+            .map(|c| canonical_cidr(c).unwrap_or_else(|| c.clone()))
             .collect();
         let configured_bypass_v6: Vec<String> = bypass_cidrs
             .iter()
             .filter(|c| is_ipv6_cidr(c))
-            .cloned()
+            .map(|c| canonical_cidr(c).unwrap_or_else(|| c.clone()))
             .collect();
 
         let mut guard = Self {
@@ -362,6 +362,9 @@ impl LinuxRouteGuard {
     /// missing (fail-closed): the monitor keeps retrying, while the rate-limited
     /// warning from the route snapshot carries the reason once per window.
     pub fn bypass_routes_installed(&self) -> bool {
+        if !self.auto_route {
+            return true;
+        }
         let snapshot = RouteSnapshot::load();
         self.bypass_routes_installed_with(&self.current_gw, self.local_dns_ip, |flag, prefix| {
             snapshot.check(flag, prefix)
@@ -1033,6 +1036,15 @@ fn gateway_for_ip(gw: &PhysicalGateways, ip: IpAddr) -> Option<&(Option<String>,
         IpAddr::V4(_) => gw.v4.as_ref(),
         IpAddr::V6(_) => gw.v6.as_ref(),
     }
+}
+
+/// Canonicalizes a CIDR so it can be compared word-for-word with the kernel
+/// routing table, which prints lowercase and compressed IPv6 prefixes.
+fn canonical_cidr(cidr: &str) -> Option<String> {
+    Some(match IpNet::parse_cidr(cidr)? {
+        IpNet::V4 { net, mask } => format!("{}/{}", Ipv4Addr::from(net), mask.count_ones()),
+        IpNet::V6 { net, mask } => format!("{}/{}", Ipv6Addr::from(net), mask.count_ones()),
+    })
 }
 
 fn is_ipv4_cidr(cidr: &str) -> bool {
@@ -1864,6 +1876,23 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
                 .iter()
                 .any(|(prefix, _, _)| prefix == cidr)
         );
+    }
+
+    #[test]
+    fn route_snapshot_matches_canonical_prefixes() {
+        assert_eq!(
+            canonical_cidr("2001:0DB8:0001::/64").as_deref(),
+            Some("2001:db8:1::/64")
+        );
+        assert_eq!(
+            canonical_cidr("10.20.0.0/16").as_deref(),
+            Some("10.20.0.0/16")
+        );
+        let table = "2001:db8:1::/64 dev eth0 proto static metric 100\n\
+                     198.18.0.0/24 via 10.0.0.1 dev eth0";
+        assert!(route_snapshot_has_prefix(table, "2001:db8:1::/64"));
+        assert!(route_snapshot_has_prefix(table, "198.18.0.0/24"));
+        assert!(!route_snapshot_has_prefix(table, "2001:db8:2::/64"));
     }
 
     #[test]
