@@ -976,47 +976,50 @@ fn relay_write_idle(relay_idle: Option<Duration>, client_idle: Duration) -> Dura
     relay_idle.unwrap_or(client_idle)
 }
 
-/// One idle deadline shared by both directions of a TCP relay. Any successful
-/// read or write in either direction pushes the same deadline, so a quiet
-/// download does not kill a flow whose upload is still active.
+/// One idle timestamp shared by both directions of a TCP relay. Any successful
+/// read or write in either direction refreshes it, so a quiet download does not
+/// kill a flow whose upload is still active. `touch` does not wake the idle
+/// direction; each read checks the timestamp only when its sleep expires.
 #[derive(Clone)]
 struct RelayIdle {
-    idle: Duration,
-    deadline: watch::Sender<tokio::time::Instant>,
+    idle_ms: u64,
+    origin: tokio::time::Instant,
+    last_activity_ms: Arc<AtomicU64>,
 }
 
 impl RelayIdle {
     fn new(idle: Duration) -> Self {
-        let deadline = tokio::time::Instant::now()
-            .checked_add(idle)
-            .unwrap_or_else(tokio::time::Instant::now);
         Self {
-            idle,
-            deadline: watch::channel(deadline).0,
+            idle_ms: u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
+            origin: tokio::time::Instant::now(),
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     fn touch(&self) {
-        let next = tokio::time::Instant::now()
-            .checked_add(self.idle)
-            .unwrap_or_else(tokio::time::Instant::now);
-        let _ = self.deadline.send_replace(next);
+        self.last_activity_ms
+            .store(self.now_ms(), Ordering::Release);
     }
 
     async fn read<T>(&self, fut: impl std::future::Future<Output = T>) -> Result<T, ()> {
         let mut fut = std::pin::pin!(fut);
         loop {
-            let mut changed = self.deadline.subscribe();
-            let deadline = *changed.borrow_and_update();
+            let last = self.last_activity_ms.load(Ordering::Acquire);
+            let wait_ms = last
+                .saturating_add(self.idle_ms)
+                .saturating_sub(self.now_ms());
             tokio::select! {
                 biased;
                 out = &mut fut => return Ok(out),
-                _ = tokio::time::sleep_until(deadline) => {
-                    if *self.deadline.borrow() <= tokio::time::Instant::now() {
+                _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {
+                    if self.last_activity_ms.load(Ordering::Acquire) == last {
                         return Err(());
                     }
                 }
-                _ = changed.changed() => {}
             }
         }
     }
@@ -1692,6 +1695,20 @@ mod tests {
         }
     }
 
+    struct PollCounter(Arc<AtomicU64>);
+
+    impl std::future::Future for PollCounter {
+        type Output = ();
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            std::task::Poll::Pending
+        }
+    }
+
     struct PendingShutdownSink {
         calls: Arc<AtomicU64>,
         armed: Arc<AtomicU64>,
@@ -2064,6 +2081,47 @@ mod tests {
             .expect("a dead flow must still be reaped")
             .expect("upload task");
         assert_eq!(idle, Err(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_idle_touch_does_not_wake_the_idle_direction() {
+        let clock = RelayIdle::new(Duration::from_millis(50));
+        let (active_tx, mut active_rx) = mpsc::channel::<u8>(1);
+        let idle_polls = Arc::new(AtomicU64::new(0));
+        let idle_polls_in_task = Arc::clone(&idle_polls);
+        let idle_clock = clock.clone();
+        let idle = tokio::spawn(async move {
+            relay_read(Some(&idle_clock), PollCounter(idle_polls_in_task)).await
+        });
+        let active_clock = clock.clone();
+        let active =
+            tokio::spawn(async move { relay_read(Some(&active_clock), active_rx.recv()).await });
+
+        tokio::time::advance(Duration::from_millis(40)).await;
+        clock.touch();
+        active_tx.send(7u8).await.expect("active frame");
+        let got = timeout(Duration::from_millis(20), active)
+            .await
+            .expect("active frame must arrive")
+            .expect("active task");
+        assert_eq!(got, Ok(Some(7)));
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            idle_polls.load(Ordering::Relaxed),
+            1,
+            "touch must not wake the idle direction"
+        );
+        assert!(
+            !idle.is_finished(),
+            "one-way traffic must keep the flow alive"
+        );
+
+        let expired = timeout(Duration::from_millis(60), idle)
+            .await
+            .expect("idle direction must still be reaped")
+            .expect("idle task");
+        assert_eq!(expired, Err(()));
     }
 
     #[tokio::test]
