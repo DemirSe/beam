@@ -835,14 +835,21 @@ function Test-HangRecovery {
             $baseDial = [uint64]0
         }
         # Hang: the client starts, dials TEST-NET-1, and can never finish.
+        # `IMPORT_LINK` deliberately keeps an active tunnel running (a mistyped
+        # link must not drop a working session), so the switch needs RESTART to
+        # re-read the config; `CONNECT` alone would be a no-op here.
         $synImport = Invoke-Ipc -Line ('IMPORT_LINK ' + $synthetic)
         if (-not $synImport.StartsWith('OK ')) {
             Add-Check 'hang_recovery' 'skip' 'synthetic_import_rejected'
             return
         }
-        $synConn = Invoke-Ipc -Line 'CONNECT'
-        if (-not $synConn.StartsWith('OK ')) {
+        $synRestart = Invoke-Ipc -Line 'RESTART'
+        if (-not $synRestart.StartsWith('OK ')) {
             Add-Check 'hang_recovery' 'skip' 'synthetic_connect_rejected'
+            return
+        }
+        if (-not (Wait-Connected -TimeoutSec $ConnectTimeoutSec)) {
+            Add-Check 'hang_recovery' 'skip' 'not_connected'
             return
         }
         $cpuBefore = 0.0
@@ -875,7 +882,8 @@ function Test-HangRecovery {
                 $egressNow = Get-PublicIpv4
                 $viaVps = (($egressNow -ne '') -and ($script:VpsIpv4 -ne '') -and ($egressNow -eq $script:VpsIpv4))
                 Write-Host ('hang_poll state=' + [string]$st['state'] + ' reason=' + $r +
-                    ' dial_failures=' + [string]$dialAfter + ' via_vps=' + $viaVps.ToString().ToLowerInvariant())
+                    ' dial_failures=' + [string]$dialAfter + ' generation=' + [string]$st['generation'] +
+                    ' via_vps=' + $viaVps.ToString().ToLowerInvariant())
                 if (($r -eq 'dial_failures') -or ($r -eq 'probe_failed') -or ($r -eq 'no_gateway')) {
                     $failReason = $r
                 }
@@ -922,7 +930,7 @@ function Test-HangRecovery {
             Add-Check 'hang_recovery' 'fail' 'reimport_failed'
             return
         }
-        $recConn = Invoke-Ipc -Line 'CONNECT'
+        $recConn = Invoke-Ipc -Line 'RESTART'
         if (-not $recConn.StartsWith('OK ')) {
             Add-Check 'hang_recovery' 'fail' 'reconnect_rejected'
             return
