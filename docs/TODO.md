@@ -5,7 +5,11 @@ repeated here.
 
 ## Open
 
-1. **Real hang test.** The liveness path is proven with forced failures, not
-   with a frozen process. The check needs about 15 minutes without the tunnel
-   and must show the timer restarting a process that stays `active` but cannot
-   finish a handshake.
+None.
+
+The real hang check is closed: `hang_recovery` in
+`scripts/windows-live-checks.ps1` points a running client at an unreachable
+server, drives traffic through the tunnel, and requires a failure signal (state
+change, reason token, or a rising `dial_failures`), a live process, no CPU
+spin, and a real link that reconnects. Evidence: `windows-live-e2e` run
+46063427533.
