@@ -1033,8 +1033,30 @@ impl UpstreamShutdown {
         if self.done {
             return;
         }
-        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
+        // Claim the shutdown before awaiting it so cancellation cannot leave a
+        // second shutdown behind.
         self.done = true;
+        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TcpRelayExit {
+    Complete,
+    Shutdown,
+    NetworkReset,
+}
+
+/// Releases the flow permit before any best-effort upstream half-close.
+async fn finish_tcp_relay<W: AsyncWriteExt + Unpin>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    exit: TcpRelayExit,
+    upstream_shutdown: &mut UpstreamShutdown,
+    up_w: &mut W,
+) {
+    drop(permit);
+    if exit == TcpRelayExit::Complete {
+        upstream_shutdown.once(up_w).await;
     }
 }
 
@@ -1307,7 +1329,7 @@ fn spawn_tcp_relay(
     };
 
     tokio::spawn(async move {
-        let _permit = permit;
+        let permit = permit;
         // The engine can stop between the spawn and this first poll; abort the
         // local flow instead of leaving a detached task behind.
         if *shutdown.borrow() {
@@ -1568,21 +1590,18 @@ fn spawn_tcp_relay(
             tun_w.shutdown();
         };
 
-        tokio::select! {
+        let exit = tokio::select! {
             biased;
-            () = wait_shutdown(&mut shutdown) => {
-                // The common shutdown below still half-closes upstream before
-                // the split halves are dropped on this shrinking pool.
-            }
+            () = wait_shutdown(&mut shutdown) => TcpRelayExit::Shutdown,
             Ok(()) = async {
                 match network_reset.as_mut() {
                     Some(rx) => rx.changed().await,
                     None => std::future::pending().await,
                 }
-            } => {}
-            _ = async { tokio::join!(c2s, s2c) } => {}
-        }
-        upstream_shutdown.once(&mut up_w).await;
+            } => TcpRelayExit::NetworkReset,
+            _ = async { tokio::join!(c2s, s2c) } => TcpRelayExit::Complete,
+        };
+        finish_tcp_relay(permit, exit, &mut upstream_shutdown, &mut up_w).await;
     });
 }
 
@@ -1670,6 +1689,51 @@ mod tests {
         DialFailure {
             stage: DialFailureStage::TcpConnect,
             kind: DialFailureKind::Refused,
+        }
+    }
+
+    struct PendingShutdownSink {
+        calls: Arc<AtomicU64>,
+        armed: Arc<AtomicU64>,
+    }
+
+    impl PendingShutdownSink {
+        fn new(calls: Arc<AtomicU64>) -> Self {
+            Self {
+                calls,
+                armed: Arc::new(AtomicU64::new(1)),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(1, Ordering::Release);
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PendingShutdownSink {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.armed.swap(0, Ordering::AcqRel) == 1 {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+            }
+            std::task::Poll::Pending
         }
     }
 
@@ -2255,6 +2319,56 @@ mod tests {
             1,
             "an EOF half-close must not be repeated at the common exit"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_upstream_shutdown_is_not_retried() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut sink = PendingShutdownSink::new(Arc::clone(&calls));
+        let mut shutdown = UpstreamShutdown::default();
+
+        tokio::select! {
+            () = shutdown.once(&mut sink) => panic!("mock shutdown must hang"),
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        sink.arm();
+        timeout(Duration::from_millis(1), shutdown.once(&mut sink))
+            .await
+            .expect("a second call must not wait for the shutdown timeout");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "a cancelled shutdown must not be attempted twice"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn network_reset_releases_tcp_permit_without_upstream_shutdown() {
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = permits.clone().acquire_owned().await.expect("test permit");
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut sink = PendingShutdownSink::new(Arc::clone(&calls));
+        let mut shutdown = UpstreamShutdown::default();
+
+        let cleanup = tokio::spawn(async move {
+            finish_tcp_relay(permit, TcpRelayExit::NetworkReset, &mut shutdown, &mut sink).await;
+        });
+        let acquired = timeout(Duration::from_millis(1), permits.clone().acquire_owned())
+            .await
+            .expect("network reset must not hold the permit during shutdown")
+            .expect("permit must be available");
+        timeout(Duration::from_millis(1), cleanup)
+            .await
+            .expect("network reset cleanup must finish promptly")
+            .expect("cleanup task");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "network reset must skip the best-effort upstream shutdown"
+        );
+        drop(acquired);
     }
 
     #[tokio::test]
