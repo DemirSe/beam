@@ -1228,11 +1228,23 @@ fn spawn_ip_child(bin: &str, args: &[&str], deadline: Instant) -> io::Result<Out
             format!("`ip {}` deadline exhausted", args.join(" ")),
         ));
     }
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut busy = 0;
+    let mut child = loop {
+        match Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => break child,
+            // A concurrent write or upgrade can make the binary briefly busy.
+            Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy && busy < 2 => {
+                busy += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    };
     let stdout = child.stdout.take().map(read_bounded_ip_output);
     let stderr = child.stderr.take().map(read_bounded_ip_output);
 
@@ -1648,9 +1660,13 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+    // Fake `ip` tests fork children; running them in parallel under load can
+    // make the spawn fail transiently, so serialize them.
+    static FAKE_IP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct FakeIp {
         dir: PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     fn test_dir(name: &str) -> PathBuf {
@@ -1664,15 +1680,19 @@ mod tests {
 
     impl FakeIp {
         fn new_in(dir: PathBuf, script: &str) -> Self {
+            let guard = FAKE_IP_LOCK.lock().unwrap_or_else(|err| err.into_inner());
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("fake ip dir");
             let path = dir.join("ip");
-            std::fs::write(&path, script).expect("write fake ip");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            let tmp = dir.join("ip.tmp");
+            std::fs::write(&tmp, script).expect("write fake ip");
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))
                 .expect("make fake ip executable");
+            // Publish atomically so a concurrent exec never sees a writable file.
+            std::fs::rename(&tmp, &path).expect("publish fake ip");
             let leaked = Box::leak(path.to_string_lossy().into_owned().into_boxed_str());
             TEST_IP_BINARY.set(Some(leaked));
-            Self { dir }
+            Self { dir, _lock: guard }
         }
 
         fn log_path(&self) -> PathBuf {
