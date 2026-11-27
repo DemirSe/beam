@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Focused regression tests for the IPv4-only Linux client normalizer."""
+import copy
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 
@@ -197,6 +199,43 @@ class IPv4OnlyNormalizerTests(unittest.TestCase):
         self.policy.normalize(config)
         self.assertEqual(config["route"]["rules"][1], private)
         self.assertTrue(self.policy.is_udp443_reject(config["route"]["rules"][2]))
+
+    def test_private_rule_with_extra_keys_precedes_udp_reject(self):
+        private = {
+            "ip_is_private": True,
+            "outbound": "direct",
+            "comment": "LAN direct",
+            "tag": "lan-direct",
+        }
+        config = _config("172.19.0.1/30", "192.0.2.53")
+        config["route"]["rules"] = [{"action": "sniff"}, private]
+        self.policy.normalize(config)
+        rules = config["route"]["rules"]
+        self.assertEqual(rules[0], {"ip_version": 6, "action": "reject"})
+        self.assertEqual(rules[1], private)
+        self.assertEqual(rules[1]["comment"], "LAN direct")
+        self.assertEqual(rules[1]["tag"], "lan-direct")
+        self.assertTrue(self.policy.is_udp443_reject(rules[2]))
+        self.assertEqual(sum(self.policy.is_udp443_reject(r) for r in rules), 1)
+        self.assertEqual(
+            sum(
+                1 for r in rules
+                if isinstance(r, dict)
+                and r.get("ip_is_private") is True
+                and r.get("outbound") == "direct"
+            ),
+            1,
+        )
+        snapshot = copy.deepcopy(config)
+        self.policy.normalize(config)
+        self.assertEqual(config, snapshot)
+
+    def test_stock_example_output_is_byte_identical(self):
+        path = ROOT / "clients/linux-tray/config.example.json"
+        original = path.read_text(encoding="utf-8")
+        config = json.loads(original)
+        self.policy.normalize(config)
+        self.assertEqual(json.dumps(config, indent=2) + "\n", original)
 
 
 if __name__ == "__main__":

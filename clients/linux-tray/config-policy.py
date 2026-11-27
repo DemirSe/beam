@@ -81,10 +81,15 @@ def ensure_ipv4_only(config: dict) -> None:
 def normalize(config: dict) -> None:
     route = config.setdefault("route", {})
     rules = route.setdefault("rules", [])
-    private = next((r for r in rules if r in (
-        {"ip_is_private": True, "outbound": "direct"},
-        {"ip_is_private": True, "ip_version": 4, "outbound": "direct"},
-    )), None)
+    private = next(
+        (
+            r for r in rules
+            if isinstance(r, dict)
+            and r.get("ip_is_private") is True
+            and r.get("outbound") == "direct"
+        ),
+        None,
+    )
     reject = {
         "action": "reject",
         "network": "udp",
