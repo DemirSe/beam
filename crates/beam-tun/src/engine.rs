@@ -45,6 +45,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Upper bound on simultaneous upstream REALITY handshakes so an outage or
 /// burst of new flows cannot starve active relay tasks on small worker pools.
 const MAX_CONCURRENT_DIALS: usize = 16;
+/// Queue budget for excess dials, independent of the whole handshake timeout.
+const DIAL_QUEUE_WAIT: Duration = Duration::from_secs(2);
 /// Consecutive dial failures within [`FAILURE_STREAK_WINDOW`] that engage
 /// outage fast-fail backoff (probing with exponential delay 1 s -> 5 s).
 const OUTAGE_BACKOFF_STREAK: u64 = 5;
@@ -1177,6 +1179,20 @@ impl DialGate {
     }
 }
 
+/// Acquires a dial permit with the short queue budget and counts only queue
+/// rejections here, separately from the local TCP connection limit.
+async fn acquire_dial_permit(
+    gate: &DialGate,
+    activity: Option<&TunnelActivity>,
+    drops: &DropCounters,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permit = gate.acquire(activity, DIAL_QUEUE_WAIT).await;
+    if permit.is_none() {
+        drops.dial_throttled.incr();
+    }
+    permit
+}
+
 /// Resolves when the engine shuts down, or when its shutdown channel is gone
 /// (nothing can ever signal a graceful stop then), so a detached relay task
 /// never outlives the engine that spawned it.
@@ -1240,7 +1256,7 @@ fn spawn_tcp_relay(
                 conn.stream.abort();
                 return;
             }
-            slot = dial_gate.acquire(activity.as_deref(), client_config.handshake_timeout) => {
+            slot = acquire_dial_permit(&dial_gate, activity.as_deref(), &drops) => {
                 match slot {
                     Some(slot) => slot,
                     None => {
@@ -1248,7 +1264,6 @@ fn spawn_tcp_relay(
                             dst = %conn.dst,
                             "upstream dial throttled by outage backoff or timeout; resetting flow"
                         );
-                        drops.tcp_limit.incr();
                         conn.stream.abort();
                         return;
                     }
@@ -1921,6 +1936,41 @@ mod tests {
             assert!(!is_fatal_tun_send_error(&io::Error::from_raw_os_error(8)));
             assert!(!is_fatal_tun_send_error(&io::Error::from_raw_os_error(259)));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_queue_budget_is_short_and_counted_separately() {
+        let gate = Arc::new(DialGate::new(1, Instant::now()));
+        let held = gate
+            .acquire(None, DIAL_QUEUE_WAIT)
+            .await
+            .expect("first dial holds the only permit");
+        let drops = Arc::new(DropCounters::default());
+        let started = tokio::time::Instant::now();
+
+        let queued = timeout(
+            Duration::from_secs(5),
+            acquire_dial_permit(&gate, None, &drops),
+        )
+        .await
+        .expect("queue wait must be bounded")
+        .is_none();
+
+        assert!(
+            queued,
+            "a stalled dial must fail rather than wait indefinitely"
+        );
+        assert!(
+            started.elapsed() >= DIAL_QUEUE_WAIT,
+            "the short queue budget must actually elapse"
+        );
+        assert_eq!(drops.snapshot().dial_throttled, 1);
+        assert_eq!(
+            drops.snapshot().tcp_limit,
+            0,
+            "dial throttling must not be reported as a local connection-limit RST"
+        );
+        drop(held);
     }
 
     #[tokio::test]
