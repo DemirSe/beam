@@ -17,7 +17,9 @@
     single 100 MiB measured transfer reports Mbps from curl's own byte rate. A
     short body fails the round, so a throttled reply cannot look fast. CPU
     seconds (process TotalProcessorTime delta over the measured transfer)
-    separate a CPU-bound gap from a per-flow gap. Beam drops come from the
+    separate a CPU-bound gap from a per-flow gap. sys_cpu_pct samples the
+    whole-machine _Total counter over the same window (it includes kernel
+    TCP work done for sing-box) and sys_core_s converts it to core-seconds. Beam drops come from the
     secret-free STATUS drops token ('none' when absent); sing-box reports
     'n/a'. With -MultiFlow, four concurrent 10 MB transfers also report an
     aggregate multi4_mbps, which shows whether a limit is per flow or shared.
@@ -165,6 +167,69 @@ function Get-ProcessCpuSeconds {
         return $proc.TotalProcessorTime.TotalSeconds
     } catch {
         return -1.0
+    }
+}
+
+function Get-CoreCount {
+    # Logical processor count for normalising system-wide CPU.
+    # Falls back to the perf counter instance count when needed.
+    try {
+        $n = [System.Environment]::ProcessorCount
+        if ($n -gt 0) { return [int]$n }
+    } catch {
+    }
+    try {
+        $list = @(Get-CimInstance Win32_PerfRawData_PerfOS_Processor -ErrorAction Stop |
+            Where-Object { $_.Name -ne '_Total' })
+        if ($list.Count -gt 0) { return [int]$list.Count }
+    } catch {
+    }
+    return 0
+}
+
+function Get-SystemCpuSnapshot {
+    # One cumulative whole-machine CPU sample (busy ticks + timestamp).
+    # Never throws; ok=$false means the caller must report 'n/a'.
+    $snap = @{ ok = $false; busy = 0.0; stamp = 0.0 }
+    try {
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+        $inst = Get-CimInstance Win32_PerfRawData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop |
+            Select-Object -First 1
+        if ($null -eq $inst) { return $snap }
+        $b = 0.0
+        $s = 0.0
+        if (-not [double]::TryParse([string]$inst.PercentProcessorTime, [System.Globalization.NumberStyles]::Float, $inv, [ref]$b)) { return $snap }
+        if (-not [double]::TryParse([string]$inst.Timestamp_Sys100NS, [System.Globalization.NumberStyles]::Float, $inv, [ref]$s)) { return $snap }
+        $snap['busy'] = $b
+        $snap['stamp'] = $s
+        $snap['ok'] = $true
+    } catch {
+    }
+    return $snap
+}
+
+function Get-SystemCpuBusyPct {
+    # Whole-machine busy percent over the measured transfer:
+    # busy = 100 * dPercentProcessorTime / dTimestamp_Sys100NS.
+    # Clamped to 0..100*core count; 'n/a' on any failure.
+    param([hashtable]$Before, [hashtable]$After, [int]$Cores = 0)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    try {
+        if (($null -eq $Before) -or ($null -eq $After)) { return 'n/a' }
+        if ((-not $Before['ok']) -or (-not $After['ok'])) { return 'n/a' }
+        $dBusy = [double]$After['busy'] - [double]$Before['busy']
+        $dStamp = [double]$After['stamp'] - [double]$Before['stamp']
+        if ($dStamp -le 0) { return 'n/a' }
+        if ($dBusy -lt 0) { return 'n/a' }
+        $pct = 100.0 * $dBusy / $dStamp
+        if ($pct -lt 0) { $pct = 0 }
+        if ($Cores -gt 0) {
+            $cap = 100.0 * [double]$Cores
+            if ($pct -gt $cap) { $pct = $cap }
+        }
+        return ([math]::Round($pct, 1)).ToString('F1', $inv)
+    } catch {
+        return 'n/a'
     }
 }
 
@@ -396,13 +461,33 @@ function Measure-ConnectedMetrics {
     $ttfb = Measure-HttpsTtfbMs
     $null = Invoke-DownloadWarmup
     # CPU seconds are sampled around the measured transfer only, so a slow
-    # handshake or DNS query cannot be charged to the download path.
+    # handshake or DNS query cannot be charged to the download path. The
+    # system-wide counters use the same window, so kernel TCP work done for
+    # sing-box is included too.
+    $cores = Get-CoreCount
+    $coresStr = 'n/a'
+    if ($cores -gt 0) { $coresStr = $cores.ToString($inv) }
     $cpu0 = Get-ProcessCpuSeconds -ProcessId $RamPid -ProcessName $RamName
+    $sys0 = Get-SystemCpuSnapshot
+    $swDown = [System.Diagnostics.Stopwatch]::StartNew()
     $down = Measure-DownloadMbps
+    $swDown.Stop()
+    $wallSecs = $swDown.Elapsed.TotalSeconds
     $cpu1 = Get-ProcessCpuSeconds -ProcessId $RamPid -ProcessName $RamName
+    $sys1 = Get-SystemCpuSnapshot
     $cpu = 'n/a'
     if (($cpu0 -ge 0) -and ($cpu1 -ge $cpu0)) {
         $cpu = ([math]::Round($cpu1 - $cpu0, 1)).ToString('F1', $inv)
+    }
+    $sys = Get-SystemCpuBusyPct -Before $sys0 -After $sys1 -Cores $cores
+    # Core-seconds burned by the whole machine during the transfer:
+    # sys_cpu_pct / 100 * cores * wall_seconds.
+    $sysCore = 'n/a'
+    if (($sys -ne 'n/a') -and ($sys -ne '') -and ($cores -gt 0) -and ($wallSecs -gt 0)) {
+        $sysVal = 0.0
+        if ([double]::TryParse($sys, [System.Globalization.NumberStyles]::Float, $inv, [ref]$sysVal)) {
+            $sysCore = ([math]::Round($sysVal / 100.0 * [double]$cores * $wallSecs, 1)).ToString('F1', $inv)
+        }
     }
     $multi4 = Measure-Multi4DownloadMbps
     $multi4Exit = [string]$script:LastMulti4CurlExit
@@ -415,6 +500,7 @@ function Measure-ConnectedMetrics {
         ram_mb = $ram; https_ttfb_ms = $ttfb; download_mbps = $down
         multi4_mbps = $multi4; multi4_curl_exit = $multi4Exit; multi4_http_code = $multi4Http
         dns_ms = $dns; dns_direct_ms = $dnsDirect; cpu_s = $cpu
+        sys_cpu_pct = $sys; sys_core_s = $sysCore; cores = $coresStr
         egress_via_vps = $via.ToString().ToLowerInvariant()
     }
 }
@@ -424,7 +510,7 @@ function New-RoundRow {
         connect_ms = 'fail'; ram_mb = 'n/a'; https_ttfb_ms = 'fail'
         download_mbps = 'fail'; multi4_mbps = 'fail'; dns_ms = 'fail'; dns_direct_ms = 'fail'
         egress_via_vps = 'false'
-        cpu_s = 'n/a'; drops = 'none'; curl_exit = 'n/a'; http_code = 'n/a'
+        cpu_s = 'n/a'; sys_cpu_pct = 'n/a'; sys_core_s = 'n/a'; cores = 'n/a'; drops = 'none'; curl_exit = 'n/a'; http_code = 'n/a'
         multi4_curl_exit = 'n/a'; multi4_http_code = 'n/a'
         rtt_ms = 'n/a'; error = ''
     }
@@ -441,6 +527,9 @@ function Format-RoundLine {
         ' dns_ms=' + $Round['dns_ms'] +
         ' dns_direct_ms=' + $Round['dns_direct_ms'] +
         ' cpu_s=' + $Round['cpu_s'] +
+        ' sys_cpu_pct=' + $Round['sys_cpu_pct'] +
+        ' sys_core_s=' + $Round['sys_core_s'] +
+        ' cores=' + $Round['cores'] +
         ' drops=' + $Round['drops'] +
         ' rtt_ms=' + $Round['rtt_ms'] +
         ' curl_exit=' + $Round['curl_exit'] +
@@ -848,6 +937,9 @@ try {
         ('| dns_ms | ' + (Format-AggCell -Rows $beamRounds -Key 'dns_ms' -Decimals 0) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'dns_ms' -Decimals 0) + ' |'),
         ('| dns_direct_ms | ' + (Format-AggCell -Rows $beamRounds -Key 'dns_direct_ms' -Decimals 0) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'dns_direct_ms' -Decimals 0) + ' |'),
         ('| cpu_s | ' + (Format-AggCell -Rows $beamRounds -Key 'cpu_s' -Decimals 1) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'cpu_s' -Decimals 1) + ' |'),
+        ('| sys_cpu_pct | ' + (Format-AggCell -Rows $beamRounds -Key 'sys_cpu_pct' -Decimals 1) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'sys_cpu_pct' -Decimals 1) + ' |'),
+        ('| sys_core_s | ' + (Format-AggCell -Rows $beamRounds -Key 'sys_core_s' -Decimals 1) + ' | ' + (Format-AggCell -Rows $sbRounds -Key 'sys_core_s' -Decimals 1) + ' |'),
+        ('| cores | ' + (Format-JoinCell -Rows $beamRounds -Key 'cores') + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'cores') + ' |'),
         ('| drops | ' + (Format-JoinCell -Rows $beamRounds -Key 'drops') + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'drops') + ' |'),
         ('| rtt_ms | ' + (Format-AggCell -Rows $beamRounds -Key 'rtt_ms' -Decimals 0) + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'rtt_ms') + ' |'),
         ('| download_curl_exit | ' + (Format-JoinCell -Rows $beamRounds -Key 'curl_exit') + ' | ' + (Format-JoinCell -Rows $sbRounds -Key 'curl_exit') + ' |'),
