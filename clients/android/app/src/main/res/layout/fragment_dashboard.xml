@@ -88,6 +88,7 @@
                 <TextView
                     android:id="@+id/statusBadge"
                     android:layout_width="wrap_content"
+                    android:accessibilityLiveRegion="polite"
                     android:layout_height="wrap_content"
                     android:background="@drawable/bg_status_badge"
                     android:backgroundTint="@color/status_disconnected"
@@ -102,6 +103,7 @@
                 <TextView
                     android:id="@+id/statusDetail"
                     android:layout_width="match_parent"
+                    android:accessibilityLiveRegion="polite"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
                     android:background="@drawable/bg_detail_banner"

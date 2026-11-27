@@ -24,6 +24,7 @@
     <string name="dashboard_add_profile">Add a profile</string>
     <string name="dashboard_telemetry">Telemetry</string>
     <string name="action_connect">Connect</string>
+    <string name="action_retry">Try again</string>
     <string name="action_disconnect">Disconnect</string>
     <string name="action_connecting">Connecting…</string>
     <string name="action_disconnecting">Disconnecting…</string>
@@ -41,6 +42,7 @@
     <string name="profiles_add">Add profile</string>
     <string name="profiles_scan">Scan QR code</string>
     <string name="profiles_delete">Delete profile</string>
+    <string name="profiles_delete_content_description">Delete %1$s</string>
     <string name="profiles_delete_title">Delete profile?</string>
     <string name="profiles_delete_message">%1$s is removed from this device.</string>
     <string name="profiles_add_title">Paste vless:// link</string>

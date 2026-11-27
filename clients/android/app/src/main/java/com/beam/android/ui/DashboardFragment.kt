@@ -19,7 +19,9 @@ import com.beam.android.storage.EncryptedProfileStore
 import com.beam.android.vpn.TelemetryDto
 import com.beam.android.vpn.VpnState
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
@@ -43,6 +45,9 @@ class DashboardFragment : Fragment() {
     private var lastTelemetryJson: String? = null
     private var lastRenderedTelemetry: TelemetryDto? = null
     private var hasRenderedTelemetry: Boolean = false
+    private var profileLoadJob: Job? = null
+    private var connectLookupJob: Job? = null
+    private var connectPending = false
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -64,19 +69,38 @@ class DashboardFragment : Fragment() {
 
     override fun onResume() {
         super.onResume()
-        renderActiveProfile()
+        // Recovery hatch: a connect that never produced a state change must not leave
+        // the button stuck on "Connecting…".
+        if (connectPending) {
+            connectPending = false
+            connectLookupJob?.cancel()
+            renderStatus((requireActivity() as MainActivity).status.value)
+        }
+        if (!isHidden) renderActiveProfile()
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
         tabVisible.value = !hidden
-        if (!hidden && _binding != null) renderActiveProfile()
+        if (!hidden && _binding != null) {
+            if (connectPending) {
+                connectPending = false
+                connectLookupJob?.cancel()
+                renderStatus((requireActivity() as MainActivity).status.value)
+            }
+            renderActiveProfile()
+        }
     }
 
     override fun onDestroyView() {
         lastTelemetryJson = null
         lastRenderedTelemetry = null
         hasRenderedTelemetry = false
+        profileLoadJob?.cancel()
+        profileLoadJob = null
+        connectLookupJob?.cancel()
+        connectLookupJob = null
+        connectPending = false
         _binding = null
         super.onDestroyView()
     }
@@ -87,7 +111,15 @@ class DashboardFragment : Fragment() {
         viewLifecycleOwner.lifecycleScope.launch {
             viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
                 launch {
-                    main.status.collectLatest { renderStatus(it) }
+                    main.status.collectLatest { status ->
+                        // A local banner clear (DISCONNECTED + null detail) is not service truth;
+                        // keep connectPending active so a Retry tap does not flicker or double-dial.
+                        if (status.state != VpnState.DISCONNECTED || status.detail != null) {
+                            connectPending = false
+                            connectLookupJob?.cancel()
+                        }
+                        renderStatus(status)
+                    }
                 }
                 launch {
                     combine(
@@ -120,15 +152,36 @@ class DashboardFragment : Fragment() {
             main.requestDisconnect()
             return
         }
+        // A teardown in progress or a tap already being served must not start a dial.
+        if (state == VpnState.DISCONNECTING || connectPending || connectLookupJob?.isActive == true) {
+            return
+        }
+        connectPending = true
+        renderStatus(main.status.value)
         val context = requireContext()
-        viewLifecycleOwner.lifecycleScope.launch {
+        connectLookupJob = viewLifecycleOwner.lifecycleScope.launch {
             val profile = withContext(Dispatchers.IO) {
-                runCatching { EncryptedProfileStore(context).getActiveProfile() }.getOrNull()
+                try {
+                    EncryptedProfileStore(context).getActiveProfile()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
             }
             if (profile == null) {
+                connectPending = false
+                renderStatus(main.status.value)
                 main.openProfiles()
             } else {
                 main.requestConnect(profile.id)
+                // Watchdog: if the service never emits a new state, restore the button
+                // automatically without waiting for a tab switch or resume.
+                delay(CONNECT_PENDING_TIMEOUT_MS)
+                if (connectPending) {
+                    connectPending = false
+                    renderStatus(main.status.value)
+                }
             }
         }
     }
@@ -187,7 +240,7 @@ class DashboardFragment : Fragment() {
     private fun renderStatus(status: BeamStatus) {
         val binding = _binding ?: return
         val accent = ContextCompat.getColor(requireContext(), statusColor(status.state))
-        binding.statusBadge.text = getString(statusLabel(status.state))
+        setTextIfChanged(binding.statusBadge, getString(statusLabel(status.state)))
         binding.statusBadge.setTextColor(accent)
         binding.statusBadge.backgroundTintList =
             ColorStateList.valueOf(ColorUtils.setAlphaComponent(accent, BADGE_ALPHA))
@@ -195,12 +248,18 @@ class DashboardFragment : Fragment() {
         val detail = status.detail?.takeIf { it.isNotBlank() }
         binding.statusDetail.isVisible = detail != null
         if (detail != null) {
-            binding.statusDetail.text = detail
+            setTextIfChanged(binding.statusDetail, detail)
             binding.statusDetail.setTextColor(accent)
             binding.statusDetail.backgroundTintList =
                 ColorStateList.valueOf(ColorUtils.setAlphaComponent(accent, BANNER_ALPHA))
         }
 
+        if (connectPending) {
+            // A tap is being served: instant feedback, and renderStatus re-enables later.
+            binding.connectButton.isEnabled = false
+            binding.connectButton.text = getString(R.string.action_connecting)
+            return
+        }
         val connected = status.state == VpnState.CONNECTED || status.state == VpnState.DEGRADED
         // Stays enabled while CONNECTING as "Cancel" so a hanging dial can abort.
         binding.connectButton.isEnabled = connected || status.state == VpnState.DISCONNECTED ||
@@ -210,16 +269,23 @@ class DashboardFragment : Fragment() {
                 VpnState.CONNECTED, VpnState.DEGRADED -> R.string.action_disconnect
                 VpnState.CONNECTING -> R.string.action_cancel
                 VpnState.DISCONNECTING -> R.string.action_disconnecting
-                else -> R.string.action_connect
+                else -> if (detail != null) R.string.action_retry else R.string.action_connect
             },
         )
     }
 
     private fun renderActiveProfile() {
         val context = requireContext()
-        viewLifecycleOwner.lifecycleScope.launch {
+        profileLoadJob?.cancel()
+        profileLoadJob = viewLifecycleOwner.lifecycleScope.launch {
             val profile = withContext(Dispatchers.IO) {
-                runCatching { EncryptedProfileStore(context).getActiveProfile() }.getOrNull()
+                try {
+                    EncryptedProfileStore(context).getActiveProfile()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
             }
             val binding = _binding ?: return@launch
             binding.activeProfileName.text =
@@ -261,6 +327,7 @@ class DashboardFragment : Fragment() {
 
     private companion object {
         const val POLL_INTERVAL_MS = 2_000L
+        const val CONNECT_PENDING_TIMEOUT_MS = 8_000L
         const val BADGE_ALPHA = 0x26
         const val BANNER_ALPHA = 0x1A
     }

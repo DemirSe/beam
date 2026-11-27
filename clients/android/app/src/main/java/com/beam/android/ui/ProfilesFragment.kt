@@ -2,6 +2,7 @@ package com.beam.android.ui
 
 import android.app.Activity
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
 import android.os.Bundle
@@ -26,7 +27,9 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -43,6 +46,8 @@ class ProfilesFragment : Fragment() {
     private lateinit var store: EncryptedProfileStore
     private lateinit var adapter: ProfilesAdapter
     private var activeDialog: AlertDialog? = null
+    private var reloadJob: Job? = null
+    private var activeProfileId: String? = null
 
     private val scanLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -81,7 +86,7 @@ class ProfilesFragment : Fragment() {
 
     override fun onResume() {
         super.onResume()
-        reload()
+        if (!isHidden) reload()
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
@@ -92,17 +97,26 @@ class ProfilesFragment : Fragment() {
     override fun onDestroyView() {
         activeDialog?.dismiss()
         activeDialog = null
+        reloadJob?.cancel()
+        reloadJob = null
         _binding = null
         super.onDestroyView()
     }
 
     private fun reload() {
-        viewLifecycleOwner.lifecycleScope.launch {
+        reloadJob?.cancel()
+        reloadJob = viewLifecycleOwner.lifecycleScope.launch {
             val (profiles, activeId) = withContext(Dispatchers.IO) {
-                runCatching { store.listProfilesWithActiveId() }
-                    .getOrDefault(emptyList<VlessProfile>() to null)
+                try {
+                    store.listProfilesWithActiveId()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    emptyList<VlessProfile>() to null
+                }
             }
             val binding = _binding ?: return@launch
+            activeProfileId = activeId
             adapter.submit(profiles, activeId)
             binding.profilesEmpty.isVisible = profiles.isEmpty()
             binding.profilesList.isVisible = profiles.isNotEmpty()
@@ -110,12 +124,15 @@ class ProfilesFragment : Fragment() {
     }
 
     private fun selectProfile(profile: VlessProfile) {
+        // Tapping the profile that is already active changes nothing.
+        if (profile.id == activeProfileId) return
         val main = activity as? MainActivity
         viewLifecycleOwner.lifecycleScope.launch {
             val saved = withContext(Dispatchers.IO) {
                 runCatching { store.setActiveProfileId(profile.id) }.isSuccess
             }
             if (saved) {
+                main?.clearErrorDetail()
                 reload()
                 main?.showReconnectHint()
             } else {
@@ -186,6 +203,7 @@ class ProfilesFragment : Fragment() {
                         }
                         runCatching { store.deleteProfile(profile.id) }
                     }
+                    main?.clearErrorDetail()
                     if (_binding != null) reload()
                 }
             }
@@ -200,7 +218,6 @@ class ProfilesFragment : Fragment() {
         val content = layoutInflater.inflate(R.layout.dialog_add_profile, null)
         val input = content.findViewById<TextInputEditText>(R.id.dialogLinkInput)
         val layout = content.findViewById<TextInputLayout>(R.id.dialogLinkLayout)
-        clipVlessLink()?.let { input.setText(it) }
         input.doAfterTextChanged { layout.error = null }
 
         val dialog = MaterialAlertDialogBuilder(requireContext())
@@ -227,6 +244,14 @@ class ProfilesFragment : Fragment() {
         activeDialog = dialog
         dialog.setOnDismissListener { if (activeDialog === dialog) activeDialog = null }
         dialog.show()
+        // A clipboard read can block on the system service, so never do it on the UI thread.
+        val appContext = requireContext().applicationContext
+        viewLifecycleOwner.lifecycleScope.launch {
+            val link = withContext(Dispatchers.IO) { clipVlessLink(appContext) }
+            if (link != null && dialog.isShowing && input.text.isNullOrEmpty()) {
+                input.setText(link)
+            }
+        }
     }
 
     /** Validates and stores [raw]; [onSaved] gets false and nothing is saved when invalid. */
@@ -287,11 +312,11 @@ class ProfilesFragment : Fragment() {
         return LinkInfo(fragment?.let { android.net.Uri.decode(it) } ?: host, host, port)
     }
 
-    private fun clipVlessLink(): String? {
-        val manager = requireContext().getSystemService(ClipboardManager::class.java) ?: return null
+    private fun clipVlessLink(context: Context): String? {
+        val manager = context.getSystemService(ClipboardManager::class.java) ?: return null
         val clip = manager.primaryClip ?: return null
         if (clip.itemCount == 0) return null
-        val text = clip.getItemAt(0).coerceToText(requireContext()).toString().trim()
+        val text = clip.getItemAt(0).coerceToText(context).toString().trim()
         return text.takeIf { it.startsWith("vless://", ignoreCase = true) && it.length <= MAX_LINK_LENGTH }
     }
 
