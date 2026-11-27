@@ -394,10 +394,11 @@ impl LinuxRouteGuard {
         };
         if !self.server_ip.is_loopback() && gateway_for_ip(gw, self.server_ip).is_some() {
             if self.server_bypass_route.is_none() && !self.server_bypass_preexisting {
-                return BypassRouteState::Absent;
+                state = state.merge(BypassRouteState::Absent);
+            } else {
+                let (flag, prefix) = host_route_args(self.server_ip);
+                state = state.merge(checked(flag, &prefix).into());
             }
-            let (flag, prefix) = host_route_args(self.server_ip);
-            state = state.merge(checked(flag, &prefix).into());
         }
         if let Some(dns_ip) = local_dns
             && !dns_ip.is_loopback()
@@ -406,10 +407,11 @@ impl LinuxRouteGuard {
             && gateway_for_ip(gw, dns_ip).is_some()
         {
             if self.local_dns_bypass_route.is_none() && !self.local_dns_bypass_preexisting {
-                return BypassRouteState::Absent;
+                state = state.merge(BypassRouteState::Absent);
+            } else {
+                let (flag, prefix) = host_route_args(dns_ip);
+                state = state.merge(checked(flag, &prefix).into());
             }
-            let (flag, prefix) = host_route_args(dns_ip);
-            state = state.merge(checked(flag, &prefix).into());
         }
         if gw.v4.is_some() {
             for cidr in &self.configured_bypass_v4 {
@@ -464,8 +466,8 @@ impl LinuxRouteGuard {
         let state = self.bypass_routes_installed_with(new_gw, new_local_dns, |flag, prefix| {
             snapshot.check(flag, prefix)
         });
-        // A genuine miss authorizes the reinstall. When every unresolved route
-        // is an error, keep the last-known routes and let the caller retry.
+        // A genuine miss authorizes the reinstall. When any route is an error,
+        // keep the last-known routes and let the caller retry.
         if state == BypassRouteState::Error {
             return false;
         }
@@ -553,9 +555,13 @@ impl LinuxRouteGuard {
 
         if let Some((maybe_gw, dev)) = new_gw.v4.as_ref() {
             for cidr_entry in &self.configured_bypass_v4 {
-                if recheck.check("-4", cidr_entry).is_present() {
-                    debug!(cidr = %cidr_entry, "preserving pre-existing exact IPv4 route");
-                    continue;
+                match recheck.check("-4", cidr_entry) {
+                    RouteCheck::Present => {
+                        debug!(cidr = %cidr_entry, "preserving pre-existing exact IPv4 route");
+                        continue;
+                    }
+                    RouteCheck::Absent => {}
+                    RouteCheck::Error(_) => continue,
                 }
                 if let Err(err) = install_v4_bypass(cidr_entry, maybe_gw.as_deref(), dev) {
                     warn!(cidr = %cidr_entry, error = %err, "failed to install IPv4 bypass CIDR route");
@@ -566,9 +572,13 @@ impl LinuxRouteGuard {
             }
             for &(ip, _) in &self.dynamic_bypass_v4 {
                 let host = format!("{ip}/32");
-                if recheck.check("-4", &host).is_present() {
-                    debug!(prefix = %host, "preserving pre-existing exact IPv4 route");
-                    continue;
+                match recheck.check("-4", &host) {
+                    RouteCheck::Present => {
+                        debug!(prefix = %host, "preserving pre-existing exact IPv4 route");
+                        continue;
+                    }
+                    RouteCheck::Absent => {}
+                    RouteCheck::Error(_) => continue,
                 }
                 if install_v4_bypass(&host, maybe_gw.as_deref(), dev).is_ok() {
                     info!(prefix = %host, via = ?maybe_gw, dev = %dev, "installed dynamic bypass.domains route");
@@ -580,9 +590,13 @@ impl LinuxRouteGuard {
 
         if let Some((maybe_gw, dev)) = new_gw.v6.as_ref() {
             for cidr_entry in &self.configured_bypass_v6 {
-                if recheck.check("-6", cidr_entry).is_present() {
-                    debug!(cidr = %cidr_entry, "preserving pre-existing exact IPv6 route");
-                    continue;
+                match recheck.check("-6", cidr_entry) {
+                    RouteCheck::Present => {
+                        debug!(cidr = %cidr_entry, "preserving pre-existing exact IPv6 route");
+                        continue;
+                    }
+                    RouteCheck::Absent => {}
+                    RouteCheck::Error(_) => continue,
                 }
                 if let Err(err) = install_v6_bypass(cidr_entry, maybe_gw.as_deref(), dev) {
                     warn!(cidr = %cidr_entry, error = %err, "failed to install IPv6 bypass CIDR route");
@@ -593,9 +607,13 @@ impl LinuxRouteGuard {
             }
             for &(ip, _) in &self.dynamic_bypass_v6 {
                 let host = format!("{ip}/128");
-                if recheck.check("-6", &host).is_present() {
-                    debug!(prefix = %host, "preserving pre-existing exact IPv6 route");
-                    continue;
+                match recheck.check("-6", &host) {
+                    RouteCheck::Present => {
+                        debug!(prefix = %host, "preserving pre-existing exact IPv6 route");
+                        continue;
+                    }
+                    RouteCheck::Absent => {}
+                    RouteCheck::Error(_) => continue,
                 }
                 if install_v6_bypass(&host, maybe_gw.as_deref(), dev).is_ok() {
                     info!(prefix = %host, via = ?maybe_gw, dev = %dev, "installed dynamic bypass.domains route");
@@ -1317,13 +1335,13 @@ impl BypassRouteState {
         matches!(self, Self::Installed)
     }
 
-    /// A known miss wins over an unknown lookup; otherwise any error wins.
+    /// An unresolved lookup wins over a known miss; otherwise a miss wins.
     fn merge(self, other: Self) -> Self {
         use BypassRouteState as State;
         match (self, other) {
-            (State::Absent, _) | (_, State::Absent) => State::Absent,
             (State::Error, _) | (_, State::Error) => State::Error,
-            _ => State::Installed,
+            (State::Absent, _) | (_, State::Absent) => State::Absent,
+            (State::Installed, State::Installed) => State::Installed,
         }
     }
 }
@@ -2046,6 +2064,94 @@ broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
         assert!(log.contains("-4 route show"), "{log}");
         assert!(!log.contains("-6 route show"), "{log}");
         drop(fake);
+    }
+
+    #[test]
+    fn error_state_blocks_reconcile_when_other_family_misses() {
+        assert_eq!(
+            BypassRouteState::Absent.merge(BypassRouteState::Error),
+            BypassRouteState::Error
+        );
+        assert_eq!(
+            BypassRouteState::Error.merge(BypassRouteState::Absent),
+            BypassRouteState::Error
+        );
+
+        let dir = test_dir("mixed-family-error");
+        let log = dir.join("ip.log");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$*\" in\n\
+                   *\"-6 route show\"*) echo transient >&2; exit 2 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log.display()
+            ),
+        );
+        let mut guard = route_guard_for_tests();
+        let v6_cidr = "2001:db8:1::/64".to_owned();
+        guard.current_gw.v6 = Some((Some("fe80::1".to_owned()), "eth0".to_owned()));
+        guard.configured_bypass_v6.push(v6_cidr.clone());
+        guard.extra_bypass_v4.push((
+            "198.51.100.0/24".to_owned(),
+            Some("192.168.1.1".to_owned()),
+            "eth0".to_owned(),
+        ));
+        guard.extra_bypass_v6.push((
+            v6_cidr.clone(),
+            Some("fe80::1".to_owned()),
+            "eth0".to_owned(),
+        ));
+        let gw = guard.current_gw.clone();
+
+        assert!(
+            !guard.update_bypass_gateway(&gw, None),
+            "an IPv6 error must survive an IPv4 miss"
+        );
+        let log = read_fake_ip_log(&fake.log_path());
+        assert!(!log.contains("route del"), "an error drained routes: {log}");
+        assert_eq!(guard.extra_bypass_v4.len(), 1);
+        assert_eq!(guard.extra_bypass_v6.len(), 1);
+    }
+
+    #[test]
+    fn recheck_error_does_not_replace_existing_route() {
+        let dir = test_dir("recheck-error");
+        let log = dir.join("ip.log");
+        let checked = dir.join("checked");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$*\" in\n\
+                   *\"-4 route show\"*) [ -f \"{}\" ] && {{ echo transient >&2; exit 2; }}; : > \"{}\"; exit 0 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log.display(),
+                checked.display(),
+                checked.display(),
+            ),
+        );
+        let mut guard = route_guard_for_tests();
+        let cidr = "198.51.100.0/24".to_owned();
+        guard.configured_bypass_v4.push(cidr.clone());
+        guard.extra_bypass_v4.push((
+            cidr.clone(),
+            Some("192.168.1.1".to_owned()),
+            "eth0".to_owned(),
+        ));
+        let gw = guard.current_gw.clone();
+
+        assert!(guard.update_bypass_gateway(&gw, None));
+        let log = read_fake_ip_log(&fake.log_path());
+        assert!(
+            !log.contains("route replace"),
+            "an unresolved recheck must not overwrite a route: {log}"
+        );
     }
 
     #[test]
