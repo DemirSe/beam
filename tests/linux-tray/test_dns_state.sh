@@ -402,6 +402,9 @@ check_core_dir() {
       path="$1"
       case "$path" in
         */LICENSE) printf '%s\n' "$core_uid" ;;
+        "${FAKE_PARENT_PATH:-/nonexistent}")
+          [ "$fmt" = '%A' ] && printf '%s\n' "${FAKE_PARENT_MODE:-$dir_mode}" ||
+            printf '%s\n' "$core_uid" ;;
         *) [ "$fmt" = '%A' ] && printf '%s\n' "$dir_mode" || printf '%s\n' "$core_uid" ;;
       esac
     }
@@ -432,6 +435,17 @@ check_core_dir 1 0 '-rwxr-xrwx' 'group or world writable'
 ln -s "$TMP/core-dir" "$TMP/core-link"
 CORE_TEST_DIR="$TMP/core-link"
 check_core_dir 1 0 '-rwxr-xr-x' 'must not be a symlink'
+# A trailing slash hides the symlink from -L; strip it before the check.
+CORE_TEST_DIR="$TMP/core-link/"
+check_core_dir 1 0 '-rwxr-xr-x' 'must not be a symlink'
+# A writable ancestor lets another user replace the directory after validation.
+mkdir -p "$TMP/core-parent/core"
+printf 'license\n' > "$TMP/core-parent/core/LICENSE"
+FAKE_PARENT_PATH="$TMP/core-parent"
+FAKE_PARENT_MODE='-rwxrwxr-x'
+CORE_TEST_DIR="$TMP/core-parent/core"
+check_core_dir 1 0 '-rwxr-xr-x' 'group or world writable'
+unset FAKE_PARENT_PATH FAKE_PARENT_MODE
 CORE_TEST_DIR="$TMP/core-dir"
 ln -s "$TMP/core-dir/LICENSE" "$TMP/core-dir/LICENSE.link"
 mv -f "$TMP/core-dir/LICENSE.link" "$TMP/core-dir/LICENSE.symlink"

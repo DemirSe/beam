@@ -90,29 +90,67 @@ trap cleanup EXIT
 
 # An untrusted core tree can hold genuine pinned binaries plus a LICENSE
 # symlink to a secret. Resolve no symlink and accept only a root-owned,
-# non-writable directory and a root-owned regular LICENSE.
+# non-writable directory and a root-owned regular LICENSE. Every ancestor
+# must also be safe: a writable parent can replace the directory after it is
+# checked.
 validate_core_dir() {
-    local dir="$1" owner perms
-    if [ -L "$dir" ]; then
-        echo "CORE_DIR must not be a symlink: $dir" >&2
-        return 1
-    fi
-    if [ ! -d "$dir" ]; then
-        echo "CORE_DIR is not a directory: $dir" >&2
-        return 1
-    fi
-    owner=$(stat -c %u -- "$dir") || return 1
-    if [ "$owner" != 0 ]; then
-        echo "CORE_DIR must be owned by root: $dir" >&2
-        return 1
-    fi
-    perms=$(stat -c %A -- "$dir") || return 1
-    case "${perms:5:1}${perms:8:1}" in
-        *w*)
-            echo "CORE_DIR must not be group or world writable: $dir" >&2
+    local dir="$1" owner perms part prefix
+    local IFS=/
+
+    check_component() {
+        local path="$1"
+        if [ -L "$path" ]; then
+            echo "CORE_DIR must not be a symlink: $path" >&2
             return 1
-            ;;
+        fi
+        if [ ! -d "$path" ]; then
+            echo "CORE_DIR is not a directory: $path" >&2
+            return 1
+        fi
+        owner=$(stat -c %u -- "$path") || return 1
+        if [ "$owner" != 0 ]; then
+            echo "CORE_DIR must be owned by root: $path" >&2
+            return 1
+        fi
+        perms=$(stat -c %A -- "$path") || return 1
+        case "${perms:5:1}${perms:8:1}" in
+            *w*)
+                echo "CORE_DIR must not be group or world writable: $path" >&2
+                return 1
+                ;;
+        esac
+    }
+
+    # A trailing slash makes -L follow the link instead of naming it.
+    while [ "$dir" != / ] && [ "${dir%/}" != "$dir" ]; do
+        dir=${dir%/}
+    done
+    [ -n "$dir" ] || {
+        echo "CORE_DIR must not be empty" >&2
+        return 1
+    }
+    case "$dir" in
+        /*) ;;
+        *) dir="$PWD/$dir" ;;
     esac
+
+    prefix=/
+    check_component "$prefix" || return 1
+    for part in $dir; do
+        [ -n "$part" ] && [ "$part" != . ] || continue
+        if [ "$part" = .. ]; then
+            prefix=${prefix%/*}
+            [ -n "$prefix" ] || prefix=/
+            continue
+        fi
+        if [ "$prefix" = / ]; then
+            prefix="/$part"
+        else
+            prefix="$prefix/$part"
+        fi
+        check_component "$prefix" || return 1
+    done
+
     if [ -L "$dir/LICENSE" ] || [ ! -f "$dir/LICENSE" ]; then
         echo "LICENSE must be a root-owned regular file, not a symlink: $dir/LICENSE" >&2
         return 1
