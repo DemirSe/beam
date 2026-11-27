@@ -598,8 +598,10 @@ platform-independent core shared with the Android `VpnService` backend.
 - **Custom proxy TCP/IP stack (`ProxyTcpStack`):** zero external TCP stack
   dependencies, IPv4 + IPv6, RFC 7323 Window Scaling (socket buffers derived
   from a 256 MiB aggregate budget — 512 KiB/direction at the default 256
-  connections, clamped to `64 KiB..=4 MiB` to stay under `MemoryMax=512M`),
-  zero-copy `VecDeque::as_slices()` TX segmentation, immediate dup-ACKs on
+  connections, clamped to `64 KiB..=4 MiB` to stay under `MemoryMax=512M`), a
+  relay reply queue capped at 64 KiB/flow (16 MiB at 256 flows, so 272 MiB
+  total with the socket buffers), zero-copy `VecDeque::as_slices()` TX
+  segmentation, immediate dup-ACKs on
   out-of-order segments, and prompt window updates. The packet parser walks
   IPv6 extension headers (Hop-by-Hop, Routing, Destination Options) and drops
   fragmented IPv4 and IPv6 packets.

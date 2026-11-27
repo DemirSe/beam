@@ -168,8 +168,8 @@ impl TcpStackConfig {
     /// Low-RAM always-on profile for Android `VpnService`.
     ///
     /// Worst case is 128 flows times 128 KiB times two directions (32 MiB),
-    /// plus the bounded relay reply queue of `ANDROID_S2C_STREAM_CHANNEL_CAP`
-    /// queued 16 KiB read buffers per flow (64 KiB per flow, 8 MiB in total),
+    /// plus the bounded relay reply queue (`S2C_STREAM_CHANNEL_CAP` queued
+    /// chunks, at most 64 KiB per flow, 8 MiB in total),
     /// plus up to 64 KiB of retained bulk-upload coalesce capacity per flow
     /// (8 MiB in total). The 30-minute idle timeout keeps 15-minute FCM/MTalk
     /// push sockets alive with zero relay wakeups while idle.
@@ -187,10 +187,28 @@ impl TcpStackConfig {
 #[cfg(test)]
 mod mobile_tests {
     use super::*;
-    use crate::proxy_tcp::ANDROID_S2C_STREAM_CHANNEL_CAP;
+    use crate::proxy_tcp::{
+        S2C_QUEUE_BYTES_PER_FLOW, S2C_READ_CHUNK_BYTES, S2C_STREAM_CHANNEL_CAP,
+    };
 
-    /// Android relay read buffers are 16 KiB, so a queued reply costs that much.
-    const S2C_CHUNK_BYTES: u64 = 16 * 1024;
+    #[test]
+    fn default_profile_bounds_socket_and_relay_queue_bytes() {
+        let cfg = TcpStackConfig::default();
+        assert_eq!(cfg.max_connections, 256);
+        assert_eq!(
+            S2C_STREAM_CHANNEL_CAP * S2C_READ_CHUNK_BYTES,
+            S2C_QUEUE_BYTES_PER_FLOW,
+            "relay queue depth must be derived from the read chunk size"
+        );
+        // `beam-client` derives 512 KiB per direction at the default 256 flows.
+        let socket_bytes_per_direction = 512 * 1024;
+        let per_flow = socket_bytes_per_direction * 2 + S2C_QUEUE_BYTES_PER_FLOW;
+        let total = per_flow * cfg.max_connections;
+        assert!(
+            total <= 384 * 1024 * 1024,
+            "default TCP memory {total} bytes exceeds MemoryHigh=384M"
+        );
+    }
 
     #[test]
     fn mobile_profile_fits_android_ram_and_keeps_push_sockets_alive() {
@@ -201,10 +219,9 @@ mod mobile_tests {
             socket_budget <= 32 * 1024 * 1024,
             "mobile buffer budget {socket_budget} bytes exceeds 32 MiB"
         );
-        // The bounded reply queue adds at most `ANDROID_S2C_STREAM_CHANNEL_CAP`
-        // queued 16 KiB read buffers per flow on top of the socket buffers.
-        let reply_budget =
-            cfg.max_connections as u64 * ANDROID_S2C_STREAM_CHANNEL_CAP as u64 * S2C_CHUNK_BYTES;
+        // The bounded reply queue adds at most 64 KiB per flow on top of the
+        // socket buffers.
+        let reply_budget = cfg.max_connections as u64 * S2C_QUEUE_BYTES_PER_FLOW as u64;
         assert!(
             reply_budget <= 8 * 1024 * 1024,
             "mobile relay reply queue budget {reply_budget} bytes exceeds 8 MiB"

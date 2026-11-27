@@ -27,16 +27,17 @@ const MAX_INCOMING_PACKETS: usize = 2048;
 const MAX_INCOMING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OOO_SEGMENTS: usize = 256;
 const STREAM_CHANNEL_CAP: usize = 16;
-/// Reply-queue depth per flow on Android: 4 queued 16 KiB read buffers (64 KiB)
-/// bound transient RSS during bulk downloads.
+/// Upper bound on relay -> stack reply bytes queued per flow. This is charged
+/// on top of the two socket buffers.
+pub(crate) const S2C_QUEUE_BYTES_PER_FLOW: usize = 64 * 1024;
+/// Relay read chunk size. Keep in sync with `engine::S2C_READ_BUF_BYTES`.
 #[cfg(any(target_os = "android", test))]
-pub(crate) const ANDROID_S2C_STREAM_CHANNEL_CAP: usize = 4;
-/// Depth of the per-flow relay -> stack reply queue. Other targets keep 16 for
-/// write-syscall batching.
-#[cfg(target_os = "android")]
-pub(crate) const S2C_STREAM_CHANNEL_CAP: usize = ANDROID_S2C_STREAM_CHANNEL_CAP;
-#[cfg(not(target_os = "android"))]
-pub(crate) const S2C_STREAM_CHANNEL_CAP: usize = STREAM_CHANNEL_CAP;
+pub(crate) const S2C_READ_CHUNK_BYTES: usize = 16 * 1024;
+#[cfg(not(any(target_os = "android", test)))]
+pub(crate) const S2C_READ_CHUNK_BYTES: usize = 64 * 1024;
+/// Depth of the per-flow relay -> stack reply queue, derived from the chunk
+/// size so queued bytes never exceed [`S2C_QUEUE_BYTES_PER_FLOW`].
+pub(crate) const S2C_STREAM_CHANNEL_CAP: usize = S2C_QUEUE_BYTES_PER_FLOW / S2C_READ_CHUNK_BYTES;
 const RELAY_COALESCE_BYTES: usize = 64 * 1024;
 /// Upper bound on recycled outbound IP/TCP packet buffers held by [`ProxyTcpStack`].
 /// Capped at 128 entries <= 4096 B each (<= 512 KiB worst case, ~192 KiB at MTU).
