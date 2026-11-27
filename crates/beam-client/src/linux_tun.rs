@@ -1294,13 +1294,31 @@ fn run_ip(args: &[&str]) -> io::Result<()> {
     run_ip_with_deadline(args, Instant::now() + IP_CHILD_DEADLINE)
 }
 
+fn child_deadline(deadline: Instant) -> Instant {
+    std::cmp::min(deadline, Instant::now() + IP_CHILD_DEADLINE)
+}
+
+fn ip_delete_already_removed(args: &[&str], stderr: &str) -> bool {
+    if !args.contains(&"del") {
+        return false;
+    }
+    let detail = stderr.to_ascii_lowercase();
+    detail.contains("no such process") || detail.contains("esrch")
+}
+
 fn run_ip_with_deadline(args: &[&str], deadline: Instant) -> io::Result<()> {
+    let deadline = child_deadline(deadline);
     let output = spawn_ip_child(ip_binary()?, args, deadline)?;
     if output.status.success() {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let detail = stderr.trim();
+    // A route that is already gone is the desired end state during cleanup.
+    if ip_delete_already_removed(args, detail) {
+        debug!(command = %args.join(" "), detail, "route was already removed");
+        return Ok(());
+    }
     if detail.is_empty() {
         Err(io::Error::other(format!(
             "`ip {}` exited with {}",
@@ -2173,6 +2191,35 @@ broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
     }
 
     #[test]
+    fn esrch_delete_counts_as_removed() {
+        let dir = test_dir("esrch-delete");
+        let state = dir.join("routes.state");
+        let fake = FakeIp::new_in(
+            dir,
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+               *\"route del\"*) echo 'RTNETLINK answers: No such process' >&2; exit 2 ;;\n\
+             esac\n\
+             exit 0\n",
+        );
+        write_routes_state_atomic(
+            &state,
+            &[PersistedRoute {
+                family: 4,
+                prefix: "203.0.113.5/32".to_owned(),
+                gateway: None,
+                dev: "eth0".to_owned(),
+            }],
+        );
+        assert_eq!(cleanup_persisted_routes(&state).expect("cleanup"), 1);
+        assert!(
+            !state.exists(),
+            "ESRCH is the desired end state, so routes.state must not be retained"
+        );
+        drop(fake);
+    }
+
+    #[test]
     fn quiet_sweep_removes_only_expired_daemon_dynamic_routes() {
         let dir = test_dir("sweep");
         let log = dir.join("ip.log");
@@ -2279,6 +2326,25 @@ broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
         ));
         let _ = std::fs::remove_file(&path);
         assert_eq!(cleanup_persisted_routes(&path).expect("noop"), 0);
+    }
+
+    #[test]
+    fn cleanup_child_is_capped_below_the_total_deadline() {
+        let dir = test_dir("cleanup-child-cap");
+        let fake = FakeIp::new_in(dir, "#!/bin/sh\nexec sleep 30\n");
+        let start = Instant::now();
+        let err = run_ip_with_deadline(
+            &["route", "del", "198.51.100.1/32", "dev", "eth0"],
+            Instant::now() + SHUTDOWN_IP_BUDGET,
+        )
+        .expect_err("a hung cleanup child must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "one child must not consume the whole shutdown budget: {:?}",
+            start.elapsed()
+        );
+        drop(fake);
     }
 
     #[test]
