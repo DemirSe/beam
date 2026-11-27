@@ -189,6 +189,27 @@ impl ExcludeIps {
         self.list.len()
     }
 
+    /// Replaces excluded address `old` with `new` in place, keeping the inline
+    /// scan and the hash set consistent.
+    ///
+    /// Used on a server-IP handover so the new upstream endpoint is never routed
+    /// back into the tunnel. A `new` that is already excluded only drops `old`,
+    /// avoiding duplicate entries from repeated handovers.
+    pub fn replace(&mut self, old: IpAddr, new: IpAddr) {
+        if old == new {
+            return;
+        }
+        if self.list.contains(&new) {
+            self.list.retain(|ip| *ip != old);
+        } else if let Some(slot) = self.list.iter_mut().find(|ip| **ip == old) {
+            *slot = new;
+        } else {
+            self.list.push(new);
+        }
+        self.set =
+            (self.list.len() > Self::HASH_THRESHOLD).then(|| self.list.iter().copied().collect());
+    }
+
     /// Returns `true` when nothing is excluded.
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
@@ -802,6 +823,78 @@ mod tests {
         }
         assert!(!hashed.contains(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 10))));
         assert_eq!(hashed.len(), 9);
+    }
+
+    #[test]
+    fn exclude_ips_replace_swaps_a_server_ip_in_the_inline_list() {
+        let old = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let new = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let mut exclusions = ExcludeIps::new(&[old]);
+
+        exclusions.replace(old, new);
+
+        assert!(!exclusions.contains(old));
+        assert!(exclusions.contains(new));
+        assert_eq!(exclusions.len(), 1);
+    }
+
+    #[test]
+    fn exclude_ips_replace_keeps_the_hash_set_consistent_above_the_threshold() {
+        let entries: Vec<IpAddr> = (1..=9)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(198, 18, 0, i)))
+            .collect();
+        let old = entries[3];
+        let new = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 99));
+        let mut exclusions = ExcludeIps::new(&entries);
+        assert!(exclusions.set.is_some(), "nine entries use the hash set");
+
+        exclusions.replace(old, new);
+
+        assert!(exclusions.set.is_some(), "the list size did not change");
+        assert_eq!(exclusions.len(), 9);
+        assert!(!exclusions.contains(old));
+        assert!(exclusions.contains(new));
+    }
+
+    #[test]
+    fn exclude_ips_replace_drops_a_duplicate_and_falls_back_below_the_threshold() {
+        let entries: Vec<IpAddr> = (1..=9)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(198, 18, 0, i)))
+            .collect();
+        let old = entries[3];
+        // `new` is already excluded, so only `old` is removed: the list shrinks
+        // to eight entries and must fall back to the inline scan.
+        let new = entries[5];
+        let mut exclusions = ExcludeIps::new(&entries);
+        assert!(exclusions.set.is_some(), "nine entries use the hash set");
+
+        exclusions.replace(old, new);
+
+        assert_eq!(exclusions.len(), 8);
+        assert!(
+            exclusions.set.is_none(),
+            "eight entries use the inline scan"
+        );
+        assert!(!exclusions.contains(old));
+        assert!(exclusions.contains(new));
+    }
+
+    #[test]
+    fn exclude_ips_replace_adds_an_absent_entry_only_once() {
+        let present = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let absent = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8));
+        let new = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let mut exclusions = ExcludeIps::new(&[present]);
+
+        exclusions.replace(absent, new);
+        assert_eq!(exclusions.len(), 2);
+        assert!(exclusions.contains(present));
+        assert!(exclusions.contains(new));
+
+        // A repeated handover to the same address must not duplicate it.
+        exclusions.replace(new, new);
+        assert_eq!(exclusions.len(), 2);
+        assert!(exclusions.contains(new));
     }
 
     #[test]

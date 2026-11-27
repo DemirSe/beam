@@ -58,6 +58,7 @@ class MainActivity : AppCompatActivity() {
         private set
 
     private var boundBinder: IBinder? = null
+    private var boundDeathRecipient: IBinder.DeathRecipient? = null
     private var isBound = false
     private var pendingProfileId: String? = null
 
@@ -65,10 +66,6 @@ class MainActivity : AppCompatActivity() {
     // banner updates so an older read cannot overwrite a newer callback.
     private val statusLock = Any()
     private val callbackSeq = AtomicLong(0L)
-
-    private val binderDeathRecipient = IBinder.DeathRecipient {
-        runOnUiThread { handleBinderDied() }
-    }
 
     private val stateCallback = object : IBeamStateCallback.Stub() {
         override fun onStateChanged(state: Int, detail: String?) {
@@ -84,7 +81,11 @@ class MainActivity : AppCompatActivity() {
             val service = binder?.let { IBeamVpnService.Stub.asInterface(it) } ?: return
             unlinkBinderDeath()
             boundBinder = binder
-            runCatching { binder.linkToDeath(binderDeathRecipient, 0) }
+            // Link a recipient that is bound to THIS binder, so a death from a
+            // superseded binding can never tear down the current connection.
+            val recipient = IBinder.DeathRecipient { runOnUiThread { handleBinderDied(binder) } }
+            boundDeathRecipient = recipient
+            runCatching { binder.linkToDeath(recipient, 0) }
             beam = service
             runCatching { service.registerCallback(stateCallback) }
             val seqBefore = callbackSeq.get()
@@ -204,13 +205,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun unlinkBinderDeath() {
         val prev = boundBinder
+        val recipient = boundDeathRecipient
         boundBinder = null
-        if (prev != null) {
-            runCatching { prev.unlinkToDeath(binderDeathRecipient, 0) }
+        boundDeathRecipient = null
+        if (prev != null && recipient != null) {
+            runCatching { prev.unlinkToDeath(recipient, 0) }
         }
     }
 
-    private fun handleBinderDied() {
+    private fun handleBinderDied(diedBinder: IBinder? = null) {
+        // Ignore a death reported for a binder that this activity already replaced.
+        if (diedBinder != null && boundBinder !== diedBinder) return
+        // An unsolicited death is only real when the current binder is dead.
+        if (diedBinder == null && boundBinder?.isBinderAlive == true) return
         unlinkBinderDeath()
         synchronized(statusLock) {
             beam = null
@@ -335,10 +342,16 @@ class MainActivity : AppCompatActivity() {
             Context.BIND_AUTO_CREATE,
         )
         if (!isBound) {
+            val hadPending = pendingProfileId != null
             pendingProfileId = null
-            synchronized(statusLock) {
-                callbackSeq.incrementAndGet()
-                _status.value = BeamStatus(_status.value.state, getString(R.string.connect_failed))
+            // Only a dropped queued connect is a connect failure; a plain bind
+            // failure from a normal resume must not paint an error banner.
+            if (hadPending) {
+                synchronized(statusLock) {
+                    callbackSeq.incrementAndGet()
+                    _status.value =
+                        BeamStatus(_status.value.state, getString(R.string.connect_failed))
+                }
             }
         }
     }

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use beam_core::address::{Address, NetLocation};
 use beam_core::client::{BeamClientConfig, ClientError, dial_tcp};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -625,7 +625,7 @@ where
 async fn run_engine_inner<D, S>(
     mut device: D,
     mut stack: S,
-    config: TunEngineConfig,
+    mut config: TunEngineConfig,
     mut shutdown: watch::Receiver<bool>,
     activity: Option<Arc<TunnelActivity>>,
     drops: Arc<DropCounters>,
@@ -675,6 +675,9 @@ where
             None => DnsInterceptor::new(config.client.clone(), dns_cfg.clone(), tun_tx.clone()),
         });
     let mut network_reset = config.network_reset.clone();
+    // The server IP currently excluded from tunneling; a handover swaps it so
+    // the new endpoint is never routed back into the tunnel.
+    let mut active_server_ip = config.client.server_addr.ip();
     let client_config = Arc::new(config.client);
 
     let mut recv_buf = vec![0u8; device.mtu().clamp(2048, MAX_PACKET_BUF)];
@@ -768,6 +771,16 @@ where
                 }
             } => {
                 let generation = network_reset.as_ref().map(|rx| *rx.borrow()).unwrap_or(0);
+                if let Some(override_lock) = client_config.server_addr_override.as_ref() {
+                    let new_ip = override_lock
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ip();
+                    if new_ip != active_server_ip {
+                        config.route.exclude_ips.replace(active_server_ip, new_ip);
+                        active_server_ip = new_ip;
+                    }
+                }
                 info!(generation, "network transition detected; resetting TCP flows, XUDP mux, and local DNS cache");
                 stack.reset_all(&mut tx_batch);
                 for pkt in tx_batch.drain(..) {
@@ -1208,6 +1221,11 @@ fn spawn_tcp_relay(
         let (mut tun_r, mut tun_w) = conn.stream.into_split();
         let (mut up_r, mut up_w) = tokio::io::split(upstream);
 
+        // Fires only on an abnormal client-to-server exit (write/flush error or
+        // write timeout), so a normal client EOF still drains the download
+        // direction and keeps TCP half-close working.
+        let c2s_aborted = Notify::new();
+
         let c2s = async {
             // Reused across iterations so coalescing never grows a fresh Vec per
             // write; stays empty (zero allocation) when no coalescing is needed.
@@ -1233,10 +1251,12 @@ fn spawn_tcp_relay(
                     }
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "write", &err);
+                        c2s_aborted.notify_one();
                         break;
                     }
                     Err(_) => {
                         warn_relay_timeout(conn.dst, "write", write_idle);
+                        c2s_aborted.notify_one();
                         break;
                     }
                 }
@@ -1255,10 +1275,12 @@ fn spawn_tcp_relay(
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "flush", &err);
+                        c2s_aborted.notify_one();
                         break;
                     }
                     Err(_) => {
                         warn_relay_timeout(conn.dst, "flush", write_idle);
+                        c2s_aborted.notify_one();
                         break;
                     }
                 }
@@ -1275,6 +1297,12 @@ fn spawn_tcp_relay(
                 let read_res = tokio::select! {
                     biased;
                     () = tun_w.closed() => {
+                        tun_w.return_buf(buf);
+                        break;
+                    }
+                    // The upload direction failed for good: no reply can reach
+                    // the peer any more, so stop waiting for one.
+                    () = c2s_aborted.notified() => {
                         tun_w.return_buf(buf);
                         break;
                     }
