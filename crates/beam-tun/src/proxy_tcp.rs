@@ -54,6 +54,12 @@ const MAX_RETRIES: u8 = 20;
 /// TCP slot forever.
 const MAX_PERSIST_PROBES: u16 = 225;
 const CLOSING_TIMEOUT_MS: i64 = 5_000;
+/// Release an oversized `ProxyTcpStack::incoming_buf` once the burst is polled.
+const INCOMING_BUF_SHRINK_THRESHOLD: usize = 256 * 1024;
+const INCOMING_BUF_SHRINK_TARGET: usize = 64 * 1024;
+/// Same for the per-packet length list (`incoming_lens`).
+const INCOMING_LENS_SHRINK_THRESHOLD: usize = 256;
+const INCOMING_LENS_SHRINK_TARGET: usize = 64;
 
 type FlowKey = (IpAddr, u16, IpAddr, u16);
 
@@ -195,13 +201,15 @@ struct TcpConn {
 }
 
 impl TcpConn {
-    fn rcv_wnd_bytes(&self) -> u32 {
-        let used = self
-            .in_flight_relay
+    fn in_order_rcv_bytes(&self) -> usize {
+        self.in_flight_relay
             .load(Ordering::Acquire)
             .saturating_add(self.pending_to_relay_bytes)
-            .saturating_add(self.ooo_bytes)
-            .saturating_add(self.rcv_coalesce.len());
+            .saturating_add(self.rcv_coalesce.len())
+    }
+
+    fn rcv_wnd_bytes(&self) -> u32 {
+        let used = self.in_order_rcv_bytes().saturating_add(self.ooo_bytes);
         let avail = self.max_rcv_buf.saturating_sub(used);
         let max_scaled = (u32::from(u16::MAX)) << self.our_wscale;
         u32::try_from(avail).unwrap_or(max_scaled).min(max_scaled)
@@ -341,12 +349,18 @@ impl TcpConn {
     }
 
     fn send_syn_ack(&mut self, now_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
-        let mss_u16 = self.mss as u16;
-        let mss_bytes = mss_u16.to_be_bytes();
-        let options: Vec<u8> = if self.our_wscale > 0 {
-            vec![2, 4, mss_bytes[0], mss_bytes[1], 1, 3, 3, self.our_wscale]
+        let mss_bytes = (self.mss as u16).to_be_bytes();
+        // Fixed stack buffer: SYN|ACK is the first packet of every flow, so it
+        // must not allocate an options `Vec`.
+        let mut options_buf = [0u8; 8];
+        options_buf[..4].copy_from_slice(&[2, 4, mss_bytes[0], mss_bytes[1]]);
+        if self.our_wscale > 0 {
+            options_buf[4..].copy_from_slice(&[1, 3, 3, self.our_wscale]);
+        }
+        let options: &[u8] = if self.our_wscale > 0 {
+            &options_buf
         } else {
-            vec![2, 4, mss_bytes[0], mss_bytes[1]]
+            &options_buf[..4]
         };
         // RFC 7323 §2.2: the Window field in a SYN / SYN+ACK segment MUST NOT be scaled.
         let unscaled_wnd = self.rcv_wnd_bytes().min(u32::from(u16::MAX)) as u16;
@@ -360,7 +374,7 @@ impl TcpConn {
             self.rcv_nxt,
             TCP_SYN | TCP_ACK,
             unscaled_wnd,
-            &options,
+            options,
             &[],
             &[],
         ) {
@@ -398,6 +412,7 @@ impl TcpConn {
         seg: &crate::packet::TcpSegmentView<'_>,
         now_ms: i64,
         tx_out: &mut Vec<Vec<u8>>,
+        tx_pool: &mut Vec<Vec<u8>>,
     ) {
         self.last_activity_ms = now_ms;
 
@@ -429,7 +444,7 @@ impl TcpConn {
         }
 
         if (seg.flags & TCP_ACK) != 0 {
-            self.process_ack(seg.seq, seg.ack, seg.window, now_ms, tx_out);
+            self.process_ack(seg.seq, seg.ack, seg.window, now_ms, tx_out, tx_pool);
         }
 
         if self.state == TcpState::Closed {
@@ -523,6 +538,7 @@ impl TcpConn {
         raw_window: u16,
         now_ms: i64,
         tx_out: &mut Vec<Vec<u8>>,
+        tx_pool: &mut Vec<Vec<u8>>,
     ) {
         // RFC 793 §3.9 SND.WL1 / SND.WL2: only a segment newer than the one that
         // last updated the window may change `snd_wnd`, so a reordered stale ACK
@@ -588,7 +604,14 @@ impl TcpConn {
             self.dup_acks = self.dup_acks.saturating_add(1);
             if self.dup_acks == 3 {
                 let len = self.tx_buf.len().min(self.mss);
-                self.emit_tx_segment(0, len, TCP_ACK | TCP_PSH, self.snd_una, tx_out, None);
+                self.emit_tx_segment(
+                    0,
+                    len,
+                    TCP_ACK | TCP_PSH,
+                    self.snd_una,
+                    tx_out,
+                    Some(tx_pool),
+                );
                 self.rto_deadline_ms = Some(now_ms + self.rto_ms);
             }
         }
@@ -618,12 +641,15 @@ impl TcpConn {
             self.drain_ooo();
             false
         } else {
-            if self.ooo.len() < MAX_OOO_SEGMENTS
-                && self.ooo_bytes.saturating_add(payload.len()) <= self.max_rcv_buf
-            {
+            let existing = self.ooo.get(&seq).map_or(0, Vec::len);
+            let delta = payload.len().saturating_sub(existing);
+            // `rcv_wnd_bytes()` already subtracts `ooo_bytes`, so bounding the
+            // *growth* by it keeps `in_order + ooo_bytes <= max_rcv_buf` exactly,
+            // without counting the queued bytes twice.
+            if self.ooo.len() < MAX_OOO_SEGMENTS && delta <= self.rcv_wnd_bytes() as usize {
                 let entry = self.ooo.entry(seq).or_default();
                 if payload.len() > entry.len() {
-                    self.ooo_bytes = self.ooo_bytes.saturating_add(payload.len() - entry.len());
+                    self.ooo_bytes = self.ooo_bytes.saturating_add(delta);
                     *entry = payload.to_vec();
                 }
             }
@@ -645,19 +671,40 @@ impl TcpConn {
             };
             self.ooo_bytes = self.ooo_bytes.saturating_sub(seg.len());
             let skip = self.rcv_nxt.wrapping_sub(seq) as usize;
-            if skip < seg.len() {
-                // If `avail == 0` (zero receive window), the segment is dropped
-                // here rather than re-queued; recovery relies on peer retransmit.
-                let avail = self.rcv_wnd_bytes() as usize;
-                let fresh = &seg[skip..];
-                let accept = fresh.len().min(avail);
-                if accept > 0 {
-                    self.rcv_coalesce.extend_from_slice(&fresh[..accept]);
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(accept as u32);
-                    if self.rcv_coalesce.len() >= RELAY_COALESCE_BYTES {
-                        self.queue_coalesce_chunk();
-                    }
+            if skip >= seg.len() {
+                // Fully stale: every byte is already delivered, so drop it.
+                continue;
+            }
+            let avail = self.rcv_wnd_bytes() as usize;
+            if avail == 0 {
+                // Receive window is full: keep the bytes queued so a window
+                // update delivers them instead of waiting for a retransmit.
+                self.ooo_bytes = self.ooo_bytes.saturating_add(seg.len());
+                self.ooo.insert(seq, seg);
+                break;
+            }
+            let fresh_len = seg.len() - skip;
+            let accept = fresh_len.min(avail);
+            if accept > 0 {
+                self.rcv_coalesce
+                    .extend_from_slice(&seg[skip..skip + accept]);
+                self.rcv_nxt = self.rcv_nxt.wrapping_add(accept as u32);
+                if self.rcv_coalesce.len() >= RELAY_COALESCE_BYTES {
+                    self.queue_coalesce_chunk();
                 }
+            }
+            if accept < fresh_len {
+                // Only part of the segment fit: re-queue the remainder at the
+                // new `rcv_nxt` instead of discarding fresh bytes. A segment
+                // already queued at that key is kept unless the remainder is
+                // longer, so `ooo_bytes` stays the exact map footprint.
+                let rest = seg[skip + accept..].to_vec();
+                let entry = self.ooo.entry(self.rcv_nxt).or_default();
+                if rest.len() > entry.len() {
+                    self.ooo_bytes = self.ooo_bytes.saturating_add(rest.len() - entry.len());
+                    *entry = rest;
+                }
+                break;
             }
         }
     }
@@ -848,7 +895,13 @@ impl TcpConn {
         .min()
     }
 
-    fn check_timers(&mut self, now_ms: i64, idle_timeout_ms: i64, tx_out: &mut Vec<Vec<u8>>) {
+    fn check_timers(
+        &mut self,
+        now_ms: i64,
+        idle_timeout_ms: i64,
+        tx_out: &mut Vec<Vec<u8>>,
+        tx_pool: &mut Vec<Vec<u8>>,
+    ) {
         if let Some(deadline) = self.state_deadline_ms
             && now_ms >= deadline
         {
@@ -913,7 +966,14 @@ impl TcpConn {
                 | TcpState::LastAck => {
                     if !self.tx_buf.is_empty() {
                         let len = self.tx_buf.len().min(self.mss);
-                        self.emit_tx_segment(0, len, TCP_ACK | TCP_PSH, self.snd_una, tx_out, None);
+                        self.emit_tx_segment(
+                            0,
+                            len,
+                            TCP_ACK | TCP_PSH,
+                            self.snd_una,
+                            tx_out,
+                            Some(tx_pool),
+                        );
                     } else if self.fin_sent
                         && self.snd_una == self.fin_seq
                         && let Some(pkt) =
@@ -971,6 +1031,17 @@ impl ProxyTcpStack {
         i64::try_from(self.config.idle_timeout_ms)
             .unwrap_or(i64::MAX)
             .max(1)
+    }
+
+    /// Releases the oversized inbound buffers a burst left behind, so a single
+    /// burst does not pin its peak allocation for the life of the stack.
+    fn shrink_incoming_bufs(&mut self) {
+        if self.incoming_buf.capacity() > INCOMING_BUF_SHRINK_THRESHOLD {
+            self.incoming_buf.shrink_to(INCOMING_BUF_SHRINK_TARGET);
+        }
+        if self.incoming_lens.capacity() > INCOMING_LENS_SHRINK_THRESHOLD {
+            self.incoming_lens.shrink_to(INCOMING_LENS_SHRINK_TARGET);
+        }
     }
 
     fn schedule_conn_timer(
@@ -1164,7 +1235,7 @@ impl NetStack for ProxyTcpStack {
             }
 
             if let Some(conn) = self.conns.get_mut(&flow) {
-                conn.on_segment(&seg, now_ms, tx_out);
+                conn.on_segment(&seg, now_ms, tx_out, &mut self.tx_buf_pool);
                 if !conn.in_poll_batch {
                     conn.in_poll_batch = true;
                     self.poll_batch.push(flow);
@@ -1209,6 +1280,7 @@ impl NetStack for ProxyTcpStack {
         }
         self.incoming_buf.clear();
         self.incoming_lens.clear();
+        self.shrink_incoming_bufs();
 
         // Drain flows dirtied by async relay tasks (`TunTcpStream` / Reader / Writer).
         {
@@ -1299,6 +1371,30 @@ impl NetStack for ProxyTcpStack {
                     }
                 } else {
                     conn.flush_rcv_to_relay();
+                    if !conn.ooo.is_empty()
+                        && !conn.peer_fin_received
+                        && matches!(
+                            conn.state,
+                            TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
+                        )
+                        && conn.in_order_rcv_bytes() < conn.max_rcv_buf
+                    {
+                        let rcv_before = conn.rcv_nxt;
+                        conn.drain_ooo();
+                        if conn.rcv_nxt != rcv_before {
+                            if let Some(fin_seq) = conn.peer_fin_seq
+                                && fin_seq == conn.rcv_nxt
+                                && !conn.peer_fin_received
+                            {
+                                conn.peer_fin_seq = None;
+                                conn.consume_peer_fin(now_ms, tx_out);
+                            }
+                            if conn.state != TcpState::Closed {
+                                conn.need_ack = true;
+                            }
+                            conn.flush_rcv_to_relay();
+                        }
+                    }
                     conn.drain_from_relay(now_ms, &self.relay_pool);
                     conn.flush_tx(now_ms, tx_out, &mut self.tx_buf_pool);
 
@@ -1339,7 +1435,7 @@ impl NetStack for ProxyTcpStack {
                         conn.need_ack = false;
                     }
 
-                    conn.check_timers(now_ms, idle_timeout_ms, tx_out);
+                    conn.check_timers(now_ms, idle_timeout_ms, tx_out, &mut self.tx_buf_pool);
                     keep = conn.state != TcpState::Closed;
                     if keep {
                         Self::schedule_conn_timer(&mut self.timers, flow, conn, idle_timeout_ms);
@@ -1404,6 +1500,7 @@ impl NetStack for ProxyTcpStack {
         }
         self.incoming_buf.clear();
         self.incoming_lens.clear();
+        self.shrink_incoming_bufs();
         self.timers.clear();
         self.poll_batch.clear();
         self.dirty
@@ -1692,6 +1789,169 @@ mod tests {
             }
         }
         assert!(distinct >= 32, "ISN looks constant: {distinct}/64 differ");
+    }
+
+    #[test]
+    fn out_of_order_segments_are_not_admitted_into_a_full_window() {
+        let cfg = TcpStackConfig {
+            socket_buffer_bytes: MIN_TCP_BUF, // 64 KiB
+            ..TcpStackConfig::default()
+        };
+        let mut stack = ProxyTcpStack::new(cfg);
+        let (_srv_nxt, _acc) = handshake(&mut stack, 1000);
+        let conn = stack.conns.values_mut().next().expect("conn");
+        conn.rcv_nxt = 5001;
+        conn.ooo.clear();
+        conn.ooo_bytes = 0;
+        // In-order data already fills the whole receive buffer.
+        conn.rcv_coalesce = vec![0xab; MIN_TCP_BUF];
+        assert_eq!(conn.rcv_wnd_bytes(), 0);
+
+        assert!(
+            conn.process_data(6001, b"out-of-order"),
+            "a segment ahead of rcv_nxt is out-of-order"
+        );
+        assert!(conn.ooo.is_empty(), "a full window must admit no OOO bytes");
+        assert_eq!(conn.ooo_bytes, 0);
+        assert_eq!(conn.rcv_nxt, 5001, "rcv_nxt must not move for OOO data");
+    }
+
+    #[test]
+    fn drain_ooo_keeps_queued_data_until_the_window_opens() {
+        let cfg = TcpStackConfig {
+            socket_buffer_bytes: MIN_TCP_BUF, // 64 KiB
+            ..TcpStackConfig::default()
+        };
+        let mut stack = ProxyTcpStack::new(cfg);
+        let (_srv_nxt, _acc) = handshake(&mut stack, 1000);
+        let conn = stack.conns.values_mut().next().expect("conn");
+        conn.rcv_nxt = 5001;
+        conn.rcv_coalesce.clear();
+        conn.ooo.clear();
+        conn.ooo.insert(5001, b"hello".to_vec());
+        conn.ooo_bytes = 5;
+
+        // Window closed by in-order data: the ready segment must stay queued.
+        conn.rcv_coalesce = vec![0xab; MIN_TCP_BUF];
+        assert_eq!(conn.rcv_wnd_bytes(), 0);
+        conn.drain_ooo();
+        assert_eq!(
+            conn.ooo.get(&5001).map(Vec::as_slice),
+            Some(&b"hello"[..]),
+            "a full window must not drop queued OOO data"
+        );
+        assert_eq!(conn.ooo_bytes, 5);
+        assert_eq!(conn.rcv_nxt, 5001);
+
+        // Window opens: notify the flow's dirty handle (as `TunTcpReader` does
+        // when draining `in_flight_relay`) so `poll()` delivers the preserved
+        // OOO bytes automatically without waiting for a peer retransmit.
+        conn.rcv_coalesce.clear();
+        conn.dirty_handle.as_ref().expect("dirty handle").wake();
+        let mut tx_out = Vec::new();
+        let mut accepted = Vec::new();
+        stack.poll(1010, &mut tx_out, &mut accepted);
+        let conn = stack.conns.values_mut().next().expect("conn");
+        assert!(conn.ooo.is_empty());
+        assert_eq!(conn.ooo_bytes, 0);
+        assert_eq!(conn.rcv_nxt, 5006);
+        assert!(
+            !tx_out.is_empty(),
+            "poll() must emit a cumulative ACK when OOO data advances rcv_nxt"
+        );
+        assert_eq!(
+            conn.in_flight_relay.swap(0, Ordering::AcqRel),
+            5,
+            "the 5 preserved OOO bytes must have been flushed to the relay"
+        );
+
+        // Partial accept: only the free window bytes advance and the rest is
+        // re-queued at the new `rcv_nxt` instead of being dropped.
+        conn.rcv_nxt = 6000;
+        conn.rcv_coalesce = vec![0xab; MIN_TCP_BUF - 4];
+        conn.ooo.clear();
+        conn.ooo.insert(6000, b"abcdef".to_vec());
+        conn.ooo_bytes = 6;
+        conn.drain_ooo();
+        // The in-order buffer reaches the coalesce flush size here, so the
+        // accepted prefix is checked on the relay queue.
+        let delivered: Vec<u8> = conn
+            .pending_to_relay
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        assert!(
+            delivered.ends_with(b"abcd"),
+            "the accepted prefix must be delivered to the relay"
+        );
+        assert_eq!(conn.rcv_nxt, 6004, "only the free window bytes may advance");
+        assert_eq!(
+            conn.ooo.get(&6004).map(Vec::as_slice),
+            Some(&b"ef"[..]),
+            "the remainder must be re-queued at the new rcv_nxt"
+        );
+        assert_eq!(conn.ooo_bytes, 2);
+
+        // A segment already queued at the new `rcv_nxt` must survive the
+        // re-queue, and the accounting must match the map footprint.
+        conn.rcv_nxt = 7000;
+        conn.pending_to_relay.clear();
+        conn.pending_to_relay_bytes = 0;
+        // Leaves exactly 4 bytes of window once the popped segment is released.
+        conn.rcv_coalesce = vec![0xab; MIN_TCP_BUF - 8];
+        conn.ooo.clear();
+        conn.ooo.insert(7000, b"abcdef".to_vec());
+        conn.ooo.insert(7004, b"efgh".to_vec());
+        conn.ooo_bytes = 10;
+        conn.drain_ooo();
+        assert_eq!(conn.rcv_nxt, 7004);
+        assert_eq!(
+            conn.ooo.get(&7004).map(Vec::as_slice),
+            Some(&b"efgh"[..]),
+            "an overlapping queued segment must not be overwritten"
+        );
+        assert_eq!(
+            conn.ooo_bytes,
+            conn.ooo.values().map(Vec::len).sum::<usize>(),
+            "ooo_bytes must match the queued map footprint"
+        );
+
+        // Even when `in_order + ooo_bytes == max_rcv_buf` (so `rcv_wnd_bytes()`
+        // is still 0), freeing enough in-order space for the ready OOO segment
+        // must allow `poll()` to drain it without deadlocking.
+        conn.rcv_nxt = 8000;
+        conn.rcv_coalesce.clear();
+        conn.pending_to_relay.clear();
+        conn.pending_to_relay_bytes = 0;
+        conn.in_flight_relay
+            .store(MIN_TCP_BUF - 2, Ordering::Release);
+        conn.ooo.clear();
+        conn.ooo.insert(8000, b"ef".to_vec());
+        conn.ooo_bytes = 2;
+        assert_eq!(conn.rcv_wnd_bytes(), 0);
+        conn.dirty_handle.as_ref().expect("dirty handle").wake();
+        tx_out.clear();
+        stack.poll(1020, &mut tx_out, &mut accepted);
+        let conn = stack.conns.values_mut().next().expect("conn");
+        assert!(conn.ooo.is_empty());
+        assert_eq!(conn.ooo_bytes, 0);
+        assert_eq!(conn.rcv_nxt, 8002);
+
+        // Once the peer's FIN is consumed, `poll()` must not drain any bogus
+        // OOO segment sitting past the FIN sequence number.
+        conn.in_flight_relay.store(0, Ordering::Release);
+        conn.ooo.insert(8003, b"post-fin".to_vec());
+        conn.ooo_bytes = 8;
+        let fin_seg = make_seg(8002, conn.snd_nxt, TCP_FIN | TCP_ACK, 65535, &[], &[]);
+        stack.push_ip_tcp(&fin_seg);
+        tx_out.clear();
+        stack.poll(1030, &mut tx_out, &mut accepted);
+        let conn = stack.conns.values().next().expect("conn");
+        assert_eq!(conn.state, TcpState::CloseWait);
+        assert_eq!(
+            conn.rcv_nxt, 8003,
+            "rcv_nxt must stop at FIN+1 and never advance over post-FIN OOO data"
+        );
     }
 
     #[test]
@@ -2584,6 +2844,38 @@ mod tests {
         assert_eq!(tx.len(), 1, "idle expiration must emit RST");
         let rst = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
         assert_ne!(rst.flags & TCP_RST, 0);
+    }
+
+    #[test]
+    fn incoming_buffers_shrink_after_a_large_burst_is_polled() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let (srv_nxt, _acc) = handshake(&mut stack, 1000);
+
+        // Queue one burst that is well above both shrink thresholds.
+        let payload = vec![0x11u8; 1200];
+        let mut seq = 1001u32;
+        for _ in 0..512 {
+            stack.push_ip_tcp(&make_seg(seq, srv_nxt, TCP_ACK, 65535, &[], &payload));
+            seq = seq.wrapping_add(payload.len() as u32);
+        }
+        assert!(
+            stack.incoming_buf.capacity() > INCOMING_BUF_SHRINK_THRESHOLD,
+            "burst must grow the buffer past the shrink threshold"
+        );
+        assert!(stack.incoming_lens.capacity() > INCOMING_LENS_SHRINK_THRESHOLD);
+
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+        stack.poll(50, &mut tx, &mut accepted);
+
+        assert!(
+            stack.incoming_buf.capacity() <= INCOMING_BUF_SHRINK_THRESHOLD,
+            "polling a burst must release its peak allocation"
+        );
+        assert!(
+            stack.incoming_lens.capacity() <= INCOMING_LENS_SHRINK_THRESHOLD,
+            "polling a burst must release its peak length-vector allocation"
+        );
     }
 
     #[test]
