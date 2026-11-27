@@ -1891,6 +1891,8 @@ mod tests {
         assert_eq!(decoder.buffered(), 0);
     }
 
+    // Linux truncates oversize datagrams in `recv_from`; Windows returns WSAEMSGSIZE (10040).
+    #[cfg(unix)]
     #[tokio::test]
     async fn dropped_legacy_replies_do_not_refresh_idle_clock() {
         let responder = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -2077,6 +2079,8 @@ mod tests {
         ));
     }
 
+    // Linux truncates oversize datagrams in `recv_from`; Windows returns WSAEMSGSIZE (10040).
+    #[cfg(unix)]
     #[tokio::test]
     async fn fixed_oversize_reply_is_dropped_without_closing() {
         let responder = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
