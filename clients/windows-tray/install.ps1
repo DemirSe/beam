@@ -30,7 +30,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$SourceDir = $PSScriptRoot,
+    [string]$SourceDir = "",
     [string]$InstallDir = (Join-Path $env:ProgramFiles "beam"),
     [string]$DataDir = (Join-Path $env:ProgramData "beam"),
     [string]$ServiceName = "BeamClient",
@@ -52,6 +52,16 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($SourceDir)) {
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $SourceDir = $PSScriptRoot
+    } elseif (-not [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Path)) {
+        $SourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    } else {
+        $SourceDir = (Get-Location).Path
+    }
+}
 
 $PinnedWintunSha256 = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
 $LegacyTaskName = "beam-tray"
@@ -639,7 +649,7 @@ try {
     }
 } catch {
     Write-Host ""
-    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "ERROR (line $($_.InvocationInfo.ScriptLineNumber)): $($_.Exception.Message)" -ForegroundColor Red
     if (-not $NonInteractive) {
         $null = Read-Host "Press Enter to close"
     }
