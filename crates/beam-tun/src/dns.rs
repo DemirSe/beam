@@ -385,13 +385,30 @@ pub fn parse_dns_query(wire: &[u8]) -> Option<DnsQuery> {
     })
 }
 
+/// Transaction ID expected from a response. Plain UDP/TCP and the local
+/// resolver must echo the client ID; DoH uses ID 0 per RFC 8484.
+fn expected_response_tx_id(
+    upstream: &DnsUpstream,
+    use_local: bool,
+    query_tx_id: u16,
+) -> Option<u16> {
+    if use_local || !matches!(upstream, DnsUpstream::Doh { .. }) {
+        Some(query_tx_id)
+    } else {
+        None
+    }
+}
+
 /// Returns `true` when the response has `QR=1`, `QDCOUNT=1`, and its question
-/// matches the query.
+/// matches the query. `expected_tx_id` is `None` only for DoH.
 ///
-/// An upstream resolver is untrusted: a reply with extra questions or for a
-/// different name, type, or class is rejected before it is delivered or cached.
-fn response_question_matches(query: &DnsQuery, resp: &[u8]) -> bool {
+/// An upstream resolver is untrusted: a wrong ID, extra questions, or a
+/// different name, type, or class is rejected before delivery or caching.
+fn response_question_matches(query: &DnsQuery, resp: &[u8], expected_tx_id: Option<u16>) -> bool {
     if resp.len() < 12 || resp.len() > MAX_DOH_RESPONSE_BYTES {
+        return false;
+    }
+    if expected_tx_id.is_some_and(|expected| u16::from_be_bytes([resp[0], resp[1]]) != expected) {
         return false;
     }
     let flags = u16::from_be_bytes([resp[2], resp[3]]);
@@ -413,6 +430,18 @@ fn response_question_matches(query: &DnsQuery, resp: &[u8]) -> bool {
     let qtype = u16::from_be_bytes([resp[next], resp[next + 1]]);
     let qclass = u16::from_be_bytes([resp[next + 2], resp[next + 3]]);
     qname.eq_ignore_ascii_case(&query.qname) && qtype == query.qtype && qclass == query.qclass
+}
+
+/// Parses a response only after its transport-scoped ID and question match.
+fn validated_response_meta(
+    query: &DnsQuery,
+    resp: &[u8],
+    expected_tx_id: Option<u16>,
+) -> Option<(Option<u32>, Vec<IpAddr>)> {
+    if !response_question_matches(query, resp, expected_tx_id) {
+        return None;
+    }
+    Some(parse_dns_response_meta(resp))
 }
 
 /// Parses a domain name at `start` (supporting RFC 1035 compression pointers
@@ -1758,6 +1787,7 @@ impl DnsInterceptor {
         } else {
             dns_cfg.upstream.kind()
         };
+        let expected_tx_id = expected_response_tx_id(&dns_cfg.upstream, use_local, query.tx_id);
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -1804,95 +1834,97 @@ impl DnsInterceptor {
 
             let reply_wire = match result {
                 Ok(mut resp) if resp.len() >= 12 && resp.len() <= MAX_DOH_RESPONSE_BYTES => {
-                    if !response_question_matches(&query, &resp) {
+                    let Some((maybe_ttl, ips)) =
+                        validated_response_meta(&query, &resp, expected_tx_id)
+                    else {
                         counters.servfail_mismatch.incr();
                         debug!(
                             qname = %query.qname,
                             local = use_local,
-                            "DNS response question does not match the query; replying with SERVFAIL"
+                            "DNS response ID or question does not match the query; replying with SERVFAIL"
                         );
                         if let Some(suppressed) = DNS_UPSTREAM_LOG.allow() {
                             warn!(
                                 qtype = query.qtype,
                                 upstream_kind,
                                 local = use_local,
-                                stage = "question_mismatch",
+                                stage = "response_mismatch",
                                 suppressed,
                                 "DNS response rejected; replying with SERVFAIL"
                             );
                         }
-                        build_servfail_response(&wire_owned)
-                    } else {
-                        // Rewrite tx_id to match the client query. DoH uses tx_id 0
-                        // per RFC 8484 and TCP/XUDP are 1-to-1 exchanges, so question
-                        // matching above is what prevents cross-query injection.
-                        let id = query.tx_id.to_be_bytes();
-                        resp[0] = id[0];
-                        resp[1] = id[1];
-                        let (maybe_ttl, ips) = parse_dns_response_meta(&resp);
-                        // Install the dynamic bypass route BEFORE the reply is
-                        // sent so the follow-up SYN cannot race the route into
-                        // the tunnel. The callback runs the blocking `ip`
-                        // install on the blocking pool; awaiting its handle
-                        // yields the worker thread instead of blocking it.
-                        // The shared `bypass_permits` semaphore bounds hung
-                        // `ip` calls across the miss and hit paths so they
-                        // cannot grow blocking tasks unboundedly; this await
-                        // is bounded by `BYPASS_ROUTE_TIMEOUT`, but a still
-                        // running install keeps its permit until it ends.
-                        if is_bypass_domain
-                            && !ips.is_empty()
-                            && let Some(cb) = dns_cfg.on_bypass_ips.as_ref()
-                        {
-                            if let Ok(bypass_permit) = bypass_permits.clone().try_acquire_owned() {
-                                let ip_count = ips.len();
-                                let mut handle = cb(ips);
-                                let outcome = timeout(BYPASS_ROUTE_TIMEOUT, &mut handle).await;
-                                let still_running = outcome.is_err();
-                                if !matches!(&outcome, Ok(Ok(())))
-                                    && let Some(suppressed) = DNS_BYPASS_LOG.allow()
-                                {
-                                    warn!(
-                                        ip_count,
-                                        stage = "bypass_route_timeout",
-                                        suppressed,
-                                        "bypass route install did not finish cleanly; replying without waiting"
-                                    );
-                                }
-                                if still_running {
-                                    tokio::spawn(async move {
-                                        let _permit = bypass_permit;
-                                        let _ = handle.await;
-                                    });
-                                }
-                            } else if let Some(suppressed) = DNS_BYPASS_LOG.allow() {
+                        if let Some(resp) = build_servfail_response(&wire_owned) {
+                            send_udp_reply(&tun_tx, &counters, src, dst, &resp, None);
+                        }
+                        return;
+                    };
+                    // Rewrite tx_id to match the client query. Plain UDP/TCP
+                    // IDs were verified above; DoH keeps ID 0 on the wire.
+                    let id = query.tx_id.to_be_bytes();
+                    resp[0] = id[0];
+                    resp[1] = id[1];
+                    // Install the dynamic bypass route BEFORE the reply is
+                    // sent so the follow-up SYN cannot race the route into
+                    // the tunnel. The callback runs the blocking `ip`
+                    // install on the blocking pool; awaiting its handle
+                    // yields the worker thread instead of blocking it.
+                    // The shared `bypass_permits` semaphore bounds hung
+                    // `ip` calls across the miss and hit paths so they
+                    // cannot grow blocking tasks unboundedly; this await
+                    // is bounded by `BYPASS_ROUTE_TIMEOUT`, but a still
+                    // running install keeps its permit until it ends.
+                    if is_bypass_domain
+                        && !ips.is_empty()
+                        && let Some(cb) = dns_cfg.on_bypass_ips.as_ref()
+                    {
+                        if let Ok(bypass_permit) = bypass_permits.clone().try_acquire_owned() {
+                            let ip_count = ips.len();
+                            let mut handle = cb(ips);
+                            let outcome = timeout(BYPASS_ROUTE_TIMEOUT, &mut handle).await;
+                            let still_running = outcome.is_err();
+                            if !matches!(&outcome, Ok(Ok(())))
+                                && let Some(suppressed) = DNS_BYPASS_LOG.allow()
+                            {
                                 warn!(
-                                    ip_count = ips.len(),
-                                    stage = "bypass_route_saturated",
+                                    ip_count,
+                                    stage = "bypass_route_timeout",
                                     suppressed,
-                                    "bypass route install skipped because all permits are busy"
+                                    "bypass route install did not finish cleanly; replying without waiting"
                                 );
                             }
-                        }
-                        // Re-check after awaiting bypass route installation so a
-                        // handover during that await cannot repopulate the cache.
-                        if *net_gen_rx.borrow() != start_gen {
-                            return;
-                        }
-                        if let Some(ttl) = maybe_ttl {
-                            match cache.lock() {
-                                Ok(mut guard) => guard.insert(
-                                    &query,
-                                    Arc::from(resp.as_slice()),
-                                    ttl,
-                                    use_local,
-                                    Instant::now(),
-                                ),
-                                Err(_) => log_pool_poisoned("dns_cache"),
+                            if still_running {
+                                tokio::spawn(async move {
+                                    let _permit = bypass_permit;
+                                    let _ = handle.await;
+                                });
                             }
+                        } else if let Some(suppressed) = DNS_BYPASS_LOG.allow() {
+                            warn!(
+                                ip_count = ips.len(),
+                                stage = "bypass_route_saturated",
+                                suppressed,
+                                "bypass route install skipped because all permits are busy"
+                            );
                         }
-                        fit_response_for_udp(&wire_owned, resp)
                     }
+                    // Re-check after awaiting bypass route installation so a
+                    // handover during that await cannot repopulate the cache.
+                    if *net_gen_rx.borrow() != start_gen {
+                        return;
+                    }
+                    if let Some(ttl) = maybe_ttl {
+                        match cache.lock() {
+                            Ok(mut guard) => guard.insert(
+                                &query,
+                                Arc::from(resp.as_slice()),
+                                ttl,
+                                use_local,
+                                Instant::now(),
+                            ),
+                            Err(_) => log_pool_poisoned("dns_cache"),
+                        }
+                    }
+                    fit_response_for_udp(&wire_owned, resp)
                 }
                 Ok(_) => {
                     counters.servfail_upstream.incr();
@@ -2922,48 +2954,175 @@ mod tests {
             Ipv4Addr::new(1, 2, 3, 4),
             60,
         );
-        assert!(response_question_matches(&query, &matching));
+        assert!(response_question_matches(
+            &query,
+            &matching,
+            Some(query.tx_id)
+        ));
 
         let wrong_name = build_a_response(
             &build_query(0x1111, "evil.example", 1),
             Ipv4Addr::new(1, 2, 3, 4),
             60,
         );
-        assert!(!response_question_matches(&query, &wrong_name));
+        assert!(!response_question_matches(
+            &query,
+            &wrong_name,
+            Some(query.tx_id)
+        ));
 
         let wrong_type = build_a_response(
             &build_query(0x1111, "good.example", 28),
             Ipv4Addr::new(1, 2, 3, 4),
             60,
         );
-        assert!(!response_question_matches(&query, &wrong_type));
+        assert!(!response_question_matches(
+            &query,
+            &wrong_type,
+            Some(query.tx_id)
+        ));
 
         let mut class_query = build_query(0x1111, "good.example", 1);
         let class_at = class_query.len() - 2;
         class_query[class_at..].copy_from_slice(&3u16.to_be_bytes());
         let wrong_class = build_a_response(&class_query, Ipv4Addr::new(1, 2, 3, 4), 60);
-        assert!(!response_question_matches(&query, &wrong_class));
+        assert!(!response_question_matches(
+            &query,
+            &wrong_class,
+            Some(query.tx_id)
+        ));
 
         // Truncated, question-less, multi-question, and QR=0 responses never match.
-        assert!(!response_question_matches(&query, &matching[..11]));
+        assert!(!response_question_matches(
+            &query,
+            &matching[..11],
+            Some(query.tx_id)
+        ));
         let mut no_question = matching.clone();
         no_question[4] = 0;
         no_question[5] = 0;
-        assert!(!response_question_matches(&query, &no_question));
+        assert!(!response_question_matches(
+            &query,
+            &no_question,
+            Some(query.tx_id)
+        ));
 
         let mut two_questions = matching.clone();
         two_questions[4] = 0;
         two_questions[5] = 2;
-        assert!(!response_question_matches(&query, &two_questions));
+        assert!(!response_question_matches(
+            &query,
+            &two_questions,
+            Some(query.tx_id)
+        ));
 
         let mut qr_zero = matching.clone();
         qr_zero[2] &= !0x80;
-        assert!(!response_question_matches(&query, &qr_zero));
+        assert!(!response_question_matches(
+            &query,
+            &qr_zero,
+            Some(query.tx_id)
+        ));
 
         let mut multi_q_query = build_query(0x1111, "good.example", 1);
         multi_q_query[4] = 0;
         multi_q_query[5] = 2;
         assert!(parse_dns_query(&multi_q_query).is_none());
+    }
+
+    #[tokio::test]
+    async fn plain_reply_ids_are_verified_and_doh_id_zero_is_allowed() {
+        let tcp = DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53));
+        let udp = DnsUpstream::PlainUdp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53));
+        let doh = DnsUpstream::Doh {
+            host: "dns.example".to_owned(),
+            port: 443,
+            path: "/dns-query".to_owned(),
+        };
+        let query_wire = build_query(0x1234, "id.example", 1);
+        let query = parse_dns_query(&query_wire).expect("query");
+        assert_eq!(
+            expected_response_tx_id(&tcp, false, query.tx_id),
+            Some(query.tx_id)
+        );
+        assert_eq!(
+            expected_response_tx_id(&udp, false, query.tx_id),
+            Some(query.tx_id)
+        );
+        assert_eq!(expected_response_tx_id(&doh, false, query.tx_id), None);
+        assert_eq!(
+            expected_response_tx_id(&doh, true, query.tx_id),
+            Some(query.tx_id),
+            "local replies are plain DNS even with a DoH tunnel upstream"
+        );
+
+        // A well-formed, cacheable plain-TCP answer with the wrong ID.
+        let bad = build_a_response(
+            &build_query(0xbeef, "id.example", 1),
+            Ipv4Addr::new(203, 0, 113, 9),
+            60,
+        );
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let wire = bad.clone();
+        let srv = tokio::spawn(async move {
+            let mut len_buf = [0u8; 2];
+            server.read_exact(&mut len_buf).await.expect("len");
+            let n = usize::from(u16::from_be_bytes(len_buf));
+            let mut q = vec![0u8; n];
+            server.read_exact(&mut q).await.expect("query");
+            let resp_len = u16::try_from(wire.len()).expect("resp len");
+            server
+                .write_all(&resp_len.to_be_bytes())
+                .await
+                .expect("resp len");
+            server.write_all(&wire).await.expect("resp body");
+        });
+        let tcp_resp = send_tcp_dns_request(&mut client, &query_wire)
+            .await
+            .expect("tcp response");
+        srv.await.expect("fake tcp dns server");
+        assert_eq!(u16::from_be_bytes([tcp_resp[0], tcp_resp[1]]), 0xbeef);
+        assert_eq!(parse_dns_response_meta(&tcp_resp).0, Some(60));
+        assert!(
+            validated_response_meta(
+                &query,
+                &tcp_resp,
+                expected_response_tx_id(&tcp, false, query.tx_id)
+            )
+            .is_none(),
+            "wrong-ID plain TCP reply must be rejected before caching"
+        );
+        assert!(
+            validated_response_meta(
+                &query,
+                &tcp_resp,
+                expected_response_tx_id(&udp, false, query.tx_id)
+            )
+            .is_none(),
+            "plain UDP must reject the same wrong-ID reply"
+        );
+        let (interceptor, _) = test_interceptor(None);
+        assert!(
+            interceptor
+                .cache
+                .lock()
+                .expect("cache")
+                .get(&query, Instant::now())
+                .is_none(),
+            "a rejected reply must not enter the cache"
+        );
+
+        // RFC 8484 DoH answers carry ID 0 while the client query keeps its ID.
+        let mut doh_resp = build_a_response(&query_wire, Ipv4Addr::new(1, 1, 1, 1), 60);
+        doh_resp[0..2].copy_from_slice(&0u16.to_be_bytes());
+        let (ttl, ips) = validated_response_meta(
+            &query,
+            &doh_resp,
+            expected_response_tx_id(&doh, false, query.tx_id),
+        )
+        .expect("DoH ID 0 accepted");
+        assert_eq!(ttl, Some(60));
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
     }
 
     #[test]
