@@ -210,7 +210,8 @@ mod tests {
     #[test]
     fn boottime_offset_saturates_when_the_tick_count_lags() {
         assert_eq!(compute_boottime_offset(0, 600_000_000), Duration::ZERO);
-        assert_eq!(compute_boottime_offset(9_999, 100_000), Duration::ZERO);
+        // 9_999 ms tick vs 10_000 ms (100_000_000 × 100 ns) unbiased uptime.
+        assert_eq!(compute_boottime_offset(9_999, 100_000_000), Duration::ZERO);
     }
 
     #[test]
