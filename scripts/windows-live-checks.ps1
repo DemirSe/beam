@@ -870,6 +870,12 @@ function Test-HangRecovery {
                 try { $dialAfter = [uint64]([string]$st['dial_failures']) } catch {
                 }
                 $r = [string]$st['reason']
+                # Secret-free evidence: state token, reason token, counter, and
+                # whether egress still leaves through the VPS (no address printed).
+                $egressNow = Get-PublicIpv4
+                $viaVps = (($egressNow -ne '') -and ($script:VpsIpv4 -ne '') -and ($egressNow -eq $script:VpsIpv4))
+                Write-Host ('hang_poll state=' + [string]$st['state'] + ' reason=' + $r +
+                    ' dial_failures=' + [string]$dialAfter + ' via_vps=' + $viaVps.ToString().ToLowerInvariant())
                 if (($r -eq 'dial_failures') -or ($r -eq 'probe_failed') -or ($r -eq 'no_gateway')) {
                     $failReason = $r
                 }

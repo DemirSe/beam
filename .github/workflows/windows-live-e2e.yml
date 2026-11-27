@@ -18,6 +18,11 @@ on:
         required: false
         default: false
         type: boolean
+      rounds:
+        description: 'Comparison rounds (1-3, clamped)'
+        required: false
+        default: '3'
+        type: string
       compare_singbox:
         description: 'Run head-to-head comparison against sing-box.exe'
         required: false
@@ -178,7 +183,7 @@ jobs:
           BEAM_LIVE_VLESS_LINK: ${{ secrets.BEAM_LIVE_VLESS_LINK }}
         run: |
           $extracted = Join-Path $env:RUNNER_TEMP 'windows-live-e2e\extracted'
-          pwsh -NoProfile -File scripts/windows-vs-singbox.ps1 -PackageDir $extracted -SingboxExe $env:SINGBOX_EXE -CompareSingbox
+          pwsh -NoProfile -File scripts/windows-vs-singbox.ps1 -PackageDir $extracted -SingboxExe $env:SINGBOX_EXE -CompareSingbox -Rounds ${{ inputs.rounds }}
 
       - name: Live behavioral checks (routes, DNS, IPv6, restart, crash recovery, hang recovery)
         if: inputs.run_behavior_checks && !cancelled()
