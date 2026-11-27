@@ -365,7 +365,7 @@ impl LinuxRouteGuard {
         if !self.auto_route {
             return true;
         }
-        let snapshot = RouteSnapshot::load();
+        let snapshot = RouteSnapshot::load(&self.current_gw);
         self.bypass_routes_installed_with(&self.current_gw, self.local_dns_ip, |flag, prefix| {
             snapshot.check(flag, prefix)
         })
@@ -460,7 +460,7 @@ impl LinuxRouteGuard {
         if !self.auto_route {
             return true;
         }
-        let snapshot = RouteSnapshot::load();
+        let snapshot = RouteSnapshot::load(new_gw);
         let state = self.bypass_routes_installed_with(new_gw, new_local_dns, |flag, prefix| {
             snapshot.check(flag, prefix)
         });
@@ -493,7 +493,7 @@ impl LinuxRouteGuard {
 
         self.current_gw = new_gw.clone();
         self.local_dns_ip = new_local_dns;
-        let recheck = RouteSnapshot::load();
+        let recheck = RouteSnapshot::load(new_gw);
 
         if !self.server_ip.is_loopback()
             && let Some((maybe_gw, dev)) = gateway_for_ip(new_gw, self.server_ip)
@@ -1181,13 +1181,21 @@ fn resolve_ip_binary(
     Ok(found)
 }
 
+struct BoundedIpOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
 fn read_bounded_ip_output<R: io::Read + Send + 'static>(
     reader: R,
-) -> std::thread::JoinHandle<Vec<u8>> {
+) -> std::thread::JoinHandle<BoundedIpOutput> {
     std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let _ = reader.take(MAX_IP_OUTPUT_BYTES).read_to_end(&mut out);
-        out
+        let mut bytes = Vec::new();
+        let read = reader.take(MAX_IP_OUTPUT_BYTES + 1).read_to_end(&mut bytes);
+        BoundedIpOutput {
+            truncated: read.is_ok_and(|n| n as u64 > MAX_IP_OUTPUT_BYTES),
+            bytes,
+        }
     })
 }
 
@@ -1242,14 +1250,23 @@ fn spawn_ip_child(bin: &str, args: &[&str], deadline: Instant) -> io::Result<Out
             None => std::thread::sleep(IP_CHILD_POLL_INTERVAL),
         }
     };
+    let stdout = stdout.and_then(|reader| reader.join().ok());
+    let stderr = stderr.and_then(|reader| reader.join().ok());
+    if stdout.as_ref().is_some_and(|out| out.truncated)
+        || stderr.as_ref().is_some_and(|out| out.truncated)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "`ip {}` output exceeded {MAX_IP_OUTPUT_BYTES} bytes",
+                args.join(" ")
+            ),
+        ));
+    }
     Ok(Output {
         status,
-        stdout: stdout
-            .and_then(|reader| reader.join().ok())
-            .unwrap_or_default(),
-        stderr: stderr
-            .and_then(|reader| reader.join().ok())
-            .unwrap_or_default(),
+        stdout: stdout.map(|out| out.bytes).unwrap_or_default(),
+        stderr: stderr.map(|out| out.bytes).unwrap_or_default(),
     })
 }
 
@@ -1329,10 +1346,18 @@ struct RouteSnapshot {
 }
 
 impl RouteSnapshot {
-    fn load() -> Self {
+    fn load(gw: &PhysicalGateways) -> Self {
         Self {
-            v4: Self::load_family("-4"),
-            v6: Self::load_family("-6"),
+            v4: if gw.v4.is_some() {
+                Self::load_family("-4")
+            } else {
+                Ok(String::new())
+            },
+            v6: if gw.v6.is_some() {
+                Self::load_family("-6")
+            } else {
+                Ok(String::new())
+            },
         }
     }
 
@@ -1376,10 +1401,35 @@ impl RouteSnapshot {
     }
 }
 
+fn parse_route_prefix(word: &str) -> Option<IpNet> {
+    if word.contains('/') {
+        return IpNet::parse_cidr(word);
+    }
+    match word.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => IpNet::parse_cidr(&format!("{word}/32")),
+        Ok(IpAddr::V6(_)) => IpNet::parse_cidr(&format!("{word}/128")),
+        Err(_) => None,
+    }
+}
+
 fn route_snapshot_has_prefix(output: &str, prefix: &str) -> bool {
-    output
-        .lines()
-        .any(|line| line.split_whitespace().any(|word| word == prefix))
+    let Some(wanted) = parse_route_prefix(prefix) else {
+        return false;
+    };
+    output.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        let Some(destination) = words.next() else {
+            return false;
+        };
+        if matches!(
+            destination,
+            "blackhole" | "unreachable" | "prohibit" | "throw" | "local" | "broadcast"
+        ) || line.split_whitespace().any(|word| word == "linkdown")
+        {
+            return false;
+        }
+        parse_route_prefix(destination).is_some_and(|net| net == wanted)
+    })
 }
 
 /// Result of an exact-route lookup, distinguishing a missing route from a
@@ -1922,6 +1972,80 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
             .filter(|line| line.contains("route show"))
             .count();
         assert_eq!(shows, 2, "one snapshot per family, not per CIDR: {log}");
+    }
+
+    #[test]
+    fn route_snapshot_matches_host_routes_and_ignores_non_unicast() {
+        let table = "\
+default via 192.168.1.1 dev eth0 proto dhcp metric 100\n\
+153.56.184.142 via 10.61.135.13 dev enp0s20f0u5\n\
+2001:db8:abcd::1 via fe80::1 dev eth0 proto static metric 100 src 2001:db8:abcd::2\n\
+198.51.100.0/24 via 10.0.0.1 dev eth0 proto static metric 100\n\
+    nexthop via 10.0.0.2 dev eth1 weight 1\n\
+    nexthop via 10.0.0.3 dev eth2 weight 1\n\
+blackhole 203.0.113.9/32\n\
+unreachable 203.0.113.8/32\n\
+prohibit 203.0.113.7/32\n\
+throw 203.0.113.6/32\n\
+local 127.0.0.1/32 dev lo proto kernel scope host src 127.0.0.1\n\
+broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
+198.51.100.1/32 dev eth0 proto static linkdown\n";
+        assert!(route_snapshot_has_prefix(table, "153.56.184.142/32"));
+        assert!(route_snapshot_has_prefix(table, "2001:db8:abcd::1/128"));
+        assert!(route_snapshot_has_prefix(table, "2001:0DB8:ABCD::1/128"));
+        assert!(route_snapshot_has_prefix(table, "198.51.100.0/24"));
+        assert!(!route_snapshot_has_prefix(table, "203.0.113.9/32"));
+        assert!(!route_snapshot_has_prefix(table, "203.0.113.8/32"));
+        assert!(!route_snapshot_has_prefix(table, "203.0.113.7/32"));
+        assert!(!route_snapshot_has_prefix(table, "203.0.113.6/32"));
+        assert!(!route_snapshot_has_prefix(table, "127.0.0.1/32"));
+        assert!(!route_snapshot_has_prefix(table, "192.168.1.255/32"));
+        assert!(!route_snapshot_has_prefix(table, "198.51.100.1/32"));
+    }
+
+    #[test]
+    fn truncated_snapshot_is_lookup_error() {
+        let dir = test_dir("truncated-snapshot");
+        let fake = FakeIp::new_in(
+            dir,
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+               *\"route show\"*) yes x | head -c 70000; exit 0 ;;\n\
+             esac\n\
+             exit 0\n",
+        );
+        let snapshot = RouteSnapshot::load(&route_guard_for_tests().current_gw);
+        assert!(
+            matches!(
+                snapshot.check("-4", "198.51.100.1/32"),
+                RouteCheck::Error(_)
+            ),
+            "a cut table must not be read as an absent route"
+        );
+        drop(fake);
+    }
+
+    #[test]
+    fn snapshot_skips_family_without_gateway() {
+        let dir = test_dir("snapshot-no-gw-family");
+        let log = dir.join("ip.log");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+                log.display()
+            ),
+        );
+        let gw = PhysicalGateways {
+            v4: Some((Some("192.168.1.1".to_owned()), "eth0".to_owned())),
+            v6: None,
+        };
+        let _ = RouteSnapshot::load(&gw);
+        let log = read_fake_ip_log(&fake.log_path());
+        assert_eq!(log.lines().count(), 1, "unexpected ip calls: {log}");
+        assert!(log.contains("-4 route show"), "{log}");
+        assert!(!log.contains("-6 route show"), "{log}");
+        drop(fake);
     }
 
     #[test]
