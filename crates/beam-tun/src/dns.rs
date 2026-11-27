@@ -1630,28 +1630,46 @@ impl DnsInterceptor {
         };
         if let Some(cached) = cached {
             self.counters.hits.incr();
+            // Reply first: everything below (answer parse, limiter, task
+            // spawn) is best-effort bypass bookkeeping that must not delay
+            // the already-cached answer. It reads only `cached`/`query`, so
+            // running it after the send is semantically identical.
+            if cached.len() <= udp_dns_response_limit(wire) {
+                send_udp_reply(
+                    &self.tun_tx,
+                    &self.counters,
+                    src,
+                    dst,
+                    &cached,
+                    Some(query.tx_id),
+                );
+            } else if let Some(reply) =
+                fit_response_for_udp(wire, patch_tx_id(&cached, query.tx_id))
+            {
+                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &reply, None);
+            }
             // Re-fire `on_bypass_ips` on bypass-domain cache hits so a
             // previously failed route install (e.g. no gateway at first
             // lookup) recovers without waiting for TTL expiry. The spawn
-            // keeps the TUN loop non-blocking; the reply below is sent
-            // immediately from the already-cached answer.
+            // keeps the TUN loop non-blocking; the reply above is already
+            // queued from the cached answer.
             if is_bypass_domain
                 && self.dns_config.on_bypass_ips.is_some()
                 && let Ok(permit) = self.bypass_permits.clone().try_acquire_owned()
-            {
-                // Parse the cached reply only once a re-fire can actually run.
-                let (_, refire_ips) = parse_dns_response_meta(&cached);
                 // Best-effort re-fire: the shared `bypass_permits` semaphore
                 // bounds concurrent installs across the miss and hit paths,
                 // and `MAX_BYPASS_REFIRE_PER_WINDOW` per window stops a flood
                 // of cached bypass queries from fork-storming `ip`. The
-                // cached reply below is sent immediately without waiting.
-                // The install await is bounded by `BYPASS_ROUTE_TIMEOUT` so
-                // a hung `ip` cannot permanently pin a permit.
-                if !refire_ips.is_empty()
-                    && self.bypass_refire_limit.allow().is_some()
-                    && let Some(cb) = self.dns_config.on_bypass_ips.clone()
-                {
+                // limiter is checked before parsing so a suppressed window
+                // pays no answer-parse allocation. The install await is
+                // bounded by `BYPASS_ROUTE_TIMEOUT` so a hung `ip` cannot
+                // permanently pin a permit.
+                && self.bypass_refire_limit.allow().is_some()
+                && let Some(cb) = self.dns_config.on_bypass_ips.clone()
+            {
+                // Parse the cached reply only once a re-fire can actually run.
+                let (_, refire_ips) = parse_dns_response_meta(&cached);
+                if !refire_ips.is_empty() {
                     let qname = query.qname.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -1668,20 +1686,6 @@ impl DnsInterceptor {
                         }
                     });
                 }
-            }
-            if cached.len() <= udp_dns_response_limit(wire) {
-                send_udp_reply(
-                    &self.tun_tx,
-                    &self.counters,
-                    src,
-                    dst,
-                    &cached,
-                    Some(query.tx_id),
-                );
-            } else if let Some(reply) =
-                fit_response_for_udp(wire, patch_tx_id(&cached, query.tx_id))
-            {
-                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &reply, None);
             }
             return;
         }

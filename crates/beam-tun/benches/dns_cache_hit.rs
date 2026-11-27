@@ -162,4 +162,40 @@ fn main() {
 
     let ip: IpAddr = dst.ip();
     let _ = ip;
+
+    // Full warm-cache fast path per query, as `handle_query` pays it:
+    // parse the wire query, lock + probe the cache, size-check the reply,
+    // build the tx_id-patched TUN packet. Varying tx_ids cycle through
+    // prebuilt wires so every iteration is a genuine hit (tx_id is not
+    // part of the cache key) and nothing is dead-code-eliminated.
+    const FAST_WIRES: usize = 1024;
+    let fast_queries: Vec<Vec<u8>> = (0..FAST_WIRES)
+        .map(|i| build_query(i as u16, name))
+        .collect();
+    let fast_cache = std::sync::Mutex::new(cache);
+    let start = Instant::now();
+    let mut fast_bytes = 0usize;
+    for round in 0..ROUNDS {
+        let wire = &fast_queries[round % FAST_WIRES];
+        let q = parse_dns_query(black_box(wire)).expect("query");
+        let hit = fast_cache
+            .lock()
+            .expect("cache lock")
+            .get(&q, Instant::now())
+            .expect("cache hit");
+        let pkt = build_ip_udp_packet_patched(
+            dst.ip(),
+            dst.port(),
+            src.ip(),
+            src.port(),
+            &hit,
+            Some((0, q.tx_id.to_be_bytes())),
+        )
+        .expect("reply packet");
+        fast_bytes += black_box(pkt).len();
+    }
+    let fast = start.elapsed();
+    assert_eq!(fast_bytes, new_bytes);
+    let fast_ns = fast.as_secs_f64() * 1e9 / ROUNDS as f64;
+    println!("  fast path parse+get+packet {fast_ns:8.1} ns/hit   {fast:?} total");
 }
