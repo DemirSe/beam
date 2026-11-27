@@ -171,7 +171,12 @@ impl ExcludeIps {
     /// Builds the exclusion set, normalizing mapped and compatible IPv6
     /// literals to the embedded IPv4 form used by destination classification.
     pub fn new(entries: &[IpAddr]) -> Self {
-        let list: Vec<IpAddr> = entries.iter().copied().map(normalize_destination).collect();
+        let mut list: Vec<IpAddr> = Vec::with_capacity(entries.len());
+        for ip in entries.iter().copied().map(normalize_destination) {
+            if !list.contains(&ip) {
+                list.push(ip);
+            }
+        }
         Self {
             set: (list.len() > Self::HASH_THRESHOLD).then(|| list.iter().copied().collect()),
             list,
@@ -180,6 +185,7 @@ impl ExcludeIps {
 
     /// Returns `true` when `ip` is explicitly excluded.
     pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = normalize_destination(ip);
         match self.set.as_ref() {
             Some(set) => set.contains(&ip),
             None => self.list.contains(&ip),
@@ -210,8 +216,8 @@ impl ExcludeIps {
         } else {
             self.list.push(new);
         }
-        self.set =
-            (self.list.len() > Self::HASH_THRESHOLD).then(|| self.list.iter().copied().collect());
+        let list = self.list.clone();
+        *self = Self::new(&list);
     }
 
     /// Returns `true` when nothing is excluded.
@@ -356,7 +362,7 @@ fn normalize_destination(ip: IpAddr) -> IpAddr {
 /// Returns `true` for loopback, private/ULA, CGNAT, special-purpose,
 /// link-local, multicast, broadcast, or unspecified IP addresses.
 pub fn is_non_global_ip(ip: IpAddr) -> bool {
-    match ip {
+    match normalize_destination(ip) {
         IpAddr::V4(v4) => is_non_global_ipv4(v4),
         IpAddr::V6(v6) => is_non_global_ipv6(v6),
     }
@@ -907,6 +913,45 @@ mod tests {
             policy.classify(&parse_ip(&pkt).expect("ip")),
             RouteDecision::Drop
         );
+    }
+
+    #[test]
+    fn exclude_ips_normalizes_arguments_and_deduplicates_entries() {
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().expect("mapped");
+        let compatible: IpAddr = "::203.0.113.7".parse().expect("compatible");
+        let plain: IpAddr = "203.0.113.7".parse().expect("plain");
+        let exclusions = ExcludeIps::new(&[plain, mapped, compatible]);
+
+        assert_eq!(exclusions.len(), 1, "normalized duplicates must collapse");
+        assert!(exclusions.contains(mapped));
+        assert!(exclusions.contains(compatible));
+        assert!(exclusions.contains(plain));
+    }
+
+    #[test]
+    fn exclude_ips_replace_normalizes_mapped_and_compatible_arguments() {
+        let old: IpAddr = "::ffff:203.0.113.7".parse().expect("old mapped");
+        let new: IpAddr = "::198.51.100.7".parse().expect("new compatible");
+        let mut exclusions = ExcludeIps::new(&[old]);
+
+        exclusions.replace(old, new);
+
+        assert_eq!(exclusions.len(), 1);
+        assert!(!exclusions.contains("203.0.113.7".parse().expect("old plain")));
+        assert!(exclusions.contains("198.51.100.7".parse().expect("new plain")));
+        assert!(exclusions.contains(new));
+    }
+
+    #[test]
+    fn direct_non_global_check_normalizes_mapped_and_compatible_addresses() {
+        for literal in ["::ffff:192.168.1.1", "::192.168.1.1"] {
+            let ip: IpAddr = literal.parse().expect("private literal");
+            assert!(is_non_global_ip(ip), "{literal} must follow IPv4 policy");
+        }
+        for literal in ["::ffff:8.8.8.8", "::8.8.8.8"] {
+            let ip: IpAddr = literal.parse().expect("public literal");
+            assert!(!is_non_global_ip(ip), "{literal} must stay global");
+        }
     }
 
     #[test]
