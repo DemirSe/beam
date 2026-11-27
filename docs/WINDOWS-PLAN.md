@@ -43,8 +43,8 @@ Every phase follows this exact workflow:
 | Phase | Scope | Files Owned | Status | Verification / Notes |
 |---|---|---|---|---|
 | **Phase 1** | Cross-platform core (`beam-sys` Windows skeleton + `beam-core`/`beam-tun` Windows build + initial `windows-build.yml`) | `crates/beam-sys/`, `crates/beam-core/`, `crates/beam-tun/`, `.github/workflows/windows-build.yml` | Done | Local `make verify` + `beam-sys` Windows MSVC clippy + 3-round (DeepSeek+Muse) QC clean; full Windows CI pending push |
-| **Phase 2** | Windows OS primitives in `beam-sys` (`wintun.rs`, `wfp.rs`, `iphelper.rs`, `service.rs`, `pipe.rs`) | `crates/beam-sys/src/windows/*` | In Progress | — |
-| **Phase 3** | Native Windows `beam-client.exe` (`win_tun.rs`, `win_routes.rs`, `win_health.rs`, `win_service.rs`, `win_ipc.rs`, `config.rs`, `main.rs`) | `crates/beam-client/src/*` | Pending | — |
+| **Phase 2** | Windows OS primitives in `beam-sys` (`wintun.rs`, `wfp.rs`, `iphelper.rs`, `service.rs`, `pipe.rs`) | `crates/beam-sys/src/windows/*` | Done | Local `make verify` + `beam-sys` Windows MSVC clippy + 3-round (DeepSeek+Muse) QC clean; runtime Windows tests pending CI |
+| **Phase 3** | Native Windows `beam-client.exe` (`win_tun.rs`, `win_routes.rs`, `win_health.rs`, `win_service.rs`, `win_ipc.rs`, `config.rs`, `main.rs`) | `crates/beam-client/src/*` | In Progress | — |
 | **Phase 4** | Unelevated `beam-tray.exe` + `vless://` import dialog + C unit tests | `clients/windows-tray/*`, `tests/windows-tray/*` | Pending | — |
 | **Phase 5** | Installer (`install.ps1`/`.cmd`), release packaging (`release.yml`, `release-windows-tray.sh`), contract tests & docs | `clients/windows-tray/install*`, `scripts/release-windows-tray.sh`, `.github/workflows/*`, `tests/release/*`, `docs/*`, `README.md`, `AGENTS.md` | Pending | — |
 | **Phase 6** | Live Windows PC verification (install, `vless://` import, leaks, roaming, sleep/wake, kill recovery, uninstall) & cleanup | Live Windows host + remove `docs/WINDOWS-PLAN.md` | Pending | — |

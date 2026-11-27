@@ -5,7 +5,12 @@
 //! primitives live in [`socket`] so the Linux and Windows socket helpers stay
 //! separate.
 
+pub mod iphelper;
+pub mod pipe;
+pub mod service;
 pub mod socket;
+pub mod wfp;
+pub mod wintun;
 
 pub use socket::{
     bind_socket_to_interface_v4, bind_socket_to_interface_v6, set_tcp_keepalive, set_tcp_keepcnt,
