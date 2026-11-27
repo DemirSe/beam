@@ -62,7 +62,9 @@
 #define BEAM_DNS_CTRLD "[Resolve]\nDNS=1.1.1.1\nDomains=~.\n"
 /* Without ctrld, an empty DNS= clears the inherited list; repeats append. */
 #define BEAM_DNS_CLEAR "[Resolve]\nDNS=\nDNS=1.1.1.1\nDomains=~.\n"
+#ifndef ALLOWED_USER
 #define ALLOWED_USER "/etc/beam/allowed-user"
+#endif
 #ifndef LOCK_PATH
 #define LOCK_PATH "/run/beam-helper.lock"
 #endif
@@ -125,6 +127,24 @@ static int allowed_user(void)
     while (len && (allowed[len - 1] == '\n' || allowed[len - 1] == '\r'))
         allowed[--len] = '\0';
     return strcmp(allowed, pw->pw_name) == 0;
+}
+
+/* Reject paths run before sanitize(), so syslog is safe here. Show only a
+ * bounded, printable form of the command: never file content or a secret. */
+static void log_reject(const char *reason, const char *command)
+{
+    struct passwd *pw = getpwuid(getuid());
+    char shown[32];
+    size_t i, n = 0;
+
+    for (i = 0; command && command[i] && n + 1 < sizeof(shown); i++) {
+        unsigned char c = (unsigned char)command[i];
+        shown[n++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    shown[n] = '\0';
+    syslog(LOG_WARNING, "rejected %s: uid=%u user=%s command=%s", reason,
+           (unsigned)getuid(), (pw && pw->pw_name) ? pw->pw_name : "unknown",
+           shown);
 }
 
 static void close_extra_fds(void)
@@ -588,21 +608,30 @@ int main(int argc, char **argv)
 {
     const char *command;
 
-    if (geteuid() != 0)
+    if (geteuid() != 0) {
+        log_reject("effective uid is not root", argc > 1 ? argv[1] : "");
         return 1;
-    if (!allowed_user())
+    }
+    if (!allowed_user()) {
+        log_reject("user is not allowed", argc > 1 ? argv[1] : "");
         return 1;
-    if (argc != 2)
+    }
+    if (argc != 2) {
+        log_reject("bad argument count", argc > 1 ? argv[1] : "");
         return 1;
+    }
 
     command = argv[1];
     if (strcmp(command, "dns-on") == 0 ||
         strcmp(command, "dns-off") == 0 ||
         strcmp(command, "restore-dns") == 0 ||
         strcmp(command, "ctrld-off") == 0) {
-        if (getuid() != 0)
+        if (getuid() != 0) {
+            log_reject("dns command from non-root", command);
             return 1;
+        }
     } else if (strcmp(command, "up") != 0 && strcmp(command, "down") != 0) {
+        log_reject("unknown command", command);
         return 1;
     }
 

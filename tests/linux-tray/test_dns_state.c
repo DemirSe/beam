@@ -14,10 +14,41 @@
  * or restore rename next to a byte-identical host file.
  */
 
+#define _GNU_SOURCE
+#include <stdarg.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 /* Injected by -DUNLINK=beam_test_unlink and -DRENAME=beam_test_rename in
  * test_dns_state.sh. */
 int beam_test_unlink(const char *path);
 int beam_test_rename(const char *from, const char *to);
+
+/* Test doubles for the early reject paths. No syslog daemon or root is
+ * needed: the calls are counted and the formatted text is inspected. */
+void beam_test_syslog(int priority, const char *fmt, ...);
+uid_t beam_test_geteuid(void);
+
+static int syslog_calls;
+static char syslog_last[512];
+static int fake_euid;
+
+void beam_test_syslog(int priority, const char *fmt, ...)
+{
+    va_list ap;
+
+    (void)priority;
+    syslog_calls++;
+    va_start(ap, fmt);
+    vsnprintf(syslog_last, sizeof(syslog_last), fmt, ap);
+    va_end(ap);
+}
+
+uid_t beam_test_geteuid(void)
+{
+    return fake_euid ? (uid_t)1 : (uid_t)0;
+}
 
 #define main beam_helper_main
 #include "../../clients/linux-tray/helper.c"
@@ -117,6 +148,56 @@ static void reset_state(void)
     unlink(BEAM_OWNED);
     unlink(OTHER_DROPIN);
     unlink(RELOAD_FAIL);
+}
+
+static void check_rejects(void)
+{
+    char *up[] = { "beam-helper", "up", NULL };
+    char *bad[] = { "beam-helper", "bad\nsecret", NULL };
+    char *dns[] = { "beam-helper", "dns-off", NULL };
+    struct passwd *pw = getpwuid(getuid());
+    FILE *f;
+
+    unlink(ALLOWED_USER);
+    fake_euid = 1;
+    syslog_calls = 0;
+    CHECK(beam_helper_main(2, up) == 1);
+    CHECK(syslog_calls == 1);
+    CHECK(strstr(syslog_last, "effective uid is not root") != NULL);
+    CHECK(strstr(syslog_last, "uid=") != NULL);
+
+    fake_euid = 0;
+    syslog_calls = 0;
+    CHECK(beam_helper_main(2, up) == 1);
+    CHECK(syslog_calls == 1);
+    CHECK(strstr(syslog_last, "user is not allowed") != NULL);
+    CHECK(strstr(syslog_last, "uid=") != NULL);
+
+    f = fopen(ALLOWED_USER, "w");
+    CHECK(f != NULL);
+    if (f) {
+        if (pw)
+            fprintf(f, "%s\n", pw->pw_name);
+        fclose(f);
+    }
+
+    syslog_calls = 0;
+    CHECK(beam_helper_main(1, up) == 1);
+    CHECK(syslog_calls == 1);
+    CHECK(strstr(syslog_last, "bad argument count") != NULL);
+
+    syslog_calls = 0;
+    CHECK(beam_helper_main(2, bad) == 1);
+    CHECK(syslog_calls == 1);
+    CHECK(strstr(syslog_last, "unknown command") != NULL);
+    CHECK(strstr(syslog_last, "bad?secret") != NULL);
+    CHECK(strchr(syslog_last, '\n') == NULL);
+
+    syslog_calls = 0;
+    CHECK(beam_helper_main(2, dns) == 1);
+    CHECK(syslog_calls == 1);
+    CHECK(strstr(syslog_last, "dns command from non-root") != NULL);
+    unlink(ALLOWED_USER);
 }
 
 int main(void)
@@ -495,6 +576,8 @@ int main(void)
     CHECK(file_is(BEAM_DROPIN, USER_DNS));
     CHECK(!exists(BEAM_SAVED));
     CHECK(!exists(BEAM_OWNED));
+
+    check_rejects();
 
     reset_state();
     if (failures) {

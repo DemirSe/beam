@@ -265,8 +265,10 @@ second cooldown after each helper action.
 The helper only accepts fixed commands, checks that its real user matches
 `/etc/beam/allowed-user`, clears its environment, redirects stdio, closes
 inherited descriptors, and executes
-absolute `systemctl` paths. The TUN profile excludes the VLESS server from the
-TUN route, and uses `auto_redirect: true` for TCP.
+absolute `systemctl` paths. For each rejected call the helper writes one
+warning to the system log. The warning names the reason, the invoking uid and
+user, and a printable form of the command. The TUN profile excludes the VLESS
+server from the TUN route, and uses `auto_redirect: true` for TCP.
 
 The helper is local, unsigned, and setuid root; treat the repository and
 installer as trusted input. SELinux relabeling is attempted on Fedora, but the
@@ -276,8 +278,9 @@ the ctrld and no-ctrld paths, same-content host files, every marker/crash state,
 the edit conflicts, a failed delete that keeps the marker, a failed marker
 delete or restore rename next to a byte-identical host file, and a manual
 `restore-dns` followed by `dns-off` in a temporary directory without root. It
-also checks the installer's resolver and directory preconditions, the stop
-guard before the BBR files, and the unit ordering. It does not test the live
+also checks that each rejected helper call logs one warning. It checks the
+installer's resolver and directory preconditions, the stop guard before the
+BBR files, and the unit ordering. It does not test the live
 resolver.
 
 ## Mobile profile
