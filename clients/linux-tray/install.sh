@@ -88,6 +88,7 @@ BACKUP_READY=0
 INSTALL_COMMITTED=0
 SERVICE_WAS_ACTIVE=0
 DNS_RESET_ENABLED=0
+CLIENT_ENABLED=0
 MANAGED_PATHS=(
     /etc/beam/config.json
     /etc/beam/allowed-user
@@ -129,6 +130,15 @@ rollback_live() {
         fi
     done
     systemctl daemon-reload 2>/dev/null || true
+    # Restore the inherited wants symlink; MANAGED_PATHS does not hold it.
+    if [ "$CLIENT_ENABLED" = "1" ]; then
+        if ! systemctl enable beam-client.service >/dev/null 2>&1; then
+            echo "installer: could not restore beam-client enablement" >&2
+            failed=1
+        fi
+    else
+        systemctl disable beam-client.service >/dev/null 2>&1 || true
+    fi
     if [ "$DNS_RESET_ENABLED" = "1" ]; then
         if ! systemctl enable beam-dns-reset.service >/dev/null 2>&1; then
             echo "installer: could not restore beam-dns-reset enablement" >&2
@@ -191,6 +201,9 @@ backup_live
 BACKUP_READY=1
 if systemctl is-enabled --quiet beam-dns-reset.service 2>/dev/null; then
     DNS_RESET_ENABLED=1
+fi
+if systemctl is-enabled --quiet beam-client 2>/dev/null; then
+    CLIENT_ENABLED=1
 fi
 
 if systemctl is-active --quiet beam-client 2>/dev/null; then
@@ -313,6 +326,11 @@ EOF
 chmod 0644 /etc/systemd/system/beam-dns-reset.service
 systemctl daemon-reload
 systemctl enable beam-dns-reset.service
+# An inherited wants symlink would start this unit at boot with a DNS change.
+if ! systemctl disable beam-client.service >/dev/null 2>&1; then
+    echo "installer: could not disable beam-client" >&2
+    exit 1
+fi
 
 if command -v restorecon >/dev/null 2>&1; then
     restorecon -RFv /usr/local/lib/beam /usr/local/libexec /usr/local/bin/beam-tray         /etc/beam /etc/systemd/system/beam-client.service         /etc/systemd/system/beam-dns-reset.service         /usr/share/applications/beam-tray.desktop >/dev/null 2>&1 || true

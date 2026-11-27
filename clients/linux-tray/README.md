@@ -27,7 +27,9 @@ these inputs before it changes live files:
 The script runs `config-policy.py` and checks the config with `sing-box check`.
 It stages files under `/usr/local/lib` and backs up managed paths.
 It stops `beam-client` before it installs new files.
-It leaves the service stopped and disabled. Failed installs restore the backups.
+It leaves the service stopped and disabled. It disables an inherited unit so
+the new unit cannot start at boot. Failed installs restore the backups and the
+earlier enablement state.
 
 ## Native `beam-client` or this install: choose one
 

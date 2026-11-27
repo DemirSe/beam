@@ -122,6 +122,26 @@ printf '%s\n' "$reset_after" | tr ' ' '\n' | grep -qxF 'systemd-resolved.service
   exit 1
 }
 
+# The installer must record inherited enablement, restore it on rollback, and
+# leave the unit disabled after a successful install. The wants symlink is not
+# a managed path, so systemctl handles it.
+enabled_line=$(grep -n 'systemctl is-enabled --quiet beam-client' "$INSTALL" | cut -d: -f1 || true)
+[ -n "$enabled_line" ] && [ "$enabled_line" -lt "$stop_line" ] || {
+  echo "install.sh: beam-client enablement is not recorded before the stop" >&2
+  exit 1
+}
+disable_line=$(grep -n '^if ! systemctl disable beam-client.service' "$INSTALL" | cut -d: -f1 || true)
+commit_line=$(grep -n '^INSTALL_COMMITTED=1' "$INSTALL" | cut -d: -f1 || true)
+[ -n "$disable_line" ] && [ -n "$commit_line" ] && [ "$disable_line" -lt "$commit_line" ] || {
+  echo "install.sh: successful install does not disable beam-client" >&2
+  exit 1
+}
+rollback_body=$(sed -n '/^rollback_live() {/,/^}/p' "$INSTALL")
+printf '%s\n' "$rollback_body" | grep -qF 'systemctl enable beam-client.service' || {
+  echo "install.sh: rollback does not restore beam-client enablement" >&2
+  exit 1
+}
+
 # A fresh install must name the pinned core files it needs, not fail later in
 # the staging copy.
 core_list=$(sed -n 's/^for core_file in \(.*\); do$/\1/p' "$INSTALL")

@@ -253,7 +253,9 @@ and unit files are restored from the pre-install snapshot; an active service is
 started again with the restored configuration. If restoration itself fails, the
 installer exits nonzero and keeps the snapshot under
 `/usr/local/lib/.beam-backup.*` for recovery. A normal install leaves the
-service installed but neither enabled nor started.
+service installed but neither enabled nor started. The installer records the
+earlier enablement state, disables an inherited unit on success, and restores
+that state on rollback.
 
 DNS changes use `systemctl reload systemd-resolved`, so rapid tray toggles do not
 restart the resolver or hit its start limit. The tray also applies a three
