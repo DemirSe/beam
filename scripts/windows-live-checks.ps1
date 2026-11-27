@@ -833,6 +833,28 @@ try {
     } catch {
         Write-Host 'logs_preserved=false'
     }
+    # Print the WFP/route/dns lines from the service log so a failing run shows
+    # why the leak guard did or did not block. IP literals are redacted.
+    try {
+        $logPath = Join-Path $env:ProgramData 'beam\beam-client.log'
+        if (Test-Path -LiteralPath $logPath) {
+            $hits = @(Select-String -LiteralPath $logPath -Pattern 'leak guard|block_physical_dns|split routes|wfp|dns interceptor' -ErrorAction SilentlyContinue | Select-Object -Last 15)
+            $digestIndex = 0
+            foreach ($h in $hits) {
+                $text = [string]$h.Line
+                $text = [regex]::Replace($text, '\d{1,3}(\.\d{1,3}){3}', '<ip>')
+                $text = [regex]::Replace($text, '([0-9a-fA-F]{2}:){4,}[0-9a-fA-F:]+', '<v6>')
+                if ($text.Length -gt 220) { $text = $text.Substring(0, 220) }
+                $digestIndex = $digestIndex + 1
+                Write-Host ('log_digest=' + $digestIndex + ': ' + $text)
+            }
+            Write-Host ('log_digest_lines=' + $digestIndex)
+        } else {
+            Write-Host 'log_digest=missing'
+        }
+    } catch {
+        Write-Host 'log_digest=error'
+    }
     # ALWAYS restore runner connectivity: disconnect, uninstall, verify cleanup.
     try {
         $null = Invoke-Ipc -Line 'DISCONNECT'
