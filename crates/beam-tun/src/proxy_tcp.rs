@@ -495,6 +495,17 @@ impl TcpConn {
             return;
         }
 
+        // A zero-window persist probe uses `seq = snd_una - 1`. Answer it once
+        // when our window has reopened, even below the ordinary update
+        // threshold, so the peer does not stay stalled after a small drain.
+        if self.last_advertised_wnd == 0
+            && seg.seq == self.snd_una.wrapping_sub(1)
+            && seg.payload.is_empty()
+            && self.rcv_wnd_bytes() > 0
+        {
+            self.need_ack = true;
+        }
+
         let mut emit_dup_ack = false;
         if !seg.payload.is_empty() {
             if matches!(
@@ -2584,6 +2595,63 @@ mod tests {
         let ack_seg = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
         assert_eq!(ack_seg.flags, TCP_ACK);
         assert_eq!(ack_seg.ack, seq);
+    }
+
+    #[tokio::test]
+    async fn zero_window_persist_probe_acknowledges_the_reopened_window() {
+        // The client config derives 512 KiB per direction at 256 flows.
+        let cfg = TcpStackConfig {
+            socket_buffer_bytes: 512 * 1024,
+            ..TcpStackConfig::default()
+        };
+        let mut stack = ProxyTcpStack::new(cfg);
+        let (srv_nxt, acc) = handshake(&mut stack, 1000);
+        let (mut reader, _writer) = acc.stream.into_split();
+
+        // Fill the 512 KiB receive buffer so the advertised window reaches zero.
+        let payload = vec![0x5a_u8; 1024];
+        let mut seq = 1001u32;
+        for _ in 0..512 {
+            stack.push_ip_tcp(&make_seg(seq, srv_nxt, TCP_ACK, 1024, &[], &payload));
+            seq = seq.wrapping_add(payload.len() as u32);
+        }
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+        stack.poll(30, &mut tx, &mut accepted);
+        let conn = stack.conns.values().next().expect("conn");
+        assert_eq!(conn.rcv_wnd_bytes(), 0);
+        assert_eq!(conn.last_advertised_wnd, 0);
+
+        // One drained 64 KiB chunk reopens the window below the 128 KiB
+        // ordinary update threshold, so no unsolicited ACK is expected.
+        let chunk = reader.recv_chunk().await.expect("queued chunk");
+        assert_eq!(chunk.len(), RELAY_COALESCE_BYTES);
+        tx.clear();
+        stack.poll(40, &mut tx, &mut accepted);
+        assert!(tx.is_empty(), "small window growth must stay silent");
+
+        let probe_seq = stack
+            .conns
+            .values()
+            .next()
+            .expect("conn")
+            .snd_una
+            .wrapping_sub(1);
+        stack.push_ip_tcp(&make_seg(probe_seq, srv_nxt, TCP_ACK, 0, &[], &[]));
+        stack.poll(50, &mut tx, &mut accepted);
+        assert_eq!(tx.len(), 1, "persist probe must get one window ACK");
+        let ack_seg = parse_tcp(parse_ip(&tx[0]).expect("ip").payload).expect("tcp");
+        assert_eq!(ack_seg.flags, TCP_ACK);
+        assert_eq!(ack_seg.seq, srv_nxt);
+        assert_eq!(
+            ack_seg.window, 512,
+            "64 KiB scaled by 128 must be advertised"
+        );
+
+        tx.clear();
+        stack.push_ip_tcp(&make_seg(probe_seq, srv_nxt, TCP_ACK, 0, &[], &[]));
+        stack.poll(60, &mut tx, &mut accepted);
+        assert!(tx.is_empty(), "repeated must not flood window ACKs");
     }
 
     #[tokio::test]

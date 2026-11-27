@@ -583,6 +583,14 @@ VLESS with `xtls-rprx-vision` is expected to work.
   change. Client TUN profiles use MTU 1500; lowering that MTU loses some
   HTTP/3 paths and stalls large H3 bodies in gVisor.
 
+### Proxy TCP stack
+
+- Ordinary receive-window updates use the RFC 1122 / Linux threshold: a
+  reopening from below 128 KiB to at least 128 KiB, or 128 KiB of growth, emits
+  an ACK at the default socket-buffer size. A zero-window peer's persist probe
+  (`seq = snd_una - 1`) instead gets one ACK as soon as the window is above
+  zero, so a single freed 64 KiB chunk does not leave the peer stalled.
+
 ## Client (`beam-client`)
 
 `beam-client` is a lightweight, single-purpose Rust TUN client for `beam`
