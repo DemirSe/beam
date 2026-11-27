@@ -588,8 +588,9 @@ VLESS with `xtls-rprx-vision` is expected to work.
 - Ordinary receive-window updates use the RFC 1122 / Linux threshold: a
   reopening from below 128 KiB to at least 128 KiB, or 128 KiB of growth, emits
   an ACK at the default socket-buffer size. A zero-window peer's persist probe
-  (`seq = snd_una - 1`) instead gets one ACK as soon as the window is above
-  zero, so a single freed 64 KiB chunk does not leave the peer stalled.
+  (`seq = rcv_nxt - 1` in the peer's receive sequence space) instead gets one
+  ACK as soon as the window is above zero, so a single freed 64 KiB chunk does
+  not leave the peer stalled.
 - The local TCP handshake can finish before the upstream dial. Early
   application bytes may be ACKed and queued before the tunnel is up; that ACK
   is not an upstream delivery acknowledgment. A failed or timed-out dial

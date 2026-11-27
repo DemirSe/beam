@@ -495,11 +495,12 @@ impl TcpConn {
             return;
         }
 
-        // A zero-window persist probe uses `seq = snd_una - 1`. Answer it once
-        // when our window has reopened, even below the ordinary update
-        // threshold, so the peer does not stay stalled after a small drain.
+        // A zero-window persist probe uses the peer's receive sequence space:
+        // `seq = rcv_nxt - 1` from our side. Answer it once when our window has
+        // reopened, even below the ordinary update threshold, so the peer does
+        // not stay stalled after a small drain.
         if self.last_advertised_wnd == 0
-            && seg.seq == self.snd_una.wrapping_sub(1)
+            && seg.seq == self.rcv_nxt.wrapping_sub(1)
             && seg.payload.is_empty()
             && self.rcv_wnd_bytes() > 0
         {
@@ -2630,13 +2631,15 @@ mod tests {
         stack.poll(40, &mut tx, &mut accepted);
         assert!(tx.is_empty(), "small window growth must stay silent");
 
-        let probe_seq = stack
-            .conns
-            .values()
-            .next()
-            .expect("conn")
-            .snd_una
-            .wrapping_sub(1);
+        let conn = stack.conns.values().next().expect("conn");
+        // A persist probe is sent in the peer's receive sequence space: its
+        // seq is one before the next byte it expects from us (`rcv_nxt`).
+        let probe_seq = conn.rcv_nxt.wrapping_sub(1);
+        let unrelated_seq = conn.rcv_nxt.wrapping_sub(2);
+        stack.push_ip_tcp(&make_seg(unrelated_seq, srv_nxt, TCP_ACK, 0, &[], &[]));
+        stack.poll(45, &mut tx, &mut accepted);
+        assert!(tx.is_empty(), "an unrelated seq must not reopen the window");
+
         stack.push_ip_tcp(&make_seg(probe_seq, srv_nxt, TCP_ACK, 0, &[], &[]));
         stack.poll(50, &mut tx, &mut accepted);
         assert_eq!(tx.len(), 1, "persist probe must get one window ACK");
