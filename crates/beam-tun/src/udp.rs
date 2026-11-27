@@ -429,6 +429,17 @@ impl UdpNatBridge {
         }
     }
 
+    /// Runs one bounded idle sweep when a session is already finished or
+    /// expired. The engine calls this once per tick before its biased select,
+    /// so continuous TUN traffic cannot starve NAT cleanup.
+    pub fn sweep_if_due(&mut self) -> bool {
+        if self.next_sweep_delay_ms() == Some(0) {
+            self.sweep_idle();
+            return true;
+        }
+        false
+    }
+
     /// Returns the next timer delay needed for idle UDP session sweeping or
     /// XUDP reconnect backoff retry when datagrams are queued, or `None` when
     /// idle (allowing the TUN engine to sleep with zero idle wakeups).
@@ -616,6 +627,52 @@ mod tests {
         );
         bridge.sweep_idle();
         assert!(bridge.sessions.is_empty(), "the finished session is reaped");
+    }
+
+    #[tokio::test]
+    async fn zero_delay_sweep_runs_inline_even_when_the_device_stays_ready() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig::default(),
+            tun_tx,
+            Arc::new(Notify::new()),
+            dummy_drops(),
+        );
+        let task = tokio::spawn(async {});
+        for _ in 0..8 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(task.is_finished(), "the fake session task must finish");
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_100);
+        let (tx, _rx) = mpsc::channel(PER_SESSION_SEND_QUEUE);
+        bridge.sessions.insert(
+            src,
+            NatEntry {
+                tx,
+                last_active_ms: Arc::new(AtomicU64::new(bridge.now_ms())),
+                task,
+            },
+        );
+        assert_eq!(bridge.next_sweep_delay_ms(), Some(0));
+
+        let mut sweeps = 0;
+        for _ in 0..3 {
+            if bridge.sweep_if_due() {
+                sweeps += 1;
+            }
+            // A continuously ready device branch wins this biased select, as
+            // it does on a busy tunnel; cleanup already ran before it.
+            tokio::select! {
+                biased;
+                _ = std::future::ready(()) => {}
+            }
+        }
+        assert_eq!(sweeps, 1, "one tick may sweep at most once");
+        assert!(bridge.sessions.is_empty(), "finished session was reaped");
     }
 
     #[tokio::test]

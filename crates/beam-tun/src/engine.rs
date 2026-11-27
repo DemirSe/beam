@@ -734,6 +734,9 @@ where
         }
 
         let tcp_delay = stack.poll_delay_ms(start.elapsed().as_millis() as i64);
+        // Sweep due NAT entries before the biased select: a continuously ready
+        // device branch would otherwise starve the timer branch below it.
+        udp_bridge.sweep_if_due();
         let udp_delay = update_udp_sweep_deadline(
             &mut next_udp_sweep_at,
             udp_bridge.next_sweep_delay_ms(),
