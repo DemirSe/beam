@@ -40,12 +40,17 @@ class NetworkMonitor(
         // onAvailable()/onCapabilitiesChanged() delivered by registerDefaultNetworkCallback()
         // does not fire a spurious network_reset ~300 ms after every VPN connect.
         val active = runCatching { connectivityManager.activeNetwork }.getOrNull()
-        if (active != null) {
+        val caps = if (active != null) {
+            runCatching { connectivityManager.getNetworkCapabilities(active) }.getOrNull()
+        } else {
+            null
+        }
+        // Defensive guard: addDisallowedApplication(packageName) normally keeps the
+        // physical network as our default, but if self-exclude fails or an OEM/work
+        // profile surfaces a VPN network, never seed or hand it to the engine.
+        if (active != null && !isVpnNetwork(caps)) {
             lastNetworkHandle = active.networkHandle
-            lastValidated = runCatching {
-                connectivityManager.getNetworkCapabilities(active)
-                    ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
-            }.getOrDefault(false)
+            lastValidated = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
             onInitialNetwork(active)
         }
         runCatching { connectivityManager.registerDefaultNetworkCallback(this) }
@@ -81,6 +86,9 @@ class NetworkMonitor(
     }
 
     override fun onAvailable(network: Network) {
+        // Never let the VPN's own network become the underlying network.
+        val caps = runCatching { connectivityManager.getNetworkCapabilities(network) }.getOrNull()
+        if (isVpnNetwork(caps)) return
         synchronized(callbackLock) {
             if (stopped) return
             val handle = network.networkHandle
@@ -98,6 +106,7 @@ class NetworkMonitor(
     }
 
     override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+        if (isVpnNetwork(caps)) return
         val handle = network.networkHandle
         val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
         val needsDefaultCheck = synchronized(callbackLock) {
@@ -141,7 +150,7 @@ class NetworkMonitor(
     override fun onLost(network: Network) {
         synchronized(callbackLock) {
             if (stopped) return
-            if (lastNetworkHandle != null && lastNetworkHandle != network.networkHandle) return
+            if (lastNetworkHandle != network.networkHandle) return
             // A queued switch to the lost network must not apply afterwards.
             pending?.let(handler::removeCallbacks)
             pending = null
@@ -160,6 +169,9 @@ class NetworkMonitor(
             handler.postDelayed(r, DEBOUNCE_MS)
         }
     }
+
+    private fun isVpnNetwork(caps: NetworkCapabilities?): Boolean =
+        caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
 
     private fun debounceLocked(network: Network) {
         if (stopped) return

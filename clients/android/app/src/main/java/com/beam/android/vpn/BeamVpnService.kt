@@ -56,7 +56,7 @@ class BeamVpnService : VpnService() {
         private const val RESOLVE_TIMEOUT_MS = 5_000L
 
         /** Backoff delays between hostname re-resolution retries on network switch. */
-        private val NETWORK_SWITCH_RESOLVE_BACKOFF_MS = longArrayOf(1_500L, 3_000L)
+        private val NETWORK_SWITCH_RESOLVE_BACKOFF_MS = longArrayOf(1_500L, 3_000L, 6_000L)
 
         /** Backoff delays for restarting an engine that exited without a user disconnect. */
         private val ENGINE_RETRY_BACKOFF_MS = longArrayOf(2_000L, 5_000L)
@@ -175,11 +175,12 @@ class BeamVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                // Capture stopGen on main immediately, then run teardown off main
-                // so nativeStop() (up to 2 s) never stalls the service main thread
-                // and a stale stop cannot tear down a newer connect().
+                // Capture stopGen on main immediately. disconnect() itself never
+                // blocks: it detaches state under stateLock and hands nativeStop()
+                // (up to 2 s) plus the TUN close to cleanupExecutor, and a stale
+                // stop still cannot tear down a newer connect().
                 val stopGen = connectGeneration.incrementAndGet()
-                serviceScope.launch { disconnect(expectedGen = stopGen) }
+                disconnect(expectedGen = stopGen)
             }
             // ACTION_START, null action, or SERVICE_INTERFACE (Always-on VPN): connect.
             else -> {
@@ -293,13 +294,24 @@ class BeamVpnService : VpnService() {
         // never sees startForeground() on a bound-only stopped service, and
         // unbinding MainActivity / TileService never tears down an active tunnel.
         // EXTRA_KEEP_ALIVE_ONLY prevents onStartCommand from re-entering connect().
-        runCatching {
-            startService(
+        // Use startForegroundService() rather than startService(): on Android 12+,
+        // startService() throws in the background even when an FGS exemption
+        // applies (such as an active tunnel restarting itself or a TileService
+        // start). If no exemption applies, startForegroundService() throws
+        // ForegroundServiceStartNotAllowedException and abortConnect() cleans up.
+        val keepAlive = runCatching {
+            ContextCompat.startForegroundService(
+                this,
                 Intent(this, BeamVpnService::class.java)
                     .setAction(ACTION_START)
                     .putExtra(EXTRA_PROFILE_ID, profileId)
                     .putExtra(EXTRA_KEEP_ALIVE_ONLY, true),
             )
+        }
+        if (keepAlive.isFailure) {
+            Log.e(TAG, "startForegroundService failed", keepAlive.exceptionOrNull())
+            abortConnect(myGen, previous)
+            return
         }
         // Android 12+ kills the service if the foreground notification is late,
         // so it goes up before any DNS or Keystore work (outside stateLock) and
@@ -312,35 +324,48 @@ class BeamVpnService : VpnService() {
                 )
             }.onSuccess { lastNotifiedState = VpnState.CONNECTING }
         }
+        if (promoted.isFailure) {
+            Log.e(TAG, "startForeground failed", promoted.exceptionOrNull())
+            abortConnect(myGen, previous)
+            return
+        }
         // Always release any detached previous engine/TUN on the dedicated
         // cleanup executor so cancelling connectJob or serviceScope can never
         // leak an old Rust runtime or TUN descriptor.
         scheduleRelease(previous)
-        if (promoted.isFailure) {
-            Log.e(TAG, "startForeground failed", promoted.exceptionOrNull())
-            val failedChanged = synchronized(stateLock) {
-                if (connectGeneration.get() == myGen) {
-                    pendingProfileId = null
-                    updateStateLocked(
-                        VpnState.DISCONNECTED,
-                        getString(R.string.vpn_error_generic),
-                    )
-                } else {
-                    false
-                }
-            }
-            if (failedChanged) publishCurrentState()
-            synchronized(stateLock) {
-                if (connectGeneration.get() == myGen) {
-                    stopSelf()
-                }
-            }
-            return
-        }
         publishCurrentState()
         synchronized(stateLock) {
             if (connectGeneration.get() == myGen) {
                 connectJob = serviceScope.launch { runConnect(profileId, myGen) }
+            }
+        }
+    }
+
+    /**
+     * Aborts a connect attempt that could not claim the foreground service.
+     * Releases whatever the attempt already detached, clears the pending
+     * profile, and stops the service while this attempt still owns it.
+     */
+    private fun abortConnect(myGen: Long, previous: ReleasedResources) {
+        // previous was detached with keepForeground = true; demote the foreground
+        // service too (still gated on myGen under callbackLock) so a failed
+        // promotion cannot leave a stale notification behind while bound.
+        scheduleRelease(previous.copy(stopForeground = true))
+        val failedChanged = synchronized(stateLock) {
+            if (connectGeneration.get() == myGen) {
+                pendingProfileId = null
+                updateStateLocked(
+                    VpnState.DISCONNECTED,
+                    getString(R.string.vpn_error_generic),
+                )
+            } else {
+                false
+            }
+        }
+        if (failedChanged) publishCurrentState()
+        synchronized(stateLock) {
+            if (connectGeneration.get() == myGen) {
+                stopSelf()
             }
         }
     }
@@ -492,8 +517,12 @@ class BeamVpnService : VpnService() {
             val newMonitor = NetworkMonitor(
                 cm,
                 onInitialNetwork = { network ->
-                    runCatching { setUnderlyingNetworks(arrayOf(network)) }
-                        .onFailure { Log.w(TAG, "initial setUnderlyingNetworks failed", it) }
+                    // A superseded attempt must not reseat the underlying network
+                    // after a newer connect() or disconnect() took over.
+                    if (connectGeneration.get() == myGen) {
+                        runCatching { setUnderlyingNetworks(arrayOf(network)) }
+                            .onFailure { Log.w(TAG, "initial setUnderlyingNetworks failed", it) }
+                    }
                 },
                 onNetworkSwitch = { network ->
                     if (connectGeneration.get() == myGen) {
@@ -854,7 +883,9 @@ class BeamVpnService : VpnService() {
 
     override fun onRevoke() {
         val stopGen = connectGeneration.incrementAndGet()
-        serviceScope.launch { disconnect(expectedGen = stopGen) }
+        // Same non-blocking teardown as ACTION_STOP: state is cleared under
+        // stateLock and nativeStop() runs on cleanupExecutor.
+        disconnect(expectedGen = stopGen)
     }
 
     override fun onDestroy() {

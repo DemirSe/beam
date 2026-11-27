@@ -23,6 +23,7 @@ import com.beam.android.databinding.FragmentProfilesBinding
 import com.beam.android.storage.EncryptedProfileStore
 import com.beam.android.storage.VlessProfile
 import com.beam.android.vpn.BeamNativeBridge
+import com.beam.android.vpn.BeamVpnService
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
@@ -207,16 +208,34 @@ class ProfilesFragment : Fragment() {
 
     private fun confirmDelete(profile: VlessProfile) {
         val main = activity as? MainActivity
+        val appContext = requireContext().applicationContext
         val dialog = MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.profiles_delete_title)
             .setMessage(getString(R.string.profiles_delete_message, profile.name))
             .setNegativeButton(R.string.action_cancel, null)
             .setPositiveButton(R.string.action_delete) { _, _ ->
+                // Read the binder on the main thread; only the store and binder
+                // calls go to IO.
+                val beam = main?.beam
                 viewLifecycleOwner.lifecycleScope.launch {
                     withContext(Dispatchers.IO) {
-                        val connectedId = runCatching { main?.beam?.getActiveProfileId() }.getOrNull()
-                        if (main?.isTunnelActive() == true && connectedId == profile.id) {
-                            runCatching { main.beam?.disconnect() }
+                        if (beam != null) {
+                            val connectedId = runCatching { beam.getActiveProfileId() }.getOrNull()
+                            if (connectedId == profile.id) {
+                                runCatching { beam.disconnect() }
+                            }
+                        } else {
+                            // An unbound UI leaves the profile as the :vpn target, so
+                            // deleting it must stop the tunnel that it still describes.
+                            val previousActiveId = runCatching { store.getActiveProfileId() }.getOrNull()
+                            if (previousActiveId == profile.id) {
+                                runCatching {
+                                    appContext.startService(
+                                        Intent(appContext, BeamVpnService::class.java)
+                                            .setAction(BeamVpnService.ACTION_STOP),
+                                    )
+                                }
+                            }
                         }
                         runCatching { store.deleteProfile(profile.id) }
                     }
