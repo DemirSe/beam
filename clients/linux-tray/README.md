@@ -70,6 +70,7 @@ sing-box DNS behaviour and recovery steps.
 It writes a `99-beam.conf` drop-in with `DNS=1.1.1.1` and `Domains=~.`, then reloads systemd-resolved.
 `dns-off` runs from `ExecStopPost`. It restores the saved files and reloads the resolver.
 `beam-dns-reset.service` runs `restore-dns` at boot.
+The reset unit orders after ctrld but does not start it.
 
 ## Recover from a bad DNS state
 

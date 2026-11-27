@@ -320,8 +320,9 @@ chmod 0644 /etc/systemd/system/beam-client.service
 cat > /etc/systemd/system/beam-dns-reset.service <<'EOF'
 [Unit]
 Description=Restore DNS after a beam client reboot
+# Order after ctrld without starting it: the file restore and reload do not
+# need a running ctrld, and a boot-time start can re-create its drop-in.
 After=systemd-resolved.service ctrld.service
-Wants=ctrld.service
 # Restore the previous DNS state before a client start can write a new one.
 Before=beam-client.service
 # Run for a saved ctrld or host drop-in, for a leftover beam 99-beam.conf

@@ -104,6 +104,13 @@ and no autostart entry.
   `ctrld.service`. `dns-on` reloads the resolver and moves the ctrld drop-in
   aside. Ordering after ctrld stops a late ctrld start from re-creating that
   drop-in in the middle of `dns-on`.
+- `beam-dns-reset.service` names `ctrld.service` only in `After=`. It does not
+  start ctrld. The file restore and resolver reload do not need a running
+  ctrld. On a host with ctrld installed but disabled, the boot reset does not
+  start it. The restored `10-controld.conf` then points at `127.0.0.1:5300`
+  with no listener. DNS stays broken until another unit starts ctrld or an
+  operator moves that file out. This choice avoids a boot-time ctrld start
+  that can re-create the drop-in beside the saved copy.
 - Limits: the helper manages only systemd-resolved global drop-ins. The
   isolated state test proves the drop-in file handling, not the resolver
   behavior. These paths can bypass or override the helper's file, and they

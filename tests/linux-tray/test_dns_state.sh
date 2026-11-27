@@ -121,6 +121,14 @@ printf '%s\n' "$reset_after" | tr ' ' '\n' | grep -qxF 'systemd-resolved.service
   echo "install.sh: boot reset is not ordered after systemd-resolved.service" >&2
   exit 1
 }
+printf '%s\n' "$reset_after" | tr ' ' '\n' | grep -qxF 'ctrld.service' || {
+  echo "install.sh: boot reset is not ordered after ctrld.service" >&2
+  exit 1
+}
+if printf '%s\n' "$reset_unit" | grep -qxF 'Wants=ctrld.service'; then
+  echo "install.sh: boot reset starts ctrld" >&2
+  exit 1
+fi
 
 # The installer must record inherited enablement, restore it on rollback, and
 # leave the unit disabled after a successful install. The wants symlink is not
