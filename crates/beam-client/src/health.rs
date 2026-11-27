@@ -343,17 +343,13 @@ pub fn spawn_network_monitor(
                     // No live dial signal: fall back to a bounded reachability probe.
                     match probe_server_rtt(server_addr).await {
                         Ok(rtt_ms) => {
-                            is_connected = true;
+                            let (state, reason, rtt) = bare_probe_tick_decision(rtt_ms);
+                            // A TCP handshake is not an authenticated tunnel dial.
+                            is_connected = false;
                             write_status_atomic(
                                 &status_path,
                                 &StatusInfo::new(
-                                    &ifname,
-                                    LinkState::Connected,
-                                    Some(rtt_ms),
-                                    "probe_ok",
-                                    generation,
-                                    bypass_ok,
-                                    &activity,
+                                    &ifname, state, rtt, reason, generation, bypass_ok, &activity,
                                 ),
                             );
                             offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
@@ -479,6 +475,12 @@ fn probe_tick_decision(
         return Some((LinkState::Reconnecting, "dial_failures", None));
     }
     recent_rtt.map(|rtt| (LinkState::Connected, "dial_activity", Some(rtt)))
+}
+
+/// A bare TCP connect proves only that the server port answers. Keep the link
+/// out of the connected state so a portal that passes TCP cannot look healthy.
+fn bare_probe_tick_decision(rtt_ms: u64) -> (LinkState, &'static str, Option<u64>) {
+    (LinkState::Reconnecting, "probe_ok", Some(rtt_ms))
 }
 
 /// The no-netlink fallback poll grows only while nothing changed and no probe
@@ -946,6 +948,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_probe_success_without_dial_activity_is_not_connected() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind probe target");
+        let addr = listener.local_addr().expect("probe addr");
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let rtt = probe_server_rtt(addr).await.expect("tcp probe succeeds");
+        let _ = accept.await;
+        let activity = TunnelActivity::new();
+        assert_eq!(activity.recent_rtt(RECENT_ACTIVITY_WINDOW), None);
+        assert_eq!(probe_tick_decision(false, 0, None), None);
+
+        let (state, reason, rtt_ms) = bare_probe_tick_decision(rtt);
+        let text = format_status(&StatusInfo::new(
+            "beamtun0", state, rtt_ms, reason, 0, true, &activity,
+        ));
+        assert!(text.contains("state=reconnecting\n"));
+        assert!(!text.contains("state=connected\n"));
+        assert!(text.contains("reason=probe_ok\n"));
+        assert!(!text.contains("reason=dial_activity\n"));
+    }
+
+    #[tokio::test]
     async fn probe_reports_the_underlying_error_kind() {
         // A closed loopback port must surface as a connect refusal. The port is
         // released between bind and connect, so another process can take it and
@@ -999,7 +1027,7 @@ mod tests {
             "beamtun0",
             LinkState::Connected,
             Some(37),
-            "probe_ok",
+            "dial_activity",
             4,
             true,
             &activity,
@@ -1013,7 +1041,7 @@ mod tests {
         assert!(text.contains("ts="));
         assert!(text.contains("pid="));
         // New diagnostic keys (ignored by older trays).
-        assert!(text.contains("reason=probe_ok\n"));
+        assert!(text.contains("reason=dial_activity\n"));
         assert!(text.contains("generation=4\n"));
         assert!(text.contains("bypass_ok=1\n"));
         assert!(text.contains("dial_failures=1\n"));
