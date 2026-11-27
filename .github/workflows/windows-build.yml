@@ -104,7 +104,7 @@ jobs:
       - name: Tray logic unit tests (MSVC C11)
         shell: cmd
         run: |
-          cl /nologo /std:c11 /W4 /WX /O2 tests\windows-tray\test_tray_logic.c /Fe:test_tray_logic.exe
+          cl /nologo /std:c11 /W4 /WX /O2 /D_CRT_SECURE_NO_WARNINGS tests\windows-tray\test_tray_logic.c /Fe:test_tray_logic.exe || exit /b 1
           .\test_tray_logic.exe
 
       - name: Download and verify WinTun 0.14.1 (amd64)
