@@ -520,9 +520,9 @@ impl LinuxRouteGuard {
                         }
                     }
                 }
-                // The lookup failed again: keep the last-known route state instead
-                // of reinstalling on every monitor cycle.
-                RouteCheck::Error(_) => {}
+                // The lookup is unresolved or the route is linkdown: keep the
+                // last-known route state instead of reinstalling every cycle.
+                RouteCheck::Unusable | RouteCheck::Error(_) => {}
             }
         }
 
@@ -547,9 +547,9 @@ impl LinuxRouteGuard {
                         warn!(ip = %dns_ip, dev = %dev, error = %err, "failed to install local DNS bypass route");
                     }
                 },
-                // The lookup failed again: keep the last-known route state instead
-                // of reinstalling on every monitor cycle.
-                RouteCheck::Error(_) => {}
+                // The lookup is unresolved or the route is linkdown: keep the
+                // last-known route state instead of reinstalling every cycle.
+                RouteCheck::Unusable | RouteCheck::Error(_) => {}
             }
         }
 
@@ -561,7 +561,7 @@ impl LinuxRouteGuard {
                         continue;
                     }
                     RouteCheck::Absent => {}
-                    RouteCheck::Error(_) => continue,
+                    RouteCheck::Unusable | RouteCheck::Error(_) => continue,
                 }
                 if let Err(err) = install_v4_bypass(cidr_entry, maybe_gw.as_deref(), dev) {
                     warn!(cidr = %cidr_entry, error = %err, "failed to install IPv4 bypass CIDR route");
@@ -578,7 +578,7 @@ impl LinuxRouteGuard {
                         continue;
                     }
                     RouteCheck::Absent => {}
-                    RouteCheck::Error(_) => continue,
+                    RouteCheck::Unusable | RouteCheck::Error(_) => continue,
                 }
                 if install_v4_bypass(&host, maybe_gw.as_deref(), dev).is_ok() {
                     info!(prefix = %host, via = ?maybe_gw, dev = %dev, "installed dynamic bypass.domains route");
@@ -596,7 +596,7 @@ impl LinuxRouteGuard {
                         continue;
                     }
                     RouteCheck::Absent => {}
-                    RouteCheck::Error(_) => continue,
+                    RouteCheck::Unusable | RouteCheck::Error(_) => continue,
                 }
                 if let Err(err) = install_v6_bypass(cidr_entry, maybe_gw.as_deref(), dev) {
                     warn!(cidr = %cidr_entry, error = %err, "failed to install IPv6 bypass CIDR route");
@@ -613,7 +613,7 @@ impl LinuxRouteGuard {
                         continue;
                     }
                     RouteCheck::Absent => {}
-                    RouteCheck::Error(_) => continue,
+                    RouteCheck::Unusable | RouteCheck::Error(_) => continue,
                 }
                 if install_v6_bypass(&host, maybe_gw.as_deref(), dev).is_ok() {
                     info!(prefix = %host, via = ?maybe_gw, dev = %dev, "installed dynamic bypass.domains route");
@@ -1382,8 +1382,10 @@ impl From<RouteCheck> for BypassRouteState {
     fn from(check: RouteCheck) -> Self {
         match check {
             RouteCheck::Present => Self::Installed,
+            // A linkdown route belongs to the host: it must not be replaced,
+            // and the monitor must keep retrying while it is unusable.
+            RouteCheck::Unusable | RouteCheck::Error(_) => Self::Error,
             RouteCheck::Absent => Self::Absent,
-            RouteCheck::Error(_) => Self::Error,
         }
     }
 }
@@ -1444,8 +1446,7 @@ impl RouteSnapshot {
             &self.v6
         };
         match table {
-            Ok(output) if route_snapshot_has_prefix(output, prefix) => RouteCheck::Present,
-            Ok(_) => RouteCheck::Absent,
+            Ok(output) => route_snapshot_check(output, prefix),
             Err(err) => route_check_error(prefix, io::Error::other(err.clone())),
         }
     }
@@ -1462,24 +1463,41 @@ fn parse_route_prefix(word: &str) -> Option<IpNet> {
     }
 }
 
-fn route_snapshot_has_prefix(output: &str, prefix: &str) -> bool {
+fn route_snapshot_check(output: &str, prefix: &str) -> RouteCheck {
     let Some(wanted) = parse_route_prefix(prefix) else {
-        return false;
+        return RouteCheck::Absent;
     };
-    output.lines().any(|line| {
-        let mut words = line.split_whitespace();
-        let Some(destination) = words.next() else {
-            return false;
+    let mut present = false;
+    let mut unusable = false;
+    for line in output.lines() {
+        let Some(destination) = line.split_whitespace().next() else {
+            continue;
         };
         if matches!(
             destination,
             "blackhole" | "unreachable" | "prohibit" | "throw" | "local" | "broadcast"
-        ) || line.split_whitespace().any(|word| word == "linkdown")
-        {
-            return false;
+        ) {
+            continue;
         }
-        parse_route_prefix(destination).is_some_and(|net| net == wanted)
-    })
+        if parse_route_prefix(destination).is_some_and(|net| net == wanted) {
+            if route_line_has_linkdown(line) {
+                unusable = true;
+            } else {
+                present = true;
+            }
+        }
+    }
+    if unusable {
+        RouteCheck::Unusable
+    } else if present {
+        RouteCheck::Present
+    } else {
+        RouteCheck::Absent
+    }
+}
+
+fn route_line_has_linkdown(line: &str) -> bool {
+    line.split_whitespace().any(|word| word == "linkdown")
 }
 
 /// Result of an exact-route lookup, distinguishing a missing route from a
@@ -1488,6 +1506,8 @@ fn route_snapshot_has_prefix(output: &str, prefix: &str) -> bool {
 pub enum RouteCheck {
     /// The route exists in the main table.
     Present,
+    /// The route exists but carries `linkdown`, so it cannot carry traffic.
+    Unusable,
     /// The lookup succeeded and found no route.
     Absent,
     /// The lookup could not be completed (`ip` missing, exited non-zero, ...).
@@ -1498,6 +1518,12 @@ impl RouteCheck {
     /// Returns `true` only for [`RouteCheck::Present`].
     pub const fn is_present(&self) -> bool {
         matches!(self, Self::Present)
+    }
+
+    /// Returns `true` only for [`RouteCheck::Unusable`].
+    #[cfg(test)]
+    const fn is_unusable(&self) -> bool {
+        matches!(self, Self::Unusable)
     }
 
     /// Returns the lookup error, if any.
@@ -1544,11 +1570,7 @@ fn classify_exact_route_output(
             )),
         );
     }
-    if parse_exact_route_exists(stdout) {
-        RouteCheck::Present
-    } else {
-        RouteCheck::Absent
-    }
+    parse_exact_route_check(stdout)
 }
 
 /// Logs a failed route lookup at rate-limited `warn` level and returns it.
@@ -1566,10 +1588,24 @@ fn route_check_error(prefix: &str, err: io::Error) -> RouteCheck {
     RouteCheck::Error(err)
 }
 
-/// Returns `true` if `ip route show exact <prefix>` output reports an existing
-/// route in the main routing table.
-fn parse_exact_route_exists(stdout: &str) -> bool {
-    stdout.lines().any(|line| !line.trim().is_empty())
+/// Classifies `ip route show exact <prefix>` output as present, unusable, or
+/// absent.
+fn parse_exact_route_check(stdout: &str) -> RouteCheck {
+    let mut present = false;
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        present = true;
+        if route_line_has_linkdown(line) {
+            return RouteCheck::Unusable;
+        }
+    }
+    if present {
+        RouteCheck::Present
+    } else {
+        RouteCheck::Absent
+    }
 }
 
 fn configure_resolved_link_dns(ifname: &str, peer_ip: Ipv4Addr) {
@@ -1765,14 +1801,58 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
 
     #[test]
     fn exact_route_output_detection() {
-        assert!(!parse_exact_route_exists(""));
-        assert!(!parse_exact_route_exists("   \n\t\n"));
-        assert!(parse_exact_route_exists(
-            "172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown\n"
+        assert!(!parse_exact_route_check("").is_present());
+        assert!(!parse_exact_route_check("   \n\t\n").is_present());
+        assert!(
+            parse_exact_route_check(
+                "172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown\n"
+            )
+            .is_unusable()
+        );
+        assert!(parse_exact_route_check("203.0.113.10 via 192.168.1.1 dev wlan0\n").is_present());
+    }
+
+    #[test]
+    fn linkdown_route_is_not_overwritten_or_deleted() {
+        let dir = test_dir("linkdown-route");
+        let log = dir.join("ip.log");
+        let _fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$*\" in\n\
+                   *\"route show\"*) printf '%s\\n' '172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown' ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log.display(),
+            ),
+        );
+        let cidr = "172.17.0.0/16";
+        let mut guard = route_guard_for_tests();
+        guard.configured_bypass_v4.push(cidr.to_owned());
+        guard.extra_bypass_v4.push((
+            cidr.to_owned(),
+            Some("192.168.1.1".to_owned()),
+            "eth0".to_owned(),
         ));
-        assert!(parse_exact_route_exists(
-            "203.0.113.10 via 192.168.1.1 dev wlan0\n"
-        ));
+        let gw = guard.current_gw.clone();
+
+        assert!(
+            !guard.bypass_routes_installed(),
+            "a linkdown route is not a usable bypass route"
+        );
+        assert!(
+            !guard.update_bypass_gateway(&gw, None),
+            "a host-owned linkdown route must stop the reconcile"
+        );
+        let log = read_fake_ip_log(&_fake.log_path());
+        assert!(!log.contains("route del"), "linkdown route deleted: {log}");
+        assert!(
+            !log.contains("route replace"),
+            "linkdown route overwritten: {log}"
+        );
+        assert_eq!(guard.extra_bypass_v4.len(), 1);
     }
 
     #[test]
@@ -1998,9 +2078,9 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
         );
         let table = "2001:db8:1::/64 dev eth0 proto static metric 100\n\
                      198.18.0.0/24 via 10.0.0.1 dev eth0";
-        assert!(route_snapshot_has_prefix(table, "2001:db8:1::/64"));
-        assert!(route_snapshot_has_prefix(table, "198.18.0.0/24"));
-        assert!(!route_snapshot_has_prefix(table, "2001:db8:2::/64"));
+        assert!(route_snapshot_check(table, "2001:db8:1::/64").is_present());
+        assert!(route_snapshot_check(table, "198.18.0.0/24").is_present());
+        assert!(!route_snapshot_check(table, "2001:db8:2::/64").is_present());
     }
 
     #[test]
@@ -2048,17 +2128,17 @@ throw 203.0.113.6/32\n\
 local 127.0.0.1/32 dev lo proto kernel scope host src 127.0.0.1\n\
 broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
 198.51.100.1/32 dev eth0 proto static linkdown\n";
-        assert!(route_snapshot_has_prefix(table, "153.56.184.142/32"));
-        assert!(route_snapshot_has_prefix(table, "2001:db8:abcd::1/128"));
-        assert!(route_snapshot_has_prefix(table, "2001:0DB8:ABCD::1/128"));
-        assert!(route_snapshot_has_prefix(table, "198.51.100.0/24"));
-        assert!(!route_snapshot_has_prefix(table, "203.0.113.9/32"));
-        assert!(!route_snapshot_has_prefix(table, "203.0.113.8/32"));
-        assert!(!route_snapshot_has_prefix(table, "203.0.113.7/32"));
-        assert!(!route_snapshot_has_prefix(table, "203.0.113.6/32"));
-        assert!(!route_snapshot_has_prefix(table, "127.0.0.1/32"));
-        assert!(!route_snapshot_has_prefix(table, "192.168.1.255/32"));
-        assert!(!route_snapshot_has_prefix(table, "198.51.100.1/32"));
+        assert!(route_snapshot_check(table, "153.56.184.142/32").is_present());
+        assert!(route_snapshot_check(table, "2001:db8:abcd::1/128").is_present());
+        assert!(route_snapshot_check(table, "2001:0DB8:ABCD::1/128").is_present());
+        assert!(route_snapshot_check(table, "198.51.100.0/24").is_present());
+        assert!(!route_snapshot_check(table, "203.0.113.9/32").is_present());
+        assert!(!route_snapshot_check(table, "203.0.113.8/32").is_present());
+        assert!(!route_snapshot_check(table, "203.0.113.7/32").is_present());
+        assert!(!route_snapshot_check(table, "203.0.113.6/32").is_present());
+        assert!(!route_snapshot_check(table, "127.0.0.1/32").is_present());
+        assert!(!route_snapshot_check(table, "192.168.1.255/32").is_present());
+        assert!(route_snapshot_check(table, "198.51.100.1/32").is_unusable());
     }
 
     #[test]
