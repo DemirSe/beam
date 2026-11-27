@@ -18,7 +18,7 @@ INSTALL="$HERE/../../clients/linux-tray/install.sh"
 # live-file writes. Without the last two conditions, a power loss can leave DNS
 # pointed at the dead tunnel or leave a stale marker behind.
 for cond in 10-controld.conf.beam-off 99-beam.conf.beam-prev 99-beam.conf \
-            99-beam.conf.beam-own; do
+            99-beam.conf.beam-own 99-beam.conf.beam-reload; do
   grep -qxF "ConditionPathExists=|/etc/systemd/resolved.conf.d/$cond" \
     "$INSTALL" || {
     echo "install.sh: missing boot-reset condition for $cond" >&2

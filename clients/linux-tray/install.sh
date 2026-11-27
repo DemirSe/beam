@@ -326,11 +326,13 @@ Wants=ctrld.service
 Before=beam-client.service
 # Run for a saved ctrld or host drop-in, for a leftover beam 99-beam.conf
 # from a power loss on a host that had neither ctrld nor a saved file, and for
-# the ownership marker of a crash between the marker and live-file writes.
+# the ownership marker of a crash between the marker and live-file writes,
+# or the trigger left by a dns-off reload failure.
 ConditionPathExists=|/etc/systemd/resolved.conf.d/10-controld.conf.beam-off
 ConditionPathExists=|/etc/systemd/resolved.conf.d/99-beam.conf.beam-prev
 ConditionPathExists=|/etc/systemd/resolved.conf.d/99-beam.conf
 ConditionPathExists=|/etc/systemd/resolved.conf.d/99-beam.conf.beam-own
+ConditionPathExists=|/etc/systemd/resolved.conf.d/99-beam.conf.beam-reload
 
 [Service]
 Type=oneshot

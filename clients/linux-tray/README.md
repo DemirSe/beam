@@ -76,3 +76,7 @@ It writes a `99-beam.conf` drop-in with `DNS=1.1.1.1` and `Domains=~.`, then rel
 Run `/usr/local/libexec/beam-helper restore-dns` by hand.
 The helper marks the live files that it writes.
 It keeps an unmarked file and reports it for manual inspection.
+If `dns-off` logs `could not reload systemd-resolved`, the helper writes
+`99-beam.conf.beam-reload`. The boot reset retries the reload for that file.
+To fix it now, run `sudo systemctl reload systemd-resolved`, then run
+`sudo /usr/local/libexec/beam-helper restore-dns` to clear the trigger.

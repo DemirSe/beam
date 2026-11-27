@@ -146,6 +146,7 @@ static void reset_state(void)
     unlink(BEAM_DROPIN);
     unlink(BEAM_SAVED);
     unlink(BEAM_OWNED);
+    unlink(BEAM_RELOAD_PENDING);
     unlink(OTHER_DROPIN);
     unlink(RELOAD_FAIL);
 }
@@ -493,6 +494,31 @@ int main(void)
     CHECK(!exists(BEAM_SAVED));
     CHECK(!exists(BEAM_OWNED));
     unlink(RELOAD_FAIL);
+
+    /* A dns-off reload failure leaves a reset trigger after restore, so a
+     * later boot reset or manual restore-dns retries the failed reload. */
+    reset_state();
+    write_file(BEAM_DROPIN, USER_DNS);
+    CHECK(dns_on() == 0);
+    write_file(RELOAD_FAIL, "");
+    CHECK(dns_off() == 1);
+    CHECK(file_is(BEAM_DROPIN, USER_DNS));
+    CHECK(!exists(BEAM_SAVED));
+    CHECK(!exists(BEAM_OWNED));
+    CHECK(file_is(BEAM_RELOAD_PENDING, "reload failed\n"));
+    unlink(RELOAD_FAIL);
+    CHECK(dns_off() == 0);
+    CHECK(!exists(BEAM_RELOAD_PENDING));
+    CHECK(file_is(BEAM_DROPIN, USER_DNS));
+
+    /* The trigger is also written when dns-off had nothing to restore. */
+    reset_state();
+    write_file(RELOAD_FAIL, "");
+    CHECK(dns_off() == 1);
+    CHECK(file_is(BEAM_RELOAD_PENDING, "reload failed\n"));
+    unlink(RELOAD_FAIL);
+    CHECK(dns_off() == 0);
+    CHECK(!exists(BEAM_RELOAD_PENDING));
 
     /* A ctrld conflict does not block the host-file restore. The live host
      * file comes back, the saved beam copy is consumed, and the ctrld

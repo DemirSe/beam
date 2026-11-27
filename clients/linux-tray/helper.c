@@ -59,6 +59,9 @@
 /* Exact bytes of the live file written by this helper; the only ownership
  * proof. The suffix is not .conf, so systemd-resolved ignores it. */
 #define BEAM_OWNED DNS_DIR "/99-beam.conf.beam-own"
+/* A dns-off reload failure leaves this boot-reset trigger after the saved
+ * files are gone. Its suffix is not .conf, so resolved ignores it. */
+#define BEAM_RELOAD_PENDING DNS_DIR "/99-beam.conf.beam-reload"
 #define BEAM_DNS_CTRLD "[Resolve]\nDNS=1.1.1.1\nDomains=~.\n"
 /* Without ctrld, an empty DNS= clears the inherited list; repeats append. */
 #define BEAM_DNS_CLEAR "[Resolve]\nDNS=\nDNS=1.1.1.1\nDomains=~.\n"
@@ -553,6 +556,12 @@ static int dns_off(void)
     if (reload_resolved() != 0) {
         syslog(LOG_ERR, "could not reload systemd-resolved");
         rc = -1;
+        /* restore_dns() removed its markers. Keep a trigger so the boot
+         * reset or a later restore-dns retries the failed reload. */
+        if (write_text(BEAM_RELOAD_PENDING, "reload failed\n", 0600) != 0)
+            log_errno("could not write", BEAM_RELOAD_PENDING);
+    } else {
+        unlink(BEAM_RELOAD_PENDING);
     }
     if (access(CTRL_SAVED, F_OK) == 0 || access(BEAM_SAVED, F_OK) == 0 ||
         access(BEAM_OWNED, F_OK) == 0)

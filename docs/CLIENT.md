@@ -93,8 +93,9 @@ and no autostart entry.
   comes back without the matching DNS state.
 - `beam-dns-reset.service` is enabled at boot and is ordered before
   `beam-client.service`. It runs when any of these files exists: the saved
-  ctrld drop-in, the saved host drop-in, a `99-beam.conf`, or the ownership
-  marker. The condition only starts the unit. The helper still decides what it
+  ctrld drop-in, the saved host drop-in, a `99-beam.conf`, the ownership
+  marker, or the dns-off reload-failure trigger. The condition only starts the
+  unit. The helper still decides what it
   can delete. On a host with its own `99-beam.conf`, the unit runs, leaves that
   file, and exits 0. A marker with no live file covers a crash between the two
   writes. The marker-less leftover above is a documented limit, not a
@@ -148,6 +149,13 @@ resolvectl status
 | `10-controld.conf.beam-off` and a live `10-controld.conf` | ctrld was reinstalled or upgraded while connected. Keep the live ctrld file. Move the stale saved copy out, then reload. |
 | Restored `10-controld.conf`, then DNS fails | ctrld was removed while connected. The restored file points at `127.0.0.1:5300` with no listener. Move that file out, reload, then connect again: `dns-on` takes the no-ctrld path. |
 | A marker or saved file remains after a clean restore | A delete or rename failed. Check ownership and permissions. Run `sudo /usr/local/libexec/beam-helper restore-dns` again. |
+
+If the journal names `could not reload systemd-resolved`, `dns-off` wrote
+`99-beam.conf.beam-reload` after it restored the files. The boot reset runs
+for that file and retries the reload. To fix it now, run
+`sudo systemctl reload systemd-resolved`, then run
+`sudo /usr/local/libexec/beam-helper restore-dns`. That run clears the
+trigger.
 
 Finish with `sudo systemctl reload systemd-resolved` and `resolvectl query
 <name>`. Only remove a file after you know what wrote it.
