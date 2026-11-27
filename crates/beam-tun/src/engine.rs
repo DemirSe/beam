@@ -2,7 +2,7 @@
 //! [`NetStack`], `beam_core::client::dial_tcp`, and [`UdpNatBridge`].
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
@@ -17,7 +17,8 @@ use tracing::{debug, info, warn};
 use crate::device::TunDevice;
 use crate::dns::{DnsConfig, DnsInterceptor};
 use crate::packet::{
-    build_icmp_port_unreachable, build_tcp_rst_for_packet, is_fragment, parse_ip, parse_udp,
+    IP_PROTO_TCP, IpPacketView, build_icmp_port_unreachable, build_tcp_rst_for_packet, is_fragment,
+    parse_ip, parse_tcp, parse_udp,
 };
 use crate::ratelimit::RateLimiter;
 use crate::router::{RouteDecision, RoutePolicy};
@@ -678,7 +679,9 @@ where
                 Arc::clone(counters),
             ),
             None => DnsInterceptor::new(config.client.clone(), dns_cfg.clone(), tun_tx.clone()),
-        });
+        })
+        .map(Arc::new);
+    let tun_dns_peer = config.dns.as_ref().and_then(|dns| dns.tun_dns_peer);
     let mut network_reset = config.network_reset.clone();
     // The server IP currently excluded from tunneling; a handover swaps it so
     // the new endpoint is never routed back into the tunnel.
@@ -722,6 +725,18 @@ where
         }
 
         for conn in accepted.drain(..) {
+            if is_tun_dns_tcp_target(conn.dst, tun_dns_peer)
+                && let Some(dns) = dns_interceptor.clone()
+            {
+                spawn_dns_tcp_stream(
+                    conn,
+                    dns,
+                    Arc::clone(&tcp_permits),
+                    network_reset.clone(),
+                    shutdown.clone(),
+                );
+                continue;
+            }
             spawn_tcp_relay(
                 conn,
                 Arc::clone(&client_config),
@@ -806,7 +821,15 @@ where
                     if n > 0 {
                         let raw = &recv_buf[..n];
                         if let Some(ip) = parse_ip(raw) {
-                            match config.route.classify(&ip) {
+                            let decision = if is_tun_dns_tcp_packet(&ip, tun_dns_peer) {
+                                // The peer is a private address, so the normal
+                                // private-drop policy would blackhole the
+                                // stub's TCP retry before the stack sees it.
+                                RouteDecision::ProxyTcp
+                            } else {
+                                config.route.classify(&ip)
+                            };
+                            match decision {
                                 RouteDecision::ProxyTcp => {
                                     stack.push_ip_tcp(ip.raw);
                                 }
@@ -1196,7 +1219,7 @@ async fn acquire_dial_permit(
 /// Resolves when the engine shuts down, or when its shutdown channel is gone
 /// (nothing can ever signal a graceful stop then), so a detached relay task
 /// never outlives the engine that spawned it.
-async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
+pub(crate) async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
     loop {
         if *rx.borrow() {
             return;
@@ -1205,6 +1228,56 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
             return;
         }
     }
+}
+
+/// Returns `true` only for the derived TUN DNS peer on port 53.
+fn is_tun_dns_tcp_target(dst: SocketAddr, peer: Option<Ipv4Addr>) -> bool {
+    dst.port() == 53 && peer.is_some_and(|peer| dst.ip() == IpAddr::V4(peer))
+}
+
+/// Returns `true` only for TCP packets addressed to the derived DNS peer on
+/// port 53, so the local TCP stack can complete the stub's handshake.
+fn is_tun_dns_tcp_packet(ip: &IpPacketView<'_>, peer: Option<Ipv4Addr>) -> bool {
+    ip.protocol == IP_PROTO_TCP
+        && parse_tcp(ip.payload).is_some_and(|tcp| {
+            is_tun_dns_tcp_target(SocketAddr::new(ip.dst_ip, tcp.dst_port), peer)
+        })
+}
+
+/// Serves an accepted local stream on the DNS interceptor instead of dialing
+/// the tunnel. The stream still takes one TCP connection permit.
+fn spawn_dns_tcp_stream(
+    mut conn: AcceptedTcpStream,
+    dns: Arc<DnsInterceptor>,
+    permits: Arc<Semaphore>,
+    mut network_reset: Option<watch::Receiver<u64>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let Ok(permit) = permits.try_acquire_owned() else {
+        debug!(dst = %conn.dst, "TUN DNS TCP connection limit reached; aborting with RST");
+        conn.stream.abort();
+        return;
+    };
+
+    tokio::spawn(async move {
+        let _permit = permit;
+        if *shutdown.borrow() {
+            conn.stream.abort();
+            return;
+        }
+        let mut serve = std::pin::pin!(dns.serve_tcp_stream(conn.src, conn.dst, conn.stream));
+        tokio::select! {
+            biased;
+            () = wait_shutdown(&mut shutdown) => {}
+            Ok(()) = async {
+                match network_reset.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            () = &mut serve => {}
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1590,6 +1663,7 @@ fn update_udp_sweep_deadline(
 mod tests {
     use super::*;
     use crate::device::MemoryTun;
+    use crate::packet::build_ip_tcp_packet_slices;
     use std::collections::VecDeque;
 
     fn test_failure() -> DialFailure {
@@ -1597,6 +1671,70 @@ mod tests {
             stage: DialFailureStage::TcpConnect,
             kind: DialFailureKind::Refused,
         }
+    }
+
+    #[test]
+    fn tun_dns_tcp_predicate_matches_only_the_configured_peer_port() {
+        let peer = Ipv4Addr::new(172, 19, 0, 2);
+        let other = Ipv4Addr::new(172, 19, 0, 3);
+        assert!(is_tun_dns_tcp_target(
+            SocketAddr::new(IpAddr::V4(peer), 53),
+            Some(peer)
+        ));
+        assert!(!is_tun_dns_tcp_target(
+            SocketAddr::new(IpAddr::V4(peer), 54),
+            Some(peer)
+        ));
+        assert!(!is_tun_dns_tcp_target(
+            SocketAddr::new(IpAddr::V4(other), 53),
+            Some(peer)
+        ));
+        assert!(!is_tun_dns_tcp_target(
+            SocketAddr::new(IpAddr::V4(peer), 53),
+            None
+        ));
+    }
+
+    #[test]
+    fn tun_dns_tcp_packet_predicate_allows_only_the_peer_syn() {
+        let peer = Ipv4Addr::new(172, 19, 0, 2);
+        let src = IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1));
+        let packet = |dst: Ipv4Addr, port: u16| {
+            build_ip_tcp_packet_slices(
+                src,
+                54_000,
+                IpAddr::V4(dst),
+                port,
+                1,
+                0,
+                0x02,
+                65_535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("test TCP packet")
+        };
+        let raw = packet(peer, 53);
+        assert!(is_tun_dns_tcp_packet(
+            &parse_ip(&raw).expect("test IP packet"),
+            Some(peer)
+        ));
+        let raw = packet(peer, 54);
+        assert!(!is_tun_dns_tcp_packet(
+            &parse_ip(&raw).expect("test IP packet"),
+            Some(peer)
+        ));
+        let raw = packet(Ipv4Addr::new(172, 19, 0, 3), 53);
+        assert!(!is_tun_dns_tcp_packet(
+            &parse_ip(&raw).expect("test IP packet"),
+            Some(peer)
+        ));
+        let raw = packet(peer, 53);
+        assert!(!is_tun_dns_tcp_packet(
+            &parse_ip(&raw).expect("test IP packet"),
+            None
+        ));
     }
 
     #[tokio::test]

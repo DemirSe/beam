@@ -24,13 +24,14 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::time::{Instant as TokioInstant, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
 use crate::packet::build_ip_udp_packet_patched;
 use crate::ratelimit::RateLimiter;
+use crate::stack::TunTcpStream;
 use crate::stats::{DnsCounters, DnsSnapshot};
 
 const MAX_DNS_QUERY_BYTES: usize = 1232;
@@ -273,6 +274,9 @@ pub struct DnsConfig {
     /// Optional local DNS server reached directly (outside the tunnel) for
     /// `local_suffixes` and `bypass_domains`.
     pub local_upstream: Option<SocketAddr>,
+    /// Derived TUN peer address advertised as the interface DNS server.
+    /// Only this peer's TCP/53 traffic is served locally.
+    pub tun_dns_peer: Option<Ipv4Addr>,
     /// Optional callback invoked on network transitions to re-detect the
     /// host's local DNS server when `local_upstream` was auto-detected.
     pub refresh_local_upstream: Option<LocalDnsRefresh>,
@@ -304,6 +308,7 @@ impl std::fmt::Debug for DnsConfig {
         f.debug_struct("DnsConfig")
             .field("upstream", &self.upstream)
             .field("local_upstream", &self.local_upstream)
+            .field("tun_dns_peer", &self.tun_dns_peer)
             .field("local_suffixes", &self.local_suffixes)
             .field("bypass_domains", &self.bypass_domains)
             .field("cache_size", &self.cache_size)
@@ -330,6 +335,7 @@ impl DnsConfig {
         Self {
             upstream,
             local_upstream,
+            tun_dns_peer: None,
             refresh_local_upstream: None,
             local_socket_protector: None,
             local_suffixes: Self::default_local_suffixes(),
@@ -357,7 +363,11 @@ pub struct DnsQuery {
 
 /// Zero-panic RFC 1035 DNS query parser.
 pub fn parse_dns_query(wire: &[u8]) -> Option<DnsQuery> {
-    if wire.len() < 12 || wire.len() > MAX_DNS_QUERY_BYTES {
+    parse_dns_query_bounded(wire, MAX_DNS_QUERY_BYTES)
+}
+
+fn parse_dns_query_bounded(wire: &[u8], max_len: usize) -> Option<DnsQuery> {
+    if wire.len() < 12 || wire.len() > max_len {
         return None;
     }
     let tx_id = u16::from_be_bytes([wire[0], wire[1]]);
@@ -656,7 +666,11 @@ pub fn parse_dns_response_meta(wire: &[u8]) -> (Option<u32>, Vec<IpAddr>) {
 /// Builds a minimal RFC 1035 `SERVFAIL` reply matching `query_wire`'s `tx_id`
 /// and question section.
 pub fn build_servfail_response(query_wire: &[u8]) -> Option<Vec<u8>> {
-    if query_wire.len() < 12 || query_wire.len() > MAX_DNS_QUERY_BYTES {
+    build_servfail_response_bounded(query_wire, MAX_DNS_QUERY_BYTES)
+}
+
+fn build_servfail_response_bounded(query_wire: &[u8], max_len: usize) -> Option<Vec<u8>> {
+    if query_wire.len() < 12 || query_wire.len() > max_len {
         return None;
     }
     let (_, q_end) = parse_dns_name(query_wire, 12)?;
@@ -1427,6 +1441,51 @@ fn dns_xudp_config() -> XudpClientConfig {
     }
 }
 
+/// Delivery target for one resolved DNS response.
+///
+/// UDP keeps the existing size fit and zero-copy tx_id patch; TCP sends the
+/// full answer through a oneshot to the stream task.
+enum DnsReplySink {
+    Udp {
+        src: SocketAddr,
+        dst: SocketAddr,
+        tun_tx: mpsc::Sender<Vec<u8>>,
+    },
+    Tcp(Option<oneshot::Sender<Vec<u8>>>),
+}
+
+impl DnsReplySink {
+    fn send(
+        &mut self,
+        wire: &[u8],
+        reply: &[u8],
+        tx_id: Option<u16>,
+        fit_for_udp: bool,
+        counters: &DnsCounters,
+    ) {
+        match self {
+            Self::Udp { src, dst, tun_tx } => {
+                if fit_for_udp {
+                    if let Some(reply) = fit_response_for_udp(wire, reply.to_vec()) {
+                        send_udp_reply(tun_tx, counters, *src, *dst, &reply, None);
+                    }
+                } else {
+                    send_udp_reply(tun_tx, counters, *src, *dst, reply, tx_id);
+                }
+            }
+            Self::Tcp(sender) => {
+                let reply = match tx_id {
+                    Some(id) => patch_tx_id(reply, id),
+                    None => reply.to_vec(),
+                };
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(reply);
+                }
+            }
+        }
+    }
+}
+
 /// Non-blocking DNS interceptor embedded in `beam-tun`'s engine loop.
 pub struct DnsInterceptor {
     // `Arc`-shared so a cache miss clones two pointers instead of copying up
@@ -1589,7 +1648,83 @@ impl DnsInterceptor {
 
     /// Handles one intercepted UDP/53 query packet without blocking the TUN loop.
     pub fn handle_query(&self, src: SocketAddr, dst: SocketAddr, wire: &[u8]) {
-        let Some(query) = parse_dns_query(wire) else {
+        self.answer_query(
+            dst,
+            wire,
+            DnsReplySink::Udp {
+                src,
+                dst,
+                tun_tx: self.tun_tx.clone(),
+            },
+            MAX_DNS_QUERY_BYTES,
+        );
+    }
+
+    /// Serves RFC 1035 DNS-over-TCP queries on one accepted TUN stream.
+    ///
+    /// Each query is length-prefixed and bounded to [`MAX_DOH_RESPONSE_BYTES`].
+    /// Queries run sequentially on the stream. Every read and write has the
+    /// configured query deadline; EOF, a bad prefix, a timeout, or a write
+    /// error ends the task.
+    pub(crate) async fn serve_tcp_stream(
+        &self,
+        src: SocketAddr,
+        dst: SocketAddr,
+        mut stream: TunTcpStream,
+    ) {
+        debug!(peer = %src, dst = %dst, "serving DNS over TCP on TUN peer");
+        let frame_timeout = self.dns_config.query_timeout;
+        let wait_timeout = frame_timeout
+            .saturating_add(BYPASS_ROUTE_TIMEOUT)
+            .saturating_add(Duration::from_millis(100));
+        loop {
+            let mut len_buf = [0u8; 2];
+            let query_len = match timeout(frame_timeout, stream.read_exact(&mut len_buf)).await {
+                Ok(Ok(_)) => usize::from(u16::from_be_bytes(len_buf)),
+                Ok(Err(_)) | Err(_) => return,
+            };
+            if query_len == 0 || query_len > MAX_DOH_RESPONSE_BYTES {
+                self.counters.dropped_malformed.incr();
+                return;
+            }
+
+            let mut wire = vec![0u8; query_len];
+            if !matches!(
+                timeout(frame_timeout, stream.read_exact(&mut wire)).await,
+                Ok(Ok(_))
+            ) {
+                return;
+            }
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.answer_query(
+                dst,
+                &wire,
+                DnsReplySink::Tcp(Some(reply_tx)),
+                MAX_DOH_RESPONSE_BYTES,
+            );
+            let reply = match timeout(wait_timeout, reply_rx).await {
+                Ok(Ok(reply)) => reply,
+                _ => build_servfail_response_bounded(&wire, MAX_DOH_RESPONSE_BYTES)
+                    .unwrap_or_default(),
+            };
+            if reply.is_empty() || reply.len() > MAX_DOH_RESPONSE_BYTES {
+                return;
+            }
+            if !write_tcp_reply(&mut stream, &reply, frame_timeout).await {
+                return;
+            }
+        }
+    }
+
+    fn answer_query(
+        &self,
+        dst: SocketAddr,
+        wire: &[u8],
+        mut target: DnsReplySink,
+        max_query_bytes: usize,
+    ) {
+        let Some(query) = parse_dns_query_bounded(wire, max_query_bytes) else {
             self.counters.dropped_malformed.incr();
             return;
         };
@@ -1631,8 +1766,8 @@ impl DnsInterceptor {
                     "local DNS name has no local upstream; replying with SERVFAIL"
                 );
             }
-            if let Some(sf) = build_servfail_response(wire) {
-                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &sf, None);
+            if let Some(sf) = build_servfail_response_bounded(wire, max_query_bytes) {
+                target.send(wire, &sf, None, false, &self.counters);
             }
             return;
         }
@@ -1651,8 +1786,8 @@ impl DnsInterceptor {
                     "local DNS query re-entered the tunnel; replying with SERVFAIL"
                 );
             }
-            if let Some(sf) = build_servfail_response(wire) {
-                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &sf, None);
+            if let Some(sf) = build_servfail_response_bounded(wire, max_query_bytes) {
+                target.send(wire, &sf, None, false, &self.counters);
             }
             return;
         }
@@ -1662,7 +1797,7 @@ impl DnsInterceptor {
         // servers never cause dual-stack apps to stall or fail on IPv6.
         if self.dns_config.ipv4_only && !use_local && query.qtype == 28 {
             if let Some(empty) = build_empty_noerror_response(wire) {
-                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &empty, None);
+                target.send(wire, &empty, None, false, &self.counters);
             }
             return;
         }
@@ -1682,20 +1817,8 @@ impl DnsInterceptor {
             // spawn) is best-effort bypass bookkeeping that must not delay
             // the already-cached answer. It reads only `cached`/`query`, so
             // running it after the send is semantically identical.
-            if cached.len() <= udp_dns_response_limit(wire) {
-                send_udp_reply(
-                    &self.tun_tx,
-                    &self.counters,
-                    src,
-                    dst,
-                    &cached,
-                    Some(query.tx_id),
-                );
-            } else if let Some(reply) =
-                fit_response_for_udp(wire, patch_tx_id(&cached, query.tx_id))
-            {
-                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &reply, None);
-            }
+            let fits_udp = cached.len() <= udp_dns_response_limit(wire);
+            target.send(wire, &cached, Some(query.tx_id), !fits_udp, &self.counters);
             // Re-fire `on_bypass_ips` on bypass-domain cache hits so a
             // previously failed route install (e.g. no gateway at first
             // lookup) recovers without waiting for TTL expiry. The spawn
@@ -1761,8 +1884,8 @@ impl DnsInterceptor {
                     "DNS concurrency limit reached; replying with SERVFAIL"
                 );
             }
-            if let Some(sf) = build_servfail_response(wire) {
-                send_udp_reply(&self.tun_tx, &self.counters, src, dst, &sf, None);
+            if let Some(sf) = build_servfail_response_bounded(wire, max_query_bytes) {
+                target.send(wire, &sf, None, false, &self.counters);
             }
             return;
         };
@@ -1780,7 +1903,6 @@ impl DnsInterceptor {
         let local_udp_pool = Arc::clone(&self.local_udp_pool);
         let cache = Arc::clone(&self.cache);
         let counters = Arc::clone(&self.counters);
-        let tun_tx = self.tun_tx.clone();
         let bypass_permits = Arc::clone(&self.bypass_permits);
         let upstream_kind = if use_local {
             "local_udp"
@@ -1853,8 +1975,10 @@ impl DnsInterceptor {
                                 "DNS response rejected; replying with SERVFAIL"
                             );
                         }
-                        if let Some(resp) = build_servfail_response(&wire_owned) {
-                            send_udp_reply(&tun_tx, &counters, src, dst, &resp, None);
+                        if let Some(resp) =
+                            build_servfail_response_bounded(&wire_owned, max_query_bytes)
+                        {
+                            target.send(&wire_owned, &resp, None, false, &counters);
                         }
                         return;
                     };
@@ -1924,11 +2048,11 @@ impl DnsInterceptor {
                             Err(_) => log_pool_poisoned("dns_cache"),
                         }
                     }
-                    fit_response_for_udp(&wire_owned, resp)
+                    Some(resp)
                 }
                 Ok(_) => {
                     counters.servfail_upstream.incr();
-                    build_servfail_response(&wire_owned)
+                    build_servfail_response_bounded(&wire_owned, max_query_bytes)
                 }
                 Err(err) => {
                     counters.servfail_upstream.incr();
@@ -1960,12 +2084,12 @@ impl DnsInterceptor {
                             "DNS resolution failed; replying with SERVFAIL"
                         );
                     }
-                    build_servfail_response(&wire_owned)
+                    build_servfail_response_bounded(&wire_owned, max_query_bytes)
                 }
             };
 
             if let Some(resp) = reply_wire {
-                send_udp_reply(&tun_tx, &counters, src, dst, &resp, None);
+                target.send(&wire_owned, &resp, None, true, &counters);
             }
         });
     }
@@ -2005,6 +2129,20 @@ fn send_udp_reply(
         // channel so the loss shows up in diagnostics instead of silently.
         None => counters.tun_tx_dropped.incr(),
     }
+}
+
+/// Writes one framed DNS-over-TCP reply under a bounded deadline.
+async fn write_tcp_reply(stream: &mut TunTcpStream, reply: &[u8], deadline: Duration) -> bool {
+    let Ok(len) = u16::try_from(reply.len()) else {
+        return false;
+    };
+    timeout(deadline, async {
+        stream.write_all(&len.to_be_bytes()).await?;
+        stream.write_all(reply).await?;
+        stream.flush().await
+    })
+    .await
+    .is_ok_and(|result| result.is_ok())
 }
 
 async fn resolve_local_udp(
@@ -2746,6 +2884,8 @@ pub fn try_decode_chunked_body(raw: &[u8]) -> io::Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stack::RelayBufPool;
+    use tokio::sync::Notify;
 
     fn build_query(tx_id: u16, name: &str, qtype: u16) -> Vec<u8> {
         let mut out = Vec::new();
@@ -3400,6 +3540,237 @@ mod tests {
         );
         dns_cfg.query_timeout = Duration::from_millis(300);
         (DnsInterceptor::new(client_cfg, dns_cfg, tun_tx), tun_rx)
+    }
+
+    fn tcp_stream_pair() -> (TunTcpStream, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let (in_tx, in_rx) = mpsc::channel(8);
+        let (out_tx, out_rx) = mpsc::channel(8);
+        let stream = TunTcpStream::new_with_accounting(
+            in_rx,
+            out_tx,
+            Arc::new(Notify::new()),
+            None,
+            None,
+            None,
+            RelayBufPool::new(),
+        );
+        (stream, in_tx, out_rx)
+    }
+
+    fn tcp_frame(wire: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(wire.len()).expect("test frame fits");
+        let mut out = Vec::with_capacity(2 + wire.len());
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(wire);
+        out
+    }
+
+    async fn read_tcp_frame(rx: &mut mpsc::Receiver<Vec<u8>>) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        while buf.len() < 2 {
+            buf.extend_from_slice(&rx.recv().await?);
+        }
+        let len = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
+        while buf.len() < 2 + len {
+            buf.extend_from_slice(&rx.recv().await?);
+        }
+        Some(buf[2..2 + len].to_vec())
+    }
+
+    fn build_large_response(query: &[u8], txt_records: usize) -> Vec<u8> {
+        let mut resp = build_a_response(query, Ipv4Addr::new(203, 0, 113, 42), 120);
+        let count = u16::try_from(1 + txt_records).expect("test record count");
+        resp[6..8].copy_from_slice(&count.to_be_bytes());
+        for _ in 0..txt_records {
+            resp.extend_from_slice(&[0xc0, 0x0c]);
+            resp.extend_from_slice(&16u16.to_be_bytes());
+            resp.extend_from_slice(&1u16.to_be_bytes());
+            resp.extend_from_slice(&120u32.to_be_bytes());
+            resp.extend_from_slice(&201u16.to_be_bytes());
+            resp.push(200u8);
+            resp.extend_from_slice(&[b'x'; 200]);
+        }
+        resp
+    }
+
+    #[tokio::test]
+    async fn tcp_dns_returns_the_full_answer_above_the_udp_limit() {
+        let local = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local DNS");
+        let local_addr = local.local_addr().expect("local DNS addr");
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DNS_QUERY_BYTES];
+            let (n, peer) = local.recv_from(&mut buf).await.expect("query");
+            let resp = build_large_response(&buf[..n], 8);
+            assert!(resp.len() > MAX_UDP_DNS_RESPONSE_BYTES);
+            local.send_to(&resp, peer).await.expect("reply");
+        });
+
+        let (interceptor, _tun_rx) = test_interceptor(Some(local_addr));
+        let (stream, in_tx, mut out_rx) = tcp_stream_pair();
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_001);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        let query = build_query(0x5A5A, "large.lan", 16);
+        in_tx.send(tcp_frame(&query)).await.expect("queue query");
+
+        let serve = tokio::spawn(async move {
+            interceptor.serve_tcp_stream(src, dst, stream).await;
+        });
+        let resp = timeout(Duration::from_secs(2), read_tcp_frame(&mut out_rx))
+            .await
+            .expect("framed reply")
+            .expect("reply bytes");
+        assert!(
+            resp.len() > MAX_UDP_DNS_RESPONSE_BYTES,
+            "full answer required"
+        );
+        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0x5A5A);
+        assert_eq!(resp[2] & 0x02, 0, "TCP answer must not set TC");
+        assert_eq!(resp[3] & 0x0f, 0);
+
+        drop(in_tx);
+        timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("stream task ends on EOF")
+            .expect("stream task joined");
+        server.await.expect("local DNS server done");
+    }
+
+    #[tokio::test]
+    async fn tcp_dns_rejects_zero_and_oversized_length_prefixes() {
+        for prefix in [0u16, u16::MAX] {
+            let (interceptor, _tun_rx) = test_interceptor(None);
+            let (stream, in_tx, mut out_rx) = tcp_stream_pair();
+            let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_002);
+            let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+            in_tx
+                .send(prefix.to_be_bytes().to_vec())
+                .await
+                .expect("queue prefix");
+
+            let serve = tokio::spawn(async move {
+                interceptor.serve_tcp_stream(src, dst, stream).await;
+            });
+            timeout(Duration::from_secs(1), serve)
+                .await
+                .expect("bad prefix closes the stream")
+                .expect("stream task joined");
+            assert!(out_rx.try_recv().is_err(), "bad prefix must get no reply");
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_dns_serves_two_pipelined_queries_sequentially() {
+        let local = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local DNS");
+        let local_addr = local.local_addr().expect("local DNS addr");
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DNS_QUERY_BYTES];
+            for ip in [Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2)] {
+                let (n, peer) = local.recv_from(&mut buf).await.expect("query");
+                let resp = build_a_response(&buf[..n], ip, 60);
+                local.send_to(&resp, peer).await.expect("reply");
+            }
+        });
+
+        let (interceptor, _tun_rx) = test_interceptor(Some(local_addr));
+        let (stream, in_tx, mut out_rx) = tcp_stream_pair();
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_003);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        let first = build_query(0x1111, "one.lan", 1);
+        let second = build_query(0x2222, "two.lan", 1);
+        in_tx.send(tcp_frame(&first)).await.expect("queue first");
+        in_tx.send(tcp_frame(&second)).await.expect("queue second");
+
+        let serve = tokio::spawn(async move {
+            interceptor.serve_tcp_stream(src, dst, stream).await;
+        });
+        for expected in [0x1111u16, 0x2222] {
+            let resp = timeout(Duration::from_secs(2), read_tcp_frame(&mut out_rx))
+                .await
+                .expect("pipelined reply")
+                .expect("reply bytes");
+            assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), expected);
+            assert_eq!(resp[3] & 0x0f, 0);
+        }
+
+        drop(in_tx);
+        timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("stream task ends on EOF")
+            .expect("stream task joined");
+        server.await.expect("local DNS server done");
+    }
+
+    #[tokio::test]
+    async fn tcp_dns_overload_returns_servfail_with_the_query_tx_id() {
+        let (interceptor, _tun_rx) = test_interceptor(None);
+        let held = interceptor
+            .inflight
+            .clone()
+            .try_acquire_many_owned(MAX_INFLIGHT_DNS_QUERIES as u32)
+            .expect("hold all query permits");
+        let (stream, in_tx, mut out_rx) = tcp_stream_pair();
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_004);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        let query = build_query(0xBEEF, "busy.example", 1);
+        in_tx.send(tcp_frame(&query)).await.expect("queue query");
+
+        let serve = tokio::spawn(async move {
+            interceptor.serve_tcp_stream(src, dst, stream).await;
+        });
+        let resp = timeout(Duration::from_secs(2), read_tcp_frame(&mut out_rx))
+            .await
+            .expect("SERVFAIL reply")
+            .expect("reply bytes");
+        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0xBEEF);
+        assert_eq!(resp[2] & 0x02, 0);
+        assert_eq!(resp[3] & 0x0f, 2);
+
+        drop(in_tx);
+        timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("stream task ends on EOF")
+            .expect("stream task joined");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn tcp_dns_timeout_returns_servfail_without_caching_it() {
+        let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind silent local DNS");
+        let silent_addr = silent.local_addr().expect("silent DNS addr");
+        let (interceptor, _tun_rx) = test_interceptor(Some(silent_addr));
+        let counters = Arc::clone(&interceptor.counters);
+        let cache = Arc::clone(&interceptor.cache);
+        let (stream, in_tx, mut out_rx) = tcp_stream_pair();
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_005);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        let query = build_query(0xCAFE, "slow.lan", 1);
+        in_tx.send(tcp_frame(&query)).await.expect("queue query");
+
+        let serve = tokio::spawn(async move {
+            interceptor.serve_tcp_stream(src, dst, stream).await;
+        });
+        let resp = timeout(Duration::from_secs(2), read_tcp_frame(&mut out_rx))
+            .await
+            .expect("SERVFAIL after timeout")
+            .expect("reply bytes");
+        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0xCAFE);
+        assert_eq!(resp[3] & 0x0f, 2);
+        let stats = counters.snapshot();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.servfail_upstream, 1);
+        assert!(cache.lock().expect("cache lock").entries.is_empty());
+
+        drop(in_tx);
+        timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("stream task ends on EOF")
+            .expect("stream task joined");
     }
 
     #[tokio::test]

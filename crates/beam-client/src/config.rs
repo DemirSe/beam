@@ -380,6 +380,11 @@ impl ClientFileConfig {
             .ok_or_else(|| ConfigError::Invalid("tun.address must be valid IPv4 CIDR".into()))?;
         let mut fixed_local_dns = None;
         let mut initial_local_dns = None;
+        let tun_dns_peer = if self.dns.enabled {
+            derive_tun_peer_ipv4(&self.tun.address)
+        } else {
+            None
+        };
         let dns_cfg = if self.dns.enabled {
             if self.dns.cache_size > 16_384 {
                 return Err(ConfigError::Invalid(
@@ -413,16 +418,12 @@ impl ClientFileConfig {
             cfg.cache_size = self.dns.cache_size;
             cfg.query_timeout = Duration::from_millis(self.dns.query_timeout_ms);
             cfg.ipv4_only = self.dns.ipv4_only;
+            cfg.tun_dns_peer = tun_dns_peer;
             Some(cfg)
         } else {
             None
         };
 
-        let tun_dns_peer = if dns_cfg.is_some() {
-            derive_tun_peer_ipv4(&self.tun.address)
-        } else {
-            None
-        };
         let server_ip = self.server.address.ip();
         let exclude_ips = vec![server_ip];
 
@@ -649,6 +650,16 @@ mod tests {
         assert_eq!(cfg.tun_name, "beamtun0");
         assert_eq!(cfg.mtu, 1500);
         assert!(cfg.engine.route.reject_quic);
+    }
+
+    #[test]
+    fn tun_dns_peer_is_wired_into_the_engine_dns_config() {
+        let cfg = ClientFileConfig::parse_and_validate(EXAMPLE).expect("example config valid");
+        let peer = Ipv4Addr::new(172, 19, 0, 2);
+        assert_eq!(cfg.tun_dns_peer, Some(peer));
+        let dns = cfg.engine.dns.as_ref().expect("example DNS enabled");
+        assert_eq!(dns.tun_dns_peer, Some(peer));
+        assert_eq!(dns.tun_dns_peer, cfg.tun_dns_peer);
     }
 
     #[test]

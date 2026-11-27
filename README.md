@@ -639,7 +639,10 @@ platform-independent core shared with the Android `VpnService` backend.
   tunnel with a bounded LRU TTL cache, automatic `.lan`/`.local`/`.internal` + `[bypass]`
   (`cidrs` and `domains`) split to the pre-VPN local DNS, and `reject_quic = true`
   by default (immediate ICMP/ICMPv6 Port Unreachable on UDP/443 so browsers
-  fall back cleanly to TCP/HTTPS + Vision Direct). Note the LAN DNS trust
+  fall back cleanly to TCP/HTTPS + Vision Direct). The derived TUN DNS peer
+  also serves RFC 1035 DNS-over-TCP on port 53 from the same resolver: each
+  framed query is bounded to 16 KiB, served sequentially, and answered with
+  the full upstream response instead of a UDP `TC=1` reply. Note the LAN DNS trust
   boundary for `bypass.domains`: those names are resolved via the unauthenticated
   local LAN resolver (`dns.local_upstream` or auto-detected system DNS), and
   resolved IPs receive temporary, bounded, `info`-logged `/32` or `/128` host
