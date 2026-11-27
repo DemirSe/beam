@@ -329,18 +329,28 @@ class ProfilesFragment : Fragment() {
         }
     }
 
-    private fun parseLink(uri: String): LinkInfo? = parseWithNative(uri) ?: parseWithUri(uri)
+    private fun parseLink(uri: String): LinkInfo? = when (val native = parseWithNative(uri)) {
+        is NativeParse.Ok -> native.info
+        NativeParse.Rejected -> null
+        NativeParse.Unavailable -> parseWithUri(uri)
+    }
 
-    /** Native parser from beam-core; unavailable until libbeam_android.so is loaded. */
-    private fun parseWithNative(uri: String): LinkInfo? = runCatching {
-        val json = JSONObject(BeamNativeBridge.nativeParseVlessLink(uri) ?: return@runCatching null)
-        if (!json.optBoolean("ok")) return@runCatching null
+    /** Native parser from beam-core; falls back only when libbeam_android.so is unavailable. */
+    private fun parseWithNative(uri: String): NativeParse {
+        val raw = try {
+            BeamNativeBridge.nativeParseVlessLink(uri)
+        } catch (_: Throwable) {
+            return NativeParse.Unavailable
+        }
+        if (raw == null) return NativeParse.Unavailable
+        val json = runCatching { JSONObject(raw) }.getOrNull() ?: return NativeParse.Unavailable
+        if (!json.optBoolean("ok")) return NativeParse.Rejected
         val host = json.optString("server").trim()
-        if (host.isEmpty()) return@runCatching null
+        if (host.isEmpty()) return NativeParse.Rejected
         val port = json.optInt("port", DEFAULT_PORT).takeIf { it in 1..65535 } ?: DEFAULT_PORT
         val name = json.optString("name").trim().takeIf { it.isNotEmpty() && it != "null" } ?: host
-        LinkInfo(name, host, port)
-    }.getOrNull()
+        return NativeParse.Ok(LinkInfo(name, host, port))
+    }
 
     /** Safe fallback so the UI still works when the native library is missing. */
     private fun parseWithUri(uri: String): LinkInfo? = runCatching {
@@ -371,6 +381,13 @@ class ProfilesFragment : Fragment() {
     }
 
     private data class LinkInfo(val name: String, val host: String, val port: Int)
+
+    /** Distinguishes a rejected link from a missing native library. */
+    private sealed interface NativeParse {
+        data class Ok(val info: LinkInfo) : NativeParse
+        object Rejected : NativeParse
+        object Unavailable : NativeParse
+    }
 
     private companion object {
         const val MAX_LINK_LENGTH = 2048

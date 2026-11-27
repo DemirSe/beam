@@ -35,13 +35,19 @@ object VpnConfigBuilder {
      * Drops entries the engine config or route table would reject: blanks,
      * malformed CIDRs, `/0` (it would capture all traffic) and prefixes that
      * overlap the TUN subnet, which would bypass the TUN DNS server.
+     *
+     * IPv6 prefixes are kept only when [allowIpv6] is set: API 31-32 routes the
+     * IPv4 complement and cannot honour them.
      */
-    fun sanitizeBypassCidrs(cidrs: List<String>): List<String> = cidrs
+    fun sanitizeBypassCidrs(
+        cidrs: List<String>,
+        allowIpv6: Boolean = true,
+    ): List<String> = cidrs
         .map { it.trim() }
         .filter {
             it.isNotEmpty() &&
                 it.substringAfterLast('/').toIntOrNull() != 0 &&
-                Ipv4RouteCalculator.isValidCidr(it, allowIpv6 = true) &&
+                Ipv4RouteCalculator.isValidCidr(it, allowIpv6 = allowIpv6) &&
                 !Ipv4RouteCalculator.overlapsTunSubnet(it)
         }
         .take(SettingsValidator.MAX_BYPASS_CIDRS)

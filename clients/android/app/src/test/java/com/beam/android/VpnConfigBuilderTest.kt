@@ -114,6 +114,16 @@ class VpnConfigBuilderTest {
             VpnConfigBuilder.sanitizeBypassCidrs(many).size,
         )
     }
+
+    @Test
+    fun `ipv6 bypass needs api 33 where exclude route exists`() {
+        val input = listOf("10.0.0.0/8", "fd00::/8")
+        assertEquals(
+            listOf("10.0.0.0/8"),
+            VpnConfigBuilder.sanitizeBypassCidrs(input, allowIpv6 = false),
+        )
+        assertEquals(input, VpnConfigBuilder.sanitizeBypassCidrs(input))
+    }
 }
 
 class TelemetryDtoTest {

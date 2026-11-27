@@ -15,7 +15,15 @@ class Ipv4RouteCalculatorTest {
 
     @Test
     fun `invalid and ipv6 entries are ignored`() {
-        val invalid = listOf("10.0.0.0", "10.0.0.0/33", "010.0.0.0/8", "999.1.1.1/8", "fd00::/8")
+        val invalid = listOf(
+            "10.0.0.0",
+            "10.0.0.0/33",
+            "010.0.0.0/8",
+            "999.1.1.1/8",
+            "fd00::/8",
+            "+1.2.3.4/8",
+            "1.2.3.4/+8",
+        )
         assertEquals(
             Ipv4RouteCalculator.subtractCidrs(emptyList()),
             Ipv4RouteCalculator.subtractCidrs(invalid),
@@ -135,6 +143,9 @@ class Ipv4RouteCalculatorTest {
         assertFalse(Ipv4RouteCalculator.isValidCidr("10.0.0.0/8/8"))
         assertFalse(Ipv4RouteCalculator.isValidCidr("10.0.0.0/"))
         assertFalse(Ipv4RouteCalculator.isValidCidr("example.com/8"))
+        assertFalse(Ipv4RouteCalculator.isValidCidr("+1.2.3.4/8"))
+        assertFalse(Ipv4RouteCalculator.isValidCidr("1.+2.3.4/8"))
+        assertFalse(Ipv4RouteCalculator.isValidCidr("1.2.3.4/+8"))
     }
 
     @Test

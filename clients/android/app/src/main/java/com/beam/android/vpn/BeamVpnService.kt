@@ -394,7 +394,10 @@ class BeamVpnService : VpnService() {
 
             // A bypass CIDR that covers the TUN /30 would bypass the TUN DNS.
             val rawBypass = settings.bypassCidrs
-            val bypass = VpnConfigBuilder.sanitizeBypassCidrs(rawBypass)
+            val bypass = VpnConfigBuilder.sanitizeBypassCidrs(
+                rawBypass,
+                allowIpv6 = Build.VERSION.SDK_INT >= 33,
+            )
             if (bypass.size != rawBypass.size) {
                 Log.w(TAG, "dropped ${rawBypass.size - bypass.size} unsupported bypass CIDRs")
             }
