@@ -65,8 +65,8 @@ const MAX_LOCAL_UDP_STALE_REPLIES: usize = 8;
 const BYPASS_ROUTE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Max concurrent bypass route installs shared by the cache-miss and
 /// cache-hit paths (each may fork `ip`). A hung `ip` call holds its permit
-/// only until `BYPASS_ROUTE_TIMEOUT`, so hung installs cannot grow blocking
-/// tasks unboundedly.
+/// until the blocking install finishes, even after `BYPASS_ROUTE_TIMEOUT`,
+/// so hung installs cannot grow blocking tasks unboundedly.
 const MAX_BYPASS_REFIRE_INFLIGHT: usize = 4;
 /// Max cache-hit bypass re-fires per [`BYPASS_REFIRE_WINDOW`].
 const MAX_BYPASS_REFIRE_PER_WINDOW: u32 = 4;
@@ -1680,9 +1680,9 @@ impl DnsInterceptor {
                 // and `MAX_BYPASS_REFIRE_PER_WINDOW` per window stops a flood
                 // of cached bypass queries from fork-storming `ip`. The
                 // limiter is checked before parsing so a suppressed window
-                // pays no answer-parse allocation. The install await is
-                // bounded by `BYPASS_ROUTE_TIMEOUT` so a hung `ip` cannot
-                // permanently pin a permit.
+                // pays no answer-parse allocation. The initial await is
+                // bounded by `BYPASS_ROUTE_TIMEOUT`; a still-running install
+                // keeps its permit until it finishes.
                 && self.bypass_refire_limit.allow().is_some()
                 && let Some(cb) = self.dns_config.on_bypass_ips.clone()
             {
@@ -1691,9 +1691,10 @@ impl DnsInterceptor {
                 if !refire_ips.is_empty() {
                     let qname = query.qname.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
-                        let handle = cb(refire_ips);
-                        if !matches!(timeout(BYPASS_ROUTE_TIMEOUT, handle).await, Ok(Ok(())))
+                        let mut handle = cb(refire_ips);
+                        let outcome = timeout(BYPASS_ROUTE_TIMEOUT, &mut handle).await;
+                        let still_running = outcome.is_err();
+                        if !matches!(&outcome, Ok(Ok(())))
                             && let Some(suppressed) = DNS_BYPASS_LOG.allow()
                         {
                             warn!(
@@ -1702,6 +1703,15 @@ impl DnsInterceptor {
                                 suppressed,
                                 "cache-hit bypass route install did not finish cleanly"
                             );
+                        }
+                        if still_running {
+                            // `abort()` cannot stop a running `spawn_blocking`
+                            // task, so the new owner waits and releases the
+                            // permit only when the install actually ends.
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let _ = handle.await;
+                            });
                         }
                     });
                 }
@@ -1827,20 +1837,20 @@ impl DnsInterceptor {
                         // yields the worker thread instead of blocking it.
                         // The shared `bypass_permits` semaphore bounds hung
                         // `ip` calls across the miss and hit paths so they
-                        // cannot grow blocking tasks unboundedly; the await is
-                        // bounded by `BYPASS_ROUTE_TIMEOUT` so a hung install
-                        // cannot permanently pin a permit.
+                        // cannot grow blocking tasks unboundedly; this await
+                        // is bounded by `BYPASS_ROUTE_TIMEOUT`, but a still
+                        // running install keeps its permit until it ends.
                         if is_bypass_domain
                             && !ips.is_empty()
                             && let Some(cb) = dns_cfg.on_bypass_ips.as_ref()
                         {
-                            if let Ok(_bypass_permit) = bypass_permits.clone().try_acquire_owned() {
+                            if let Ok(bypass_permit) = bypass_permits.clone().try_acquire_owned() {
                                 let ip_count = ips.len();
-                                let handle = cb(ips);
-                                if !matches!(
-                                    timeout(BYPASS_ROUTE_TIMEOUT, handle).await,
-                                    Ok(Ok(()))
-                                ) && let Some(suppressed) = DNS_BYPASS_LOG.allow()
+                                let mut handle = cb(ips);
+                                let outcome = timeout(BYPASS_ROUTE_TIMEOUT, &mut handle).await;
+                                let still_running = outcome.is_err();
+                                if !matches!(&outcome, Ok(Ok(())))
+                                    && let Some(suppressed) = DNS_BYPASS_LOG.allow()
                                 {
                                     warn!(
                                         ip_count,
@@ -1848,6 +1858,12 @@ impl DnsInterceptor {
                                         suppressed,
                                         "bypass route install did not finish cleanly; replying without waiting"
                                     );
+                                }
+                                if still_running {
+                                    tokio::spawn(async move {
+                                        let _permit = bypass_permit;
+                                        let _ = handle.await;
+                                    });
                                 }
                             } else if let Some(suppressed) = DNS_BYPASS_LOG.allow() {
                                 warn!(
@@ -4640,6 +4656,140 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "reply must arrive near the 500 ms bound, took {elapsed:?}"
         );
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn hung_bypass_installs_hold_permits_until_they_finish() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind fake dns");
+        let server_addr = server.local_addr().expect("server addr");
+        let srv = tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_LOCAL_UDP_RECV_BYTES];
+            loop {
+                let Ok((n, peer)) = server.recv_from(&mut buf).await else {
+                    return;
+                };
+                if n < 12 {
+                    continue;
+                }
+                let resp = build_a_response(&buf[..n], Ipv4Addr::new(203, 0, 113, 9), 60);
+                let _ = server.send_to(&resp, peer).await;
+            }
+        });
+
+        let (tun_tx, mut tun_rx) = mpsc::channel(64);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            dummy_reality,
+            [2u8; 16],
+        );
+        let finished = Arc::new(AtomicBool::new(false));
+        // Always release stubbed blocking tasks, even if an assertion fails.
+        struct ReleaseInstalls(Arc<AtomicBool>);
+        impl Drop for ReleaseInstalls {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _release = ReleaseInstalls(Arc::clone(&finished));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let finished_cb = Arc::clone(&finished);
+        let calls_cb = Arc::clone(&calls);
+        let mut dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            Some(server_addr),
+        );
+        dns_cfg.bypass_domains = vec!["bypass.test".to_owned()];
+        dns_cfg.on_bypass_ips = Some(Arc::new(move |_ips: Vec<IpAddr>| {
+            calls_cb.fetch_add(1, Ordering::SeqCst);
+            let finished_inner = Arc::clone(&finished_cb);
+            tokio::task::spawn_blocking(move || {
+                while !finished_inner.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        }));
+        let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_123);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+
+        // Miss path: the reply still arrives after the 500 ms deadline, but
+        // the hung install must keep holding its permit.
+        let start = TokioInstant::now();
+        interceptor.handle_query(src, dst, &build_query(0x5555, "host.bypass.test", 1));
+        timeout(Duration::from_secs(3), tun_rx.recv())
+            .await
+            .expect("reply despite hung install")
+            .expect("packet");
+        assert!(start.elapsed() >= BYPASS_ROUTE_TIMEOUT);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            interceptor.bypass_permits.available_permits(),
+            MAX_BYPASS_REFIRE_INFLIGHT - 1
+        );
+
+        // More misses fill the remaining permits but cannot exceed the bound.
+        for i in 0..8u16 {
+            let wire = build_query(0x6000 + i, &format!("host{i}.bypass.test"), 1);
+            interceptor.handle_query(src, dst, &wire);
+        }
+        timeout(Duration::from_secs(3), async {
+            while tun_rx.len() < 8 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all eight replies");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_BYPASS_REFIRE_INFLIGHT,
+            "miss installs must stay bounded"
+        );
+        assert_eq!(interceptor.bypass_permits.available_permits(), 0);
+
+        finished.store(true, Ordering::SeqCst);
+        timeout(Duration::from_secs(3), async {
+            while interceptor.bypass_permits.available_permits() != MAX_BYPASS_REFIRE_INFLIGHT {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("permit released when the install finishes");
+
+        // Cache-hit path: a hung re-fire must also hold its permit.
+        finished.store(false, Ordering::SeqCst);
+        let before = calls.load(Ordering::SeqCst);
+        for i in 0..50u16 {
+            let mut hit = build_query(0x5555, "host.bypass.test", 1);
+            hit[0..2].copy_from_slice(&i.to_be_bytes());
+            interceptor.handle_query(src, dst, &hit);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let fired = calls.load(Ordering::SeqCst) - before;
+        assert!(fired > 0 && fired <= MAX_BYPASS_REFIRE_INFLIGHT);
+        assert_eq!(
+            interceptor.bypass_permits.available_permits(),
+            MAX_BYPASS_REFIRE_INFLIGHT - fired
+        );
+        finished.store(true, Ordering::SeqCst);
+        timeout(Duration::from_secs(3), async {
+            while interceptor.bypass_permits.available_permits() != MAX_BYPASS_REFIRE_INFLIGHT {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("re-fire permits released when installs finish");
         srv.abort();
     }
 
