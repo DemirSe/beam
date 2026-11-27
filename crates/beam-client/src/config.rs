@@ -710,14 +710,21 @@ mod tests {
         let cfg = ClientFileConfig::parse_and_validate(EXAMPLE).expect("example config valid");
         assert!(cfg.engine.dns.as_ref().expect("dns").single_label_local);
 
-        let raw = EXAMPLE.replace(
+        // The example may document the key, so drop it before adding a value.
+        let base: String = EXAMPLE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("single_label_local"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let raw = base.replace(
             "ipv4_only = false",
             "ipv4_only = false\nsingle_label_local = false",
         );
         let cfg = ClientFileConfig::parse_and_validate(&raw).expect("explicit false valid");
         assert!(!cfg.engine.dns.as_ref().expect("dns").single_label_local);
 
-        let bad = EXAMPLE.replace(
+        let bad = base.replace(
             "ipv4_only = false",
             "ipv4_only = false\nsingle_label_local = \"false\"",
         );
