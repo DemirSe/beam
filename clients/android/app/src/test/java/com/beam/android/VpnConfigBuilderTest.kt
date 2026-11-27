@@ -124,6 +124,25 @@ class VpnConfigBuilderTest {
         )
         assertEquals(input, VpnConfigBuilder.sanitizeBypassCidrs(input))
     }
+
+    @Test
+    fun `recommended tcp cap scales with device ram`() {
+        val gib = 1024L * 1024 * 1024
+        assertEquals(128, VpnConfigBuilder.recommendedMaxTcpConnections(0L))
+        assertEquals(128, VpnConfigBuilder.recommendedMaxTcpConnections(4L * gib))
+        assertEquals(256, VpnConfigBuilder.recommendedMaxTcpConnections(6L * gib))
+        assertEquals(256, VpnConfigBuilder.recommendedMaxTcpConnections(8L * gib))
+
+        val json = VpnConfigBuilder.buildConfigJson(
+            vlessUri = "vless://example",
+            dohUrl = AppSettings.DEFAULT_DOH_URL,
+            ipv4Only = true,
+            rejectQuic = true,
+            bypassCidrs = emptyList(),
+            maxTcpConnections = 256,
+        )
+        assertEquals(256, org.json.JSONObject(json).getInt("max_tcp_connections"))
+    }
 }
 
 class TelemetryDtoTest {

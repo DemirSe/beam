@@ -1,5 +1,6 @@
 package com.beam.android.vpn
 
+import android.app.ActivityManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -410,6 +411,7 @@ class BeamVpnService : VpnService() {
                 rejectQuic = settings.rejectQuic,
                 bypassCidrs = bypass,
                 serverIp = serverIp,
+                maxTcpConnections = recommendedMaxTcpConnections(),
             )
 
             // Narrow establishLock: hold it only for establish(), release before
@@ -617,6 +619,13 @@ class BeamVpnService : VpnService() {
             }
         }
     }
+
+    private fun recommendedMaxTcpConnections(): Int = runCatching {
+        val am = getSystemService(ActivityManager::class.java)
+        val info = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(info)
+        VpnConfigBuilder.recommendedMaxTcpConnections(info.totalMem)
+    }.getOrDefault(VpnConfigBuilder.DEFAULT_MAX_TCP_CONNECTIONS)
 
     private fun userFacingError(t: Throwable): String = when {
         t is IllegalArgumentException && t.message?.contains("profile", ignoreCase = true) == true ->

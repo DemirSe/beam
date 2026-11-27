@@ -23,8 +23,12 @@ pub const MAX_BYPASS_CIDRS: usize = 256;
 /// Mobile idle timeout for TCP relay writes and idle XUDP mux connections.
 /// Relay reads remain uncapped (`tcp_relay_idle_timeout: None`) for push sockets.
 pub const MOBILE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Mobile DNS LRU cache cap (4x smaller than desktop's 1024 to bound worst-case RSS).
-pub const MOBILE_DNS_CACHE_SIZE: usize = 256;
+/// Mobile DNS LRU cache cap (half of desktop's 1024; ~200 KiB worst-case RSS).
+pub const MOBILE_DNS_CACHE_SIZE: usize = 512;
+/// Lowest accepted mobile TCP connection cap.
+pub const MIN_MOBILE_TCP_CONNECTIONS: usize = 64;
+/// Highest accepted mobile TCP connection cap (high-RAM devices).
+pub const MAX_MOBILE_TCP_CONNECTIONS: usize = 256;
 
 /// Configuration that `BeamNativeBridge.nativeStart` receives as JSON.
 ///
@@ -62,6 +66,9 @@ pub struct AndroidEngineConfig {
     pub reject_quic: bool,
     /// CIDR prefixes that bypass the tunnel.
     pub bypass_cidrs: Vec<String>,
+    /// Optional TCP connection cap adapted to device RAM (`64..=256`).
+    #[serde(default)]
+    pub max_tcp_connections: Option<usize>,
     /// Logcat level (`trace`, `debug`, `info`, `warn`, `error`, `off`).
     pub log_level: String,
 }
@@ -81,6 +88,7 @@ impl Default for AndroidEngineConfig {
             reject_ipv6: true,
             reject_quic: true,
             bypass_cidrs: Vec::new(),
+            max_tcp_connections: None,
             log_level: "info".to_owned(),
         }
     }
@@ -126,6 +134,13 @@ impl AndroidEngineConfig {
                 "bypass_cidrs accepts at most {MAX_BYPASS_CIDRS} entries"
             )));
         }
+        if let Some(max_tcp) = self.max_tcp_connections
+            && !(MIN_MOBILE_TCP_CONNECTIONS..=MAX_MOBILE_TCP_CONNECTIONS).contains(&max_tcp)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "max_tcp_connections must be between {MIN_MOBILE_TCP_CONNECTIONS} and {MAX_MOBILE_TCP_CONNECTIONS}"
+            )));
+        }
         if self.log_level.is_empty()
             || self.log_level.len() > 16
             || !self
@@ -140,11 +155,13 @@ impl AndroidEngineConfig {
         Ok(())
     }
 
-    /// Builds the TCP stack profile, keeping the configured MTU.
+    /// Builds the TCP stack profile, keeping the configured MTU and optional RAM-scaled flow cap.
     pub fn tcp_stack_config(&self) -> TcpStackConfig {
+        let mobile = TcpStackConfig::mobile();
         TcpStackConfig {
             mtu: self.mtu,
-            ..TcpStackConfig::mobile()
+            max_connections: self.max_tcp_connections.unwrap_or(mobile.max_connections),
+            ..mobile
         }
     }
 
@@ -567,5 +584,34 @@ mod tests {
         assert_eq!(value["ok"], false);
         assert!(value["error"].as_str().is_some_and(|text| !text.is_empty()));
         assert!(!json.contains("b831381d-6324-4d53-ad4f-8cda48b30811"));
+    }
+
+    #[test]
+    fn max_tcp_connections_defaults_scales_and_validates_bounds() {
+        let default_cfg = AndroidEngineConfig {
+            vless_uri: TEST_VLESS_URI.to_owned(),
+            ..AndroidEngineConfig::default()
+        };
+        assert_eq!(default_cfg.tcp_stack_config().max_connections, 128);
+
+        let high_ram = AndroidEngineConfig {
+            vless_uri: TEST_VLESS_URI.to_owned(),
+            max_tcp_connections: Some(256),
+            ..AndroidEngineConfig::default()
+        };
+        assert!(high_ram.validate().is_ok());
+        assert_eq!(high_ram.tcp_stack_config().max_connections, 256);
+
+        for invalid in [0, 32, 257, 1024] {
+            let bad = AndroidEngineConfig {
+                vless_uri: TEST_VLESS_URI.to_owned(),
+                max_tcp_connections: Some(invalid),
+                ..AndroidEngineConfig::default()
+            };
+            assert!(
+                bad.validate().is_err(),
+                "max_tcp_connections={invalid} must be rejected"
+            );
+        }
     }
 }

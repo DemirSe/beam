@@ -706,6 +706,16 @@ where
         udp_bridge.poll_connect();
         stack.poll(now_ms, &mut tx_batch, &mut accepted);
 
+        // Drain interactive UDP/DNS/ICMP reply packets before bulk TCP segments
+        // so voice/gaming/DNS traffic does not wait behind a full download burst,
+        // bounded so a sustained reply stream cannot postpone TUN reads.
+        for _ in 0..TUN_RX_DRAIN_MAX {
+            let Ok(pkt) = tun_rx.try_recv() else {
+                break;
+            };
+            send_tun_packet(&mut device, &pkt, &drops).await?;
+        }
+
         for pkt in tx_batch.drain(..) {
             send_tun_packet(&mut device, &pkt, &drops).await?;
             stack.recycle_tx_buf(pkt);
@@ -723,15 +733,6 @@ where
                 config.tcp_relay_idle_timeout,
                 shutdown.clone(),
             );
-        }
-
-        // Drain any pending UDP/ICMP reply packets immediately, bounded so a
-        // sustained reply stream cannot postpone TUN reads.
-        for _ in 0..TUN_RX_DRAIN_MAX {
-            let Ok(pkt) = tun_rx.try_recv() else {
-                break;
-            };
-            send_tun_packet(&mut device, &pkt, &drops).await?;
         }
 
         let tcp_delay = stack.poll_delay_ms(start.elapsed().as_millis() as i64);
