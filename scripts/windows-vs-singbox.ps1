@@ -13,15 +13,14 @@
     min/max range across rounds, plus per-round curl exit and HTTP codes.
     A per-round failure records 'fail' for that round and the run continues.
 
-    Per round and per client: one 10 MB warm-up download is discarded, then a
-    fixed 50 MB measured transfer (two 25 MB chunks in one timing window)
-    reports Mbps. Volume is deliberately bounded because the provider answers
-    burst traffic with HTTP 429. CPU seconds (process TotalProcessorTime delta
-    over the measured transfer) separate a CPU-bound gap from a per-flow gap.
-    Beam drops come from the secret-free STATUS drops token ('none' when
-    absent); sing-box reports 'n/a'. With -MultiFlow, four concurrent 10 MB
-    transfers also report an aggregate multi4_mbps, which shows whether a limit
-    is per flow or shared.
+    Per round and per client: one small warm-up download is discarded, then a
+    single 100 MiB measured transfer reports Mbps from curl's own byte rate. A
+    short body fails the round, so a throttled reply cannot look fast. CPU
+    seconds (process TotalProcessorTime delta over the measured transfer)
+    separate a CPU-bound gap from a per-flow gap. Beam drops come from the
+    secret-free STATUS drops token ('none' when absent); sing-box reports
+    'n/a'. With -MultiFlow, four concurrent 10 MB transfers also report an
+    aggregate multi4_mbps, which shows whether a limit is per flow or shared.
 
     Run 1 (beam-client.exe): packaged zip + install.ps1 + Named Pipe flow, same
     as scripts/windows-live-e2e.ps1 (async NamedPipeClientStream timeout,
@@ -59,12 +58,12 @@ $PipeName = 'beam-client-ipc'
 $IpifyUrl = 'https://api.ipify.org'
 $TtfbUrl = 'https://1.1.1.1/cdn-cgi/trace'
 $DownUrlBase = 'https://speed.cloudflare.com/__down?bytes='
-# The provider rate-limits bursts (HTTP 429), so the measured transfer is two
-# 25 MB chunks (50 MB) and the warm-up is 10 MB: enough for a clean median at
-# multi-hundred-Mbps aggregate volume stays under the observed limit.
+# speed.cloudflare.com answers burst traffic with HTTP 429 on shared runner
+# IPs, so the measured transfer uses a stable 100 MiB file instead. The
+# warm-up stays small and best effort.
+$DownUrlMeas = 'https://proof.ovh.net/files/100Mb.dat'
+$DownMeasMinBytes = 90000000
 $DownWarmBytes = 10000000
-$DownChunks = 2
-$DownChunkBytes = 25000000
 # Optional per-flow vs shared-limit probe (4 concurrent 10 MB transfers).
 $MultiFlows = 4
 $MultiChunkBytes = 10000000
@@ -217,10 +216,11 @@ $script:LastMulti4CurlExit = -1
 $script:LastMulti4HttpCode = 'n/a'
 
 function Invoke-DownloadWarmup {
-    # Discarded 10 MB request that warms the path before the measured one.
-    # Never throws, never reports; bounded so a stall cannot hang the round.
+    # Discarded 10 MB range request against the measured host, so the warm-up and
+    # the measurement share one path. Never throws, never reports; bounded so a
+    # stall cannot hang the round.
     try {
-        $null = & curl.exe -sS -o NUL -w '%{http_code}' --max-time 30 $DownUrlWarm 2>$null
+        $null = & curl.exe -sS -o NUL -w '%{http_code}' -r 0-9999999 --max-time 30 $DownUrlMeas 2>$null
     } catch {
     }
 }
@@ -230,24 +230,25 @@ function Measure-DownloadMbps {
     $script:LastHttpCode = 'n/a'
     try {
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
-        # One window over 4 chunks of the working 25 MB URL (100 MB total).
-        # Any non-2xx code or non-zero exit fails the round.
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        for ($c = 0; $c -lt $DownChunks; $c++) {
-            $out = & curl.exe -sS -o NUL -w '%{http_code}' --max-time 30 $DownUrlWarm 2>$null
-            $script:LastCurlExit = $LASTEXITCODE
-            $code = (($out | Out-String).Trim())
-            $script:LastHttpCode = $code
-            if ($LASTEXITCODE -ne 0) { $sw.Stop(); return 'fail' }
-            if ($code -notmatch '^2') { $sw.Stop(); return 'fail' }
+        # One 100 MiB transfer; a short body means a throttled or broken reply.
+        $out = & curl.exe -sS -o NUL -w '%{http_code} %{speed_download} %{size_download}' --max-time 90 $DownUrlMeas 2>$null
+        $script:LastCurlExit = $LASTEXITCODE
+        $parts = @(((($out | Out-String).Trim()) -split '\s+'))
+        $code = 'n/a'
+        if ($parts.Count -ge 1) { $code = $parts[0] }
+        $script:LastHttpCode = $code
+        if ($LASTEXITCODE -ne 0) { return 'fail' }
+        if ($code -notmatch '^2') { return 'fail' }
+        $speed = 0.0
+        if ($parts.Count -lt 2) { return 'fail' }
+        if (-not [double]::TryParse($parts[1], [System.Globalization.NumberStyles]::Float, $inv, [ref]$speed)) { return 'fail' }
+        $size = 0.0
+        if ($parts.Count -ge 3) {
+            if (-not [double]::TryParse($parts[2], [System.Globalization.NumberStyles]::Float, $inv, [ref]$size)) { $size = 0.0 }
         }
-        $sw.Stop()
-        $secs = $sw.Elapsed.TotalSeconds
-        if ($secs -le 0) { return 'fail' }
-        $totalBytes = [double]$DownChunks * [double]$DownChunkBytes
-        $mbps = $totalBytes * 8.0 / $secs / 1000000.0
-        if ($mbps -le 0) { return 'fail' }
-        return ([math]::Round($mbps, 1)).ToString('F1', $inv)
+        if ($size -lt [double]$DownMeasMinBytes) { return 'fail' }
+        if ($speed -le 0) { return 'fail' }
+        return ([math]::Round($speed * 8.0 / 1000000.0, 1)).ToString('F1', $inv)
     } catch {
         return 'fail'
     }
