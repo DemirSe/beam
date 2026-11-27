@@ -947,14 +947,24 @@ mod tests {
 
     #[tokio::test]
     async fn probe_reports_the_underlying_error_kind() {
-        // Bind and immediately drop a listener so the port is closed.
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("bind probe target");
-        let addr = listener.local_addr().expect("probe addr");
-        drop(listener);
+        // A closed loopback port must surface as a connect refusal. The port is
+        // released between bind and connect, so another process can take it and
+        // answer with a reset; retry on a fresh port instead of asserting on a
+        // race, and still fail if no attempt reports the refusal.
+        let mut last_kind = None;
+        for _ in 0..5 {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("bind probe target");
+            let addr = listener.local_addr().expect("probe addr");
+            drop(listener);
 
-        let err = probe_server_rtt(addr).await.expect_err("closed port");
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+            let err = probe_server_rtt(addr).await.expect_err("closed port");
+            if err.kind() == io::ErrorKind::ConnectionRefused {
+                return;
+            }
+            last_kind = Some(err.kind());
+        }
+        assert_eq!(last_kind, Some(io::ErrorKind::ConnectionRefused));
     }
 
     #[test]
