@@ -168,11 +168,13 @@ pub struct ExcludeIps {
 impl ExcludeIps {
     const HASH_THRESHOLD: usize = 8;
 
-    /// Builds the exclusion set from raw entries.
+    /// Builds the exclusion set, normalizing mapped and compatible IPv6
+    /// literals to the embedded IPv4 form used by destination classification.
     pub fn new(entries: &[IpAddr]) -> Self {
+        let list: Vec<IpAddr> = entries.iter().copied().map(normalize_destination).collect();
         Self {
-            list: entries.to_vec(),
-            set: (entries.len() > Self::HASH_THRESHOLD).then(|| entries.iter().copied().collect()),
+            set: (list.len() > Self::HASH_THRESHOLD).then(|| list.iter().copied().collect()),
+            list,
         }
     }
 
@@ -196,6 +198,8 @@ impl ExcludeIps {
     /// back into the tunnel. A `new` that is already excluded only drops `old`,
     /// avoiding duplicate entries from repeated handovers.
     pub fn replace(&mut self, old: IpAddr, new: IpAddr) {
+        let old = normalize_destination(old);
+        let new = normalize_destination(new);
         if old == new {
             return;
         }
@@ -870,6 +874,39 @@ mod tests {
             }
         }
         assert!(ExcludeIps::default().is_empty());
+    }
+
+    #[test]
+    fn exclude_ips_normalizes_mapped_and_compatible_entries() {
+        let mapped: IpAddr = "::ffff:1.1.1.1".parse().expect("mapped");
+        let compatible: IpAddr = "::1.1.1.2".parse().expect("compatible");
+        let genuine: IpAddr = "2001:4860:4860::8888".parse().expect("v6");
+        let exclusions = ExcludeIps::new(&[mapped, compatible, genuine]);
+
+        assert!(exclusions.contains(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(exclusions.contains(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2))));
+        assert!(exclusions.contains(genuine));
+        assert!(!exclusions.contains(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))));
+        assert!(!exclusions.contains("2001:4860:4860::8844".parse().expect("v6")));
+
+        // The reverse direction still works: a mapped destination is
+        // normalized before the plain IPv4 exclusion is checked.
+        let policy = RoutePolicy {
+            exclude_ips: ExcludeIps::new(&[IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]),
+            ..RoutePolicy::default()
+        };
+        let pkt = crate::packet::build_ip_udp_packet(
+            IpAddr::V6("fd00:be:a::1".parse().expect("src")),
+            40000,
+            mapped,
+            8080,
+            b"x",
+        )
+        .expect("mapped udp");
+        assert_eq!(
+            policy.classify(&parse_ip(&pkt).expect("ip")),
+            RouteDecision::Drop
+        );
     }
 
     #[test]
