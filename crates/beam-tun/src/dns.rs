@@ -285,6 +285,8 @@ pub struct DnsConfig {
     /// `connect` on every freshly bound local-DNS socket. A reused pooled socket
     /// skips the hook. Omitted from `Debug` like the other callbacks.
     pub local_socket_protector: Option<SocketProtector>,
+    /// When `true`, a query name with no dot uses the local resolver.
+    pub single_label_local: bool,
     /// Local-only suffixes (e.g. `["lan", "local", "internal"]`).
     pub local_suffixes: Vec<String>,
     /// Additional user-configured bypass domain suffixes.
@@ -309,6 +311,7 @@ impl std::fmt::Debug for DnsConfig {
             .field("upstream", &self.upstream)
             .field("local_upstream", &self.local_upstream)
             .field("tun_dns_peer", &self.tun_dns_peer)
+            .field("single_label_local", &self.single_label_local)
             .field("local_suffixes", &self.local_suffixes)
             .field("bypass_domains", &self.bypass_domains)
             .field("cache_size", &self.cache_size)
@@ -338,6 +341,7 @@ impl DnsConfig {
             tun_dns_peer: None,
             refresh_local_upstream: None,
             local_socket_protector: None,
+            single_label_local: true,
             local_suffixes: Self::default_local_suffixes(),
             bypass_domains: Vec::new(),
             cache_size: DEFAULT_CACHE_SIZE,
@@ -1751,7 +1755,10 @@ impl DnsInterceptor {
             .bypass_domains
             .iter()
             .any(|s| matches_domain_suffix(&query.qname, s));
-        let must_use_local = is_local || is_bypass_domain;
+        let is_single_label = self.dns_config.single_label_local
+            && !query.qname.is_empty()
+            && !query.qname.contains('.');
+        let must_use_local = is_local || is_bypass_domain || is_single_label;
         let use_local = must_use_local && current_local.is_some();
 
         // A local/bypass name has no safe answer without the local resolver.
@@ -3519,6 +3526,90 @@ mod tests {
         assert_eq!(stats.servfail_mismatch, 0);
     }
 
+    #[tokio::test]
+    async fn dotless_names_use_local_upstream_by_default() {
+        let local_dns = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let local_addr = local_dns.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for expected_ip in [Ipv4Addr::new(192, 168, 1, 77), Ipv4Addr::new(127, 0, 0, 1)] {
+                let (n, peer) = local_dns.recv_from(&mut buf).await.expect("recv");
+                let resp = build_a_response(&buf[..n], expected_ip, 60);
+                local_dns.send_to(&resp, peer).await.expect("send");
+            }
+        });
+
+        let (interceptor, mut tun_rx) = test_interceptor(Some(local_addr));
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_001);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        for (tx_id, name, ip) in [
+            (0xa101u16, "router", Ipv4Addr::new(192, 168, 1, 77)),
+            (0xa102u16, "localhost", Ipv4Addr::new(127, 0, 0, 1)),
+        ] {
+            interceptor.handle_query(src, dst, &build_query(tx_id, name, 1));
+            let pkt = timeout(Duration::from_secs(2), tun_rx.recv())
+                .await
+                .expect("reply timeout")
+                .expect("reply pkt");
+            let udp = crate::packet::parse_udp(crate::packet::parse_ip(&pkt).expect("ip").payload)
+                .expect("udp");
+            let (ttl, ips) = parse_dns_response_meta(udp.payload);
+            assert_eq!(ttl, Some(60), "{name}");
+            assert_eq!(ips, vec![IpAddr::V4(ip)], "{name}");
+        }
+        server_task.await.expect("local server done");
+        assert_eq!(interceptor.stats().servfail_upstream, 0);
+    }
+
+    #[tokio::test]
+    async fn dotted_global_and_escape_hatch_forward_to_tunnel() {
+        for (single_label_local, name) in [(true, "example.com"), (false, "router")] {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind fake tunnel server");
+            let tunnel_addr = listener.local_addr().expect("addr");
+            let (tun_tx, mut tun_rx) = mpsc::channel(8);
+            let dummy_reality = beam_core::reality::RealityClientConfig::new(
+                [1u8; 32],
+                "0123456789abcdef",
+                "whatsapp.net",
+            )
+            .expect("reality");
+            let client_cfg = BeamClientConfig::new(tunnel_addr, dummy_reality, [2u8; 16]);
+            let mut dns_cfg = DnsConfig::new(
+                DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+                None,
+            );
+            dns_cfg.single_label_local = single_label_local;
+            dns_cfg.query_timeout = Duration::from_millis(200);
+            let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+
+            let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_002);
+            let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+            interceptor.handle_query(src, dst, &build_query(0xa201, name, 1));
+            let (stream, _) = timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("the tunneled resolver must be dialed")
+                .expect("accept");
+            drop(stream);
+
+            let pkt = timeout(Duration::from_secs(2), tun_rx.recv())
+                .await
+                .expect("reply timeout")
+                .expect("reply pkt");
+            let udp = crate::packet::parse_udp(crate::packet::parse_ip(&pkt).expect("ip").payload)
+                .expect("udp");
+            assert_eq!(
+                udp.payload[3] & 0x0f,
+                2,
+                "{name}: fake tunnel cannot answer"
+            );
+            assert_eq!(interceptor.stats().misses, 1, "{name}");
+        }
+    }
+
     fn test_interceptor(
         local_upstream: Option<SocketAddr>,
     ) -> (DnsInterceptor, mpsc::Receiver<Vec<u8>>) {
@@ -3798,7 +3889,11 @@ mod tests {
 
         let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 55_020);
         let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
-        for (tx_id, name) in [(0xa001u16, "router.lan"), (0xa002, "host.bypass.test")] {
+        for (tx_id, name) in [
+            (0xa001u16, "router.lan"),
+            (0xa002u16, "host.bypass.test"),
+            (0xa003u16, "router"),
+        ] {
             let wire = build_query(tx_id, name, 1);
             interceptor.handle_query(src, dst, &wire);
             let pkt = tun_rx.try_recv().expect("immediate SERVFAIL");

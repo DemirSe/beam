@@ -332,6 +332,19 @@ The native Windows client (`beam-client.exe` Windows Service + unelevated
 `beam-tray.exe` + `%ProgramData%\beam\client.toml`) is documented in
 [`clients/windows-tray/README.md`](../clients/windows-tray/README.md).
 
+## Native client DNS names
+
+The native `beam-client` resolver treats a name without a dot as local. This
+includes `router`, `nas`, and `localhost`. The resolver sends these names to
+`dns.local_upstream` or the detected local resolver. It does not send them
+through the tunnel. If no local resolver is available, the resolver returns
+SERVFAIL. Dotted names keep the configured upstream.
+
+Set `single_label_local = false` in `[dns]` only when single-label names on
+your host are public. This restores forwarding for dotless names. The default
+value is `true`. The client rejects a value that is not a boolean. This key
+does not create a rule for one name.
+
 ## beam-client diagnostics
 
 `beam-client --check` prints the validated TUN and server policy, then one DNS

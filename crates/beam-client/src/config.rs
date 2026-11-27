@@ -124,6 +124,8 @@ pub struct DnsSection {
     pub upstream: String,
     #[serde(default)]
     pub local_upstream: Option<String>,
+    #[serde(default = "default_true")]
+    pub single_label_local: bool,
     #[serde(default = "default_local_suffixes")]
     pub local_suffixes: Vec<String>,
     #[serde(default = "default_dns_cache_size")]
@@ -140,6 +142,7 @@ impl Default for DnsSection {
             enabled: false,
             upstream: default_dns_upstream(),
             local_upstream: None,
+            single_label_local: true,
             local_suffixes: default_local_suffixes(),
             cache_size: default_dns_cache_size(),
             query_timeout_ms: default_dns_timeout_ms(),
@@ -413,6 +416,7 @@ impl ClientFileConfig {
                     detect_system_local_dns_excluding(Some(tun_net))
                 }));
             }
+            cfg.single_label_local = self.dns.single_label_local;
             cfg.local_suffixes = self.dns.local_suffixes;
             cfg.bypass_domains = self.bypass.domains;
             cfg.cache_size = self.dns.cache_size;
@@ -699,6 +703,25 @@ mod tests {
             default_tun_name(),
             if cfg!(windows) { "Beam" } else { "beamtun0" }
         );
+    }
+
+    #[test]
+    fn single_label_local_defaults_true_and_validates_escape_hatch() {
+        let cfg = ClientFileConfig::parse_and_validate(EXAMPLE).expect("example config valid");
+        assert!(cfg.engine.dns.as_ref().expect("dns").single_label_local);
+
+        let raw = EXAMPLE.replace(
+            "ipv4_only = false",
+            "ipv4_only = false\nsingle_label_local = false",
+        );
+        let cfg = ClientFileConfig::parse_and_validate(&raw).expect("explicit false valid");
+        assert!(!cfg.engine.dns.as_ref().expect("dns").single_label_local);
+
+        let bad = EXAMPLE.replace(
+            "ipv4_only = false",
+            "ipv4_only = false\nsingle_label_local = \"false\"",
+        );
+        assert!(ClientFileConfig::parse_and_validate(&bad).is_err());
     }
 
     #[test]
