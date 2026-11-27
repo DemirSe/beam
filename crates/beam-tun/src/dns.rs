@@ -21,7 +21,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::{Instant as TokioInstant, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
@@ -471,6 +471,66 @@ fn parse_dns_name(wire: &[u8], start: usize) -> Option<(String, usize)> {
     }
 }
 
+/// Walks the domain name at `start` with the same bounds and validation as
+/// [`parse_dns_name`] and returns the offset just past it.
+///
+/// Unlike [`parse_dns_name`] it builds no `String`, so callers that only need
+/// the offset (the EDNS0 scan runs on every parsed query) allocate nothing.
+fn skip_dns_name(wire: &[u8], start: usize) -> Option<usize> {
+    let mut pos = start;
+    let mut end_offset = None;
+    let mut labels = 0usize;
+    let mut hops = 0usize;
+    // Mirrors `parse_dns_name`'s `name.len()`, dots included.
+    let mut name_len = 0usize;
+
+    loop {
+        let b = *wire.get(pos)?;
+        if b == 0 {
+            return Some(end_offset.unwrap_or(pos + 1));
+        }
+        if (b & 0xc0) == 0xc0 {
+            hops += 1;
+            if hops > MAX_POINTER_HOPS {
+                return None;
+            }
+            let b2 = *wire.get(pos + 1)?;
+            let ptr = usize::from(u16::from_be_bytes([b & 0x3f, b2]));
+            if ptr >= wire.len() {
+                return None;
+            }
+            if end_offset.is_none() {
+                end_offset = Some(pos + 2);
+            }
+            pos = ptr;
+            continue;
+        }
+        if (b & 0xc0) != 0 {
+            // Reserved label type.
+            return None;
+        }
+        let len = usize::from(b);
+        if len > 63 {
+            return None;
+        }
+        labels += 1;
+        if labels > MAX_DNS_LABELS {
+            return None;
+        }
+        let label_start = pos + 1;
+        let label_end = label_start.checked_add(len)?;
+        wire.get(label_start..label_end)?;
+        if name_len > 0 {
+            name_len += 1;
+        }
+        if name_len.saturating_add(len) > MAX_DNS_NAME_LEN {
+            return None;
+        }
+        name_len += len;
+        pos = label_end;
+    }
+}
+
 /// Extracts `(cache_ttl_secs, resolved_ips)` from an RFC 1035 DNS response.
 /// Never panics on malformed input.
 pub fn parse_dns_response_meta(wire: &[u8]) -> (Option<u32>, Vec<IpAddr>) {
@@ -633,7 +693,7 @@ fn query_edns0(query_wire: &[u8]) -> Option<(usize, bool)> {
 
     let mut pos = 12usize;
     for _ in 0..qdcount {
-        let (_, next) = parse_dns_name(query_wire, pos)?;
+        let next = skip_dns_name(query_wire, pos)?;
         let after_q = next.checked_add(4)?;
         if after_q > query_wire.len() {
             return None;
@@ -642,7 +702,7 @@ fn query_edns0(query_wire: &[u8]) -> Option<(usize, bool)> {
     }
 
     for _ in 0..ancount.saturating_add(nscount) {
-        let (_, next) = parse_dns_name(query_wire, pos)?;
+        let next = skip_dns_name(query_wire, pos)?;
         let rd_header_end = next.checked_add(10)?;
         if rd_header_end > query_wire.len() {
             return None;
@@ -659,7 +719,7 @@ fn query_edns0(query_wire: &[u8]) -> Option<(usize, bool)> {
     }
 
     for _ in 0..arcount {
-        let (_, next) = parse_dns_name(query_wire, pos)?;
+        let next = skip_dns_name(query_wire, pos)?;
         let rd_header_end = next.checked_add(10)?;
         if rd_header_end > query_wire.len() {
             return None;
@@ -1360,6 +1420,9 @@ pub struct DnsInterceptor {
     tun_tx: mpsc::Sender<Vec<u8>>,
     local_udp_pool: Arc<LocalUdpPool>,
     counters: Arc<DnsCounters>,
+    /// Bumped by [`DnsInterceptor::on_network_change`] so every in-flight query
+    /// aborts at once and releases its pool and inflight permits.
+    net_gen: watch::Sender<u64>,
 }
 
 impl DnsInterceptor {
@@ -1454,6 +1517,7 @@ impl DnsInterceptor {
             tun_tx,
             local_udp_pool: Arc::new(LocalUdpPool::default()),
             counters,
+            net_gen: watch::channel(0u64).0,
         }
     }
 
@@ -1470,6 +1534,10 @@ impl DnsInterceptor {
     /// Clears local-only cache entries, drops pooled DoH/TCP/UDP connections,
     /// and refreshes auto-detected local DNS upstream on network transitions.
     pub fn on_network_change(&self) {
+        // Bump the generation first: every spawned query selects on this watch
+        // channel, so it aborts at once instead of holding its pool socket and
+        // inflight permit until `query_timeout` expires.
+        self.net_gen.send_modify(|g| *g = g.wrapping_add(1));
         match self.cache.lock() {
             Ok(mut cache) => cache.clear_local(),
             Err(_) => log_pool_poisoned("dns_cache"),
@@ -1493,6 +1561,11 @@ impl DnsInterceptor {
             self.counters.dropped_malformed.incr();
             return;
         };
+
+        // Subscribe before reading `local_upstream` so a handover during
+        // config snapshotting or before task start still cancels the query.
+        let mut net_gen_rx = self.net_gen.subscribe();
+        let start_gen = *net_gen_rx.borrow();
 
         let current_local = match self.local_upstream.lock() {
             Ok(guard) => *guard,
@@ -1652,35 +1725,46 @@ impl DnsInterceptor {
 
         tokio::spawn(async move {
             let _permit = permit;
-            let result = if use_local {
-                match current_local {
-                    Some(local_addr) => {
-                        resolve_local_udp(
-                            &local_udp_pool,
-                            local_addr,
+            let result = tokio::select! {
+                biased;
+                // A network change cancels the in-flight query immediately.
+                _ = net_gen_rx.changed() => return,
+                res = async {
+                    if use_local {
+                        match current_local {
+                            Some(local_addr) => {
+                                resolve_local_udp(
+                                    &local_udp_pool,
+                                    local_addr,
+                                    &wire_owned,
+                                    query.tx_id,
+                                    dns_cfg.query_timeout,
+                                    dns_cfg.local_protector(),
+                                )
+                                .await
+                            }
+                            None => Err(io::Error::other("no local DNS upstream configured")),
+                        }
+                    } else {
+                        resolve_tunneled(
+                            &client_cfg,
+                            &dns_cfg.upstream,
+                            &tls_cfg,
+                            &doh_pool,
+                            &tcp_pool,
+                            &udp_mux_pool,
                             &wire_owned,
-                            query.tx_id,
                             dns_cfg.query_timeout,
-                            dns_cfg.local_protector(),
+                            doh_prefix.as_deref(),
                         )
                         .await
                     }
-                    None => Err(io::Error::other("no local DNS upstream configured")),
-                }
-            } else {
-                resolve_tunneled(
-                    &client_cfg,
-                    &dns_cfg.upstream,
-                    &tls_cfg,
-                    &doh_pool,
-                    &tcp_pool,
-                    &udp_mux_pool,
-                    &wire_owned,
-                    dns_cfg.query_timeout,
-                    doh_prefix.as_deref(),
-                )
-                .await
+                } => res,
             };
+            // Never deliver or cache an answer that a handover has superseded.
+            if *net_gen_rx.borrow() != start_gen {
+                return;
+            }
 
             let reply_wire = match result {
                 Ok(mut resp) if resp.len() >= 12 && resp.len() <= MAX_DOH_RESPONSE_BYTES => {
@@ -1747,6 +1831,11 @@ impl DnsInterceptor {
                                     "bypass route install skipped because all permits are busy"
                                 );
                             }
+                        }
+                        // Re-check after awaiting bypass route installation so a
+                        // handover during that await cannot repopulate the cache.
+                        if *net_gen_rx.borrow() != start_gen {
+                            return;
                         }
                         if let Some(ttl) = maybe_ttl {
                             match cache.lock() {
@@ -2964,6 +3053,62 @@ mod tests {
         assert_eq!(sf[3] & 0x0f, 2); // SERVFAIL
     }
 
+    #[test]
+    fn skip_dns_name_matches_parse_dns_name_offsets_and_errors() {
+        let mut wire = vec![0u8; 12];
+        wire.extend_from_slice(&[3, b'w', b'w', b'w']); // 12..16
+        wire.extend_from_slice(&[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e']); // 16..24
+        wire.push(0); // 24: root ends the first name
+        wire.extend_from_slice(&[3, b'c', b'o', b'm', 0xc0, 0x10]); // 25..31 pointer -> 16
+
+        // Uncompressed name and compression-pointer name must report the same
+        // end offset as `parse_dns_name`.
+        for (start, expected) in [(12usize, 25usize), (25, 31)] {
+            let skipped = skip_dns_name(&wire, start).expect("valid name");
+            let (_, parsed) = parse_dns_name(&wire, start).expect("valid name");
+            assert_eq!(skipped, expected, "skip offset for start {start}");
+            assert_eq!(skipped, parsed, "offset must match parse for start {start}");
+        }
+
+        // Pointer loop at offset 12 (`12 -> 12`), truncated label, truncated
+        // pointer, and reserved label flags must all be rejected by both.
+        let loop_wire = [vec![0u8; 12], vec![0xc0, 0x0c]].concat();
+        let truncated_label = [3u8, b'a'];
+        let truncated_pointer = [0xc0u8];
+        let reserved_flags = [0x40u8];
+        for (bad, start) in [
+            (&loop_wire[..], 12usize),
+            (&truncated_label[..], 0),
+            (&truncated_pointer[..], 0),
+            (&reserved_flags[..], 0),
+        ] {
+            assert!(skip_dns_name(bad, start).is_none(), "must reject bad name");
+            assert!(parse_dns_name(bad, start).is_none(), "must reject bad name");
+        }
+        assert!(skip_dns_name(&wire, wire.len()).is_none(), "start past end");
+
+        // Name-length limit: four 63-byte labels fit, a fifth exceeds
+        // `MAX_DNS_NAME_LEN` and is rejected by both parsers.
+        let mut fits = Vec::new();
+        for _ in 0..4 {
+            fits.push(63u8);
+            fits.extend_from_slice(&[b'a'; 63]);
+        }
+        fits.push(0);
+        assert_eq!(skip_dns_name(&fits, 0), Some(fits.len()));
+        assert_eq!(
+            parse_dns_name(&fits, 0).map(|(_, off)| off),
+            Some(fits.len())
+        );
+
+        let mut too_long = fits[..fits.len() - 1].to_vec();
+        too_long.push(63);
+        too_long.extend_from_slice(&[b'a'; 63]);
+        too_long.push(0);
+        assert!(skip_dns_name(&too_long, 0).is_none());
+        assert!(parse_dns_name(&too_long, 0).is_none());
+    }
+
     #[tokio::test]
     async fn local_suffix_bypasses_tunnel_and_caches_reply() {
         let local_dns = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -3051,6 +3196,71 @@ mod tests {
         );
         dns_cfg.query_timeout = Duration::from_millis(300);
         (DnsInterceptor::new(client_cfg, dns_cfg, tun_tx), tun_rx)
+    }
+
+    #[tokio::test]
+    async fn network_change_cancels_inflight_query_without_reply_or_cache_entry() {
+        // A local upstream that binds but never answers, so the query can only
+        // finish by reaching `query_timeout`.
+        let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind silent upstream");
+        let silent_addr = silent.local_addr().expect("addr");
+
+        let (tun_tx, mut tun_rx) = mpsc::channel(8);
+        let dummy_reality = beam_core::reality::RealityClientConfig::new(
+            [1u8; 32],
+            "0123456789abcdef",
+            "whatsapp.net",
+        )
+        .expect("reality");
+        let client_cfg = BeamClientConfig::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
+            dummy_reality,
+            [2u8; 16],
+        );
+        let mut dns_cfg = DnsConfig::new(
+            DnsUpstream::PlainTcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)),
+            Some(silent_addr),
+        );
+        // Far longer than the deadline below, so only cancellation can finish
+        // the query in time.
+        dns_cfg.query_timeout = Duration::from_secs(30);
+        let interceptor = DnsInterceptor::new(client_cfg, dns_cfg, tun_tx);
+
+        let wire = build_query(0x9001, "nas.lan", 1);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 55_100);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        interceptor.handle_query(src, dst, &wire);
+        assert_eq!(
+            interceptor.inflight.available_permits(),
+            MAX_INFLIGHT_DNS_QUERIES - 1,
+            "the in-flight query must hold its inflight permit"
+        );
+
+        interceptor.on_network_change();
+        timeout(Duration::from_secs(2), async {
+            while interceptor.inflight.available_permits() != MAX_INFLIGHT_DNS_QUERIES {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a network change must release the inflight permit promptly");
+
+        assert!(
+            tun_rx.try_recv().is_err(),
+            "a cancelled query must not send a stale reply"
+        );
+        // Still a miss: nothing was cached, so the answer can never be replayed.
+        interceptor.handle_query(src, dst, &wire);
+        let stats = interceptor.stats();
+        assert_eq!(
+            stats.hits, 0,
+            "a cancelled query must not populate the cache"
+        );
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.servfail_upstream, 0);
+        drop(silent);
     }
 
     #[tokio::test]
