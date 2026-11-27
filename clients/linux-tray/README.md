@@ -30,8 +30,9 @@ It stages files under `/usr/local/lib` and backs up managed paths.
 It stops `beam-client` before it installs new files.
 It keeps the three newest timestamped copies of the profile and prunes older
 copies. It leaves the service stopped and disabled. It disables an inherited unit so
-the new unit cannot start at boot. Failed installs restore the backups and the
-earlier enablement state.
+the new unit cannot start at boot. Failed installs restore the backups. They
+restore only `enabled` and `enabled-runtime` state. The installer refuses a
+masked unit before it writes any unit file.
 
 ## Native `beam-client` or this install: choose one
 

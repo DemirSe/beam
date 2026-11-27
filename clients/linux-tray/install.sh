@@ -43,8 +43,8 @@ BACKUP_DIR=
 BACKUP_READY=0
 INSTALL_COMMITTED=0
 SERVICE_WAS_ACTIVE=0
-DNS_RESET_ENABLED=0
-CLIENT_ENABLED=0
+DNS_RESET_STATE=
+CLIENT_STATE=
 CONFIG_BAK_KEEP=3
 
 cleanup() {
@@ -192,6 +192,36 @@ prune_config_backups() {
     fi
 }
 
+# systemctl returns 0 for static, generated and enabled-runtime units. Only
+# enabled and enabled-runtime are enablement we can restore on rollback.
+# A masked unit must stop the install before its unit file is written.
+unit_enable_state() {
+    local unit="$1" state
+    state=$(systemctl is-enabled "$unit" 2>/dev/null) || true
+    case "$state" in
+        masked|masked-runtime)
+            echo "installer: $unit is masked; unmask it before installing" >&2
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$state"
+}
+
+restore_unit_enablement() {
+    local unit="$1" state="$2"
+    case "$state" in
+        enabled|enabled-runtime)
+            if ! systemctl enable "$unit" >/dev/null 2>&1; then
+                echo "installer: could not restore $unit enablement" >&2
+                return 1
+            fi
+            ;;
+        *)
+            systemctl disable "$unit" >/dev/null 2>&1 || true
+            ;;
+    esac
+}
+
 rollback_live() {
     local path failed=0
     for path in "${MANAGED_PATHS[@]}"; do
@@ -207,21 +237,11 @@ rollback_live() {
     done
     systemctl daemon-reload 2>/dev/null || true
     # Restore the inherited wants symlink; MANAGED_PATHS does not hold it.
-    if [ "$CLIENT_ENABLED" = "1" ]; then
-        if ! systemctl enable beam-client.service >/dev/null 2>&1; then
-            echo "installer: could not restore beam-client enablement" >&2
-            failed=1
-        fi
-    else
-        systemctl disable beam-client.service >/dev/null 2>&1 || true
+    if ! restore_unit_enablement beam-client.service "$CLIENT_STATE"; then
+        failed=1
     fi
-    if [ "$DNS_RESET_ENABLED" = "1" ]; then
-        if ! systemctl enable beam-dns-reset.service >/dev/null 2>&1; then
-            echo "installer: could not restore beam-dns-reset enablement" >&2
-            failed=1
-        fi
-    else
-        systemctl disable beam-dns-reset.service >/dev/null 2>&1 || true
+    if ! restore_unit_enablement beam-dns-reset.service "$DNS_RESET_STATE"; then
+        failed=1
     fi
     if [ "$failed" = "0" ] && [ "$SERVICE_WAS_ACTIVE" = "1" ]; then
         if ! systemctl start beam-client 2>/dev/null; then
@@ -248,12 +268,8 @@ python3 "$HERE/config-policy.py" "$CONFIG_SRC" "$NORMALIZED_CONFIG"
 BACKUP_DIR=$(mktemp -d /usr/local/lib/.beam-backup.XXXXXX)
 backup_live
 BACKUP_READY=1
-if systemctl is-enabled --quiet beam-dns-reset.service 2>/dev/null; then
-    DNS_RESET_ENABLED=1
-fi
-if systemctl is-enabled --quiet beam-client 2>/dev/null; then
-    CLIENT_ENABLED=1
-fi
+DNS_RESET_STATE=$(unit_enable_state beam-dns-reset.service) || exit 1
+CLIENT_STATE=$(unit_enable_state beam-client) || exit 1
 
 if systemctl is-active --quiet beam-client 2>/dev/null; then
     SERVICE_WAS_ACTIVE=1

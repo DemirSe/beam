@@ -136,23 +136,101 @@ if printf '%s\n' "$reset_unit" | grep -qxF 'Wants=ctrld.service'; then
   exit 1
 fi
 
-# The installer must record inherited enablement, restore it on rollback, and
-# leave the unit disabled after a successful install. The wants symlink is not
-# a managed path, so systemctl handles it.
-enabled_line=$(grep -n 'systemctl is-enabled --quiet beam-client' "$INSTALL" | cut -d: -f1 || true)
-[ -n "$enabled_line" ] && [ "$enabled_line" -lt "$stop_line" ] || {
-  echo "install.sh: beam-client enablement is not recorded before the stop" >&2
+# The installer must parse inherited enablement, restore only enabled states
+# on rollback, leave the unit disabled after a successful install, and stop on
+# a masked unit before it can write a unit file through a /dev/null symlink.
+state_body=$(sed -n '/^unit_enable_state() {/,/^}/p' "$INSTALL")
+restore_body=$(sed -n '/^restore_unit_enablement() {/,/^}/p' "$INSTALL")
+[ -n "$state_body" ] && [ -n "$restore_body" ] || {
+  echo "install.sh: missing enablement parser or restore helper" >&2
   exit 1
 }
+check_enable_state() {
+  local fake="$1" want_rc="$2" want_out="$3" want_err="$4" rc
+  (
+    systemctl() { printf '%s\n' "$FAKE_STATE"; }
+    eval "$state_body"
+    unit_enable_state beam-client
+  ) >"$TMP/state.out" 2>"$TMP/state.err" && rc=0 || rc=$?
+  [ "$rc" -eq "$want_rc" ] || {
+    echo "install.sh: state '$fake' returned $rc, expected $want_rc" >&2
+    exit 1
+  }
+  [ "$(cat "$TMP/state.out")" = "$want_out" ] || {
+    echo "install.sh: state '$fake' parsed as '$(cat "$TMP/state.out")'" >&2
+    exit 1
+  }
+  if [ -n "$want_err" ]; then
+    grep -qF "$want_err" "$TMP/state.err" || {
+      echo "install.sh: state '$fake' has no clear error" >&2
+      cat "$TMP/state.err" >&2
+      exit 1
+    }
+  fi
+}
+FAKE_STATE=enabled
+check_enable_state enabled 0 enabled ''
+FAKE_STATE=enabled-runtime
+check_enable_state enabled-runtime 0 enabled-runtime ''
+FAKE_STATE=static
+check_enable_state static 0 static ''
+FAKE_STATE=disabled
+check_enable_state disabled 0 disabled ''
+FAKE_STATE=masked
+check_enable_state masked 1 '' 'is masked'
+FAKE_STATE=masked-runtime
+check_enable_state masked-runtime 1 '' 'unmask'
+
+check_restore_state() {
+  local state="$1" want="$2" rc
+  : > "$TMP/enable.log"
+  (
+    systemctl() { printf '%s %s\n' "$1" "$2" >> "$TMP/enable.log"; }
+    eval "$restore_body"
+    restore_unit_enablement beam-client.service "$state"
+  ) >/dev/null 2>&1 && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || {
+    echo "install.sh: rollback failed for '$state'" >&2
+    exit 1
+  }
+  grep -qxF "$want" "$TMP/enable.log" || {
+    echo "install.sh: rollback of '$state' did not run '$want'" >&2
+    cat "$TMP/enable.log" >&2
+    exit 1
+  }
+  case "$state" in
+    enabled*)
+      if grep -q '^disable ' "$TMP/enable.log"; then
+        echo "install.sh: rollback disabled an enabled unit" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      if grep -q '^enable ' "$TMP/enable.log"; then
+        echo "install.sh: rollback tried to enable '$state'" >&2
+        exit 1
+      fi
+      ;;
+  esac
+}
+check_restore_state enabled 'enable beam-client.service'
+check_restore_state enabled-runtime 'enable beam-client.service'
+check_restore_state static 'disable beam-client.service'
+check_restore_state disabled 'disable beam-client.service'
+
+state_line=$(grep -n '^DNS_RESET_STATE=\$(unit_enable_state' "$INSTALL" | cut -d: -f1 || true)
+[ -n "$state_line" ] && [ "$state_line" -lt "$stop_line" ] || {
+  echo "install.sh: enablement is not parsed before the stop" >&2
+  exit 1
+}
+if grep -qF 'systemctl is-enabled --quiet' "$INSTALL"; then
+  echo "install.sh: enablement still uses --quiet" >&2
+  exit 1
+fi
 disable_line=$(grep -n '^if ! systemctl disable beam-client.service' "$INSTALL" | cut -d: -f1 || true)
 commit_line=$(grep -n '^INSTALL_COMMITTED=1' "$INSTALL" | cut -d: -f1 || true)
 [ -n "$disable_line" ] && [ -n "$commit_line" ] && [ "$disable_line" -lt "$commit_line" ] || {
   echo "install.sh: successful install does not disable beam-client" >&2
-  exit 1
-}
-rollback_body=$(sed -n '/^rollback_live() {/,/^}/p' "$INSTALL")
-printf '%s\n' "$rollback_body" | grep -qF 'systemctl enable beam-client.service' || {
-  echo "install.sh: rollback does not restore beam-client enablement" >&2
   exit 1
 }
 

@@ -270,9 +270,11 @@ and unit files are restored from the pre-install snapshot; an active service is
 started again with the restored configuration. If restoration itself fails, the
 installer exits nonzero and keeps the snapshot under
 `/usr/local/lib/.beam-backup.*` for recovery. A normal install leaves the
-service installed but neither enabled nor started. The installer records the
-earlier enablement state, disables an inherited unit on success, and restores
-that state on rollback. Before it replaces the profile, the installer keeps a
+service installed but neither enabled nor started. The installer parses the
+`systemctl is-enabled` state. On rollback it restores only `enabled` and
+`enabled-runtime`. It does not enable a `static` unit. It refuses a masked unit
+before it writes a unit file. It disables an inherited unit on success. Before
+it replaces the profile, the installer keeps a
 timestamped copy at `/etc/beam/config.json.bak-<time>` with mode 0600. It keeps
 the three newest copies and prunes older copies during install and cleanup.
 
