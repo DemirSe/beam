@@ -859,6 +859,11 @@ function Test-HangRecovery {
         $dialAfter = $baseDial
         while ([DateTime]::UtcNow -lt $deadline) {
             Start-Sleep -Seconds 3
+            # Drive real traffic through the tunnel: the client dials the server
+            # per flow, so without a flow it has nothing to fail and may
+            # legitimately stay `connected` with only the TUN up.
+            try { $null = & curl.exe -sS -o NUL --max-time 5 $HttpsProbeUrl 2>$null } catch {
+            }
             try {
                 $st = Read-Status
                 if ([string]$st['state'] -ne 'connected') { $leftConnected = $true }
