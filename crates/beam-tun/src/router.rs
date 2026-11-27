@@ -281,7 +281,8 @@ pub enum RouteDecision {
 impl RoutePolicy {
     /// Classifies an IPv4 or IPv6 packet read from the TUN interface.
     pub fn classify(&self, pkt: &IpPacketView<'_>) -> RouteDecision {
-        if self.exclude_ips.contains(pkt.dst_ip) {
+        let dst_ip = normalize_destination(pkt.dst_ip);
+        if self.exclude_ips.contains(dst_ip) {
             return RouteDecision::Drop;
         }
         let udp = if pkt.protocol == IP_PROTO_UDP {
@@ -295,10 +296,10 @@ impl RoutePolicy {
         {
             return RouteDecision::InterceptDns;
         }
-        if !self.bypass_cidrs.is_empty() && self.bypass_cidrs.contains(pkt.dst_ip) {
+        if !self.bypass_cidrs.is_empty() && self.bypass_cidrs.contains(dst_ip) {
             return RouteDecision::Drop;
         }
-        if self.drop_private_destinations && is_non_global_ip(pkt.dst_ip) {
+        if self.drop_private_destinations && is_non_global_ip(dst_ip) {
             return RouteDecision::Drop;
         }
         if self.reject_ipv6 && pkt.dst_ip.is_ipv6() {
@@ -327,6 +328,25 @@ impl RoutePolicy {
             _ => RouteDecision::Drop,
         }
     }
+}
+
+/// Applies IPv4 policy to IPv4-mapped and RFC 4291 IPv4-compatible
+/// destinations. `::1` and `::` are excluded: a blind `to_ipv4()` would turn
+/// loopback into `0.0.0.1`.
+fn normalize_destination(ip: IpAddr) -> IpAddr {
+    let IpAddr::V6(v6) = ip else {
+        return ip;
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return IpAddr::V4(v4);
+    }
+    let octets = v6.octets();
+    if !v6.is_loopback() && !v6.is_unspecified() && octets[..12].iter().all(|&b| b == 0) {
+        return IpAddr::V4(Ipv4Addr::from([
+            octets[12], octets[13], octets[14], octets[15],
+        ]));
+    }
+    ip
 }
 
 /// Returns `true` for loopback, private/ULA, CGNAT, special-purpose,
@@ -615,6 +635,57 @@ mod tests {
             policy.classify(&parse_ip(&udp).expect("ip")),
             RouteDecision::RejectIcmpUnreachable
         );
+    }
+
+    #[test]
+    fn ipv4_compatible_and_mapped_destinations_follow_ipv4_policy() {
+        let src6: IpAddr = "fd00:be:a::1".parse().expect("tun v6");
+        let compatible_private: IpAddr = "::192.168.1.1".parse().expect("compatible private");
+        let mapped_private: IpAddr = "::ffff:192.168.1.1".parse().expect("mapped private");
+        let loopback: IpAddr = "::1".parse().expect("loopback");
+        let default = RoutePolicy::default();
+
+        for dst in [compatible_private, mapped_private, loopback] {
+            let pkt =
+                crate::packet::build_ip_udp_packet(src6, 40000, dst, 8080, b"x").expect("ipv6 udp");
+            assert_eq!(
+                default.classify(&parse_ip(&pkt).expect("ip")),
+                RouteDecision::Drop,
+                "{dst} must follow the private/loopback policy"
+            );
+        }
+
+        let bypassed = IpNet::parse_cidr("1.1.1.0/24").expect("bypass cidr");
+        let policy = RoutePolicy {
+            drop_private_destinations: false,
+            bypass_cidrs: BypassCidrs::from(vec![bypassed]),
+            ..RoutePolicy::default()
+        };
+        for dst in [
+            "::1.1.1.1".parse::<IpAddr>().expect("compatible bypass"),
+            "::ffff:1.1.1.1".parse::<IpAddr>().expect("mapped bypass"),
+        ] {
+            let pkt =
+                crate::packet::build_ip_udp_packet(src6, 40001, dst, 8080, b"x").expect("ipv6 udp");
+            assert_eq!(
+                policy.classify(&parse_ip(&pkt).expect("ip")),
+                RouteDecision::Drop,
+                "{dst} must match the IPv4 bypass CIDR"
+            );
+        }
+        for dst in [
+            "::8.8.8.8".parse::<IpAddr>().expect("compatible public"),
+            "::ffff:8.8.8.8".parse::<IpAddr>().expect("mapped public"),
+            "2001:4860:4860::8888".parse::<IpAddr>().expect("global v6"),
+        ] {
+            let pkt =
+                crate::packet::build_ip_udp_packet(src6, 40002, dst, 8080, b"x").expect("ipv6 udp");
+            assert_eq!(
+                policy.classify(&parse_ip(&pkt).expect("ip")),
+                RouteDecision::ProxyUdp,
+                "{dst} must still tunnel"
+            );
+        }
     }
 
     #[test]
