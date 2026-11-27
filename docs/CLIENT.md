@@ -255,7 +255,9 @@ installer exits nonzero and keeps the snapshot under
 `/usr/local/lib/.beam-backup.*` for recovery. A normal install leaves the
 service installed but neither enabled nor started. The installer records the
 earlier enablement state, disables an inherited unit on success, and restores
-that state on rollback.
+that state on rollback. Before it replaces the profile, the installer keeps a
+timestamped copy at `/etc/beam/config.json.bak-<time>` with mode 0600. It keeps
+the three newest copies and prunes older copies during install and cleanup.
 
 DNS changes use `systemctl reload systemd-resolved`, so rapid tray toggles do not
 restart the resolver or hit its start limit. The tray also applies a three

@@ -89,6 +89,7 @@ INSTALL_COMMITTED=0
 SERVICE_WAS_ACTIVE=0
 DNS_RESET_ENABLED=0
 CLIENT_ENABLED=0
+CONFIG_BAK_KEEP=3
 MANAGED_PATHS=(
     /etc/beam/config.json
     /etc/beam/allowed-user
@@ -114,6 +115,19 @@ backup_live() {
             cp -a "$src" "$dest"
         fi
     done
+}
+
+# Timestamp suffixes sort in time order. Keep the newest copies, including
+# the one made by this install, and prune older profiles with old secrets.
+prune_config_backups() {
+    local old name
+    old=$(find /etc/beam -maxdepth 1 -type f -name 'config.json.bak-*' \
+        -printf '%f\n' | sort | head -n -"$CONFIG_BAK_KEEP")
+    if [ -n "$old" ]; then
+        while IFS= read -r name; do
+            rm -f "/etc/beam/$name"
+        done <<< "$old"
+    fi
 }
 
 rollback_live() {
@@ -171,6 +185,7 @@ cleanup() {
     if [ -n "$NORMALIZED_CONFIG" ]; then
         rm -f "$NORMALIZED_CONFIG"
     fi
+    prune_config_backups || true
     if [ "$keep_backup" = "0" ] && [ -n "$BACKUP_DIR" ]; then
         rm -rf "$BACKUP_DIR"
     fi
@@ -259,6 +274,7 @@ fi
 
 if [ -f /etc/beam/config.json ]; then
     cp -a /etc/beam/config.json "/etc/beam/config.json.bak-$(date -u +%Y%m%dT%H%M%S%NZ)"
+    prune_config_backups
 fi
 install -m 0600 "$NORMALIZED_CONFIG" /etc/beam/config.json
 printf '%s\n' "$INSTALL_USER" > /etc/beam/allowed-user

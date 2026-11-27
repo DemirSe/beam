@@ -178,6 +178,42 @@ grep -qF 'stat -Lc %u "$CORE_DIR"' "$INSTALL" || {
   exit 1
 }
 
+# Repeated installs must not retain old profiles. Run the installer's own
+# prune function against a temporary directory.
+bak_dir="$TMP/config-bak"
+mkdir -p "$bak_dir"
+keep=$(sed -n 's/^CONFIG_BAK_KEEP=//p' "$INSTALL" | head -1 || true)
+[ "$keep" = 3 ] || {
+  echo "install.sh: no bounded config backup retention" >&2
+  exit 1
+}
+prune_body=$(sed -n '/^prune_config_backups() {/,/^}/p' "$INSTALL" |
+  sed "s|/etc/beam|$bak_dir|g")
+[ -n "$prune_body" ] || {
+  echo "install.sh: missing prune_config_backups" >&2
+  exit 1
+}
+CONFIG_BAK_KEEP="$keep"
+eval "$prune_body"
+for n in 01 02 03 04 05; do
+  printf 'profile %s\n' "$n" > "$bak_dir/config.json.bak-202601${n}T000000000Z"
+  chmod 0600 "$bak_dir/config.json.bak-202601${n}T000000000Z"
+done
+prune_config_backups
+count=$(find "$bak_dir" -maxdepth 1 -type f -name 'config.json.bak-*' | wc -l)
+[ "$count" -eq "$keep" ] || {
+  echo "install.sh: kept $count config backups, expected $keep" >&2
+  exit 1
+}
+[ -f "$bak_dir/config.json.bak-20260105T000000000Z" ] || {
+  echo "install.sh: pruned the newest pre-replace copy" >&2
+  exit 1
+}
+[ "$(stat -c %a "$bak_dir/config.json.bak-20260105T000000000Z")" = 600 ] || {
+  echo "install.sh: pruned copy changed mode" >&2
+  exit 1
+}
+
 # reload_resolved() execs this absolute path. The marker makes a reload fail.
 cat > "$BIN_DIR/systemctl" <<EOF
 #!/bin/sh
