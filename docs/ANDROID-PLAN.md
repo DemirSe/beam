@@ -21,7 +21,7 @@ directly by `beam-core`, `beam-tun`, and `beam-sys`.
 | **Split tunneling** | Phase 1: self-exclude (`addDisallowedApplication(packageName)`) + LAN/custom CIDR bypass (`excludeRoute` on API 33+, complement routes on API 31-32). Phase 2: user-selectable Per-App Proxy. |
 | **DNS / IPv6 / QUIC** | Mobile profile defaults: IPv4-only (`reject_ipv6 = true`, `dns.ipv4_only = true`, capturing `::/0` in `VpnService.Builder` so IPv6 never leaks in clear), built-in `beam-tun` DoH (NextDNS / Cloudflare / custom URL), UDP/443 fast-reject (`reject_quic = true`). All configurable in Settings. |
 | **Profile storage** | Android Keystore AES-256-GCM encrypted app-private storage, multi-profile support. |
-| **Battery / RAM profile** | `TcpStackConfig::mobile()` (128 flows, 1800 s idle, ~48 MiB native ceiling), `UdpBridgeConfig::mobile()` (128 NAT sessions, 60 s idle), `tcp_relay_idle_timeout: None`, 2–4 Tokio workers (`clamp(2, 4)`), zero WakeLocks, zero idle timers, zero background UI/notification polling, Always-on VPN + Kill-switch + `BOOT_COMPLETED`. |
+| **Battery / RAM profile** | `TcpStackConfig::mobile()` (128 flows, 1800 s idle, ~64 MiB native ceiling), `UdpBridgeConfig::mobile()` (128 NAT sessions, 60 s idle), `tcp_relay_idle_timeout: None`, 2–4 Tokio workers (`clamp(2, 4)`), zero WakeLocks, zero idle timers, zero background UI/notification polling, Always-on VPN + Kill-switch + `BOOT_COMPLETED`. |
 | **Build & test flow** | Both GitHub Actions CI (`.github/workflows/android-build.yml`) and local NDK/SDK setup (`scripts/android-setup-local.sh` + `scripts/android-build.sh`) for direct `adb` device testing/profiling. |
 
 ---
@@ -123,7 +123,9 @@ stateDiagram-v2
    Healthy 15-minute push sockets stay open without triggering costly cellular
    radio reconnect storms, while dead peers fail fast.
 4. **Strict RAM ceiling:** 128 TCP flows × 128 KiB × 2 directions = 32 MiB ring
-   buffer ceiling + ~16 MiB active relay scratch ≈ **48 MiB native ceiling**
+   buffer ceiling + at most 64 KiB of queued relay replies per flow (8 MiB) +
+   up to 64 KiB of retained bulk-upload coalesce capacity per flow (8 MiB) +
+   ~16 MiB active relay scratch ≈ **64 MiB native ceiling**
    inside the isolated `:vpn` process, preventing Android LMK kills.
 5. **Fast TUN & JNI hot paths:**
    - Tokio runtime capped at `available_parallelism().clamp(2, 4)` worker threads, `max_blocking_threads(4)`.

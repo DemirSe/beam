@@ -27,6 +27,16 @@ const MAX_INCOMING_PACKETS: usize = 2048;
 const MAX_INCOMING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OOO_SEGMENTS: usize = 256;
 const STREAM_CHANNEL_CAP: usize = 16;
+/// Reply-queue depth per flow on Android: 4 queued 16 KiB read buffers (64 KiB)
+/// bound transient RSS during bulk downloads.
+#[cfg(any(target_os = "android", test))]
+pub(crate) const ANDROID_S2C_STREAM_CHANNEL_CAP: usize = 4;
+/// Depth of the per-flow relay -> stack reply queue. Other targets keep 16 for
+/// write-syscall batching.
+#[cfg(target_os = "android")]
+pub(crate) const S2C_STREAM_CHANNEL_CAP: usize = ANDROID_S2C_STREAM_CHANNEL_CAP;
+#[cfg(not(target_os = "android"))]
+pub(crate) const S2C_STREAM_CHANNEL_CAP: usize = STREAM_CHANNEL_CAP;
 const RELAY_COALESCE_BYTES: usize = 64 * 1024;
 /// Upper bound on recycled outbound IP/TCP packet buffers held by [`ProxyTcpStack`].
 /// Capped at 128 entries <= 4096 B each (<= 512 KiB worst case, ~192 KiB at MTU).
@@ -669,7 +679,16 @@ impl TcpConn {
         if self.rcv_coalesce.is_empty() {
             return;
         }
-        let chunk = std::mem::take(&mut self.rcv_coalesce);
+        let chunk = if self.rcv_coalesce.len() >= RELAY_COALESCE_BYTES {
+            // Keep one full coalesce window allocated for the next upload
+            // instead of reallocating on every flushed bulk chunk.
+            std::mem::replace(
+                &mut self.rcv_coalesce,
+                Vec::with_capacity(RELAY_COALESCE_BYTES),
+            )
+        } else {
+            std::mem::take(&mut self.rcv_coalesce)
+        };
         self.pending_to_relay_bytes = self.pending_to_relay_bytes.saturating_add(chunk.len());
         self.pending_to_relay.push_back(chunk);
     }
@@ -1252,7 +1271,7 @@ impl NetStack for ProxyTcpStack {
                     && matches!(conn.state, TcpState::Established | TcpState::CloseWait)
                 {
                     let (to_relay_tx, to_relay_rx) = mpsc::channel(STREAM_CHANNEL_CAP);
-                    let (from_relay_tx, from_relay_rx) = mpsc::channel(STREAM_CHANNEL_CAP);
+                    let (from_relay_tx, from_relay_rx) = mpsc::channel(S2C_STREAM_CHANNEL_CAP);
                     let handle = Arc::new(FlowDirtyHandle::new(flow, Arc::clone(&self.dirty)));
                     let flow_waker: Arc<dyn FlowWaker> = Arc::clone(&handle) as Arc<dyn FlowWaker>;
                     conn.accepted = true;
@@ -1524,6 +1543,31 @@ mod tests {
         assert_eq!(chunk, b"helloworld");
         // OOO FIN must now have closed the reader cleanly (EOF).
         assert!(reader.recv_chunk().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn full_coalesce_window_keeps_its_capacity_while_a_small_flush_releases_it() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let (_srv_nxt, stream) = handshake(&mut stack, 1000);
+        let (mut reader, _writer) = stream.stream.into_split();
+        let conn = stack.conns.values_mut().next().expect("conn");
+
+        conn.rcv_coalesce = vec![0xab; RELAY_COALESCE_BYTES];
+        conn.flush_rcv_to_relay();
+        assert!(reader.try_recv_chunk().is_some(), "full window delivered");
+        assert!(
+            conn.rcv_coalesce.capacity() >= RELAY_COALESCE_BYTES,
+            "a full window must stay allocated for the next bulk chunk"
+        );
+
+        conn.rcv_coalesce = vec![0xcd; 1024];
+        conn.flush_rcv_to_relay();
+        assert!(reader.try_recv_chunk().is_some(), "partial chunk delivered");
+        assert_eq!(
+            conn.rcv_coalesce.capacity(),
+            0,
+            "a partial chunk must not pin a 64 KiB buffer"
+        );
     }
 
     #[test]

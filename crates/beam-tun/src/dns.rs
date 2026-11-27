@@ -1559,7 +1559,11 @@ impl DnsInterceptor {
             // lookup) recovers without waiting for TTL expiry. The spawn
             // keeps the TUN loop non-blocking; the reply below is sent
             // immediately from the already-cached answer.
-            if is_bypass_domain {
+            if is_bypass_domain
+                && self.dns_config.on_bypass_ips.is_some()
+                && let Ok(permit) = self.bypass_permits.clone().try_acquire_owned()
+            {
+                // Parse the cached reply only once a re-fire can actually run.
                 let (_, refire_ips) = parse_dns_response_meta(&cached);
                 // Best-effort re-fire: the shared `bypass_permits` semaphore
                 // bounds concurrent installs across the miss and hit paths,
@@ -1569,9 +1573,8 @@ impl DnsInterceptor {
                 // The install await is bounded by `BYPASS_ROUTE_TIMEOUT` so
                 // a hung `ip` cannot permanently pin a permit.
                 if !refire_ips.is_empty()
-                    && let Some(cb) = self.dns_config.on_bypass_ips.clone()
-                    && let Ok(permit) = self.bypass_permits.clone().try_acquire_owned()
                     && self.bypass_refire_limit.allow().is_some()
+                    && let Some(cb) = self.dns_config.on_bypass_ips.clone()
                 {
                     let qname = query.qname.clone();
                     tokio::spawn(async move {
