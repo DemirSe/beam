@@ -1,0 +1,147 @@
+name: windows-live-e2e
+
+# Manual-only live end-to-end test of the native Windows client on
+# windows-latest against a remote VPS. Reads the client link ONLY from the
+# Actions secret BEAM_LIVE_VLESS_LINK (never as an input, never logged) and
+# always restores runner connectivity via try/finally + uninstall.
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_logs_on_failure:
+        description: 'Upload client logs when the run fails'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-live-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-e2e:
+    name: Live E2E (packaged Windows client via VPS)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-live-e2e
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Ensure nasm and cmake (aws-lc-sys)
+        shell: pwsh
+        run: |
+          $nasmDir = 'C:\Program Files\NASM'
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress
+            if (Test-Path (Join-Path $nasmDir 'nasm.exe')) {
+              Add-Content -Path $env:GITHUB_PATH -Value $nasmDir
+            }
+          }
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            choco install cmake -y --no-progress
+          }
+          $env:PATH = "$nasmDir;C:\ProgramData\chocolatey\bin;$env:PATH"
+          nasm --version
+          cmake --version
+
+      - name: Rust release build (Windows MSVC release linking)
+        run: cargo build --release -p beam-client
+
+      - name: Build beam-tray.exe (rc + cl /W4 /WX)
+        shell: cmd
+        working-directory: clients\windows-tray
+        run: |
+          rc /nologo /fo app.res app.rc
+          cl /nologo /std:c11 /W4 /WX /O2 /DUNICODE /D_UNICODE main.c app.res /Fe:beam-tray.exe /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib gdi32.lib
+
+      - name: Download and verify WinTun 0.14.1 (amd64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wintunZip = Join-Path $env:RUNNER_TEMP 'wintun-0.14.1.zip'
+          $wintunDir = Join-Path $env:RUNNER_TEMP 'wintun-extract'
+          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $wintunZip
+          Expand-Archive -Path $wintunZip -DestinationPath $wintunDir -Force
+          $dll = Join-Path $wintunDir 'wintun\bin\amd64\wintun.dll'
+          if (-not (Test-Path $dll)) {
+            throw "wintun.dll not found at $dll"
+          }
+          $expected = 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce'
+          $actual = (Get-FileHash -Path $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "wintun.dll SHA-256 mismatch: got $actual, expected $expected"
+          }
+          Write-Host "Verified wintun.dll SHA-256: $actual"
+
+      - name: Package Windows client zip
+        shell: bash
+        env:
+          BEAM_WINDOWS_CLIENT_BIN: target/release/beam-client.exe
+          BEAM_WINDOWS_TRAY_BIN: clients/windows-tray/beam-tray.exe
+          BEAM_WINDOWS_WINTUN_DLL: ${{ runner.temp }}/wintun-extract/wintun/bin/amd64/wintun.dll
+          BEAM_RELEASE_OUT: ${{ runner.temp }}/windows-client-artifact
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/windows-client-artifact"
+          BEAM_RELEASE_COMMIT="$(git rev-parse --short=12 HEAD)"
+          export BEAM_RELEASE_COMMIT
+          bash scripts/release-windows-tray.sh | tee "$RUNNER_TEMP/windows-client-artifact/release-windows-tray.txt"
+
+      - name: Extract the packaged zip to a clean directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP 'windows-client-artifact') -Filter '*.zip' |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $zip) { throw 'packaged zip not found' }
+          $dest = Join-Path $env:RUNNER_TEMP 'windows-live-e2e\extracted'
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          New-Item -ItemType Directory -Path $dest | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          Get-ChildItem $dest
+
+      - name: Check the live secret is present (no value is logged)
+        shell: pwsh
+        env:
+          BEAM_LIVE_VLESS_LINK: ${{ secrets.BEAM_LIVE_VLESS_LINK }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:BEAM_LIVE_VLESS_LINK)) {
+            Write-Error 'BEAM_LIVE_VLESS_LINK is empty or unset. Set it in the repository secrets and re-dispatch.'
+            exit 1
+          }
+          if ($env:BEAM_LIVE_VLESS_LINK -notmatch '^vless://') {
+            Write-Error 'BEAM_LIVE_VLESS_LINK does not start with vless://.'
+            exit 1
+          }
+          Write-Host 'Live secret is present; starting the live end-to-end run.'
+
+      - name: Live end-to-end run (disconnects and uninstalls even on failure)
+        shell: pwsh
+        env:
+          BEAM_LIVE_VLESS_LINK: ${{ secrets.BEAM_LIVE_VLESS_LINK }}
+        run: |
+          $extracted = Join-Path $env:RUNNER_TEMP 'windows-live-e2e\extracted'
+          pwsh -NoProfile -File scripts/windows-live-e2e.ps1 -PackageDir $extracted
+
+      - name: Upload client logs on failure
+        if: failure() && inputs.keep_logs_on_failure
+        uses: actions/upload-artifact@v4
+        with:
+          name: beam-live-e2e-logs
+          path: C:\ProgramData\beam\*.log
+          if-no-files-found: warn
+          retention-days: 3
