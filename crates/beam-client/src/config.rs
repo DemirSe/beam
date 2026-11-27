@@ -91,6 +91,12 @@ pub struct TunSection {
     pub reject_ipv6: bool,
     #[serde(default = "default_true")]
     pub drop_private_destinations: bool,
+    /// Windows WFP kill-switch blocking non-bypassed physical traffic (no-op on Linux).
+    #[serde(default = "default_true")]
+    pub strict_kill_switch: bool,
+    /// Automatically connect when the Windows Service starts (no-op on Linux).
+    #[serde(default = "default_true")]
+    pub auto_connect: bool,
 }
 
 impl Default for TunSection {
@@ -103,6 +109,8 @@ impl Default for TunSection {
             reject_quic: true,
             reject_ipv6: false,
             drop_private_destinations: true,
+            strict_kill_switch: true,
+            auto_connect: true,
         }
     }
 }
@@ -188,6 +196,12 @@ impl Default for LogSection {
     }
 }
 
+/// WinTun adapter alias on Windows; the kernel-style interface name elsewhere.
+#[cfg(windows)]
+fn default_tun_name() -> String {
+    "Beam".to_owned()
+}
+#[cfg(not(windows))]
 fn default_tun_name() -> String {
     "beamtun0".to_owned()
 }
@@ -248,6 +262,10 @@ pub struct ValidatedConfig {
     pub tun_dns_peer: Option<Ipv4Addr>,
     pub mtu: usize,
     pub auto_route: bool,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub strict_kill_switch: bool,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub auto_connect: bool,
     pub log_level: String,
     pub server_ip: IpAddr,
     pub fixed_local_dns: Option<IpAddr>,
@@ -447,6 +465,8 @@ impl ClientFileConfig {
             tun_dns_peer,
             mtu: self.tun.mtu,
             auto_route: self.tun.auto_route,
+            strict_kill_switch: self.tun.strict_kill_switch,
+            auto_connect: self.tun.auto_connect,
             log_level: self.log.level,
             server_ip,
             fixed_local_dns,
@@ -482,10 +502,12 @@ fn parse_dns_socket_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
     Ok(sock)
 }
 
-/// Auto-detects the host's pre-VPN local DNS server from systemd-resolved's
-/// upstream resolv.conf or `/etc/resolv.conf`, skipping loopback stubs and any
-/// address inside `exclude_tun_net` (or the IPv6 TUN subnet `fd00:be:a::/126`)
-/// so `systemd-resolved`'s per-link TUN DNS never self-poisons `local_upstream`.
+/// Auto-detects the host's pre-VPN local DNS server, skipping loopback stubs and
+/// any address inside `exclude_tun_net` (or the IPv6 TUN subnet `fd00:be:a::/126`)
+/// so the TUN's own DNS never self-poisons `local_upstream`.
+///
+/// Linux reads systemd-resolved's upstream resolv.conf or `/etc/resolv.conf`.
+#[cfg(not(windows))]
 pub fn detect_system_local_dns_excluding(exclude_tun_net: Option<IpNet>) -> Option<SocketAddr> {
     for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
         if let Ok(content) = std::fs::read_to_string(path)
@@ -497,10 +519,25 @@ pub fn detect_system_local_dns_excluding(exclude_tun_net: Option<IpNet>) -> Opti
     None
 }
 
+/// Windows asks the IP Helper API for the first usable adapter DNS server.
+/// `exclude_luid = 0` matches no real adapter LUID, so every up adapter counts.
+#[cfg(windows)]
+pub fn detect_system_local_dns_excluding(exclude_tun_net: Option<IpNet>) -> Option<SocketAddr> {
+    let exclude_v4_net = match exclude_tun_net {
+        Some(IpNet::V4 { net, mask }) => Some((Ipv4Addr::from(net), mask.leading_ones() as u8)),
+        _ => None,
+    };
+    beam_sys::windows::iphelper::detect_system_local_dns(0, exclude_v4_net)
+        .ok()
+        .flatten()
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 fn is_tun_ipv6(ip: IpAddr) -> bool {
     TUN_V6_NET.contains(ip)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_resolv_conf_nameserver(
     content: &str,
     exclude_tun_net: Option<IpNet>,
@@ -627,6 +664,30 @@ mod tests {
         );
         let cfg = ClientFileConfig::parse_and_validate(&raw).expect("drop_private=false valid");
         assert!(!cfg.engine.route.drop_private_destinations);
+    }
+
+    #[test]
+    fn windows_tun_flags_default_true_and_accept_explicit_false() {
+        // The example omits both keys, so Windows-only tun flags default to on.
+        let cfg = ClientFileConfig::parse_and_validate(EXAMPLE).expect("example config valid");
+        assert!(cfg.strict_kill_switch);
+        assert!(cfg.auto_connect);
+        assert!(TunSection::default().strict_kill_switch);
+        assert!(TunSection::default().auto_connect);
+
+        // Explicit `false` parses and reaches the validated config.
+        let raw = EXAMPLE.replace(
+            "reject_ipv6 = false",
+            "reject_ipv6 = false\nstrict_kill_switch = false\nauto_connect = false",
+        );
+        let cfg = ClientFileConfig::parse_and_validate(&raw).expect("explicit false valid");
+        assert!(!cfg.strict_kill_switch);
+        assert!(!cfg.auto_connect);
+
+        assert_eq!(
+            default_tun_name(),
+            if cfg!(windows) { "Beam" } else { "beamtun0" }
+        );
     }
 
     #[test]

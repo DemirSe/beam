@@ -18,7 +18,17 @@ pub use socket::{
 };
 
 use std::io;
+use std::path::Path;
 use std::time::Duration;
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    SetNamedSecurityInfoW,
+};
+use windows_sys::Win32::Security::{
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR,
+};
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime;
 
@@ -95,6 +105,90 @@ pub fn boottime_offset() -> io::Result<Duration> {
 pub fn compute_boottime_offset(tick_ms: u64, unbiased_100ns: u64) -> Duration {
     let uptime_ms = unbiased_100ns / 10_000;
     Duration::from_millis(tick_ms.saturating_sub(uptime_ms))
+}
+
+/// Restricts a file or directory's DACL to `SYSTEM` and `Administrators`
+/// (`D:P(A;;FA;;;SY)(A;;FA;;;BA)`), stripping all inherited permissions.
+///
+/// Used before renaming a newly written `client.toml` into place so secret
+/// material is never readable by non-administrator local accounts.
+pub fn set_file_admin_only_acl(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    let sddl: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;BA)\0".encode_utf16().collect();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `sddl` is a valid NUL-terminated UTF-16 string and `sd` is a live
+    // out-pointer. On success Windows allocates `sd` via `LocalAlloc`, which is
+    // freed unconditionally via `LocalFree` before this function returns.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &raw mut sd,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 || sd.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+
+    struct LocalSd(PSECURITY_DESCRIPTOR);
+    impl Drop for LocalSd {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` was allocated by
+            // `ConvertStringSecurityDescriptorToSecurityDescriptorW` and is
+            // freed exactly once here.
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+    let _guard = LocalSd(sd);
+
+    let mut dacl_present = 0_i32;
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut dacl_defaulted = 0_i32;
+    // SAFETY: `sd` is a valid self-relative security descriptor alive for the
+    // duration of `_guard`; `dacl` receives an interior pointer into `sd`.
+    let got_dacl = unsafe {
+        GetSecurityDescriptorDacl(
+            sd,
+            &raw mut dacl_present,
+            &raw mut dacl,
+            &raw mut dacl_defaulted,
+        )
+    };
+    if got_dacl == 0 || dacl_present == 0 || dacl.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide_path.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains interior NUL",
+        ));
+    }
+    wide_path.push(0);
+
+    // SAFETY: `wide_path` is a live NUL-terminated mutable UTF-16 buffer and
+    // `dacl` is a valid ACL inside `sd` (alive until `_guard` drops).
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            dacl,
+            ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

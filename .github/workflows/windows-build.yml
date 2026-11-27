@@ -1,8 +1,9 @@
 name: windows-build
 
-# Windows/MSVC build, clippy, and unit-test gate for the cross-platform core
-# crates (`beam-sys`, `beam-core`, `beam-tun`). `beam-client` and `windows-tray`
-# will be added in later phases once their Windows backends land.
+# Windows/MSVC build, clippy, and unit-test gate for `beam-sys`, `beam-core`,
+# `beam-tun`, and `beam-client`. `windows-tray` will be added in phase 4 once its
+# Win32 sources land. The release build step proves MSVC release linking, which
+# the debug-only clippy and test steps do not cover.
 
 on:
   push:
@@ -11,6 +12,7 @@ on:
       - 'crates/beam-sys/**'
       - 'crates/beam-core/**'
       - 'crates/beam-tun/**'
+      - 'crates/beam-client/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -21,6 +23,7 @@ on:
       - 'crates/beam-sys/**'
       - 'crates/beam-core/**'
       - 'crates/beam-tun/**'
+      - 'crates/beam-client/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -74,7 +77,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Rust clippy (Windows MSVC)
-        run: cargo clippy -p beam-sys -p beam-core -p beam-tun --all-targets -- -D warnings
+        run: cargo clippy -p beam-sys -p beam-core -p beam-tun -p beam-client --all-targets -- -D warnings
 
       - name: Rust tests (Windows MSVC)
-        run: cargo test -p beam-sys -p beam-core -p beam-tun -- -q
+        run: cargo test -p beam-sys -p beam-core -p beam-tun -p beam-client -- -q
+
+      - name: Rust release build (Windows MSVC release linking)
+        run: cargo build --release -p beam-client
