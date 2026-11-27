@@ -659,11 +659,14 @@ impl LinuxRouteGuard {
                 if v4.is_link_local() || v4.is_broadcast() {
                     return;
                 }
-                if let Some(pos) = self.dynamic_bypass_v4.iter().position(|(a, _)| *a == v4) {
-                    self.dynamic_bypass_v4.remove(pos);
-                    self.dynamic_bypass_v4.push_back((v4, now));
-                    return;
-                }
+                let was_tracked =
+                    if let Some(pos) = self.dynamic_bypass_v4.iter().position(|(a, _)| *a == v4) {
+                        self.dynamic_bypass_v4.remove(pos);
+                        self.dynamic_bypass_v4.push_back((v4, now));
+                        true
+                    } else {
+                        false
+                    };
                 // Private RFC1918 destinations are only dynamically bypassed
                 // when an active physical IPv4 gateway exists (and pre-existing
                 // exact routes are never overwritten).
@@ -672,8 +675,10 @@ impl LinuxRouteGuard {
                         debug!(%v4, "skipping private dynamic bypass.domains IP without IPv4 gateway");
                         return;
                     }
-                    self.evict_v4(now, true);
-                    self.dynamic_bypass_v4.push_back((v4, now));
+                    if !was_tracked {
+                        self.evict_v4(now, true);
+                        self.dynamic_bypass_v4.push_back((v4, now));
+                    }
                     return;
                 };
                 self.evict_v4(now, true);
@@ -686,14 +691,18 @@ impl LinuxRouteGuard {
                     }
                     RouteCheck::Error(_) => {
                         debug!(prefix = %host, "route state unknown; deferring bypass.domains install to the retry path");
-                        self.dynamic_bypass_v4.push_back((v4, now));
+                        if !was_tracked {
+                            self.dynamic_bypass_v4.push_back((v4, now));
+                        }
                         return;
                     }
                 }
                 match install_v4_bypass(&host, maybe_gw.as_deref(), &dev) {
                     Ok(()) => {
                         info!(prefix = %host, via = ?maybe_gw, dev = %dev, "installed dynamic bypass.domains route");
-                        self.dynamic_bypass_v4.push_back((v4, now));
+                        if !was_tracked {
+                            self.dynamic_bypass_v4.push_back((v4, now));
+                        }
                         self.extra_bypass_v4.push((host, maybe_gw, dev));
                         self.persist_routes_state();
                     }
@@ -706,18 +715,23 @@ impl LinuxRouteGuard {
                 if v6.is_unicast_link_local() {
                     return;
                 }
-                if let Some(pos) = self.dynamic_bypass_v6.iter().position(|(a, _)| *a == v6) {
-                    self.dynamic_bypass_v6.remove(pos);
-                    self.dynamic_bypass_v6.push_back((v6, now));
-                    return;
-                }
+                let was_tracked =
+                    if let Some(pos) = self.dynamic_bypass_v6.iter().position(|(a, _)| *a == v6) {
+                        self.dynamic_bypass_v6.remove(pos);
+                        self.dynamic_bypass_v6.push_back((v6, now));
+                        true
+                    } else {
+                        false
+                    };
                 let Some((maybe_gw, dev)) = self.current_gw.v6.clone() else {
                     if v6.is_unique_local() {
                         debug!(%v6, "skipping ULA dynamic bypass.domains IP without IPv6 gateway");
                         return;
                     }
-                    self.evict_v6(now, true);
-                    self.dynamic_bypass_v6.push_back((v6, now));
+                    if !was_tracked {
+                        self.evict_v6(now, true);
+                        self.dynamic_bypass_v6.push_back((v6, now));
+                    }
                     return;
                 };
                 self.evict_v6(now, true);
@@ -730,14 +744,18 @@ impl LinuxRouteGuard {
                     }
                     RouteCheck::Error(_) => {
                         debug!(prefix = %host, "route state unknown; deferring bypass.domains install to the retry path");
-                        self.dynamic_bypass_v6.push_back((v6, now));
+                        if !was_tracked {
+                            self.dynamic_bypass_v6.push_back((v6, now));
+                        }
                         return;
                     }
                 }
                 match install_v6_bypass(&host, maybe_gw.as_deref(), &dev) {
                     Ok(()) => {
                         info!(prefix = %host, via = ?maybe_gw, dev = %dev, "installed dynamic bypass.domains route");
-                        self.dynamic_bypass_v6.push_back((v6, now));
+                        if !was_tracked {
+                            self.dynamic_bypass_v6.push_back((v6, now));
+                        }
                         self.extra_bypass_v6.push((host, maybe_gw, dev));
                         self.persist_routes_state();
                     }
@@ -2086,6 +2104,59 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
             "the unresolved IP must stay tracked for the retry path"
         );
         assert!(guard.extra_bypass_v4.is_empty());
+    }
+
+    #[test]
+    fn dynamic_bypass_refresh_retries_deferred_install() {
+        let dir = test_dir("dynamic-lookup-retry");
+        let log = dir.join("ip.log");
+        let error = dir.join("error");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$*\" in\n\
+                   *\"route show exact\"*) [ -f \"{}\" ] && {{ echo transient >&2; exit 2; }}; exit 0 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log.display(),
+                error.display(),
+            ),
+        );
+        std::fs::write(&error, b"1").expect("mark lookup errors");
+        let mut guard = route_guard_for_tests();
+        let ip = Ipv4Addr::new(203, 0, 113, 77);
+
+        guard.install_dynamic_bypass_ip(IpAddr::V4(ip));
+        assert_eq!(
+            guard
+                .dynamic_bypass_v4
+                .iter()
+                .filter(|(a, _)| *a == ip)
+                .count(),
+            1,
+            "the unresolved IP must stay tracked once"
+        );
+
+        std::fs::remove_file(&error).expect("clear lookup error");
+        guard.install_dynamic_bypass_ip(IpAddr::V4(ip));
+
+        let log = read_fake_ip_log(&fake.log_path());
+        assert!(
+            log.contains("route replace 203.0.113.77/32"),
+            "a DNS refresh must retry the deferred install: {log}"
+        );
+        assert_eq!(
+            guard
+                .dynamic_bypass_v4
+                .iter()
+                .filter(|(a, _)| *a == ip)
+                .count(),
+            1,
+            "the retry must not duplicate the tracked IP"
+        );
+        assert_eq!(guard.dynamic_bypass_v4.len(), 1);
     }
 
     #[test]
