@@ -138,9 +138,10 @@ using System.Net.Sockets;
 using System.Text;
 public static class BeamBoundDns
 {
-    // Tri-state: 1 = the query reached the resolver or something answered on
-    // the wire (a leak), 0 = no reply inside the timeout (blocked), -1 = the
-    // probe itself could not run, so nothing is proven either way.
+    // Tri-state plus: 1 = the queried server answered on the wire (a leak),
+    // 0 = no reply inside the timeout (blocked), 2 = an answer arrived from a
+    // different peer, so the socket was not pinned, 3 = stray/unrelated
+    // datagram, -1 = the probe itself could not run.
     public static int TryBoundQuery(string serverIp, int ifIndex, string localIp, string name, int timeoutMs)
     {
         Socket sock = null;
@@ -192,10 +193,24 @@ public static class BeamBoundDns
             // so a receive error still proves the packet reached the wire.
             try { n = sock.ReceiveFrom(buf, ref from); }
             catch { return 1; }
-            if (n < 12) { return 1; }
-            if (buf[0] != 0x42) { return 1; }
-            if (buf[1] != 0x42) { return 1; }
-            return 1;
+            if (n < 12) { return 3; }
+            // Only a reply carrying our transaction ID and question section
+            // counts; anything else is a stray datagram, not an answer.
+            if (buf[0] != 0x42) { return 3; }
+            if (buf[1] != 0x42) { return 3; }
+            if (n < query.Length) { return 3; }
+            int k = 12;
+            while (k < query.Length)
+            {
+                if (buf[k] != query[k]) { return 3; }
+                k = k + 1;
+            }
+            IPEndPoint answerFrom = from as IPEndPoint;
+            if (answerFrom == null) { return 1; }
+            // Same peer means the packet left the physical interface: a leak.
+            // A different peer means the socket was not pinned as requested.
+            if (answerFrom.Address.Equals(server)) { return 1; }
+            return 2;
         }
         catch { return -1; }
         finally
@@ -455,6 +470,7 @@ function Test-DnsLeak {
         Ensure-BoundDnsType
         $deadline = [DateTime]::UtcNow.AddSeconds($script:CheckTimeoutSec)
         $leaked = $false
+        $unpinned = $false
         $blocked = 0
         $probeErrors = 0
         foreach ($entry in $physProbes) {
@@ -464,6 +480,7 @@ function Test-DnsLeak {
                 # query to the physical NIC so WinTun split routes cannot answer.
                 $rc = [BeamBoundDns]::TryBoundQuery([string]$entry['Server'], [int]$entry['IfIndex'], [string]$entry['LocalIp'], $DualStackName, 3000)
                 if ($rc -eq 1) { $leaked = $true; break }
+                if ($rc -eq 2) { $unpinned = $true; break }
                 if ($rc -eq 0) { $blocked = $blocked + 1 } else { $probeErrors = $probeErrors + 1 }
             } catch {
                 $probeErrors = $probeErrors + 1
@@ -471,6 +488,10 @@ function Test-DnsLeak {
         }
         if ($leaked) {
             Add-Check 'dns_leak' 'fail' 'plaintext_dns_answered_bound_probe'
+            return
+        }
+        if ($unpinned) {
+            Add-Check 'dns_leak' 'skip' 'probe_not_pinned'
             return
         }
         # A probe that could not run proves nothing: never report it as blocked.
@@ -799,6 +820,19 @@ try {
     # Exception text is ours or the sanitized server reply; never secret-bearing.
     Write-Host ("live_checks_error=" + $fatalError)
 } finally {
+    # Preserve the service log before uninstall deletes %ProgramData%\beam, so a
+    # failing run still carries WFP/route evidence. Best effort, bounded.
+    try {
+        $logDir = Join-Path $env:RUNNER_TEMP 'beam-logs'
+        $null = New-Item -ItemType Directory -Path $logDir -Force -ErrorAction SilentlyContinue
+        $dataDir = Join-Path $env:ProgramData 'beam'
+        if (Test-Path -LiteralPath $dataDir) {
+            Copy-Item -Path (Join-Path $dataDir '*.log') -Destination $logDir -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host 'logs_preserved=true'
+    } catch {
+        Write-Host 'logs_preserved=false'
+    }
     # ALWAYS restore runner connectivity: disconnect, uninstall, verify cleanup.
     try {
         $null = Invoke-Ipc -Line 'DISCONNECT'

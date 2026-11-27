@@ -13,11 +13,15 @@
     min/max range across rounds, plus per-round curl exit and HTTP codes.
     A per-round failure records 'fail' for that round and the run continues.
 
-    Per round and per client: one 25 MB warm-up download is discarded, then a
-    fixed 100 MB measured download reports Mbps. CPU seconds (process
-    TotalProcessorTime delta over the measured round) separate a CPU-bound gap
-    from a receive-window-bound gap. Beam drops come from the secret-free
-    STATUS drops token ('none' when absent); sing-box reports 'n/a'.
+    Per round and per client: one 10 MB warm-up download is discarded, then a
+    fixed 50 MB measured transfer (two 25 MB chunks in one timing window)
+    reports Mbps. Volume is deliberately bounded because the provider answers
+    burst traffic with HTTP 429. CPU seconds (process TotalProcessorTime delta
+    over the measured transfer) separate a CPU-bound gap from a per-flow gap.
+    Beam drops come from the secret-free STATUS drops token ('none' when
+    absent); sing-box reports 'n/a'. With -MultiFlow, four concurrent 10 MB
+    transfers also report an aggregate multi4_mbps, which shows whether a limit
+    is per flow or shared.
 
     Run 1 (beam-client.exe): packaged zip + install.ps1 + Named Pipe flow, same
     as scripts/windows-live-e2e.ps1 (async NamedPipeClientStream timeout,
@@ -35,7 +39,7 @@
 
 .EXAMPLE
     $env:BEAM_LIVE_VLESS_LINK = 'vless://...'
-    pwsh -File scripts/windows-vs-singbox.ps1 -PackageDir C:\extracted-zip -SingboxExe C:\tools\sing-box.exe -CompareSingbox -Rounds 3
+    pwsh -File scripts/windows-vs-singbox.ps1 -PackageDir C:\extracted-zip -SingboxExe C:\tools\sing-box.exe -CompareSingbox -Rounds 3 -MultiFlow
 #>
 
 [CmdletBinding()]
@@ -43,6 +47,7 @@ param(
     [string]$PackageDir = (Join-Path $env:RUNNER_TEMP 'windows-live-e2e\extracted'),
     [string]$SingboxExe = '',
     [switch]$CompareSingbox,
+    [switch]$MultiFlow,
     [int]$Rounds = 3
 )
 
@@ -53,10 +58,20 @@ $ServiceName = 'BeamClient'
 $PipeName = 'beam-client-ipc'
 $IpifyUrl = 'https://api.ipify.org'
 $TtfbUrl = 'https://1.1.1.1/cdn-cgi/trace'
-$DownUrlWarm = 'https://speed.cloudflare.com/__down?bytes=25000000'
-# Measured download is 4 chunks of the working 25 MB URL (100 MB total).
-$DownChunks = 4
+$DownUrlBase = 'https://speed.cloudflare.com/__down?bytes='
+# The provider rate-limits bursts (HTTP 429), so the measured transfer is two
+# 25 MB chunks (50 MB) and the warm-up is 10 MB: enough for a clean median at
+# multi-hundred-Mbps aggregate volume stays under the observed limit.
+$DownWarmBytes = 10000000
+$DownChunks = 2
 $DownChunkBytes = 25000000
+# Optional per-flow vs shared-limit probe (4 concurrent 10 MB transfers).
+$MultiFlows = 4
+$MultiChunkBytes = 10000000
+$script:MultiFlowEnabled = $false
+if ($MultiFlow) { $script:MultiFlowEnabled = $true }
+$DownUrlWarm = $DownUrlBase + [string]$DownWarmBytes
+$DownUrlWarmShort = $DownUrlBase + [string]$MultiChunkBytes
 
 function Get-MedianDouble {
     param([double[]]$Values)
@@ -202,7 +217,7 @@ $script:LastMulti4CurlExit = -1
 $script:LastMulti4HttpCode = 'n/a'
 
 function Invoke-DownloadWarmup {
-    # Discarded 25 MB request that warms the path before the measured one.
+    # Discarded 10 MB request that warms the path before the measured one.
     # Never throws, never reports; bounded so a stall cannot hang the round.
     try {
         $null = & curl.exe -sS -o NUL -w '%{http_code}' --max-time 30 $DownUrlWarm 2>$null
@@ -239,11 +254,13 @@ function Measure-DownloadMbps {
 }
 
 function Measure-Multi4DownloadMbps {
-    # Four concurrent 25 MB transfers (one curl.exe each), timed as one group.
-    # Aggregate is 100 MB over wall time; any non-2xx or non-zero exit fails.
+    # Four concurrent 10 MB transfers (one curl.exe each), timed as one group.
+    # Aggregate is flows x chunk over wall time; any non-2xx or non-zero exit
+    # fails. Off unless -MultiFlow is passed.
     $script:LastMulti4CurlExit = -1
     $script:LastMulti4HttpCode = 'n/a'
-    $flows = 4
+    if (-not $script:MultiFlowEnabled) { return 'n/a' }
+    $flows = $MultiFlows
     $tmpFiles = @()
     $procs = @()
     try {
@@ -253,7 +270,7 @@ function Measure-Multi4DownloadMbps {
         }
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         for ($i = 0; $i -lt $flows; $i++) {
-            $p = Start-Process -FilePath 'curl.exe' -ArgumentList @('-sS', '-o', 'NUL', '-w', '%{http_code}', '--max-time', '60', $DownUrlWarm) -NoNewWindow -PassThru -RedirectStandardOutput $tmpFiles[$i]
+            $p = Start-Process -FilePath 'curl.exe' -ArgumentList @('-sS', '-o', 'NUL', '-w', '%{http_code}', '--max-time', '60', $DownUrlWarmShort) -NoNewWindow -PassThru -RedirectStandardOutput $tmpFiles[$i]
             $procs += $p
         }
         $allExited = $true
@@ -305,7 +322,7 @@ function Measure-Multi4DownloadMbps {
         if ($anyFail) { return 'fail' }
         $secs = $sw.Elapsed.TotalSeconds
         if ($secs -le 0) { return 'fail' }
-        $totalBytes = [double]$flows * [double]$DownChunkBytes
+        $totalBytes = [double]$flows * [double]$MultiChunkBytes
         $mbps = $totalBytes * 8.0 / $secs / 1000000.0
         if ($mbps -le 0) { return 'fail' }
         return ([math]::Round($mbps, 1)).ToString('F1', $inv)
