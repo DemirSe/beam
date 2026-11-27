@@ -3,10 +3,11 @@
     Live behavioral verification for the native Windows client (Phase 6).
 
 .DESCRIPTION
-    Full lifecycle around five fail-closed behavioral checks, run while the
+    Full lifecycle around six fail-closed behavioral checks, run while the
     packaged client from scripts/release-windows-tray.sh is installed and
     connected to the VPS from BEAM_LIVE_VLESS_LINK:
-      route_fail_closed, dns_leak, ipv6_egress, service_restart, crash_recovery.
+      route_fail_closed, dns_leak, ipv6_egress, service_restart, crash_recovery,
+      hang_recovery.
 
     Each check prints exactly one line:
       check=<name> result=pass|fail|skip detail=<token>
@@ -31,7 +32,8 @@
 param(
     [string]$PackageDir = (Join-Path $env:RUNNER_TEMP 'windows-live-e2e\extracted'),
     [int]$ConnectTimeoutSec = 30,
-    [int]$CheckTimeoutSec = 60
+    [int]$CheckTimeoutSec = 60,
+    [int]$HangTimeoutSec = 90
 )
 
 Set-StrictMode -Version Latest
@@ -44,7 +46,9 @@ $DualStackName = 'example.com'
 $HttpsProbeUrl = 'https://example.com'
 
 $script:VpsIpv4 = ''
+$script:RealLink = ''
 $script:CheckTimeoutSec = $CheckTimeoutSec
+$script:HangTimeoutSec = $HangTimeoutSec
 # Positive control for the DNS leak check, keyed "<ifIndex>|<target>" and
 # measured before the tunnel is up. Only controlled tuples can prove a block.
 $script:ControlResults = @{}
@@ -768,6 +772,169 @@ function Test-CrashRecovery {
     }
 }
 
+function Test-HangRecovery {
+    # Proves the health path notices a client that stays alive but can never
+    # finish a handshake, then proves the tunnel recovers on the real link.
+    # A synthetic TEST-NET-1 server (192.0.2.1, same port and REALITY params
+    # as the real link) is imported, CONNECTed, and polled for a bounded
+    # window: STATUS must leave `connected` with a failure reason or a
+    # dial_failures signal, the service process must stay alive, and its CPU
+    # delta must stay bounded (a retry spin would burn about one core, near
+    # the wall-clock seconds, while backoff dials cost far less). The real
+    # link is then re-imported and must return to `connected` with VPS egress.
+    # Only the 192.0.2.1 literal is ever printed; both links stay secret.
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($null -eq $svc) {
+        Add-Check 'hang_recovery' 'skip' 'no_service'
+        return
+    }
+    try {
+        $null = Read-Status
+    } catch {
+        Add-Check 'hang_recovery' 'skip' 'no_ipc'
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($script:RealLink)) {
+        Add-Check 'hang_recovery' 'skip' 'no_link'
+        return
+    }
+    $lm = [regex]::Match($script:RealLink, '^vless://([^@]+)@(\[[^\]]+\]|[^:/?#]+)(.*)$')
+    if (-not $lm.Success) {
+        Add-Check 'hang_recovery' 'skip' 'synthetic_build_failed'
+        return
+    }
+    $synthetic = 'vless://' + $lm.Groups[1].Value + '@192.0.2.1' + $lm.Groups[3].Value
+    if (($synthetic -eq $script:RealLink) -or ($synthetic -notmatch '^vless://')) {
+        Add-Check 'hang_recovery' 'skip' 'synthetic_build_failed'
+        return
+    }
+    Write-Host 'synthetic_host=192.0.2.1'
+    try {
+        # Setup: back on the real link first, so the hang starts from connected.
+        $setupImport = Invoke-Ipc -Line ('IMPORT_LINK ' + $script:RealLink)
+        if (-not $setupImport.StartsWith('OK ')) {
+            Add-Check 'hang_recovery' 'skip' 'setup_import_rejected'
+            return
+        }
+        $setupConn = Invoke-Ipc -Line 'CONNECT'
+        if (-not $setupConn.StartsWith('OK ')) {
+            Add-Check 'hang_recovery' 'skip' 'setup_connect_rejected'
+            return
+        }
+        if (-not (Wait-Connected -TimeoutSec $ConnectTimeoutSec)) {
+            Add-Check 'hang_recovery' 'skip' 'not_connected'
+            return
+        }
+        $baseDial = [uint64]0
+        try {
+            $baseSt = Read-Status
+            if ($null -ne $baseSt['dial_failures']) {
+                $baseDial = [uint64]([string]$baseSt['dial_failures'])
+            }
+        } catch {
+            $baseDial = [uint64]0
+        }
+        # Hang: the client starts, dials TEST-NET-1, and can never finish.
+        $synImport = Invoke-Ipc -Line ('IMPORT_LINK ' + $synthetic)
+        if (-not $synImport.StartsWith('OK ')) {
+            Add-Check 'hang_recovery' 'skip' 'synthetic_import_rejected'
+            return
+        }
+        $synConn = Invoke-Ipc -Line 'CONNECT'
+        if (-not $synConn.StartsWith('OK ')) {
+            Add-Check 'hang_recovery' 'skip' 'synthetic_connect_rejected'
+            return
+        }
+        $cpuBefore = 0.0
+        try {
+            foreach ($p in @(Get-Process -Name 'beam-client' -ErrorAction SilentlyContinue)) {
+                try { $cpuBefore += $p.TotalProcessorTime.TotalSeconds } catch {
+                }
+            }
+        } catch {
+        }
+        $deadline = [DateTime]::UtcNow.AddSeconds($script:HangTimeoutSec)
+        $leftConnected = $false
+        $failReason = ''
+        $dialAfter = $baseDial
+        while ([DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Seconds 3
+            try {
+                $st = Read-Status
+                if ([string]$st['state'] -ne 'connected') { $leftConnected = $true }
+                try { $dialAfter = [uint64]([string]$st['dial_failures']) } catch {
+                }
+                $r = [string]$st['reason']
+                if (($r -eq 'dial_failures') -or ($r -eq 'probe_failed') -or ($r -eq 'no_gateway')) {
+                    $failReason = $r
+                }
+                if ($leftConnected -and (($failReason -ne '') -or ($dialAfter -gt $baseDial))) { break }
+            } catch {
+            }
+        }
+        $hangFail = ''
+        if (-not $leftConnected) {
+            $hangFail = 'stayed_connected'
+        } elseif (($failReason -eq '') -and ($dialAfter -eq $baseDial)) {
+            # No failure reason and a motionless counter prove nothing.
+            $hangFail = 'no_failure_signal'
+        } else {
+            $aliveProcs = @(Get-Process -Name 'beam-client' -ErrorAction SilentlyContinue)
+            $svcNow = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            $alive = ($aliveProcs.Count -gt 0) -or (($null -ne $svcNow) -and ($svcNow.Status -eq 'Running'))
+            if (-not $alive) {
+                $hangFail = 'service_died'
+            } else {
+                $cpuAfter = 0.0
+                foreach ($p in $aliveProcs) {
+                    try { $cpuAfter += $p.TotalProcessorTime.TotalSeconds } catch {
+                    }
+                }
+                $cpuDelta = $cpuAfter - $cpuBefore
+                if ($cpuDelta -lt 0) { $cpuDelta = 0 }
+                Write-Host ('hang_cpu_delta_sec=' + [string][math]::Round($cpuDelta, 1))
+                if ($cpuDelta -ge 30) { $hangFail = 'cpu_spin' }
+            }
+        }
+        if ($hangFail -ne '') {
+            try {
+                $null = Invoke-Ipc -Line ('IMPORT_LINK ' + $script:RealLink)
+                $null = Invoke-Ipc -Line 'CONNECT'
+            } catch {
+            }
+            Add-Check 'hang_recovery' 'fail' $hangFail
+            return
+        }
+        # Recovery: the real link must come back with VPS egress.
+        $recImport = Invoke-Ipc -Line ('IMPORT_LINK ' + $script:RealLink)
+        if (-not $recImport.StartsWith('OK ')) {
+            Add-Check 'hang_recovery' 'fail' 'reimport_failed'
+            return
+        }
+        $recConn = Invoke-Ipc -Line 'CONNECT'
+        if (-not $recConn.StartsWith('OK ')) {
+            Add-Check 'hang_recovery' 'fail' 'reconnect_rejected'
+            return
+        }
+        if (-not (Wait-Connected -TimeoutSec $script:CheckTimeoutSec)) {
+            Add-Check 'hang_recovery' 'fail' 'not_recovered'
+            return
+        }
+        $egress = Get-PublicIpv4
+        if ($egress -eq '') {
+            Add-Check 'hang_recovery' 'fail' 'egress_unreachable'
+            return
+        }
+        if (($script:VpsIpv4 -ne '') -and ($egress -ne $script:VpsIpv4)) {
+            Add-Check 'hang_recovery' 'fail' 'egress_not_vps'
+            return
+        }
+        Add-Check 'hang_recovery' 'pass' 'ok'
+    } catch {
+        Add-Check 'hang_recovery' 'fail' 'check_error'
+    }
+}
+
 try {
     $link = $env:BEAM_LIVE_VLESS_LINK
     if ([string]::IsNullOrWhiteSpace($link)) {
@@ -794,6 +961,7 @@ try {
     }
     if ($vpsHost -ne '') { Write-Host ("::add-mask::" + $vpsHost); $script:RedactList += $vpsHost }
     $script:RedactList += $link
+    $script:RealLink = $link
     $resolvedVps = ''
     if ($vpsHost -match '^\d{1,3}(\.\d{1,3}){3}$') {
         $resolvedVps = $vpsHost
@@ -873,7 +1041,7 @@ try {
     Write-Host 'connect_accepted=true'
 
     if (-not (Wait-Connected -TimeoutSec $ConnectTimeoutSec)) {
-        foreach ($n in @('route_fail_closed', 'dns_leak', 'ipv6_egress', 'service_restart', 'crash_recovery')) {
+        foreach ($n in @('route_fail_closed', 'dns_leak', 'ipv6_egress', 'service_restart', 'crash_recovery', 'hang_recovery')) {
             Add-Check $n 'skip' 'not_connected'
         }
         throw 'never_connected'
@@ -886,6 +1054,9 @@ try {
     Test-DnsLeak
     Test-Ipv6Egress
     Test-ServiceRestart
+    # Hang recovery needs a live service, so it runs before the destructive
+    # crash-recovery check that terminates the client process.
+    Test-HangRecovery
     Test-CrashRecovery
 } catch {
     $fatalError = $_.Exception.Message

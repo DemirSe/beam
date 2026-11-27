@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       run_behavior_checks:
-        description: 'Run live behavioral checks (routes, DNS, IPv6, restart, recovery)'
+        description: 'Run live behavioral checks (routes, DNS, IPv6, restart, crash recovery, hang recovery)'
         required: false
         default: true
         type: boolean
@@ -180,7 +180,7 @@ jobs:
           $extracted = Join-Path $env:RUNNER_TEMP 'windows-live-e2e\extracted'
           pwsh -NoProfile -File scripts/windows-vs-singbox.ps1 -PackageDir $extracted -SingboxExe $env:SINGBOX_EXE -CompareSingbox
 
-      - name: Live behavioral checks (routes, DNS, IPv6, restart, recovery)
+      - name: Live behavioral checks (routes, DNS, IPv6, restart, crash recovery, hang recovery)
         if: inputs.run_behavior_checks && !cancelled()
         shell: pwsh
         env:
