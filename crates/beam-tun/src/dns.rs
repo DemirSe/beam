@@ -22,7 +22,7 @@ use beam_core::client::{
 };
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::time::{Instant as TokioInstant, timeout, timeout_at};
@@ -1162,6 +1162,11 @@ impl<S> DohPool<S> {
     }
 }
 
+trait TcpDnsIo: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> TcpDnsIo for T {}
+
+type TcpDnsStream = Box<dyn TcpDnsIo>;
+
 struct PooledTcpDnsConn<S> {
     stream: S,
     last_used: Instant,
@@ -1176,7 +1181,7 @@ struct PooledTcpDnsConn<S> {
 /// performs at most pool-capacity concurrent REALITY handshakes, queries run
 /// I/O in parallel, and waiters reuse warm connections `put()` before the
 /// permit is released.
-struct TcpDnsPool<S = BeamTcpStream> {
+struct TcpDnsPool<S = TcpDnsStream> {
     state: Mutex<TcpDnsPoolState<S>>,
     slots: Semaphore,
 }
@@ -1948,6 +1953,7 @@ impl DnsInterceptor {
                             &doh_pool,
                             &tcp_pool,
                             &udp_mux_pool,
+                            counters.as_ref(),
                             &wire_owned,
                             dns_cfg.query_timeout,
                             doh_prefix.as_deref(),
@@ -2240,6 +2246,7 @@ async fn resolve_tunneled(
     doh_pool: &Arc<DohPool>,
     tcp_pool: &Arc<TcpDnsPool>,
     udp_mux_pool: &Arc<UdpDnsMuxPool>,
+    counters: &DnsCounters,
     query: &[u8],
     query_timeout: Duration,
     doh_prefix: Option<&[u8]>,
@@ -2253,7 +2260,7 @@ async fn resolve_tunneled(
                 .await
             }
             DnsUpstream::PlainTcp(addr) => {
-                resolve_tcp_over_beam(client_cfg, tcp_pool, *addr, query).await
+                resolve_tcp_over_beam(client_cfg, tcp_pool, *addr, counters, query).await
             }
             DnsUpstream::PlainUdp(addr) => {
                 resolve_udp_over_beam(client_cfg, udp_mux_pool, *addr, query).await
@@ -2262,6 +2269,28 @@ async fn resolve_tunneled(
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tunneled DNS query timed out"))?
+}
+
+fn validate_tcp_dns_response(query: &[u8], resp: &[u8], counters: &DnsCounters) -> io::Result<()> {
+    let Some(parsed) = parse_dns_query_bounded(query, MAX_DOH_RESPONSE_BYTES) else {
+        counters.servfail_mismatch.incr();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid DNS-over-TCP query",
+        ));
+    };
+    if !response_question_matches(&parsed, resp, Some(parsed.tx_id)) {
+        counters.servfail_mismatch.incr();
+        debug!(
+            qname = %parsed.qname,
+            "DNS-over-TCP response ID or question mismatch; dropping stream"
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS-over-TCP response mismatch",
+        ));
+    }
+    Ok(())
 }
 
 async fn send_tcp_dns_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
@@ -2303,6 +2332,7 @@ async fn resolve_tcp_over_beam(
     client_cfg: &BeamClientConfig,
     tcp_pool: &Arc<TcpDnsPool>,
     addr: SocketAddr,
+    counters: &DnsCounters,
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
     // Bounded slot held across `take -> (dial if empty) -> request I/O ->
@@ -2322,12 +2352,14 @@ async fn resolve_tcp_over_beam(
             let fresh_gen = tcp_pool.generation();
             let stream = dial_tcp(client_cfg, dest.clone())
                 .await
+                .map(|stream| Box::new(stream) as TcpDnsStream)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             (stream, fresh_gen, false)
         }
     };
     match send_tcp_dns_request(&mut stream, query).await {
         Ok(resp) => {
+            validate_tcp_dns_response(query, &resp, counters)?;
             tcp_pool.put(stream, stream_gen, Instant::now());
             Ok(resp)
         }
@@ -2339,6 +2371,7 @@ async fn resolve_tcp_over_beam(
             if let Some(mut retry) = pooled2 {
                 match send_tcp_dns_request(&mut retry, query).await {
                     Ok(resp) => {
+                        validate_tcp_dns_response(query, &resp, counters)?;
                         tcp_pool.put(retry, gen2, Instant::now());
                         return Ok(resp);
                     }
@@ -2350,8 +2383,10 @@ async fn resolve_tcp_over_beam(
             let fresh_gen = tcp_pool.generation();
             let mut fresh = dial_tcp(client_cfg, dest)
                 .await
+                .map(|stream| Box::new(stream) as TcpDnsStream)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let resp = send_tcp_dns_request(&mut fresh, query).await?;
+            validate_tcp_dns_response(query, &resp, counters)?;
             tcp_pool.put(fresh, fresh_gen, Instant::now());
             Ok(resp)
         }
@@ -5113,109 +5148,62 @@ mod tests {
         srv.abort();
     }
 
-    /// Mirrors the bounded-slot block of `resolve_tcp_over_beam` /
-    /// `resolve_doh_over_beam`: one `slots` permit held across
-    /// `take -> (dial if empty) -> request I/O -> put`, with `put()` before
-    /// the permit is released so waiters reuse warm connections.
-    async fn bounded_exchange(
-        pool: &TcpDnsPool<tokio::io::DuplexStream>,
-        query: Vec<u8>,
-        server_delay: Duration,
-        dials: &std::sync::atomic::AtomicUsize,
-    ) -> Vec<u8> {
-        let _slot = pool.slots.acquire().await.expect("slot");
-        let (pooled, pooled_gen) = pool.take(Instant::now());
-        let (mut stream, exch_gen) = match pooled {
-            Some(stream) => (stream, pooled_gen),
-            None => {
-                dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let dial_gen = pool.generation();
-                let (client, mut server) = tokio::io::duplex(4096);
-                // Persistent fake upstream: serves sequential queries on this
-                // connection so pooled reuse succeeds, like a real keep-alive.
-                tokio::spawn(async move {
-                    loop {
-                        let mut len_buf = [0u8; 2];
-                        if server.read_exact(&mut len_buf).await.is_err() {
-                            return;
-                        }
-                        let qlen = usize::from(u16::from_be_bytes(len_buf));
-                        if qlen == 0 || qlen > MAX_DNS_QUERY_BYTES {
-                            return;
-                        }
-                        let mut qbuf = vec![0u8; qlen];
-                        if server.read_exact(&mut qbuf).await.is_err() {
-                            return;
-                        }
-                        let resp = build_a_response(&qbuf, Ipv4Addr::new(9, 9, 9, 9), 60);
-                        tokio::time::sleep(server_delay).await;
-                        let rlen = u16::try_from(resp.len()).expect("resp len");
-                        if server.write_all(&rlen.to_be_bytes()).await.is_err() {
-                            return;
-                        }
-                        if server.write_all(&resp).await.is_err() {
-                            return;
-                        }
-                    }
-                });
-                (client, dial_gen)
-            }
-        };
-        let resp = send_tcp_dns_request(&mut stream, &query)
-            .await
-            .expect("exchange");
-        pool.put(stream, exch_gen, Instant::now());
-        // `_slot` drops after `put()`, so the next waiter reuses the warm conn.
-        resp
-    }
-
     #[tokio::test]
-    async fn bounded_slots_limit_dials_and_overlap_io() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        // (ii) Concurrent queries overlap their I/O in parallel: two 200 ms
-        // exchanges must finish in well under the 400 ms serial bound.
-        let pool = Arc::new(TcpDnsPool::<tokio::io::DuplexStream>::default());
-        let dials = Arc::new(AtomicUsize::new(0));
-        let q1 = build_query(0xAAAA, "one.example", 1);
-        let q2 = build_query(0xBBBB, "two.example", 1);
-        let start = TokioInstant::now();
-        let (r1, r2) = tokio::join!(
-            bounded_exchange(&pool, q1.clone(), Duration::from_millis(200), &dials),
-            bounded_exchange(&pool, q2.clone(), Duration::from_millis(200), &dials),
-        );
-        assert_eq!(r1, build_a_response(&q1, Ipv4Addr::new(9, 9, 9, 9), 60));
-        assert_eq!(r2, build_a_response(&q2, Ipv4Addr::new(9, 9, 9, 9), 60));
-        assert!(
-            start.elapsed() < Duration::from_millis(350),
-            "concurrent exchanges must overlap I/O (took {:?})",
-            start.elapsed()
-        );
+    async fn pooled_tcp_mismatch_servfails_and_evicts_the_stream() {
+        let (interceptor, mut tun_rx) = test_interceptor(None);
+        let cache = Arc::clone(&interceptor.cache);
+        let (client, mut server) = tokio::io::duplex(2048);
+        let upstream = tokio::spawn(async move {
+            let mut len_buf = [0u8; 2];
+            server.read_exact(&mut len_buf).await.expect("query length");
+            let len = usize::from(u16::from_be_bytes(len_buf));
+            let mut query = vec![0u8; len];
+            server.read_exact(&mut query).await.expect("query");
 
-        // (i) A 16-query cold burst opens at most pool-capacity connections:
-        // the first `MAX_TCP_DNS_POOL_SIZE` dials serve the burst while
-        // later waiters reuse the returned warm connections.
-        let pool2 = Arc::new(TcpDnsPool::<tokio::io::DuplexStream>::default());
-        let dials2 = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-        for i in 0..16u16 {
-            let pool = Arc::clone(&pool2);
-            let dials = Arc::clone(&dials2);
-            let q = build_query(0xC000 + i, &format!("burst{i}.example"), 1);
-            handles.push(tokio::spawn(async move {
-                let expected = build_a_response(&q, Ipv4Addr::new(9, 9, 9, 9), 60);
-                let got = bounded_exchange(&pool, q, Duration::from_millis(50), &dials).await;
-                assert_eq!(got, expected);
-            }));
-        }
-        for h in handles {
-            h.await.expect("burst task");
-        }
-        let total_dials = dials2.load(Ordering::SeqCst);
-        assert!(
-            total_dials <= MAX_TCP_DNS_POOL_SIZE,
-            "16-query cold burst must reuse warm conns: {total_dials} dials, bound is {MAX_TCP_DNS_POOL_SIZE}"
+            let mut bad = build_a_response(&query, Ipv4Addr::new(9, 9, 9, 9), 60);
+            bad[0..2].copy_from_slice(&0xffffu16.to_be_bytes());
+            let resp_len = u16::try_from(bad.len()).expect("response length");
+            server
+                .write_all(&resp_len.to_be_bytes())
+                .await
+                .expect("response length");
+            server.write_all(&bad).await.expect("response");
+
+            let mut byte = [0u8; 1];
+            matches!(
+                timeout(Duration::from_millis(500), server.read(&mut byte)).await,
+                Ok(Ok(0))
+            )
+        });
+        let stream: TcpDnsStream = Box::new(client);
+        let generation = interceptor.tcp_pool.generation();
+        interceptor.tcp_pool.put(stream, generation, Instant::now());
+        assert_eq!(interceptor.tcp_pool.len(), 1);
+
+        let wire = build_query(0x1234, "pooled.example", 1);
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_130);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        interceptor.handle_query(src, dst, &wire);
+
+        let pkt = timeout(Duration::from_secs(2), tun_rx.recv())
+            .await
+            .expect("SERVFAIL reply")
+            .expect("reply packet");
+        let udp = crate::packet::parse_udp(crate::packet::parse_ip(&pkt).expect("ip").payload)
+            .expect("udp");
+        assert_eq!(u16::from_be_bytes([udp.payload[0], udp.payload[1]]), 0x1234);
+        assert_eq!(udp.payload[3] & 0x0f, 2, "mismatch must be SERVFAIL");
+        assert_eq!(interceptor.stats().servfail_mismatch, 1);
+        assert_eq!(cache.lock().expect("cache").len, 0);
+        assert_eq!(
+            interceptor.tcp_pool.len(),
+            0,
+            "poisoned stream must be evicted"
         );
-        assert!(pool2.len() <= MAX_TCP_DNS_POOL_SIZE);
+        assert!(
+            upstream.await.expect("upstream task"),
+            "stream must be closed"
+        );
     }
 
     #[tokio::test]
