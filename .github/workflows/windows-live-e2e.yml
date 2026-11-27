@@ -8,6 +8,11 @@ name: windows-live-e2e
 on:
   workflow_dispatch:
     inputs:
+      run_behavior_checks:
+        description: 'Run live behavioral checks (routes, DNS, IPv6, restart, recovery)'
+        required: false
+        default: true
+        type: boolean
       keep_logs_on_failure:
         description: 'Upload client logs when the run fails'
         required: false
@@ -30,7 +35,7 @@ jobs:
   live-e2e:
     name: Live E2E (packaged Windows client via VPS)
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -174,6 +179,42 @@ jobs:
         run: |
           $extracted = Join-Path $env:RUNNER_TEMP 'windows-live-e2e\extracted'
           pwsh -NoProfile -File scripts/windows-vs-singbox.ps1 -PackageDir $extracted -SingboxExe $env:SINGBOX_EXE -CompareSingbox
+
+      - name: Live behavioral checks (routes, DNS, IPv6, restart, recovery)
+        if: inputs.run_behavior_checks && success()
+        shell: pwsh
+        env:
+          BEAM_LIVE_VLESS_LINK: ${{ secrets.BEAM_LIVE_VLESS_LINK }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $extracted = Join-Path $env:RUNNER_TEMP 'windows-live-e2e\extracted'
+          try {
+            pwsh -NoProfile -File scripts/windows-live-checks.ps1 -PackageDir $extracted
+            if ($LASTEXITCODE -ne 0) { throw "behavior_checks_failed exit=$LASTEXITCODE" }
+          } finally {
+            # Keep runner connectivity restored even when a check fails:
+            # uninstall best-effort, wait for baseline egress, then exit non-zero.
+            try {
+              $uninstallPs1 = Join-Path $extracted 'install.ps1'
+              if (Test-Path -LiteralPath $uninstallPs1) {
+                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $uninstallPs1 -Uninstall -NonInteractive
+              }
+            } catch {
+              Write-Host 'final_uninstall_best_effort=false'
+            }
+            $restored = $false
+            for ($i = 0; $i -lt 15; $i++) {
+              try {
+                $ip = (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 10).Trim()
+                if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$') { $restored = $true; break }
+              } catch {
+              }
+              Start-Sleep -Seconds 2
+            }
+            Write-Host ('baseline_internet_restored=' + $restored.ToString().ToLowerInvariant())
+            # A bricked runner must be visible: never exit 0 with no connectivity.
+            if (-not $restored) { throw 'baseline_not_restored' }
+          }
 
       - name: Upload client logs on failure
         if: failure() && inputs.keep_logs_on_failure
