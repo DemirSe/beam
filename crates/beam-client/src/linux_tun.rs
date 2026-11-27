@@ -678,9 +678,17 @@ impl LinuxRouteGuard {
                 };
                 self.evict_v4(now, true);
                 let host = format!("{v4}/32");
-                if has_exact_route("-4", &host).is_present() {
-                    debug!(prefix = %host, "preserving pre-existing exact route for bypass.domains IP");
-                    return;
+                match has_exact_route("-4", &host) {
+                    RouteCheck::Absent => {}
+                    RouteCheck::Present | RouteCheck::Unusable => {
+                        debug!(prefix = %host, "preserving pre-existing exact route for bypass.domains IP");
+                        return;
+                    }
+                    RouteCheck::Error(_) => {
+                        debug!(prefix = %host, "route state unknown; deferring bypass.domains install to the retry path");
+                        self.dynamic_bypass_v4.push_back((v4, now));
+                        return;
+                    }
                 }
                 match install_v4_bypass(&host, maybe_gw.as_deref(), &dev) {
                     Ok(()) => {
@@ -714,9 +722,17 @@ impl LinuxRouteGuard {
                 };
                 self.evict_v6(now, true);
                 let host = format!("{v6}/128");
-                if has_exact_route("-6", &host).is_present() {
-                    debug!(prefix = %host, "preserving pre-existing exact route for bypass.domains IP");
-                    return;
+                match has_exact_route("-6", &host) {
+                    RouteCheck::Absent => {}
+                    RouteCheck::Present | RouteCheck::Unusable => {
+                        debug!(prefix = %host, "preserving pre-existing exact route for bypass.domains IP");
+                        return;
+                    }
+                    RouteCheck::Error(_) => {
+                        debug!(prefix = %host, "route state unknown; deferring bypass.domains install to the retry path");
+                        self.dynamic_bypass_v6.push_back((v6, now));
+                        return;
+                    }
                 }
                 match install_v6_bypass(&host, maybe_gw.as_deref(), &dev) {
                     Ok(()) => {
@@ -1528,6 +1544,7 @@ pub enum RouteCheck {
 
 impl RouteCheck {
     /// Returns `true` only for [`RouteCheck::Present`].
+    #[cfg(test)]
     pub const fn is_present(&self) -> bool {
         matches!(self, Self::Present)
     }
@@ -2000,6 +2017,39 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
         assert!(guard.dynamic_bypass_v4.is_empty());
         assert_eq!(guard.extra_bypass_v4.len(), 1);
         assert_eq!(guard.extra_bypass_v4[0].0, "198.51.100.1/32");
+    }
+
+    #[test]
+    fn dynamic_bypass_lookup_error_defers_install() {
+        let dir = test_dir("dynamic-lookup-error");
+        let log = dir.join("ip.log");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$*\" in\n\
+                   *\"route show exact\"*) echo transient >&2; exit 2 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log.display(),
+            ),
+        );
+        let mut guard = route_guard_for_tests();
+        let ip = Ipv4Addr::new(203, 0, 113, 77);
+
+        guard.install_dynamic_bypass_ip(IpAddr::V4(ip));
+
+        let log = read_fake_ip_log(&fake.log_path());
+        assert!(
+            !log.contains("route replace"),
+            "an unknown route state must not be overwritten: {log}"
+        );
+        assert!(
+            guard.dynamic_bypass_v4.iter().any(|(a, _)| *a == ip),
+            "the unresolved IP must stay tracked for the retry path"
+        );
+        assert!(guard.extra_bypass_v4.is_empty());
     }
 
     #[test]
