@@ -70,7 +70,12 @@ TARGET="${BEAM_WINDOWS_TARGET:-x86_64-pc-windows-msvc}"
 [ -f "$BEAM_WINDOWS_TRAY_BIN" ] || die "missing tray binary $BEAM_WINDOWS_TRAY_BIN"
 [ -f "$BEAM_WINDOWS_WINTUN_DLL" ] || die "missing wintun.dll $BEAM_WINDOWS_WINTUN_DLL"
 
-WINTUN_SHA="$(sha256sum "$BEAM_WINDOWS_WINTUN_DLL" | awk '{print $1}')"
+sha256_file() {
+  # GNU coreutils sha256sum prefixes a leading '\' when the path contains '\' (Windows).
+  sha256sum "$1" | awk '{sub(/^\\/, "", $1); print $1}'
+}
+
+WINTUN_SHA="$(sha256_file "$BEAM_WINDOWS_WINTUN_DLL")"
 if [ "${BEAM_WINDOWS_SKIP_WINTUN_PIN:-0}" != "1" ]; then
   [ "$WINTUN_SHA" = "$WINTUN_AMD64_SHA256" ] ||
     die "wintun.dll SHA-256 mismatch: got $WINTUN_SHA, expected $WINTUN_AMD64_SHA256"
@@ -101,9 +106,9 @@ install -m 0644 "$WIN_DIR/install.cmd" "$STAGE/install.cmd"
 install -m 0644 "$WIN_DIR/uninstall.cmd" "$STAGE/uninstall.cmd"
 install -m 0644 "$WIN_DIR/README.md" "$STAGE/README.md"
 
-CLIENT_SHA="$(sha256sum "$STAGE/beam-client.exe" | awk '{print $1}')"
-TRAY_SHA="$(sha256sum "$STAGE/beam-tray.exe" | awk '{print $1}')"
-WINTUN_SHA="$(sha256sum "$STAGE/wintun.dll" | awk '{print $1}')"
+CLIENT_SHA="$(sha256_file "$STAGE/beam-client.exe")"
+TRAY_SHA="$(sha256_file "$STAGE/beam-tray.exe")"
+WINTUN_SHA="$(sha256_file "$STAGE/wintun.dll")"
 {
   printf '%s  %s\n' "$CLIENT_SHA" beam-client.exe
   printf '%s  %s\n' "$TRAY_SHA" beam-tray.exe
@@ -156,7 +161,7 @@ with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslev
         zf.writestr(info, src.read_bytes())
 PY
 
-ARCHIVE_SHA="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+ARCHIVE_SHA="$(sha256_file "$ARCHIVE")"
 printf '%s  %s\n' "$ARCHIVE_SHA" "$NAME.zip" > "$ARCHIVE.sha256"
 DONE=1
 

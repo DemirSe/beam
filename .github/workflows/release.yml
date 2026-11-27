@@ -137,6 +137,7 @@ jobs:
           BEAM_RELEASE_OUT: ${{ runner.temp }}/release-windows-artifact
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-windows-artifact"
           BEAM_RELEASE_COMMIT="$(git rev-parse --short=12 HEAD)"
           export BEAM_RELEASE_COMMIT
           bash scripts/release-windows-tray.sh | tee "$RUNNER_TEMP/release-windows-artifact/release-windows-tray.txt"
