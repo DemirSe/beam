@@ -26,6 +26,9 @@ upstream = "https://1.1.1.1/dns-query"
 # Omit local_upstream to auto-detect the host's pre-VPN local DNS.
 # local_upstream = "192.168.1.1:53"
 local_suffixes = ["lan", "local", "internal"]
+# Dotless names ("router", "nas") use the local resolver by default; set
+# false to forward them to the tunnel.
+single_label_local = true
 cache_size = 1024
 query_timeout_ms = 4000
 ipv4_only = false
