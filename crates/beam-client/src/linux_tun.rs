@@ -1260,6 +1260,7 @@ fn spawn_ip_child(bin: &str, args: &[&str], deadline: Instant) -> io::Result<Out
     let mut child = loop {
         match Command::new(bin)
             .args(args)
+            .env("LC_ALL", "C")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1343,7 +1344,10 @@ fn ip_delete_already_removed(args: &[&str], stderr: &str) -> bool {
         return false;
     }
     let detail = stderr.to_ascii_lowercase();
-    detail.contains("no such process") || detail.contains("esrch")
+    detail.contains("no such process")
+        || detail.contains("esrch")
+        || detail.contains("no such device")
+        || detail.contains("enodev")
 }
 
 fn run_ip_with_deadline(args: &[&str], deadline: Instant) -> io::Result<()> {
@@ -1420,9 +1424,16 @@ impl From<RouteCheck> for BypassRouteState {
 
 /// One `ip route show` snapshot per family, used for all bypass checks in a
 /// reconcile pass so the number of `ip` calls does not grow with table size.
+enum RouteTable {
+    Loaded(String),
+    /// The table exceeded the bounded read; exact lookups still work.
+    Truncated,
+    Failed(String),
+}
+
 struct RouteSnapshot {
-    v4: Result<String, String>,
-    v6: Result<String, String>,
+    v4: RouteTable,
+    v6: RouteTable,
 }
 
 impl RouteSnapshot {
@@ -1431,40 +1442,46 @@ impl RouteSnapshot {
             v4: if gw.v4.is_some() {
                 Self::load_family("-4")
             } else {
-                Ok(String::new())
+                RouteTable::Loaded(String::new())
             },
             v6: if gw.v6.is_some() {
                 Self::load_family("-6")
             } else {
-                Ok(String::new())
+                RouteTable::Loaded(String::new())
             },
         }
     }
 
-    fn load_family(family_flag: &str) -> Result<String, String> {
-        let bin = ip_binary().map_err(|err| err.to_string())?;
-        let output = spawn_ip_child(
+    fn load_family(family_flag: &str) -> RouteTable {
+        let bin = match ip_binary() {
+            Ok(bin) => bin,
+            Err(err) => return RouteTable::Failed(err.to_string()),
+        };
+        let output = match spawn_ip_child(
             bin,
             &[family_flag, "route", "show"],
             Instant::now() + IP_CHILD_DEADLINE,
-        )
-        .map_err(|err| err.to_string())?;
+        ) {
+            Ok(output) => output,
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => return RouteTable::Truncated,
+            Err(err) => return RouteTable::Failed(err.to_string()),
+        };
         if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            return RouteTable::Loaded(String::from_utf8_lossy(&output.stdout).into_owned());
         }
         let detail = String::from_utf8_lossy(&output.stderr);
         let detail = detail.trim();
-        if detail.is_empty() {
-            Err(format!(
+        RouteTable::Failed(if detail.is_empty() {
+            format!(
                 "`ip {family_flag} route show` exited with {}",
                 output.status
-            ))
+            )
         } else {
-            Err(format!(
+            format!(
                 "`ip {family_flag} route show` exited with {}: {detail}",
                 output.status
-            ))
-        }
+            )
+        })
     }
 
     fn check(&self, family_flag: &str, prefix: &str) -> RouteCheck {
@@ -1474,13 +1491,21 @@ impl RouteSnapshot {
             &self.v6
         };
         match table {
-            Ok(output) => route_snapshot_check(output, prefix),
-            Err(err) => route_check_error(prefix, io::Error::other(err.clone())),
+            RouteTable::Loaded(output) => route_snapshot_check(output, prefix),
+            RouteTable::Truncated => has_exact_route(family_flag, prefix),
+            RouteTable::Failed(err) => route_check_error(prefix, io::Error::other(err.clone())),
         }
     }
 }
 
-fn parse_route_prefix(word: &str) -> Option<IpNet> {
+fn parse_route_prefix(word: &str, family_flag: &str) -> Option<IpNet> {
+    if word == "default" {
+        return IpNet::parse_cidr(if family_flag == "-6" {
+            "::/0"
+        } else {
+            "0.0.0.0/0"
+        });
+    }
     if word.contains('/') {
         return IpNet::parse_cidr(word);
     }
@@ -1492,12 +1517,22 @@ fn parse_route_prefix(word: &str) -> Option<IpNet> {
 }
 
 fn route_snapshot_check(output: &str, prefix: &str) -> RouteCheck {
-    let Some(wanted) = parse_route_prefix(prefix) else {
+    let family_flag = if prefix.contains(':') { "-6" } else { "-4" };
+    let Some(wanted) = parse_route_prefix(prefix, family_flag) else {
         return RouteCheck::Absent;
     };
     let mut present = false;
     let mut unusable = false;
+    let mut matches_prefix = false;
     for line in output.lines() {
+        // Indented `nexthop` lines inherit the preceding destination's prefix.
+        if line.split_whitespace().next() == Some("nexthop") {
+            if matches_prefix && route_line_has_linkdown(line) {
+                unusable = true;
+            }
+            continue;
+        }
+        matches_prefix = false;
         let Some(destination) = line.split_whitespace().next() else {
             continue;
         };
@@ -1507,7 +1542,8 @@ fn route_snapshot_check(output: &str, prefix: &str) -> RouteCheck {
         ) {
             continue;
         }
-        if parse_route_prefix(destination).is_some_and(|net| net == wanted) {
+        if parse_route_prefix(destination, family_flag).is_some_and(|net| net == wanted) {
+            matches_prefix = true;
             if route_line_has_linkdown(line) {
                 unusable = true;
             } else {
@@ -2221,6 +2257,107 @@ broadcast 192.168.1.255/32 dev eth0 proto kernel scope link src 192.168.1.10\n\
                 RouteCheck::Error(_)
             ),
             "a cut table must not be read as an absent route"
+        );
+        drop(fake);
+    }
+
+    #[test]
+    fn route_snapshot_matches_default_routes() {
+        let v4 = "default via 192.168.1.1 dev eth0 proto static\n";
+        let v6 = "default via fe80::1 dev eth0 proto static\n";
+        assert!(route_snapshot_check(v4, "0.0.0.0/0").is_present());
+        assert!(route_snapshot_check(v6, "::/0").is_present());
+    }
+
+    #[test]
+    fn multipath_linkdown_nexthop_is_unusable() {
+        let table = "\
+198.51.100.0/24 proto static\n\
+    nexthop via 10.0.0.2 dev eth1 weight 1\n\
+    nexthop via 10.0.0.3 dev eth2 weight 1 linkdown\n";
+        assert!(route_snapshot_check(table, "198.51.100.0/24").is_unusable());
+    }
+
+    #[test]
+    fn truncated_snapshot_falls_back_to_exact_lookup() {
+        let dir = test_dir("truncated-fallback");
+        let log = dir.join("ip.log");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$*\" in\n\
+                   *\"route show exact\"*) echo '198.51.100.7 via 192.168.1.1 dev eth0'; exit 0 ;;\n\
+                   *\"route show\"*) yes x | head -c 70000; exit 0 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log.display(),
+            ),
+        );
+        let snapshot = RouteSnapshot::load(&route_guard_for_tests().current_gw);
+        assert!(
+            snapshot.check("-4", "198.51.100.7/32").is_present(),
+            "a large table must use exact lookups instead of failing forever"
+        );
+        let log = read_fake_ip_log(&fake.log_path());
+        assert!(log.contains("route show exact 198.51.100.7/32"), "{log}");
+    }
+
+    #[test]
+    fn every_ip_child_uses_c_locale() {
+        let dir = test_dir("c-locale");
+        let log = dir.join("ip.log");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\nprintf 'LC_ALL=%s %s\\n' \"$LC_ALL\" \"$*\" >> \"{}\"\nexit 0\n",
+                log.display(),
+            ),
+        );
+        let gw = PhysicalGateways {
+            v4: Some((Some("192.168.1.1".to_owned()), "eth0".to_owned())),
+            v6: None,
+        };
+        let _ = RouteSnapshot::load(&gw);
+        let _ = has_exact_route("-4", "203.0.113.1/32");
+        let _ = run_ip(&["route", "del", "203.0.113.1/32", "dev", "eth0"]);
+
+        let log = read_fake_ip_log(&fake.log_path());
+        assert!(log.lines().count() >= 3, "unexpected ip calls: {log}");
+        for line in log.lines() {
+            assert!(
+                line.starts_with("LC_ALL=C "),
+                "no C locale on ip child: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn enodev_delete_counts_as_removed() {
+        let dir = test_dir("enodev-delete");
+        let state = dir.join("routes.state");
+        let fake = FakeIp::new_in(
+            dir,
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+               *\"route del\"*) echo 'RTNETLINK answers: No such device' >&2; exit 2 ;;\n\
+             esac\n\
+             exit 0\n",
+        );
+        write_routes_state_atomic(
+            &state,
+            &[PersistedRoute {
+                family: 4,
+                prefix: "203.0.113.5/32".to_owned(),
+                gateway: None,
+                dev: "eth0".to_owned(),
+            }],
+        );
+        assert_eq!(cleanup_persisted_routes(&state).expect("cleanup"), 1);
+        assert!(
+            !state.exists(),
+            "ENODEV is the desired end state, so routes.state must not be retained"
         );
         drop(fake);
     }
