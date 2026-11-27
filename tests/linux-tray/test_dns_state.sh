@@ -260,6 +260,96 @@ check_restore_state enabled-runtime 'enable beam-client.service'
 check_restore_state static 'disable beam-client.service'
 check_restore_state disabled 'disable beam-client.service'
 
+# A masked unit must abort before the installer makes a backup. Replay the
+# real enablement/backup lines with a fake systemctl and fake file commands:
+# the EXIT trap must not disable a unit or write/remove a live managed file.
+state_dns_line=$(grep -n '^DNS_RESET_STATE=\$(unit_enable_state' "$INSTALL" | cut -d: -f1 || true)
+state_client_line=$(grep -n '^CLIENT_STATE=\$(unit_enable_state' "$INSTALL" | cut -d: -f1 || true)
+backup_line=$(grep -n '^BACKUP_DIR=\$(mktemp' "$INSTALL" | cut -d: -f1 || true)
+backup_call_line=$(grep -n '^backup_live$' "$INSTALL" | cut -d: -f1 || true)
+ready_line=$(grep -n '^BACKUP_READY=1' "$INSTALL" | cut -d: -f1 || true)
+[ -n "$state_dns_line" ] && [ -n "$state_client_line" ] && [ -n "$backup_line" ] &&
+  [ -n "$backup_call_line" ] && [ -n "$ready_line" ] || {
+  echo "install.sh: missing enablement/backup sequence" >&2
+  exit 1
+}
+masked_flow=$(sed -n "${state_dns_line}p;${state_client_line}p;${backup_line}p;${backup_call_line}p;${ready_line}p" "$INSTALL")
+
+MASKED_LIVE="$TMP/masked-live"
+printf 'keep\n' > "$MASKED_LIVE"
+: > "$TMP/masked.touch"
+: > "$TMP/masked.systemctl"
+cleanup_body=$(sed -n '/^cleanup() {/,/^}/p' "$INSTALL")
+backup_live_body=$(sed -n '/^backup_live() {/,/^}/p' "$INSTALL")
+rollback_body=$(sed -n '/^rollback_live() {/,/^}/p' "$INSTALL")
+[ -n "$cleanup_body" ] && [ -n "$backup_live_body" ] && [ -n "$rollback_body" ] || {
+  echo "install.sh: missing cleanup or rollback function" >&2
+  exit 1
+}
+STAGE_DIR=
+NORMALIZED_CONFIG=
+BACKUP_DIR=
+BACKUP_READY=0
+INSTALL_COMMITTED=0
+SERVICE_WAS_ACTIVE=0
+DNS_RESET_STATE=
+CLIENT_STATE=
+MANAGED_PATHS=( "$MASKED_LIVE" )
+(
+  set -e
+  mktemp() { printf '%s\n' "$TMP/masked-backup"; }
+  systemctl() {
+    printf '%s\n' "$*" >> "$TMP/masked.systemctl"
+    [ "${1:-}" = is-enabled ] && { printf 'masked\n'; return 1; }
+    return 0
+  }
+  cp() {
+    local last=
+    for last in "$@"; do :; done
+    [ "$last" = "$MASKED_LIVE" ] && printf 'cp %s\n' "$last" >> "$TMP/masked.touch"
+    return 0
+  }
+  install() {
+    local last=
+    for last in "$@"; do :; done
+    [ "$last" = "$MASKED_LIVE" ] && printf 'install %s\n' "$last" >> "$TMP/masked.touch"
+    return 0
+  }
+  rm() {
+    local arg
+    for arg in "$@"; do
+      [ "$arg" = "$MASKED_LIVE" ] && printf 'rm %s\n' "$arg" >> "$TMP/masked.touch"
+    done
+    return 0
+  }
+  eval "$cleanup_body"
+  eval "$backup_live_body"
+  eval "$state_body"
+  eval "$restore_body"
+  eval "$rollback_body"
+  trap cleanup EXIT
+  eval "$masked_flow"
+) >"$TMP/masked.out" 2>"$TMP/masked.err" && masked_rc=0 || masked_rc=$?
+[ "$masked_rc" -ne 0 ] || {
+  echo "install.sh: masked unit did not abort" >&2
+  exit 1
+}
+grep -qF 'is masked' "$TMP/masked.err" || {
+  echo "install.sh: masked unit has no clear error" >&2
+  cat "$TMP/masked.err" >&2
+  exit 1
+}
+if grep -qE '^(disable|enable|start) |^daemon-reload$' "$TMP/masked.systemctl"; then
+  echo "install.sh: rollback changed units for a masked unit" >&2
+  cat "$TMP/masked.systemctl" >&2
+  exit 1
+fi
+[ ! -s "$TMP/masked.touch" ] || {
+  echo "install.sh: rollback touched live files for a masked unit" >&2
+  cat "$TMP/masked.touch" >&2
+  exit 1
+}
+
 state_line=$(grep -n '^DNS_RESET_STATE=\$(unit_enable_state' "$INSTALL" | cut -d: -f1 || true)
 [ -n "$state_line" ] && [ "$state_line" -lt "$stop_line" ] || {
   echo "install.sh: enablement is not parsed before the stop" >&2

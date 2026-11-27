@@ -292,11 +292,14 @@ actual_lib=$(sha256sum "$STAGE_DIR/libcronet.so" | awk '{print $1}')
 python3 "$HERE/config-policy.py" "$CONFIG_SRC" "$NORMALIZED_CONFIG"
 "$STAGE_DIR/sing-box" check -c "$NORMALIZED_CONFIG"
 
+# Read enablement before taking a backup: a state-read failure must abort
+# before the EXIT trap can roll back with empty states.
+DNS_RESET_STATE=$(unit_enable_state beam-dns-reset.service) || exit 1
+CLIENT_STATE=$(unit_enable_state beam-client) || exit 1
+
 BACKUP_DIR=$(mktemp -d /usr/local/lib/.beam-backup.XXXXXX)
 backup_live
 BACKUP_READY=1
-DNS_RESET_STATE=$(unit_enable_state beam-dns-reset.service) || exit 1
-CLIENT_STATE=$(unit_enable_state beam-client) || exit 1
 
 if systemctl is-active --quiet beam-client 2>/dev/null; then
     SERVICE_WAS_ACTIVE=1
