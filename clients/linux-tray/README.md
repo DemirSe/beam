@@ -28,8 +28,9 @@ these inputs before it changes live files:
 The script runs `config-policy.py` and checks the config with `sing-box check`.
 It stages files under `/usr/local/lib` and backs up managed paths.
 It stops `beam-client` before it installs new files.
-It keeps the three newest timestamped copies of the profile and prunes older
-copies. It leaves the service stopped and disabled. It disables an inherited unit so
+It keeps one mode-0600 timestamped copy before it installs the profile. After
+the install succeeds, it keeps the three newest generated copies. It does not
+prune other backup files. It leaves the service stopped and disabled. It disables an inherited unit so
 the new unit cannot start at boot. Failed installs restore the backups. They
 restore only `enabled` and `enabled-runtime` state. The installer refuses a
 masked unit before it writes any unit file.

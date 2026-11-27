@@ -318,8 +318,8 @@ validate_line=$(grep -n '^validate_core_dir "\$CORE_DIR"' "$INSTALL" | cut -d: -
   exit 1
 }
 
-# Repeated installs must not retain old profiles. Run the installer's own
-# prune function against a temporary directory.
+# Repeated installs must not retain old generated profiles. Run the
+# installer's own backup and prune functions against a temporary directory.
 bak_dir="$TMP/config-bak"
 mkdir -p "$bak_dir"
 keep=$(sed -n 's/^CONFIG_BAK_KEEP=//p' "$INSTALL" | head -1 || true)
@@ -327,30 +327,68 @@ keep=$(sed -n 's/^CONFIG_BAK_KEEP=//p' "$INSTALL" | head -1 || true)
   echo "install.sh: no bounded config backup retention" >&2
   exit 1
 }
+backup_body=$(sed -n '/^backup_config() {/,/^}/p' "$INSTALL")
 prune_body=$(sed -n '/^prune_config_backups() {/,/^}/p' "$INSTALL" |
   sed "s|/etc/beam|$bak_dir|g")
-[ -n "$prune_body" ] || {
-  echo "install.sh: missing prune_config_backups" >&2
+[ -n "$backup_body" ] && [ -n "$prune_body" ] || {
+  echo "install.sh: missing backup_config or prune_config_backups" >&2
+  exit 1
+}
+printf '%s\n' "$prune_body" | grep -qF 'LC_ALL=C sort' || {
+  echo "install.sh: backup pruning does not use LC_ALL=C sort" >&2
+  exit 1
+}
+cleanup_body=$(sed -n '/^cleanup() {/,/^}/p' "$INSTALL")
+if printf '%s\n' "$cleanup_body" | grep -qF 'prune_config_backups'; then
+  echo "install.sh: cleanup prunes before the install is committed" >&2
+  exit 1
+fi
+prune_call=$(grep -n '^prune_config_backups$' "$INSTALL" | cut -d: -f1 || true)
+[ -n "$prune_call" ] && [ "$prune_call" -gt "$commit_line" ] || {
+  echo "install.sh: backups are pruned before the install is committed" >&2
   exit 1
 }
 CONFIG_BAK_KEEP="$keep"
+eval "$backup_body"
 eval "$prune_body"
+printf 'live profile\n' > "$bak_dir/config.json"
+chmod 0644 "$bak_dir/config.json"
+backup_config "$bak_dir"
+newest=$(find "$bak_dir" -maxdepth 1 -type f \
+  -name 'config.json.bak-????????T???????????????Z' -printf '%f\n' |
+  LC_ALL=C sort | tail -1)
+[ -n "$newest" ] || {
+  echo "install.sh: backup_config made no timestamped copy" >&2
+  exit 1
+}
+[ "$(stat -c %a "$bak_dir/$newest")" = 600 ] || {
+  echo "install.sh: backup copy is not mode 0600" >&2
+  exit 1
+}
+printf 'operator file\n' > "$bak_dir/config.json.bak-pre-upgrade"
+printf 'operator note\n' > "$bak_dir/config.json.bak-notes"
+chmod 0644 "$bak_dir/config.json.bak-pre-upgrade" "$bak_dir/config.json.bak-notes"
 for n in 01 02 03 04 05; do
-  printf 'profile %s\n' "$n" > "$bak_dir/config.json.bak-202601${n}T000000000Z"
-  chmod 0600 "$bak_dir/config.json.bak-202601${n}T000000000Z"
+  printf 'profile %s\n' "$n" > "$bak_dir/config.json.bak-202601${n}T000000000000000Z"
+  chmod 0600 "$bak_dir/config.json.bak-202601${n}T000000000000000Z"
 done
 prune_config_backups
-count=$(find "$bak_dir" -maxdepth 1 -type f -name 'config.json.bak-*' | wc -l)
+count=$(find "$bak_dir" -maxdepth 1 -type f \
+  -name 'config.json.bak-????????T???????????????Z' | wc -l)
 [ "$count" -eq "$keep" ] || {
-  echo "install.sh: kept $count config backups, expected $keep" >&2
+  echo "install.sh: kept $count generated backups, expected $keep" >&2
   exit 1
 }
-[ -f "$bak_dir/config.json.bak-20260105T000000000Z" ] || {
-  echo "install.sh: pruned the newest pre-replace copy" >&2
+[ -f "$bak_dir/config.json.bak-20260105T000000000000000Z" ] || {
+  echo "install.sh: pruned the newest generated copy" >&2
   exit 1
 }
-[ "$(stat -c %a "$bak_dir/config.json.bak-20260105T000000000Z")" = 600 ] || {
-  echo "install.sh: pruned copy changed mode" >&2
+[ -f "$bak_dir/config.json.bak-pre-upgrade" ] || {
+  echo "install.sh: pruned an operator backup" >&2
+  exit 1
+}
+[ -f "$bak_dir/config.json.bak-notes" ] || {
+  echo "install.sh: pruned a non-timestamped file" >&2
   exit 1
 }
 

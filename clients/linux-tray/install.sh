@@ -62,7 +62,6 @@ cleanup() {
     if [ -n "$NORMALIZED_CONFIG" ]; then
         rm -f "$NORMALIZED_CONFIG"
     fi
-    prune_config_backups || true
     if [ "$keep_backup" = "0" ] && [ -n "$BACKUP_DIR" ]; then
         rm -rf "$BACKUP_DIR"
     fi
@@ -179,12 +178,21 @@ backup_live() {
     done
 }
 
+backup_config() {
+    local dir="$1" dest
+    [ -f "$dir/config.json" ] || return 0
+    dest="$dir/config.json.bak-$(date -u +%Y%m%dT%H%M%S%NZ)"
+    install -m 0600 "$dir/config.json" "$dest"
+}
+
 # Timestamp suffixes sort in time order. Keep the newest copies, including
-# the one made by this install, and prune older profiles with old secrets.
+# the one made by this install. Match only generated suffixes so operator
+# files such as config.json.bak-pre-upgrade stay untouched.
 prune_config_backups() {
     local old name
-    old=$(find /etc/beam -maxdepth 1 -type f -name 'config.json.bak-*' \
-        -printf '%f\n' | sort | head -n -"$CONFIG_BAK_KEEP")
+    old=$(find /etc/beam -maxdepth 1 -type f \
+        -name 'config.json.bak-????????T???????????????Z' \
+        -printf '%f\n' | LC_ALL=C sort | head -n -"$CONFIG_BAK_KEEP")
     if [ -n "$old" ]; then
         while IFS= read -r name; do
             rm -f "/etc/beam/$name"
@@ -322,10 +330,7 @@ else
     echo "warning: kernel does not expose tcp_bbr; BBR/fq not enabled" >&2
 fi
 
-if [ -f /etc/beam/config.json ]; then
-    cp -a /etc/beam/config.json "/etc/beam/config.json.bak-$(date -u +%Y%m%dT%H%M%S%NZ)"
-    prune_config_backups
-fi
+backup_config /etc/beam
 install -m 0600 "$NORMALIZED_CONFIG" /etc/beam/config.json
 printf '%s\n' "$INSTALL_USER" > /etc/beam/allowed-user
 chmod 0644 /etc/beam/allowed-user
@@ -422,6 +427,7 @@ StartupNotify=false
 EOF
 chmod 0644 /usr/share/applications/beam-tray.desktop
 INSTALL_COMMITTED=1
+prune_config_backups
 update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
 
 echo "installed; service is not enabled or started"

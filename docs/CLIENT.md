@@ -275,8 +275,10 @@ service installed but neither enabled nor started. The installer parses the
 `enabled-runtime`. It does not enable a `static` unit. It refuses a masked unit
 before it writes a unit file. It disables an inherited unit on success. Before
 it replaces the profile, the installer keeps a
-timestamped copy at `/etc/beam/config.json.bak-<time>` with mode 0600. It keeps
-the three newest copies and prunes older copies during install and cleanup.
+timestamped copy at `/etc/beam/config.json.bak-<time>` with mode 0600. After the
+install succeeds, it keeps the three newest generated copies. It does not prune
+before that point or during rollback. Other file names, such as
+`config.json.bak-pre-upgrade`, stay untouched.
 
 DNS changes use `systemctl reload systemd-resolved`, so rapid tray toggles do not
 restart the resolver or hit its start limit. The tray also applies a three
