@@ -17,7 +17,6 @@
 //! | 13 | permit the tunnel interface (`tun_luid`) |
 //! | 12 | permit DHCP and IPv6 neighbour discovery |
 //! | 10 | permit `permit_cidrs` destinations |
-//! | 6 | permit this executable to the local DNS resolver (port 53) |
 //! | 5 | block outbound DNS (remote port 53) |
 //! | 0 | block all other outbound traffic |
 //!
@@ -82,18 +81,7 @@ pub const WEIGHT_PERMIT_TUN: u8 = 13;
 pub const WEIGHT_PERMIT_BOOTSTRAP: u8 = 12;
 
 /// Permit the configured bypass CIDRs and the server address.
-///
-/// The local DNS resolver is deliberately absent here: it is permitted for
-/// this executable only through [`WEIGHT_PERMIT_LOCAL_DNS`], so other
-/// processes cannot use it for plaintext port-53 queries.
 pub const WEIGHT_PERMIT_CIDR: u8 = 10;
-
-/// Permit this executable to reach the local DNS resolver on remote port 53.
-///
-/// Scoped with the same `ALE_APP_ID` condition as [`WEIGHT_PERMIT_SELF`], so
-/// Windows Smart Multi-Homed Name Resolution in other processes still hits
-/// [`WEIGHT_BLOCK_DNS`] and cannot wait on the physical resolver.
-pub const WEIGHT_PERMIT_LOCAL_DNS: u8 = 6;
 
 /// Block outbound DNS on any interface the permits do not cover.
 pub const WEIGHT_BLOCK_DNS: u8 = 5;
@@ -172,18 +160,7 @@ pub struct WfpConfig {
     pub strict_kill_switch: bool,
     /// Destinations that stay reachable outside the tunnel, such as the tunnel
     /// server or an IP form of a `bypass.domains` entry.
-    ///
-    /// The local DNS resolver must never appear here: a global entry would let
-    /// every process send plaintext port-53 queries to the pre-VPN resolver.
-    /// Use [`WfpConfig::local_dns_ips`] instead, which is scoped to this
-    /// executable.
     pub permit_cidrs: Vec<(IpAddr, u8)>,
-    /// Resolver IPs of the physical adapter that only this executable may
-    /// reach on remote port 53 (UDP and TCP, one filter per address and
-    /// protocol). Bypass-domain resolution uses the client's own sockets, so
-    /// it keeps working while every other process stays blocked from the
-    /// physical resolver by [`WEIGHT_BLOCK_DNS`].
-    pub local_dns_ips: Vec<IpAddr>,
 }
 
 impl WfpConfig {
@@ -196,7 +173,6 @@ impl WfpConfig {
             block_physical_dns: true,
             strict_kill_switch: false,
             permit_cidrs: Vec::new(),
-            local_dns_ips: Vec::new(),
         })
     }
 }
@@ -245,21 +221,6 @@ impl WfpGuard {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.config.permit_cidrs = previous;
-                Err(err)
-            }
-        }
-    }
-
-    /// Replaces the local DNS resolver IPs, keeping the rest unchanged.
-    ///
-    /// On failure the previous filters and previous resolver list stay in
-    /// force.
-    pub fn update_local_dns_ips(&mut self, ips: &[IpAddr]) -> io::Result<()> {
-        let previous = std::mem::replace(&mut self.config.local_dns_ips, ips.to_vec());
-        match self.rebuild() {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                self.config.local_dns_ips = previous;
                 Err(err)
             }
         }
@@ -531,7 +492,6 @@ fn plan_filters(config: &WfpConfig, app_id: FWP_BYTE_BLOB) -> io::Result<Vec<Pla
             push_cidr_filters(&mut planned, config, family, layer)?;
         }
         if config.block_physical_dns {
-            push_local_dns_filters(&mut planned, config, family, layer, app_id)?;
             // DNS over UDP and DNS over TCP need one filter each: the protocol
             // condition may appear only once per filter.
             for (protocol, name) in [
@@ -666,54 +626,6 @@ fn push_cidr_filters(
             "permit bypass destination",
             vec![condition],
         ));
-    }
-    Ok(())
-}
-
-/// Permits only this executable to reach the local DNS resolver on port 53.
-///
-/// Each resolver IP becomes one UDP and one TCP filter scoped with the
-/// `ALE_APP_ID` condition, because a field key cannot repeat inside one
-/// filter and one filter cannot cover both protocols. The weight outranks
-/// [`WEIGHT_BLOCK_DNS`], so the client's own bypass-domain resolutions keep
-/// working while every other process stays blocked from the physical
-/// resolver.
-fn push_local_dns_filters(
-    planned: &mut Vec<PlannedFilter>,
-    config: &WfpConfig,
-    family: Family,
-    layer: GUID,
-    app_id: FWP_BYTE_BLOB,
-) -> io::Result<()> {
-    for ip in &config.local_dns_ips {
-        for (protocol, name) in [
-            (IPPROTO_UDP, "permit this executable to local DNS over UDP"),
-            (IPPROTO_TCP, "permit this executable to local DNS over TCP"),
-        ] {
-            // One filter per address and protocol: a field key cannot repeat
-            // inside one filter.
-            let remote = match (family, ip) {
-                (Family::V4, IpAddr::V4(address)) => {
-                    Condition::v4_mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, *address, 32)?
-                }
-                (Family::V6, IpAddr::V6(address)) => {
-                    Condition::v6_mask(FWPM_CONDITION_IP_REMOTE_ADDRESS, *address, 128)?
-                }
-                _ => continue,
-            };
-            planned.push(PlannedFilter::new(
-                layer,
-                WEIGHT_PERMIT_LOCAL_DNS,
-                FWP_ACTION_PERMIT,
-                name,
-                vec![
-                    Condition::byte_blob(FWPM_CONDITION_ALE_APP_ID, app_id),
-                    Condition::uint8(FWPM_CONDITION_IP_PROTOCOL, protocol),
-                    Condition::uint16(FWPM_CONDITION_IP_REMOTE_PORT, DNS_PORT),
-                    remote,
-                ],
-            ));
-        }
     }
     Ok(())
 }
@@ -1044,9 +956,9 @@ mod tests {
     use super::{
         CONDITION_ICMP_TYPE, Condition, FWP_BYTE_BLOB, FWP_MATCH_RANGE, FWP_UINT16, IpAddr,
         Ipv4Addr, Ipv6Addr, MAX_FILTER_WEIGHT, PathBuf, SUBLAYER_KEY, Value, WEIGHT_BLOCK_ALL,
-        WEIGHT_BLOCK_DNS, WEIGHT_PERMIT_BOOTSTRAP, WEIGHT_PERMIT_CIDR, WEIGHT_PERMIT_LOCAL_DNS,
-        WEIGHT_PERMIT_LOOPBACK, WEIGHT_PERMIT_SELF, WEIGHT_PERMIT_TUN, WfpConfig, plan_filters,
-        prefix_to_v4_mask, prefix_to_v6_bytes, validate_config, validate_permit_cidr,
+        WEIGHT_BLOCK_DNS, WEIGHT_PERMIT_BOOTSTRAP, WEIGHT_PERMIT_CIDR, WEIGHT_PERMIT_LOOPBACK,
+        WEIGHT_PERMIT_SELF, WEIGHT_PERMIT_TUN, WfpConfig, plan_filters, prefix_to_v4_mask,
+        prefix_to_v6_bytes, validate_config, validate_permit_cidr,
     };
 
     #[test]
@@ -1142,10 +1054,6 @@ mod tests {
                     128,
                 ),
             ],
-            local_dns_ips: vec![
-                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
-                IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
-            ],
         };
         // Planning only copies the blob; WFP never reads it here.
         let app_id = FWP_BYTE_BLOB {
@@ -1183,17 +1091,6 @@ mod tests {
             config.permit_cidrs.len(),
             "every bypass CIDR needs its own single-condition filter"
         );
-
-        // The resolver permits are derived, not hardcoded: one UDP and one TCP
-        // filter per resolver IP.
-        assert_eq!(
-            planned
-                .iter()
-                .filter(|filter| filter.weight == WEIGHT_PERMIT_LOCAL_DNS)
-                .count(),
-            config.local_dns_ips.len() * 2,
-            "every resolver IP needs one UDP and one TCP app-scoped permit"
-        );
     }
 
     #[test]
@@ -1204,7 +1101,6 @@ mod tests {
             block_physical_dns: true,
             strict_kill_switch: true,
             permit_cidrs: Vec::new(),
-            local_dns_ips: Vec::new(),
         };
         let app_id = FWP_BYTE_BLOB {
             size: 0,
@@ -1266,7 +1162,6 @@ mod tests {
             WEIGHT_PERMIT_TUN,
             WEIGHT_PERMIT_BOOTSTRAP,
             WEIGHT_PERMIT_CIDR,
-            WEIGHT_PERMIT_LOCAL_DNS,
         ];
         let blocks = [WEIGHT_BLOCK_DNS, WEIGHT_BLOCK_ALL];
 
@@ -1304,7 +1199,6 @@ mod tests {
             block_physical_dns: true,
             strict_kill_switch: false,
             permit_cidrs: Vec::new(),
-            local_dns_ips: Vec::new(),
         };
         assert!(validate_config(&config).is_err(), "zero LUID must fail");
 
@@ -1321,191 +1215,5 @@ mod tests {
             .permit_cidrs
             .push((IpAddr::V6(Ipv6Addr::LOCALHOST), 129));
         assert!(validate_config(&config).is_err(), "bad prefix must fail");
-    }
-
-    fn has_field(filter: &super::PlannedFilter, field: &windows_sys::core::GUID) -> bool {
-        filter.conditions.iter().any(|condition| {
-            (
-                condition.field.data1,
-                condition.field.data2,
-                condition.field.data3,
-                condition.field.data4,
-            ) == (field.data1, field.data2, field.data3, field.data4)
-        })
-    }
-
-    fn protocol_of(filter: &super::PlannedFilter) -> Option<u8> {
-        filter.conditions.iter().find_map(|condition| {
-            let same = (
-                condition.field.data1,
-                condition.field.data2,
-                condition.field.data3,
-                condition.field.data4,
-            ) == (
-                super::FWPM_CONDITION_IP_PROTOCOL.data1,
-                super::FWPM_CONDITION_IP_PROTOCOL.data2,
-                super::FWPM_CONDITION_IP_PROTOCOL.data3,
-                super::FWPM_CONDITION_IP_PROTOCOL.data4,
-            );
-            if !same {
-                return None;
-            }
-            match *condition.value {
-                Value::Uint8(protocol) => Some(protocol),
-                _ => None,
-            }
-        })
-    }
-
-    fn remote_port_of(filter: &super::PlannedFilter) -> Option<u16> {
-        filter.conditions.iter().find_map(|condition| {
-            let same = (
-                condition.field.data1,
-                condition.field.data2,
-                condition.field.data3,
-                condition.field.data4,
-            ) == (
-                super::FWPM_CONDITION_IP_REMOTE_PORT.data1,
-                super::FWPM_CONDITION_IP_REMOTE_PORT.data2,
-                super::FWPM_CONDITION_IP_REMOTE_PORT.data3,
-                super::FWPM_CONDITION_IP_REMOTE_PORT.data4,
-            );
-            if !same {
-                return None;
-            }
-            match *condition.value {
-                Value::Uint16(port) => Some(port),
-                _ => None,
-            }
-        })
-    }
-
-    fn remote_host_of(filter: &super::PlannedFilter) -> Option<IpAddr> {
-        filter.conditions.iter().find_map(|condition| {
-            let same = (
-                condition.field.data1,
-                condition.field.data2,
-                condition.field.data3,
-                condition.field.data4,
-            ) == (
-                super::FWPM_CONDITION_IP_REMOTE_ADDRESS.data1,
-                super::FWPM_CONDITION_IP_REMOTE_ADDRESS.data2,
-                super::FWPM_CONDITION_IP_REMOTE_ADDRESS.data3,
-                super::FWPM_CONDITION_IP_REMOTE_ADDRESS.data4,
-            );
-            if !same {
-                return None;
-            }
-            match *condition.value {
-                Value::V4Mask(mask) if mask.mask == 0xffff_ffff => {
-                    Some(IpAddr::V4(Ipv4Addr::from(mask.addr)))
-                }
-                Value::V6Mask(mask) if mask.prefixLength == 128 => {
-                    Some(IpAddr::V6(Ipv6Addr::from(mask.addr)))
-                }
-                _ => None,
-            }
-        })
-    }
-
-    #[test]
-    fn local_dns_permit_is_app_scoped_udp_and_tcp() {
-        let dns_v4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        let dns_v6 = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
-        // Strict mode off isolates the DNS path from the CIDR path: any
-        // resolver permit here must come from `local_dns_ips`.
-        let config = WfpConfig {
-            tun_luid: 0x0000_0001_0000_0001,
-            self_exe_path: PathBuf::from("C:\\Program Files\\beam\\beam-client.exe"),
-            block_physical_dns: true,
-            strict_kill_switch: false,
-            permit_cidrs: Vec::new(),
-            local_dns_ips: vec![dns_v4, dns_v6],
-        };
-        let app_id = FWP_BYTE_BLOB {
-            size: 0,
-            data: std::ptr::null_mut(),
-        };
-        let planned = plan_filters(&config, app_id).expect("filter plan");
-        let dns_filters: Vec<_> = planned
-            .iter()
-            .filter(|filter| filter.weight == WEIGHT_PERMIT_LOCAL_DNS)
-            .collect();
-        // Derived, not hardcoded: one UDP and one TCP filter per resolver.
-        assert_eq!(
-            dns_filters.len(),
-            config.local_dns_ips.len() * 2,
-            "one UDP and one TCP permit per resolver IP"
-        );
-        assert!(
-            dns_filters
-                .iter()
-                .all(|filter| filter.weight > WEIGHT_BLOCK_DNS),
-            "the resolver permit must outrank the DNS block"
-        );
-        for ip in &config.local_dns_ips {
-            for protocol in [super::IPPROTO_UDP, super::IPPROTO_TCP] {
-                let found = dns_filters.iter().any(|filter| {
-                    protocol_of(filter) == Some(protocol)
-                        && remote_port_of(filter) == Some(super::DNS_PORT)
-                        && remote_host_of(filter) == Some(*ip)
-                        && has_field(filter, &super::FWPM_CONDITION_ALE_APP_ID)
-                });
-                assert!(
-                    found,
-                    "missing app-scoped {ip} permit for protocol {protocol}"
-                );
-            }
-        }
-        // Every resolver permit must carry the app-ID condition: without it
-        // any process could use the physical resolver.
-        for filter in &dns_filters {
-            assert!(
-                has_field(filter, &super::FWPM_CONDITION_ALE_APP_ID),
-                "resolver permit {:?} lost its app-ID condition",
-                filter.name
-            );
-        }
-    }
-
-    #[test]
-    fn local_dns_has_no_global_cidr_permit() {
-        let dns_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        let config = WfpConfig {
-            tun_luid: 0x0000_0001_0000_0001,
-            self_exe_path: PathBuf::from("C:\\Program Files\\beam\\beam-client.exe"),
-            block_physical_dns: true,
-            strict_kill_switch: true,
-            permit_cidrs: vec![(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 32)],
-            local_dns_ips: vec![dns_ip],
-        };
-        let app_id = FWP_BYTE_BLOB {
-            size: 0,
-            data: std::ptr::null_mut(),
-        };
-        let planned = plan_filters(&config, app_id).expect("filter plan");
-        // A global CIDR permit for the resolver would let every process send
-        // plaintext port-53 queries; the resolver must only appear in
-        // app-scoped filters.
-        for filter in planned
-            .iter()
-            .filter(|filter| filter.weight == WEIGHT_PERMIT_CIDR)
-        {
-            assert_ne!(
-                remote_host_of(filter),
-                Some(dns_ip),
-                "resolver {dns_ip} must not have a global CIDR permit"
-            );
-        }
-        // Any permit filter that names the resolver must be app-scoped.
-        for filter in planned.iter().filter(|filter| {
-            remote_host_of(filter) == Some(dns_ip) && filter.weight != WEIGHT_BLOCK_DNS
-        }) {
-            assert!(
-                has_field(filter, &super::FWPM_CONDITION_ALE_APP_ID),
-                "resolver permit {:?} must be scoped to this executable",
-                filter.name
-            );
-        }
     }
 }

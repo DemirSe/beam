@@ -435,7 +435,6 @@ mod imp {
             config.block_physical_dns = block_physical_dns;
             config.strict_kill_switch = strict_kill_switch;
             config.permit_cidrs = self.permit_cidrs();
-            config.local_dns_ips = self.local_dns_ips();
             let guard = WfpGuard::install(config)?;
             info!(
                 filters = guard.filter_count(),
@@ -445,21 +444,23 @@ mod imp {
             Ok(())
         }
 
-        /// Destinations that stay reachable outside the tunnel: the server and
-        /// every configured or resolved bypass address.
-        ///
-        /// The local DNS resolver is deliberately absent: it is permitted for
-        /// this executable only through the WFP local-DNS filters, so other
-        /// processes cannot send plaintext port-53 queries to it.
+        /// Destinations that stay reachable outside the tunnel: the server, the
+        /// local DNS upstream, and every configured or resolved bypass address.
         fn permit_cidrs(&self) -> Vec<(IpAddr, u8)> {
             let mut out = Vec::with_capacity(
                 self.static_bypass.len()
                     + self.dynamic_bypass_v4.len()
                     + self.dynamic_bypass_v6.len()
-                    + 1,
+                    + 2,
             );
             if !self.server_ip.is_loopback() {
                 out.push((self.server_ip, host_prefix(self.server_ip)));
+            }
+            if let Some(dns_ip) = self
+                .local_dns_ip
+                .filter(|ip| !ip.is_loopback() && !self.is_in_tun_subnet(*ip))
+            {
+                out.push((dns_ip, host_prefix(dns_ip)));
             }
             out.extend(self.static_bypass.iter().copied());
             out.extend(
@@ -477,48 +478,19 @@ mod imp {
             out
         }
 
-        /// Pushes the current permit lists into WFP when they changed.
+        /// Pushes the current permit list into WFP when it changed.
         fn sync_wfp_permits(&mut self) {
             let wanted = self.permit_cidrs();
-            let wanted_dns = self.local_dns_ips();
             let Some(wfp) = self.wfp.as_mut() else {
                 return;
             };
-            if wfp.config().permit_cidrs == wanted && wfp.config().local_dns_ips == wanted_dns {
+            if wfp.config().permit_cidrs == wanted {
                 return;
             }
-            // One rebuild covers both lists when both changed; otherwise only
-            // the changed list rebuilds.
-            let cidrs_changed = wfp.config().permit_cidrs != wanted;
-            let dns_changed = wfp.config().local_dns_ips != wanted_dns;
-            if cidrs_changed && let Err(err) = wfp.update_permit_cidrs(&wanted) {
-                warn!(error = %err, "failed to update the WFP permit list");
-                return;
+            match wfp.update_permit_cidrs(&wanted) {
+                Ok(()) => debug!(cidrs = wanted.len(), "updated the WFP permit list"),
+                Err(err) => warn!(error = %err, "failed to update the WFP permit list"),
             }
-            if dns_changed {
-                match wfp.update_local_dns_ips(&wanted_dns) {
-                    Ok(()) => debug!(
-                        cidrs = wanted.len(),
-                        dns = wanted_dns.len(),
-                        "updated the WFP permit list"
-                    ),
-                    Err(err) => warn!(error = %err, "failed to update the WFP DNS list"),
-                }
-            } else if cidrs_changed {
-                debug!(cidrs = wanted.len(), "updated the WFP permit list");
-            }
-        }
-
-        /// Resolver IPs only this executable may reach on port 53.
-        ///
-        /// Loopback and tunnel-subnet addresses need no physical permit:
-        /// loopback is always permitted and tunnel addresses stay inside the
-        /// tunnel interface permit.
-        fn local_dns_ips(&self) -> Vec<IpAddr> {
-            self.local_dns_ip
-                .filter(|ip| !ip.is_loopback() && !self.is_in_tun_subnet(*ip))
-                .into_iter()
-                .collect()
         }
 
         /// Returns `true` when `ip` lies inside the tunnel IPv4 or IPv6 subnet.
@@ -938,70 +910,6 @@ mod imp {
         }
         let _ = std::fs::remove_file(path);
         Ok(removed)
-    }
-
-    #[cfg(test)]
-    mod imp_tests {
-        use super::{ActivePhysicalInterface, PhysicalGateways, WindowsRouteGuard, host_prefix};
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-        use std::path::PathBuf;
-
-        fn guard_with_dns(server_ip: IpAddr, local_dns_ip: Option<IpAddr>) -> WindowsRouteGuard {
-            WindowsRouteGuard {
-                tun_luid: 0x0000_0001_0000_0001,
-                tun_index: 1,
-                auto_route: true,
-                routes_state_path: PathBuf::from("routes.state"),
-                tun_net: None,
-                server_ip,
-                local_dns_ip,
-                active_if: ActivePhysicalInterface::new(),
-                current_gw: PhysicalGateways::default(),
-                static_bypass: Vec::new(),
-                dynamic_bypass_v4: Default::default(),
-                dynamic_bypass_v6: Default::default(),
-                split_routes: Vec::new(),
-                server_route: None,
-                dns_route: None,
-                extra_routes: Vec::new(),
-                wfp: None,
-            }
-        }
-
-        #[test]
-        fn permit_cidrs_excludes_the_local_dns_resolver() {
-            let dns_v4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-            let server = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-            let guard = guard_with_dns(server, Some(dns_v4));
-            let cidrs = guard.permit_cidrs();
-            assert!(
-                !cidrs.iter().any(|(ip, _)| *ip == dns_v4),
-                "local DNS {dns_v4} must not have a global CIDR permit"
-            );
-            assert!(
-                cidrs.contains(&(server, host_prefix(server))),
-                "the server must stay reachable outside the tunnel"
-            );
-            // The resolver stays reachable for this executable only.
-            assert_eq!(guard.local_dns_ips(), vec![dns_v4]);
-        }
-
-        #[test]
-        fn local_dns_ips_skips_loopback_and_tunnel_addresses() {
-            let server = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-            let loopback = guard_with_dns(server, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
-            assert!(loopback.local_dns_ips().is_empty());
-            assert!(
-                !loopback
-                    .permit_cidrs()
-                    .iter()
-                    .any(|(ip, _)| ip.is_loopback())
-            );
-
-            let v6_tun = IpAddr::V6(Ipv6Addr::new(0xfd00, 0xbe, 0xa, 0, 0, 0, 0, 1));
-            let tun_dns = guard_with_dns(server, Some(v6_tun));
-            assert!(tun_dns.local_dns_ips().is_empty());
-        }
     }
 }
 
