@@ -29,8 +29,11 @@ const MAX_PACKET_BUF: usize = 65_536;
 const TUN_TX_CHANNEL_CAP: usize = 512;
 const RX_BATCH_MAX: usize = 128;
 /// Pending UDP/DNS/ICMP replies drained per loop iteration before the engine
-/// returns to `device.recv`, so a busy reply queue can never starve TUN reads.
-const TUN_RX_DRAIN_MAX: usize = 64;
+/// returns to `device.recv`. Match the inbound batch limit so a synchronous
+/// reject flood cannot enqueue more replies than one drain removes.
+const TUN_RX_DRAIN_MAX: usize = RX_BATCH_MAX;
+const _: () = assert!(TUN_RX_DRAIN_MAX >= RX_BATCH_MAX);
+const _: () = assert!(TUN_RX_DRAIN_MAX <= TUN_TX_CHANNEL_CAP);
 const C2S_COALESCE_TARGET: usize = 64 * 1024;
 // Android uses 16 KiB (one max TLS 1.3 record) to cut worst-case 128-flow
 // transient RSS by 4x without hurting TLS throughput.
@@ -709,12 +712,7 @@ where
         // Drain interactive UDP/DNS/ICMP reply packets before bulk TCP segments
         // so voice/gaming/DNS traffic does not wait behind a full download burst,
         // bounded so a sustained reply stream cannot postpone TUN reads.
-        for _ in 0..TUN_RX_DRAIN_MAX {
-            let Ok(pkt) = tun_rx.try_recv() else {
-                break;
-            };
-            send_tun_packet(&mut device, &pkt, &drops).await?;
-        }
+        drain_reply_queue(&mut device, &mut tun_rx, &drops).await?;
 
         for pkt in tx_batch.drain(..) {
             send_tun_packet(&mut device, &pkt, &drops).await?;
@@ -880,6 +878,22 @@ where
     }
 
     info!("beam-tun engine stopped");
+    Ok(())
+}
+
+/// Drains at most [`TUN_RX_DRAIN_MAX`] queued replies before the engine reads
+/// more packets, keeping the loop bounded by [`TUN_TX_CHANNEL_CAP`].
+async fn drain_reply_queue<D: TunDevice>(
+    device: &mut D,
+    tun_rx: &mut mpsc::Receiver<Vec<u8>>,
+    drops: &DropCounters,
+) -> Result<(), EngineError> {
+    for _ in 0..TUN_RX_DRAIN_MAX {
+        let Ok(pkt) = tun_rx.try_recv() else {
+            break;
+        };
+        send_tun_packet(device, &pkt, drops).await?;
+    }
     Ok(())
 }
 
@@ -1464,6 +1478,7 @@ fn update_udp_sweep_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::MemoryTun;
     use std::collections::VecDeque;
 
     fn test_failure() -> DialFailure {
@@ -1471,6 +1486,29 @@ mod tests {
             stage: DialFailureStage::TcpConnect,
             kind: DialFailureKind::Refused,
         }
+    }
+
+    #[tokio::test]
+    async fn reply_drain_matches_a_sustained_reject_enqueue_rate() {
+        let (_peer, mut device) = MemoryTun::pair(1500, TUN_TX_CHANNEL_CAP * 2);
+        let (tx, mut rx) = mpsc::channel(TUN_TX_CHANNEL_CAP);
+        let iterations = 8;
+        let drops = DropCounters::default();
+        for tick in 0..iterations {
+            for i in 0..RX_BATCH_MAX {
+                tx.try_send(vec![(tick * RX_BATCH_MAX + i) as u8])
+                    .expect("one inbound batch fits the bounded reply queue");
+            }
+            drain_reply_queue(&mut device, &mut rx, &drops)
+                .await
+                .expect("drain");
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "one drain per inbound batch must empty the reply queue"
+        );
+        assert_eq!(drops.snapshot().tun_tx_full, 0, "no reply may drop");
     }
 
     #[test]
