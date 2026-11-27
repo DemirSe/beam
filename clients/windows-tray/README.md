@@ -61,6 +61,19 @@ To remove everything cleanly, double-click **`uninstall.cmd`** (or run
   the WinTun adapter while connected, preventing Windows Smart Multi-Homed Name
   Resolution (SMHNR) from leaking DNS queries onto physical interfaces.
 
+- **Pre-VPN resolver exception:** while connected, plaintext port 53 is
+  blocked for every destination except the pre-VPN resolver, which the client
+  needs for `.lan`, `.local`, `.internal`, and `bypass.domains`. That exception
+  is machine-wide on purpose. Scoping it to `beam-client.exe` was tried and
+  reverted: ordinary Windows resolver lookups then stalled for about 12 s
+  (run 46065050437), because Windows waits out its blocked parallel queries
+  instead of falling back to the tunnel resolver. Scoping needs a fail-fast
+  block first.
+- **Resolver latency:** a name resolved through the tunnel resolver answers in
+  under 1 ms. `Resolve-DnsName` also reports about 18 ms because Windows races
+  every adapter's resolver; that time is the Windows resolver, not the tunnel.
+  The live comparison reports both `dns_ms` and `dns_direct_ms` for this reason.
+
 ## Build
 
 1. **Rust service (`beam-client.exe`):**
