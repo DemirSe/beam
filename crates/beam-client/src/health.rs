@@ -55,6 +55,7 @@ static PROBE_LOG: LazyLock<RateLimiter> =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkState {
     Connected,
+    Idle,
     Reconnecting,
     WaitingNetwork,
 }
@@ -63,6 +64,7 @@ impl LinkState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Connected => "connected",
+            Self::Idle => "idle",
             Self::Reconnecting => "reconnecting",
             Self::WaitingNetwork => "waiting_network",
         }
@@ -480,10 +482,10 @@ fn probe_tick_decision(
     recent_rtt.map(|rtt| (LinkState::Connected, "dial_activity", Some(rtt)))
 }
 
-/// A bare TCP connect proves only that the server port answers. Keep the link
-/// out of the connected state so a portal that passes TCP cannot look healthy.
+/// A bare TCP connect proves only that the server port answers. Report a
+/// neutral state, not a failure, so an idle healthy link does not look broken.
 fn bare_probe_tick_decision(rtt_ms: u64) -> (LinkState, &'static str, Option<u64>) {
-    (LinkState::Reconnecting, "probe_ok", Some(rtt_ms))
+    (LinkState::Idle, "probe_ok", Some(rtt_ms))
 }
 
 /// The no-netlink fallback poll grows only while nothing changed and no probe
@@ -951,7 +953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_probe_success_without_dial_activity_is_not_connected() {
+    async fn health_states_distinguish_probe_only_dial_verified_and_failed_links() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind probe target");
@@ -966,14 +968,54 @@ mod tests {
         assert_eq!(activity.recent_rtt(RECENT_ACTIVITY_WINDOW), None);
         assert_eq!(probe_tick_decision(false, 0, None), None);
 
+        // A successful TCP probe proves reachability, not tunnel liveness.
         let (state, reason, rtt_ms) = bare_probe_tick_decision(rtt);
+        assert_eq!(state, LinkState::Idle);
+        let text = format_status(&StatusInfo::new(
+            "beamtun0", state, rtt_ms, reason, 0, true, &activity,
+        ));
+        assert!(text.contains("state=idle\n"));
+        assert!(text.contains("reason=probe_ok\n"));
+        assert!(text.contains("ifname=beamtun0\n"));
+        assert!(text.contains("rtt_ms="));
+        assert!(!text.contains("state=connected\n"));
+        assert!(!text.contains("state=reconnecting\n"));
+        assert!(!text.contains("reason=dial_activity\n"));
+
+        // A dial-verified tunnel is the only green state.
+        let activity = TunnelActivity::new();
+        activity.record_dial_success(21);
+        let (state, reason, rtt_ms) =
+            probe_tick_decision(false, 0, activity.recent_rtt(RECENT_ACTIVITY_WINDOW))
+                .expect("dial activity");
+        assert_eq!(state, LinkState::Connected);
+        let text = format_status(&StatusInfo::new(
+            "beamtun0", state, rtt_ms, reason, 0, true, &activity,
+        ));
+        assert!(text.contains("state=connected\n"));
+        assert!(text.contains("reason=dial_activity\n"));
+
+        // Fresh dial failures stay degraded, even with a reachable server.
+        let activity = TunnelActivity::new();
+        for _ in 0..DEGRADED_DIAL_FAILURE_STREAK {
+            activity.record_dial_failure(beam_tun::DialFailure {
+                stage: beam_tun::DialFailureStage::TcpConnect,
+                kind: beam_tun::DialFailureKind::Refused,
+            });
+        }
+        let (state, reason, rtt_ms) = probe_tick_decision(
+            false,
+            activity.recent_failure_streak(DEGRADED_WINDOW),
+            Some(21),
+        )
+        .expect("dial failures");
+        assert_eq!(state, LinkState::Reconnecting);
         let text = format_status(&StatusInfo::new(
             "beamtun0", state, rtt_ms, reason, 0, true, &activity,
         ));
         assert!(text.contains("state=reconnecting\n"));
+        assert!(text.contains("reason=dial_failures\n"));
         assert!(!text.contains("state=connected\n"));
-        assert!(text.contains("reason=probe_ok\n"));
-        assert!(!text.contains("reason=dial_activity\n"));
     }
 
     #[tokio::test]

@@ -40,7 +40,8 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
 use crate::win_ipc::{
-    IpcStatus, MAX_DROPS_CHARS, MAX_IFNAME_CHARS, MAX_KEY_CHARS, wire_token, write_status_atomic,
+    IpcStatus, MAX_DROPS_CHARS, MAX_IFNAME_CHARS, MAX_KEY_CHARS, STATE_IDLE, wire_token,
+    write_status_atomic,
 };
 use crate::win_routes::{ActivePhysicalInterface, WindowsRouteGuard};
 
@@ -397,15 +398,16 @@ pub fn spawn_windows_network_monitor(
                     decision
                 } else {
                     match probe_server_rtt(server_addr, active_if.clone()).await {
-                        Ok(rtt_ms) => (STATE_CONNECTED, "probe_ok", Some(rtt_ms)),
+                        Ok(rtt_ms) => bare_probe_tick_decision(rtt_ms),
                         Err(err) => {
                             log_probe_failure(server_addr, &err);
                             (STATE_RECONNECTING, "probe_failed", None)
                         }
                     }
                 };
-                if state == STATE_CONNECTED {
-                    is_connected = true;
+                let probe_ok = state == STATE_CONNECTED || state == STATE_IDLE;
+                if probe_ok {
+                    is_connected = state == STATE_CONNECTED;
                     offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
                     probe_seq = probe_seq.wrapping_add(1);
                     next_probe_at = Instant::now() + next_healthy_probe_interval(probe_seq);
@@ -581,6 +583,11 @@ fn probe_tick_decision(
     recent_rtt.map(|rtt| (STATE_CONNECTED, "dial_activity", Some(rtt)))
 }
 
+/// A bare TCP connect proves reachability, not an authenticated tunnel dial.
+fn bare_probe_tick_decision(rtt_ms: u64) -> (&'static str, &'static str, Option<u64>) {
+    (STATE_IDLE, "probe_ok", Some(rtt_ms))
+}
+
 /// Whether a reconcile left the routes in an acceptable state: installed, or
 /// nothing to install because the host has no gateway at all.
 fn installed_or_idle(bypass_missing: bool, any_gw: bool) -> bool {
@@ -690,6 +697,14 @@ mod tests {
             Some((STATE_CONNECTED, "dial_activity", Some(10)))
         );
         assert_eq!(probe_tick_decision(false, 0, None), None);
+    }
+
+    #[test]
+    fn probe_only_success_reports_idle() {
+        assert_eq!(
+            bare_probe_tick_decision(12),
+            (STATE_IDLE, "probe_ok", Some(12))
+        );
     }
 
     #[test]

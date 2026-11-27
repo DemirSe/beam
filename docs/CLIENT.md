@@ -349,14 +349,20 @@ it does not know, so this list can grow without breaking an older tray. A
 a bare TCP connect to the server no longer reports the link as connected. The
 client reports this state while a new dial failure is no more than 20 s old, and
 only after three consecutive failures. A gap of more than 30 s between failures
-starts a new failure count.
+starts a new failure count. A `reason` of `probe_ok` means a bare TCP connect
+succeeded. The client reports `state=idle` with `reason=probe_ok` until a dial
+verifies the tunnel.
 
-The tray turns these keys into a degraded warning. `health.rs` emits
-`state=connected`, `state=reconnecting` (with `reason=dial_failures` while
-fresh authenticated dial failures degrade the link), or
-`state=waiting_network`; it never emits `state=degraded`. The tray shows green
-`Beam: connected` (with RTT when reported) only for `state=connected` with
-`bypass_ok != 0`. It shows a degraded warning for `state=connected` with
+The tray turns these keys into a status label. The health monitors emit these
+states: `state=connected` with `reason=dial_activity` after a verified dial;
+`state=idle` with `reason=probe_ok` after a bare TCP probe; `state=reconnecting`
+with `reason=dial_failures` while fresh dial failures degrade the link; and
+`state=waiting_network` when no gateway is available. They never emit
+`state=degraded`. The tray shows green `Beam: connected` (with RTT when
+reported) only for `state=connected` with `bypass_ok != 0`. It shows
+`Beam: idle` for `state=idle` with `bypass_ok != 0`. The Windows tray shows
+`beam: Idle` for the same state. A missing bypass route still shows the
+degraded bypass text. It shows a degraded warning for `state=connected` with
 `bypass_ok=0` (`Beam: degraded (bypass missing)`), for `state=reconnecting`
 with `reason=dial_failures` (`Beam: degraded (dial failures)`, combined with
 the bypass text when both apply), and plain `Beam: reconnecting...` or

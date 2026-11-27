@@ -263,6 +263,15 @@ static void update_ui(void)
             snprintf(label, sizeof(label), "Beam: waiting for network...");
             icon = "network-vpn-acquiring-symbolic";
             desc = "Waiting for network";
+        } else if (strcmp(state, "idle") == 0) {
+            if (!bypass_ok) {
+                snprintf(label, sizeof(label), "Beam: degraded (bypass missing)");
+                desc = "Degraded";
+            } else {
+                snprintf(label, sizeof(label), "Beam: idle");
+                desc = "Idle (unverified)";
+            }
+            icon = "network-vpn-acquiring-symbolic";
         } else if (strcmp(state, "connected") == 0 || strcmp(state, "reconnecting") == 0) {
             /*
              * Degraded takes precedence over plain reconnecting. `reason`

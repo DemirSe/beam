@@ -55,6 +55,9 @@ pub(crate) const MAX_DROPS_CHARS: usize = 256;
 /// Longest error text in a reply.
 const MAX_ERROR_CHARS: usize = 512;
 
+/// Neutral state token: the TCP probe succeeded, but no dial verified the tunnel.
+pub const STATE_IDLE: &str = "idle";
+
 /// Windows client TOML used when no config exists yet.
 ///
 /// The `[server]` table is inserted by [`import_vless_link_to_toml`]; every
@@ -96,7 +99,7 @@ pub enum IpcRequest {
 /// Status snapshot answered by `STATUS`.
 ///
 /// `state` and `reason` use the same lowercase tokens as the Linux status file
-/// (`connected`, `reconnecting`, `waiting_network`) plus the Windows-only
+/// (`connected`, `idle`, `reconnecting`, `waiting_network`) plus the Windows-only
 /// service states (`disconnected`, `connecting`, `stopping`, `error`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpcStatus {
@@ -735,6 +738,18 @@ mod tests {
              reason=dial_activity bypass_ok=1 dial_failures=3 generation=7 \
              drops=route:1,ip_parse:2"
         );
+    }
+
+    #[test]
+    fn status_reply_carries_the_idle_probe_token() {
+        let mut status = status();
+        status.state = STATE_IDLE.to_owned();
+        status.reason = "probe_ok".to_owned();
+        let reply = format_status_reply(&status);
+        assert!(reply.starts_with("OK state=idle "), "{reply}");
+        assert!(reply.contains(" reason=probe_ok "), "{reply}");
+        assert!(!reply.contains("state=connected"), "{reply}");
+        assert!(reply.len() <= MAX_REPLY_BYTES);
     }
 
     #[test]

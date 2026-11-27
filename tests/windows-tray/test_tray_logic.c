@@ -18,6 +18,10 @@ static const char STATUS_CONNECTED[] =
     "OK state=connected ifname=Beam server=203.0.113.10:443 rtt_ms=42 "
     "reason=dial_activity bypass_ok=1 dial_failures=3 generation=7 "
     "drops=route:1,ip_parse:2";
+static const char STATUS_IDLE[] =
+    "OK state=idle ifname=Beam server=203.0.113.10:443 rtt_ms=42 "
+    "reason=probe_ok bypass_ok=1 dial_failures=3 generation=7 "
+    "drops=route:1,ip_parse:2";
 static const char STATUS_DISCONNECTED[] =
     "OK state=disconnected ifname=none server=none rtt_ms=none "
     "reason=not_connected bypass_ok=1 dial_failures=0 generation=0 drops=none";
@@ -58,6 +62,12 @@ static void test_parse_status_fields(void)
     assert(strcmp(st.reason, "not_connected") == 0);
     assert(st.bypass_ok);
     assert(st.drops[0] == '\0');
+
+    /* A bare TCP probe keeps its neutral state and reason token. */
+    st = parse_or_die(STATUS_IDLE);
+    assert(strcmp(st.state, "idle") == 0);
+    assert(strcmp(st.reason, "probe_ok") == 0);
+    assert(st.has_rtt && st.rtt_ms == 42ULL);
 }
 
 static void test_parse_status_tolerates_line_endings(void)
@@ -343,6 +353,14 @@ static void test_derive_tray_state(void)
     st.bypass_ok = false;
     assert(beam_ipc_derive_tray_state(&st) == TRAY_STATE_DEGRADED);
 
+    strcpy(st.state, "idle");
+    strcpy(st.reason, "probe_ok");
+    st.bypass_ok = true;
+    assert(beam_ipc_derive_tray_state(&st) == TRAY_STATE_IDLE);
+    st.bypass_ok = false;
+    assert(beam_ipc_derive_tray_state(&st) == TRAY_STATE_DEGRADED);
+    st.bypass_ok = true;
+
     strcpy(st.state, "reconnecting");
     strcpy(st.reason, "network_change");
     assert(beam_ipc_derive_tray_state(&st) == TRAY_STATE_RECONNECTING);
@@ -377,6 +395,8 @@ static void test_derive_tray_state(void)
     /* End-to-end: wire lines map to the expected tray state. */
     st = parse_or_die(STATUS_CONNECTED);
     assert(beam_ipc_derive_tray_state(&st) == TRAY_STATE_CONNECTED);
+    st = parse_or_die(STATUS_IDLE);
+    assert(beam_ipc_derive_tray_state(&st) == TRAY_STATE_IDLE);
     st = parse_or_die(STATUS_DISCONNECTED);
     assert(beam_ipc_derive_tray_state(&st) == TRAY_STATE_DISCONNECTED);
     st = parse_or_die("ERR code=bad_request msg=unknown command");
@@ -392,6 +412,7 @@ static void test_menu_actions(void)
     assert(!beam_tray_can_connect(TRAY_STATE_DEGRADED));
     assert(!beam_tray_can_connect(TRAY_STATE_RECONNECTING));
     assert(!beam_tray_can_connect(TRAY_STATE_WAITING_NETWORK));
+    assert(!beam_tray_can_connect(TRAY_STATE_IDLE));
     assert(!beam_tray_can_connect(TRAY_STATE_STOPPING));
     assert(!beam_tray_can_connect(TRAY_STATE_UNAVAILABLE));
 
@@ -402,6 +423,7 @@ static void test_menu_actions(void)
     assert(beam_tray_can_disconnect(TRAY_STATE_DEGRADED));
     assert(beam_tray_can_disconnect(TRAY_STATE_RECONNECTING));
     assert(beam_tray_can_disconnect(TRAY_STATE_WAITING_NETWORK));
+    assert(beam_tray_can_disconnect(TRAY_STATE_IDLE));
     assert(!beam_tray_can_disconnect(TRAY_STATE_STOPPING));
     assert(!beam_tray_can_disconnect(TRAY_STATE_UNAVAILABLE));
 }
@@ -443,6 +465,8 @@ static void test_format_status_text(void)
     beam_ipc_format_status_text(&st, TRAY_STATE_DEGRADED, text, sizeof(text));
     assert(strcmp(text, "beam: Degraded") == 0);
 
+    beam_ipc_format_status_text(&st, TRAY_STATE_IDLE, text, sizeof(text));
+    assert(strcmp(text, "beam: Idle") == 0);
     beam_ipc_format_status_text(&st, TRAY_STATE_RECONNECTING, text, sizeof(text));
     assert(strcmp(text, "beam: Reconnecting...") == 0);
     beam_ipc_format_status_text(&st, TRAY_STATE_WAITING_NETWORK, text, sizeof(text));
@@ -475,7 +499,7 @@ static void test_format_status_text(void)
     /* Every state stays inside the Win32 tooltip bound (127 characters). */
     {
         int state;
-        for (state = 0; state <= (int)TRAY_STATE_UNAVAILABLE; ++state) {
+        for (state = 0; state <= (int)TRAY_STATE_IDLE; ++state) {
             beam_ipc_format_status_text(&st, (TrayState)state, text, sizeof(text));
             assert(strlen(text) > 0 && strlen(text) <= 127);
         }
@@ -486,6 +510,11 @@ static void test_format_status_text(void)
     beam_ipc_format_status_text(&st, beam_ipc_derive_tray_state(&st), text,
                                 sizeof(text));
     assert(strcmp(text, "beam: Connected (42 ms)") == 0);
+
+    st = parse_or_die(STATUS_IDLE);
+    beam_ipc_format_status_text(&st, beam_ipc_derive_tray_state(&st), text,
+                                sizeof(text));
+    assert(strcmp(text, "beam: Idle") == 0);
 }
 
 static void test_prepare_import_link(void)

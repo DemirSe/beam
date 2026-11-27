@@ -41,7 +41,8 @@ typedef enum {
     TRAY_STATE_WAITING_NETWORK  = 5,
     TRAY_STATE_STOPPING         = 6,
     TRAY_STATE_ERROR            = 7,
-    TRAY_STATE_UNAVAILABLE      = 8
+    TRAY_STATE_UNAVAILABLE      = 8,
+    TRAY_STATE_IDLE             = 9
 } TrayState;
 
 /* One parsed `STATUS` (or `ERR`) reply line. */
@@ -316,6 +317,8 @@ static inline TrayState beam_ipc_derive_tray_state(const BeamIpcStatus *st)
         return TRAY_STATE_ERROR;
     if (strcmp(st->state, "connected") == 0)
         return st->bypass_ok ? TRAY_STATE_CONNECTED : TRAY_STATE_DEGRADED;
+    if (strcmp(st->state, "idle") == 0)
+        return st->bypass_ok ? TRAY_STATE_IDLE : TRAY_STATE_DEGRADED;
     if (strcmp(st->state, "reconnecting") == 0)
         return strcmp(st->reason, "dial_failures") == 0 ? TRAY_STATE_DEGRADED
                                                         : TRAY_STATE_RECONNECTING;
@@ -340,7 +343,7 @@ static inline bool beam_tray_can_disconnect(TrayState state)
 {
     return state == TRAY_STATE_CONNECTING || state == TRAY_STATE_CONNECTED ||
            state == TRAY_STATE_DEGRADED || state == TRAY_STATE_RECONNECTING ||
-           state == TRAY_STATE_WAITING_NETWORK;
+           state == TRAY_STATE_WAITING_NETWORK || state == TRAY_STATE_IDLE;
 }
 
 /*
@@ -382,6 +385,9 @@ static inline void beam_ipc_format_status_text(const BeamIpcStatus *st, TrayStat
     }
     case TRAY_STATE_CONNECTING:
         beam_ipc_copy(out, out_cap, "beam: Connecting...");
+        break;
+    case TRAY_STATE_IDLE:
+        beam_ipc_copy(out, out_cap, "beam: Idle");
         break;
     case TRAY_STATE_RECONNECTING:
         beam_ipc_copy(out, out_cap, "beam: Reconnecting...");
