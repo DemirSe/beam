@@ -1145,14 +1145,15 @@ impl ProxyTcpStack {
 
     /// Tiered soft eviction when the TCP table is full so closing/stale flows
     /// yield their slot before a new SYN is rejected with `tcp_limit`:
-    /// 1. Oldest idle closing flow (`FinWait1`/`FinWait2`/`Closing`/`LastAck`/
-    ///    `CloseWait`) with empty buffers.
-    /// 2. Oldest half-open `SynReceived` flow idle for at least `SOFT_EVICT_SYN_MIN_AGE_MS`.
-    /// 3. Oldest quiescent flow with empty buffers idle for at least
+    /// 1. Oldest closing flow (`FinWait1`/`FinWait2`/`Closing`/`LastAck`/
+    ///    `CloseWait`) with empty buffers idle for at least
     ///    `SOFT_EVICT_ESTABLISHED_IDLE_MS`.
+    /// 2. Oldest half-open `SynReceived` flow idle for at least `SOFT_EVICT_SYN_MIN_AGE_MS`.
+    /// 3. Oldest quiescent `Established` flow with empty buffers idle for at
+    ///    least `SOFT_EVICT_ESTABLISHED_IDLE_MS`.
     ///
-    /// Buffered closing flows fall through to tier 3, which also requires empty
-    /// buffers, so a stalled half-closed transfer is never truncated.
+    /// A fresh closing flow or a buffered half-closed transfer is not a victim,
+    /// so an old idle `Established` flow yields its slot instead.
     fn evict_one_stale_conn(
         conns: &mut HashMap<FlowKey, TcpConn>,
         poll_batch: &mut Vec<FlowKey>,
@@ -1171,7 +1172,8 @@ impl ProxyTcpStack {
                 | TcpState::Closing
                 | TcpState::LastAck
                 | TcpState::CloseWait
-                    if !conn.has_buffered_data()
+                    if age_ms >= SOFT_EVICT_ESTABLISHED_IDLE_MS
+                        && !conn.has_buffered_data()
                         && best_closing.is_none_or(|(ts, _)| conn.last_activity_ms < ts) =>
                 {
                     best_closing = Some((conn.last_activity_ms, flow));
@@ -1181,12 +1183,7 @@ impl ProxyTcpStack {
                         best_syn = Some((conn.last_activity_ms, flow));
                     }
                 }
-                TcpState::FinWait1
-                | TcpState::FinWait2
-                | TcpState::Closing
-                | TcpState::LastAck
-                | TcpState::CloseWait
-                | TcpState::Established
+                TcpState::Established
                     if age_ms >= SOFT_EVICT_ESTABLISHED_IDLE_MS
                         && !is_protected_push_port(flow.3)
                         && !conn.has_buffered_data()
@@ -3304,6 +3301,8 @@ mod tests {
         let flow2: FlowKey = (client, 40002, server, 443);
         let aborted1 = Arc::clone(&stack.conns.get(&flow1).unwrap().aborted);
         stack.conns.get_mut(&flow1).unwrap().state = TcpState::FinWait2;
+        stack.conns.get_mut(&flow1).unwrap().last_activity_ms =
+            300 - SOFT_EVICT_ESTABLISHED_IDLE_MS;
         stack
             .conns
             .get_mut(&flow2)
@@ -3507,6 +3506,83 @@ mod tests {
         let overflow = stack.conns.get(&(client, 30129, server, 443)).unwrap();
         assert_eq!(first.max_rcv_buf, 128 * 1024);
         assert_eq!(overflow.max_rcv_buf, 64 * 1024);
+    }
+
+    #[test]
+    fn soft_eviction_requires_idle_age_for_an_empty_close_wait() {
+        let mut stack = ProxyTcpStack::new(TcpStackConfig::default());
+        let client = IpAddr::V4(Ipv4Addr::new(198, 19, 0, 1));
+        let server = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let mut tx = Vec::new();
+        let mut accepted = Vec::new();
+
+        for (port, seq) in [(40001u16, 1000u32), (40002u16, 2000u32)] {
+            let syn = build_ip_tcp_packet_slices(
+                client,
+                port,
+                server,
+                443,
+                seq,
+                0,
+                TCP_SYN,
+                65_535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("syn");
+            stack.push_ip_tcp(&syn);
+            stack.poll(100, &mut tx, &mut accepted);
+            let syn_ack_pkt = tx.pop().expect("synack");
+            let syn_ack = parse_tcp(parse_ip(&syn_ack_pkt).expect("ip").payload).expect("tcp");
+            let ack = build_ip_tcp_packet_slices(
+                client,
+                port,
+                server,
+                443,
+                seq + 1,
+                syn_ack.seq + 1,
+                TCP_ACK,
+                65_535,
+                &[],
+                &[],
+                &[],
+            )
+            .expect("ack");
+            stack.push_ip_tcp(&ack);
+            stack.poll(100, &mut tx, &mut accepted);
+        }
+
+        let fresh: FlowKey = (client, 40001, server, 443);
+        let idle: FlowKey = (client, 40002, server, 443);
+        let now = 100 + SOFT_EVICT_ESTABLISHED_IDLE_MS;
+        stack.conns.get_mut(&fresh).expect("fresh flow").state = TcpState::CloseWait;
+        stack
+            .conns
+            .get_mut(&fresh)
+            .expect("fresh flow")
+            .last_activity_ms = now;
+        stack
+            .conns
+            .get_mut(&idle)
+            .expect("idle flow")
+            .last_activity_ms = now - SOFT_EVICT_ESTABLISHED_IDLE_MS;
+
+        let mut batch = Vec::new();
+        assert!(ProxyTcpStack::evict_one_stale_conn(
+            &mut stack.conns,
+            &mut batch,
+            now,
+            &mut tx
+        ));
+        assert!(
+            !stack.conns.contains_key(&idle),
+            "the old idle established flow must be evicted"
+        );
+        assert!(
+            stack.conns.contains_key(&fresh),
+            "a fresh empty CloseWait must not be evicted first"
+        );
     }
 
     #[test]
