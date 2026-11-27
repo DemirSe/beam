@@ -932,11 +932,9 @@ fn warn_relay_timeout(dst: SocketAddr, op: &'static str, idle: Duration) {
 
 /// Runs `fut` with a deadline when `Some`, or awaits it directly when `None`.
 ///
-/// Only relay *reads* pass `None`, in the push-safe always-on mode: established
-/// FCM/MTalk flows wait on the socket with no redundant read cap, so
-/// `ProxyTcpStack`'s `idle_timeout_ms` plus upstream keepalive/
-/// `TCP_USER_TIMEOUT` govern flow lifetime instead of a second timer. Relay
-/// writes always pass `Some`, see [`spawn_tcp_relay`].
+/// Relay writes pass `Some` in both modes so a peer that stops draining can
+/// never wedge a task. Relay reads use [`RelayIdle`] instead; see
+/// [`spawn_tcp_relay`].
 async fn with_relay_idle<T>(
     idle: Option<Duration>,
     fut: impl std::future::Future<Output = T>,
@@ -951,6 +949,69 @@ async fn with_relay_idle<T>(
 /// idle timeout.
 fn relay_write_idle(relay_idle: Option<Duration>, client_idle: Duration) -> Duration {
     relay_idle.unwrap_or(client_idle)
+}
+
+/// One idle deadline shared by both directions of a TCP relay. Any successful
+/// read or write in either direction pushes the same deadline, so a quiet
+/// download does not kill a flow whose upload is still active.
+#[derive(Clone)]
+struct RelayIdle {
+    idle: Duration,
+    deadline: watch::Sender<tokio::time::Instant>,
+}
+
+impl RelayIdle {
+    fn new(idle: Duration) -> Self {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(idle)
+            .unwrap_or_else(tokio::time::Instant::now);
+        Self {
+            idle,
+            deadline: watch::channel(deadline).0,
+        }
+    }
+
+    fn touch(&self) {
+        let next = tokio::time::Instant::now()
+            .checked_add(self.idle)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let _ = self.deadline.send_replace(next);
+    }
+
+    async fn read<T>(&self, fut: impl std::future::Future<Output = T>) -> Result<T, ()> {
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            let mut changed = self.deadline.subscribe();
+            let deadline = *changed.borrow_and_update();
+            tokio::select! {
+                biased;
+                out = &mut fut => return Ok(out),
+                _ = tokio::time::sleep_until(deadline) => {
+                    if *self.deadline.borrow() <= tokio::time::Instant::now() {
+                        return Err(());
+                    }
+                }
+                _ = changed.changed() => {}
+            }
+        }
+    }
+}
+
+fn touch_relay(clock: Option<&RelayIdle>) {
+    if let Some(clock) = clock {
+        clock.touch();
+    }
+}
+
+/// Applies the shared relay idle clock to a read when one is configured.
+async fn relay_read<T>(
+    clock: Option<&RelayIdle>,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, ()> {
+    match clock {
+        Some(clock) => clock.read(fut).await,
+        None => Ok(fut.await),
+    }
 }
 
 /// Returns `true` when a TUN write error means the interface or descriptor is
@@ -1254,9 +1315,9 @@ fn spawn_tcp_relay(
         let c2s_tracker = activity.clone();
         let s2c_tracker = activity.clone();
 
-        // Push-safe mode unbounds reads only. Writes keep a deadline in both
-        // modes, so a peer that stops draining can never wedge this task.
-        let read_idle = relay_idle;
+        // Push-safe mode unbounds reads only; otherwise one clock covers both
+        // directions. Writes keep a bounded deadline in both modes.
+        let relay_activity = relay_idle.map(RelayIdle::new);
         let write_idle = relay_write_idle(relay_idle, client_config.idle_timeout);
         let (mut tun_r, mut tun_w) = conn.stream.into_split();
         let (mut up_r, mut up_w) = tokio::io::split(upstream);
@@ -1271,14 +1332,21 @@ fn spawn_tcp_relay(
             // write; stays empty (zero allocation) when no coalescing is needed.
             let mut scratch: Vec<u8> = Vec::new();
             loop {
-                let chunk = match with_relay_idle(read_idle, tun_r.recv_chunk()).await {
+                let chunk = match relay_read(relay_activity.as_ref(), tun_r.recv_chunk()).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => {
                         let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
                         break;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        if let Some(budget) = relay_idle {
+                            warn_relay_timeout(conn.dst, "read", budget);
+                        }
+                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
+                        break;
+                    }
                 };
+                touch_relay(relay_activity.as_ref());
                 // Coalesce immediately-queued small chunks up to C2S_COALESCE_TARGET
                 // so multi-flow uploads write full TLS records with fewer syscalls.
                 let coalesced = coalesce_c2s(&chunk, &mut scratch, || tun_r.try_recv_chunk());
@@ -1288,15 +1356,18 @@ fn spawn_tcp_relay(
                         if let Some(tracker) = c2s_tracker.as_ref() {
                             tracker.record_bytes_tx(out.len() as u64);
                         }
+                        touch_relay(relay_activity.as_ref());
                     }
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "write", &err);
                         c2s_aborted.notify_one();
+                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
                         break;
                     }
                     Err(_) => {
                         warn_relay_timeout(conn.dst, "write", write_idle);
                         c2s_aborted.notify_one();
+                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
                         break;
                     }
                 }
@@ -1312,15 +1383,17 @@ fn spawn_tcp_relay(
                     continue;
                 }
                 match with_relay_idle(Some(write_idle), up_w.flush()).await {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => touch_relay(relay_activity.as_ref()),
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "flush", &err);
                         c2s_aborted.notify_one();
+                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
                         break;
                     }
                     Err(_) => {
                         warn_relay_timeout(conn.dst, "flush", write_idle);
                         c2s_aborted.notify_one();
+                        let _ = timeout(SHUTDOWN_TIMEOUT, up_w.shutdown()).await;
                         break;
                     }
                 }
@@ -1346,14 +1419,17 @@ fn spawn_tcp_relay(
                         tun_w.return_buf(buf);
                         break;
                     }
-                    res = async { with_relay_idle(read_idle, up_r.read_buf(&mut buf)).await } => res,
+                    res = relay_read(relay_activity.as_ref(), up_r.read_buf(&mut buf)) => res,
                 };
                 let n = match read_res {
                     Ok(Ok(0)) => {
                         tun_w.return_buf(buf);
                         break;
                     }
-                    Ok(Ok(n)) => n,
+                    Ok(Ok(n)) => {
+                        touch_relay(relay_activity.as_ref());
+                        n
+                    }
                     Ok(Err(err)) => {
                         tun_w.return_buf(buf);
                         warn_relay_io(conn.dst, "read", &err);
@@ -1361,7 +1437,7 @@ fn spawn_tcp_relay(
                     }
                     Err(_) => {
                         tun_w.return_buf(buf);
-                        if let Some(budget) = read_idle {
+                        if let Some(budget) = relay_idle {
                             warn_relay_timeout(conn.dst, "read", budget);
                         }
                         break;
@@ -1372,6 +1448,7 @@ fn spawn_tcp_relay(
                         if let Some(tracker) = s2c_tracker.as_ref() {
                             tracker.record_bytes_rx(n as u64);
                         }
+                        touch_relay(relay_activity.as_ref());
                     }
                     Ok(Err(err)) => {
                         warn_relay_io(conn.dst, "send_chunk", &err);
@@ -1719,6 +1796,41 @@ mod tests {
             relay_write_idle(Some(Duration::from_secs(45)), client_idle),
             Duration::from_secs(45)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_idle_clock_resets_from_either_direction_and_reaps_dead_flows() {
+        let clock = RelayIdle::new(Duration::from_millis(50));
+        let (_upload_tx, mut upload_rx) = mpsc::channel::<u8>(1);
+        let (download_tx, mut download_rx) = mpsc::channel::<u8>(1);
+        let upload_clock = clock.clone();
+        let upload =
+            tokio::spawn(async move { relay_read(Some(&upload_clock), upload_rx.recv()).await });
+        let download_clock = clock.clone();
+        let download =
+            tokio::spawn(
+                async move { relay_read(Some(&download_clock), download_rx.recv()).await },
+            );
+
+        tokio::time::advance(Duration::from_millis(40)).await;
+        // Traffic in one direction resets the deadline seen by both reads.
+        clock.touch();
+        download_tx.send(7u8).await.expect("download frame");
+        let got = timeout(Duration::from_millis(20), download)
+            .await
+            .expect("download must arrive within the shared deadline")
+            .expect("download task");
+        assert_eq!(got, Ok(Some(7)));
+        assert!(
+            !upload.is_finished(),
+            "one-way traffic must keep the other direction alive"
+        );
+
+        let idle = timeout(Duration::from_millis(60), upload)
+            .await
+            .expect("a dead flow must still be reaped")
+            .expect("upload task");
+        assert_eq!(idle, Err(()));
     }
 
     #[tokio::test]
