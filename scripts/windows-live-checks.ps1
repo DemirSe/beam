@@ -45,8 +45,12 @@ $HttpsProbeUrl = 'https://example.com'
 
 $script:VpsIpv4 = ''
 $script:CheckTimeoutSec = $CheckTimeoutSec
-# Positive control for the DNS leak check, measured before the tunnel is up.
-$script:ControlAnswered = $false
+# Positive control for the DNS leak check, keyed "<ifIndex>|<target>" and
+# measured before the tunnel is up. Only controlled tuples can prove a block.
+$script:ControlResults = @{}
+# Values that must never reach the step log or the failure artifact.
+$script:RedactList = @()
+$script:checksPassed = 0
 
 $checkLines = New-Object System.Collections.Generic.List[string]
 $script:checksFailed = 0
@@ -64,6 +68,7 @@ function Add-Check {
     $checkLines.Add($line)
     Write-Host $line
     if ($Result -eq 'fail') { $script:checksFailed++ }
+    if ($Result -eq 'pass') { $script:checksPassed++ }
 }
 
 function Invoke-Ipc {
@@ -194,7 +199,14 @@ public static class BeamBoundDns
             // An ICMP rejection is only possible after the query left the host,
             // so a receive error still proves the packet reached the wire.
             try { n = sock.ReceiveFrom(buf, ref from); }
-            catch { return 1; }
+            catch (SocketException se)
+            {
+                // Only an ICMP rejection proves the query left the host; any
+                // other socket error means the probe tells us nothing.
+                if (se.SocketErrorCode == SocketError.ConnectionReset) { return 1; }
+                return -1;
+            }
+            catch { return -1; }
             if (n < 12) { return 3; }
             // Only a reply carrying our transaction ID and question section
             // counts; anything else is a stray datagram, not an answer.
@@ -417,28 +429,40 @@ function Test-RouteFailClosed {
     }
 }
 
-function Get-PhysicalProbeTarget {
-    # First Up non-Beam adapter with an IPv4 address, as a probe endpoint.
+function Get-DnsProbePlan {
+    # Physical resolvers to probe: one entry per (adapter, server). The probe
+    # target is a public resolver that the client does NOT permit, so an answer
+    # there means plaintext DNS escaped the tunnel.
     param([int]$BeamIf = -1)
+    $plan = @()
     try {
         foreach ($na in @(Get-NetAdapter -ErrorAction SilentlyContinue)) {
             if ($na.Name -like 'Beam*') { continue }
             if ($na.Status -ne 'Up') { continue }
             $idx = -1
             try { $idx = [int]$na.ifIndex } catch { continue }
-            if ($idx -lt 0) { continue }
-            if ($idx -eq $BeamIf) { continue }
+            if (($idx -lt 0) -or ($idx -eq $BeamIf)) { continue }
             $localIp = ''
             foreach ($a in @(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
                 if (-not [string]::IsNullOrWhiteSpace($a.IPAddress)) { $localIp = [string]$a.IPAddress; break }
             }
             if ($localIp -eq '') { continue }
-            return @{ IfIndex = $idx; LocalIp = $localIp }
+            $servers = @()
+            foreach ($o in @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+                foreach ($s in @($o.ServerAddresses)) {
+                    if ([string]::IsNullOrWhiteSpace($s)) { continue }
+                    if ($s -like '127.*') { continue }
+                    if ($servers -contains $s) { continue }
+                    $servers += $s
+                }
+            }
+            if ($servers.Count -eq 0) { continue }
+            $plan += @{ IfIndex = $idx; LocalIp = $localIp; Server = $servers[0] }
         }
     } catch {
-        return $null
+        return @()
     }
-    return $null
+    return $plan
 }
 
 function Test-DnsLeak {
@@ -452,44 +476,9 @@ function Test-DnsLeak {
         return
     }
     try {
-        $physUp = $false
-        $allAdapters = Get-NetAdapter -ErrorAction SilentlyContinue
-        foreach ($na in $allAdapters) {
-            if ($na.Name -like 'Beam*') { continue }
-            if ($na.Status -eq 'Up') { $physUp = $true; break }
-        }
-        if (-not $physUp) {
-            Add-Check 'dns_leak' 'skip' 'no_physical_if'
-            return
-        }
-        $physProbes = @()
-        $addrObjs = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue
-        foreach ($o in $addrObjs) {
-            $oIf = -1
-            try { $oIf = [int]$o.InterfaceIndex } catch { continue }
-            if ($oIf -eq $beamIf) { continue }
-            foreach ($s in $o.ServerAddresses) {
-                if ([string]::IsNullOrWhiteSpace($s)) { continue }
-                if ($s -like '127.*') { continue }
-                $dup = $false
-                foreach ($e in $physProbes) {
-                    if (($e['Server'] -eq $s) -and ([int]$e['IfIndex'] -eq $oIf)) { $dup = $true; break }
-                }
-                if ($dup) { continue }
-                $localIp = ''
-                try {
-                    $own = Get-NetIPAddress -InterfaceIndex $oIf -AddressFamily IPv4 -ErrorAction SilentlyContinue
-                    foreach ($a in @($own)) {
-                        if (-not [string]::IsNullOrWhiteSpace($a.IPAddress)) { $localIp = [string]$a.IPAddress; break }
-                    }
-                } catch {
-                    $localIp = ''
-                }
-                $physProbes += @{ Server = $s; IfIndex = $oIf; LocalIp = $localIp }
-            }
-        }
-        Write-Host ('physical_dns_count=' + $physProbes.Count)
-        if ($physProbes.Count -eq 0) {
+        $plan = @(Get-DnsProbePlan -BeamIf $beamIf)
+        Write-Host ('physical_dns_count=' + $plan.Count)
+        if ($plan.Count -eq 0) {
             Add-Check 'dns_leak' 'skip' 'no_physical_dns'
             return
         }
@@ -501,11 +490,12 @@ function Test-DnsLeak {
         $publicTargets = @('1.1.1.1', '8.8.8.8')
         $deadline = [DateTime]::UtcNow.AddSeconds($script:CheckTimeoutSec)
         $leaked = $false
-        $unpinned = $false
+        $unpinned = 0
         $blocked = 0
         $probeErrors = 0
+        $controlled = 0
         $localPermitAnswered = $false
-        foreach ($entry in $physProbes) {
+        foreach ($entry in $plan) {
             if ([DateTime]::UtcNow -ge $deadline) { break }
             try {
                 # Informational: the permitted resolver should still answer.
@@ -515,37 +505,40 @@ function Test-DnsLeak {
             }
             foreach ($target in $publicTargets) {
                 if ([DateTime]::UtcNow -ge $deadline) { break }
+                $key = ([string]$entry['IfIndex']) + '|' + $target
+                # Only interpret a tuple whose pre-connect control answered.
+                if (-not $script:ControlResults.ContainsKey($key)) { $probeErrors = $probeErrors + 1; continue }
+                if (-not [bool]$script:ControlResults[$key]) { $probeErrors = $probeErrors + 1; continue }
+                $controlled = $controlled + 1
                 try {
                     # Strictly interface-bound UDP: IP_UNICAST_IF (31) pins the
                     # query to the physical NIC so WinTun split routes cannot
                     # answer it from inside the tunnel.
                     $rc = [BeamBoundDns]::TryBoundQuery($target, [int]$entry['IfIndex'], [string]$entry['LocalIp'], $DualStackName, 3000)
                     if ($rc -eq 1) { $leaked = $true; break }
-                    if ($rc -eq 2) { $unpinned = $true; break }
-                    if ($rc -eq 0) { $blocked = $blocked + 1 } else { $probeErrors = $probeErrors + 1 }
+                    if ($rc -eq 2) { $unpinned = $unpinned + 1 }
+                    elseif ($rc -eq 0) { $blocked = $blocked + 1 }
+                    else { $probeErrors = $probeErrors + 1 }
                 } catch {
                     $probeErrors = $probeErrors + 1
                 }
             }
-            if ($leaked -or $unpinned) { break }
+            if ($leaked) { break }
         }
         Write-Host ('local_dns_permit_answered=' + $localPermitAnswered.ToString().ToLowerInvariant())
+        Write-Host ('dns_probe_controlled=' + $controlled + ' blocked=' + $blocked + ' unpinned=' + $unpinned + ' errors=' + $probeErrors)
         if ($leaked) {
             Add-Check 'dns_leak' 'fail' 'public_dns_answered'
             return
         }
-        if ($unpinned) {
-            Add-Check 'dns_leak' 'skip' 'probe_not_pinned'
+        if ($controlled -eq 0) {
+            Add-Check 'dns_leak' 'skip' 'control_probe_failed'
             return
         }
         # A probe that could not run proves nothing: never report it as blocked.
         if ($blocked -eq 0) {
+            if ($unpinned -gt 0) { Add-Check 'dns_leak' 'skip' 'probe_not_pinned'; return }
             Add-Check 'dns_leak' 'skip' 'bound_probe_error'
-            return
-        }
-        # Without a working control the "blocked" result may just be a dead probe.
-        if (-not $script:ControlAnswered) {
-            Add-Check 'dns_leak' 'skip' 'control_probe_failed'
             return
         }
         try {
@@ -793,13 +786,14 @@ try {
     if ($hostMatch.Success) {
         $vpsUser = $hostMatch.Groups['user'].Value
         $vpsHost = $hostMatch.Groups['host'].Value.Trim('[', ']')
-        if ($vpsUser -ne '') { Write-Host ("::add-mask::" + $vpsUser) }
+        if ($vpsUser -ne '') { Write-Host ("::add-mask::" + $vpsUser); $script:RedactList += $vpsUser }
     }
     foreach ($pattern in @('(?<=pbk=)[^&#]+', '(?<=sid=)[^&#]+')) {
         $m = [regex]::Match($link, $pattern)
-        if ($m.Success) { Write-Host ("::add-mask::" + $m.Value) }
+        if ($m.Success) { Write-Host ("::add-mask::" + $m.Value); $script:RedactList += $m.Value }
     }
-    if ($vpsHost -ne '') { Write-Host ("::add-mask::" + $vpsHost) }
+    if ($vpsHost -ne '') { Write-Host ("::add-mask::" + $vpsHost); $script:RedactList += $vpsHost }
+    $script:RedactList += $link
     $resolvedVps = ''
     if ($vpsHost -match '^\d{1,3}(\.\d{1,3}){3}$') {
         $resolvedVps = $vpsHost
@@ -817,7 +811,7 @@ try {
         }
     }
     $script:VpsIpv4 = $resolvedVps
-    if ($script:VpsIpv4 -ne '') { Write-Host ("::add-mask::" + $script:VpsIpv4) }
+    if ($script:VpsIpv4 -ne '') { Write-Host ("::add-mask::" + $script:VpsIpv4); $script:RedactList += $script:VpsIpv4 }
 
     $baseline = Get-PublicIpv4
     Write-Host ('baseline_egress_reachable=' + ($baseline -ne '').ToString().ToLowerInvariant())
@@ -846,17 +840,29 @@ try {
     Write-Host 'import_ok=true'
 
     # Positive control: before CONNECT nothing blocks plaintext DNS, so the same
-    # bound probe must reach a public resolver. Without this, a "blocked" result
-    # later could just mean the probe never worked.
+    # bound probes must reach a public resolver. Only tuples whose control
+    # answered can later prove a block.
     try {
         Ensure-BoundDnsType
-        $ctl = Get-PhysicalProbeTarget -BeamIf (Get-BeamIfIndex)
-        if ($null -ne $ctl) {
-            $rcCtl = [BeamBoundDns]::TryBoundQuery('1.1.1.1', [int]$ctl['IfIndex'], [string]$ctl['LocalIp'], $DualStackName, 3000)
-            if ($rcCtl -eq 1) { $script:ControlAnswered = $true }
-            Write-Host ('dns_control_probe=' + [string]$rcCtl)
-        } else {
+        $ctlPlan = @(Get-DnsProbePlan -BeamIf (Get-BeamIfIndex))
+        if ($ctlPlan.Count -eq 0) {
             Write-Host 'dns_control_probe=no_physical_if'
+        }
+        $ctlIndex = 0
+        foreach ($ctl in $ctlPlan) {
+            foreach ($t in @('1.1.1.1', '8.8.8.8')) {
+                $ctlIndex = $ctlIndex + 1
+                $key = ([string]$ctl['IfIndex']) + '|' + $t
+                $ok = $false
+                try {
+                    $rcCtl = [BeamBoundDns]::TryBoundQuery($t, [int]$ctl['IfIndex'], [string]$ctl['LocalIp'], $DualStackName, 3000)
+                    if ($rcCtl -eq 1) { $ok = $true }
+                } catch {
+                    $ok = $false
+                }
+                $script:ControlResults[$key] = $ok
+                Write-Host ('dns_control_probe_' + [string]$ctlIndex + '=' + $ok.ToString().ToLowerInvariant())
+            }
         }
     } catch {
         Write-Host 'dns_control_probe=error'
@@ -886,14 +892,25 @@ try {
     # Exception text is ours or the sanitized server reply; never secret-bearing.
     Write-Host ("live_checks_error=" + $fatalError)
 } finally {
-    # Preserve the service log before uninstall deletes %ProgramData%\beam, so a
-    # failing run still carries WFP/route evidence. Best effort, bounded.
+    # Preserve a SCRUBBED copy of the service log before uninstall deletes
+    # %ProgramData%\beam, so a failure artifact cannot carry a secret.
     try {
         $logDir = Join-Path $env:RUNNER_TEMP 'beam-logs'
         $null = New-Item -ItemType Directory -Path $logDir -Force -ErrorAction SilentlyContinue
         $dataDir = Join-Path $env:ProgramData 'beam'
         if (Test-Path -LiteralPath $dataDir) {
-            Copy-Item -Path (Join-Path $dataDir '*.log') -Destination $logDir -Force -ErrorAction SilentlyContinue
+            foreach ($src in @(Get-ChildItem -LiteralPath $dataDir -Filter '*.log' -ErrorAction SilentlyContinue)) {
+                $body = ''
+                try { $body = Get-Content -LiteralPath $src.FullName -Raw -ErrorAction Stop } catch { $body = '' }
+                foreach ($secret in $script:RedactList) {
+                    if ([string]::IsNullOrEmpty($secret)) { continue }
+                    $body = $body.Replace($secret, '<secret>')
+                }
+                $body = [regex]::Replace($body, '\d{1,3}(\.\d{1,3}){3}', '<ip>')
+                $body = [regex]::Replace($body, '([0-9a-fA-F]{2}:){4,}[0-9a-fA-F:]+', '<v6>')
+                $dest = Join-Path $logDir $src.Name
+                Set-Content -LiteralPath $dest -Value $body -Encoding UTF8 -ErrorAction Stop
+            }
         }
         Write-Host 'logs_preserved=true'
     } catch {
@@ -908,6 +925,10 @@ try {
             $digestIndex = 0
             foreach ($h in $hits) {
                 $text = [string]$h.Line
+                foreach ($secret in $script:RedactList) {
+                    if ([string]::IsNullOrEmpty($secret)) { continue }
+                    $text = $text.Replace($secret, '<secret>')
+                }
                 $text = [regex]::Replace($text, '\d{1,3}(\.\d{1,3}){3}', '<ip>')
                 $text = [regex]::Replace($text, '([0-9a-fA-F]{2}:){4,}[0-9a-fA-F:]+', '<v6>')
                 if ($text.Length -gt 220) { $text = $text.Substring(0, 220) }
@@ -944,13 +965,20 @@ try {
         Start-Sleep -Seconds 2
     }
     Write-Host ('baseline_internet_restored=' + $restored.ToString().ToLowerInvariant())
+    if (-not $restored) {
+        # A bricked host must never exit 0, even when the workflow wrapper is absent.
+        $fatalError = 'baseline_not_restored'
+    }
 
     if (($script:checksFailed -gt 0) -or ($fatalError -ne '')) {
+        $overall = 'FAIL'
+    } elseif ($script:checksPassed -eq 0) {
+        # Skips alone are not evidence: never report a green run with no pass.
         $overall = 'FAIL'
     } else {
         $overall = 'PASS'
     }
-    $lines = @("windows-live-checks: $overall") + @($checkLines)
+    $lines = @("windows-live-checks: $overall (passed=" + [string]$script:checksPassed + " failed=" + [string]$script:checksFailed + ")") + @($checkLines)
     $summary = ($lines -join "`n")
     Write-Host $summary
     if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) {

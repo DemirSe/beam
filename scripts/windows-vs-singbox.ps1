@@ -62,7 +62,7 @@ $DownUrlBase = 'https://speed.cloudflare.com/__down?bytes='
 # IPs, so the measured transfer uses a stable 100 MiB file instead. The
 # warm-up stays small and best effort.
 $DownUrlMeas = 'https://proof.ovh.net/files/100Mb.dat'
-$DownMeasMinBytes = 90000000
+$DownMeasMinBytes = 99000000
 $DownWarmBytes = 10000000
 # Optional per-flow vs shared-limit probe (4 concurrent 10 MB transfers).
 $MultiFlows = 4
