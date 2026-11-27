@@ -131,13 +131,19 @@ adb logcat -s BeamVpnService
 
 ## Known limits
 
-- Only the `arm64-v8a` ABI is built.
+- Only the `arm64-v8a` ABI is built for release (`x86_64` is added only for the
+  CI KVM emulator via `-Pbeam.includeX86_64=true`).
+- Concurrent TCP capacity scales automatically with device RAM (`128` flows on
+  devices under 6 GiB RAM, `256` flows on 6 GiB+ devices with halved buffers
+  above 128 flows). Well-known push ports (`5222`, `5223`, `5228`–`5230`,
+  `8883`) are exempt from idle eviction, and the DoH cache holds up to `512`
+  entries.
 - The TUN interface uses `198.19.0.1/30` and the TUN DNS server is
   `198.19.0.2`. A bypass CIDR that covers `198.19.0.0/30` is ignored, so the DNS
-  server can never be bypassed. Android 12 (API 31-32) has no route exclusion;
-  the app adds the complementary routes instead.
+  server can never be bypassed. Android 12 (API 31–32) has no route exclusion;
+  the app adds the complementary IPv4 routes instead and drops IPv6 bypass
+  CIDRs on that API level.
 - Split tunneling covers this app and the bypass CIDRs. Per-app proxy is not
   included.
-- The native library parses `vless://` links. The UI falls back to a plain URI
-  parser when the library is not loaded, so profile import still works. The
-  fallback accepts only REALITY links with a public key and an SNI.
+- The native library (`beam-core`) parses `vless://` links strictly; the plain
+  URI fallback runs only when `libbeam_android.so` is unavailable.

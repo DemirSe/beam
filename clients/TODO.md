@@ -1,6 +1,6 @@
 # Client backlog
 
-Active native Android client work is planned in [`docs/ANDROID-PLAN.md`](../docs/ANDROID-PLAN.md).
+The native Android client lives in [`clients/android/README.md`](android/README.md).
 This file records client-platform constraints that affect the tunnel but are not
 server defects.
 

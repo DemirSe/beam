@@ -302,9 +302,9 @@ before sniffing with `method: default` and `no_drop: true`. H3 fails fast and
 the client falls back to HTTP/2; H3 is intentionally unavailable in this
 profile. The TCP/REALITY path is unchanged.
 
-The native Android client implementation plan (always-on profile, `:vpn`
-process isolation, telemetry API, and `VpnService` wiring map) is in
-[`ANDROID-PLAN.md`](ANDROID-PLAN.md).
+The native Android client (`crates/beam-android` + `clients/android`, `:vpn`
+process isolation, Keystore storage, and `VpnService` wiring) is documented in
+[`clients/android/README.md`](../clients/android/README.md).
 
 The Windows profile is `$HOME/.config/beam/windows.json`. The installer is
 `$HOME/.config/beam/beam-install-windows.ps1`.
