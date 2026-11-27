@@ -2174,6 +2174,12 @@ async fn resolve_local_udp(
     query_timeout: Duration,
     protector: Option<SocketProtector>,
 ) -> io::Result<Vec<u8>> {
+    if query.len() > MAX_DNS_QUERY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DNS query too large for a UDP-only local upstream",
+        ));
+    }
     let (pooled, generation) = pool.take(local_upstream, Instant::now());
     let sock = match pooled {
         Some(sock) => sock,
@@ -4072,6 +4078,53 @@ mod tests {
         let stats = counters.snapshot();
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.servfail_upstream, 1);
+        assert!(cache.lock().expect("cache lock").entries.is_empty());
+
+        drop(in_tx);
+        timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("stream task ends on EOF")
+            .expect("stream task joined");
+    }
+
+    #[tokio::test]
+    async fn oversized_tcp_query_to_local_name_never_sends_udp() {
+        let local = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local DNS");
+        let local_addr = local.local_addr().expect("local DNS addr");
+        let (interceptor, _tun_rx) = test_interceptor(Some(local_addr));
+        let counters = Arc::clone(&interceptor.counters);
+        let cache = Arc::clone(&interceptor.cache);
+        let (stream, in_tx, mut out_rx) = tcp_stream_pair();
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 54_007);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)), 53);
+        let mut query = build_query(0xABCD, "big.lan", 1);
+        query.resize(2048, 0);
+        assert!(query.len() > MAX_DNS_QUERY_BYTES);
+        in_tx.send(tcp_frame(&query)).await.expect("queue query");
+
+        let serve = tokio::spawn(async move {
+            interceptor.serve_tcp_stream(src, dst, stream).await;
+        });
+        let resp = timeout(Duration::from_secs(2), read_tcp_frame(&mut out_rx))
+            .await
+            .expect("SERVFAIL reply")
+            .expect("reply bytes");
+        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0xABCD);
+        assert_eq!(resp[3] & 0x0f, 2, "oversized local query must SERVFAIL");
+
+        let mut buf = [0u8; MAX_LOCAL_UDP_RECV_BYTES];
+        assert!(
+            timeout(Duration::from_millis(100), local.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "oversized query must not be sent to the UDP-only local upstream"
+        );
+        let stats = counters.snapshot();
+        assert_eq!(stats.servfail_upstream, 1);
+        assert_eq!(stats.servfail_mismatch, 0);
+        assert_eq!(stats.timeout, 0);
         assert!(cache.lock().expect("cache lock").entries.is_empty());
 
         drop(in_tx);
