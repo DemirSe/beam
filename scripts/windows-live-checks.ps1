@@ -772,6 +772,18 @@ function Test-CrashRecovery {
     }
 }
 
+# Restores the real link and reconnects, best effort and bounded.
+function Restore-RealLink {
+    try {
+        if ([string]::IsNullOrWhiteSpace($script:RealLink)) { return }
+        try { $null = Invoke-Ipc -Line ('IMPORT_LINK ' + $script:RealLink) } catch {
+        }
+        try { $null = Invoke-Ipc -Line 'RESTART' } catch {
+        }
+    } catch {
+    }
+}
+
 function Test-HangRecovery {
     # Proves the health path notices a client that stays alive but can never
     # finish a handshake, then proves the tunnel recovers on the real link.
@@ -848,6 +860,7 @@ function Test-HangRecovery {
         }
         $synRestart = Invoke-Ipc -Line 'RESTART'
         if (-not $synRestart.StartsWith('OK ')) {
+            Restore-RealLink
             Add-Check 'hang_recovery' 'skip' 'synthetic_connect_rejected'
             return
         }
@@ -865,6 +878,7 @@ function Test-HangRecovery {
             }
         }
         if (-not $restartSeen) {
+            Restore-RealLink
             Add-Check 'hang_recovery' 'skip' 'restart_not_observed'
             return
         }
@@ -932,11 +946,7 @@ function Test-HangRecovery {
             }
         }
         if ($hangFail -ne '') {
-            try {
-                $null = Invoke-Ipc -Line ('IMPORT_LINK ' + $script:RealLink)
-                $null = Invoke-Ipc -Line 'CONNECT'
-            } catch {
-            }
+            Restore-RealLink
             Add-Check 'hang_recovery' 'fail' $hangFail
             return
         }
