@@ -4,10 +4,10 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Read as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,11 @@ pub const DEFAULT_ROUTES_STATE_PATH: &str = "/run/beam-client/routes.state";
 const MAX_DYNAMIC_BYPASS_IPS: usize = 256;
 const DYNAMIC_BYPASS_TTL: Duration = Duration::from_secs(3600);
 const MAX_PERSISTED_ROUTES: usize = 1024;
+const IP_CHILD_DEADLINE: Duration = Duration::from_millis(500);
+const IP_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_IP_OUTPUT_BYTES: u64 = 64 * 1024;
+/// Keep the whole shutdown/cleanup sequence below `TimeoutStopSec=45s`.
+const SHUTDOWN_IP_BUDGET: Duration = Duration::from_secs(30);
 /// At most one `warn!` for a full dynamic-bypass table per interval and address
 /// family, so a busy host with `bypass.domains` cannot flood the journal and an
 /// IPv4 warning does not silence IPv6.
@@ -785,35 +790,80 @@ impl Drop for LinuxRouteGuard {
         // Skip `dev <ifname>` deletions when the interface is gone so shutdown
         // emits zero spurious `Cannot find device` errors or extra forks.
         let iface_exists = Path::new("/sys/class/net").join(&self.ifname).exists();
+        let deadline = Instant::now() + SHUTDOWN_IP_BUDGET;
+        let mut complete = true;
         if iface_exists {
-            if self.installed_v4_low {
-                let _ = run_ip(&["route", "del", "0.0.0.0/1", "dev", &self.ifname]);
+            if self.installed_v4_low
+                && run_ip_with_deadline(
+                    &["route", "del", "0.0.0.0/1", "dev", &self.ifname],
+                    deadline,
+                )
+                .is_err()
+            {
+                complete = false;
             }
-            if self.installed_v4_high {
-                let _ = run_ip(&["route", "del", "128.0.0.0/1", "dev", &self.ifname]);
+            if self.installed_v4_high
+                && run_ip_with_deadline(
+                    &["route", "del", "128.0.0.0/1", "dev", &self.ifname],
+                    deadline,
+                )
+                .is_err()
+            {
+                complete = false;
             }
-            if self.installed_v6_low {
-                let _ = run_ip(&["-6", "route", "del", "::/1", "dev", &self.ifname]);
+            if self.installed_v6_low
+                && run_ip_with_deadline(
+                    &["-6", "route", "del", "::/1", "dev", &self.ifname],
+                    deadline,
+                )
+                .is_err()
+            {
+                complete = false;
             }
-            if self.installed_v6_high {
-                let _ = run_ip(&["-6", "route", "del", "8000::/1", "dev", &self.ifname]);
+            if self.installed_v6_high
+                && run_ip_with_deadline(
+                    &["-6", "route", "del", "8000::/1", "dev", &self.ifname],
+                    deadline,
+                )
+                .is_err()
+            {
+                complete = false;
             }
         }
         for (cidr_entry, maybe_gw, dev) in &self.extra_bypass_v4 {
-            let _ = remove_v4_bypass(cidr_entry, maybe_gw.as_deref(), dev);
+            if remove_v4_bypass_with_deadline(cidr_entry, maybe_gw.as_deref(), dev, deadline)
+                .is_err()
+            {
+                complete = false;
+            }
         }
         for (cidr_entry, maybe_gw, dev) in &self.extra_bypass_v6 {
-            let _ = remove_v6_bypass(cidr_entry, maybe_gw.as_deref(), dev);
+            if remove_v6_bypass_with_deadline(cidr_entry, maybe_gw.as_deref(), dev, deadline)
+                .is_err()
+            {
+                complete = false;
+            }
         }
-        if let Some((ip, maybe_gw, dev)) = self.local_dns_bypass_route.as_ref() {
-            let _ = remove_host_bypass(*ip, maybe_gw.as_deref(), dev);
+        if let Some((ip, maybe_gw, dev)) = self.local_dns_bypass_route.as_ref()
+            && remove_host_bypass_with_deadline(*ip, maybe_gw.as_deref(), dev, deadline).is_err()
+        {
+            complete = false;
         }
         if let Some((ip, maybe_gw, dev)) = self.server_bypass_route.as_ref()
-            && let Err(err) = remove_host_bypass(*ip, maybe_gw.as_deref(), dev)
+            && let Err(err) =
+                remove_host_bypass_with_deadline(*ip, maybe_gw.as_deref(), dev, deadline)
         {
             warn!(%ip, error = %err, "failed to remove server bypass route on shutdown");
+            complete = false;
         }
-        let _ = std::fs::remove_file(&self.routes_state_path);
+        if complete {
+            let _ = std::fs::remove_file(&self.routes_state_path);
+        } else {
+            warn!(
+                path = %self.routes_state_path.display(),
+                "kept routes.state after incomplete shutdown cleanup; ExecStopPost will retry"
+            );
+        }
     }
 }
 
@@ -926,8 +976,8 @@ pub fn write_routes_state_atomic(path: &Path, routes: &[PersistedRoute]) {
 }
 
 /// Reads `path` (if present), removes any persisted bypass routes best-effort,
-/// and deletes the state file. Used by `beam-client --cleanup-routes` in
-/// `ExecStopPost` to recover from `SIGKILL`/OOM crashes.
+/// and keeps a bounded state file for routes that still need removal. Used by
+/// `beam-client --cleanup-routes` in `ExecStopPost` after a `SIGKILL`/OOM crash.
 pub fn cleanup_persisted_routes(path: &Path) -> io::Result<usize> {
     let content = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -935,18 +985,40 @@ pub fn cleanup_persisted_routes(path: &Path) -> io::Result<usize> {
         Err(err) => return Err(err),
     };
     let routes = parse_routes_state(&content);
+    let deadline = Instant::now() + SHUTDOWN_IP_BUDGET;
     let mut removed = 0usize;
+    let mut remaining = Vec::new();
     for route in &routes {
         let res = if route.family == 4 {
-            remove_v4_bypass(&route.prefix, route.gateway.as_deref(), &route.dev)
+            remove_v4_bypass_with_deadline(
+                &route.prefix,
+                route.gateway.as_deref(),
+                &route.dev,
+                deadline,
+            )
         } else {
-            remove_v6_bypass(&route.prefix, route.gateway.as_deref(), &route.dev)
+            remove_v6_bypass_with_deadline(
+                &route.prefix,
+                route.gateway.as_deref(),
+                &route.dev,
+                deadline,
+            )
         };
         if res.is_ok() {
             removed += 1;
+        } else {
+            remaining.push(route.clone());
         }
     }
-    let _ = std::fs::remove_file(path);
+    if remaining.is_empty() {
+        let _ = std::fs::remove_file(path);
+    } else {
+        warn!(
+            remaining = remaining.len(),
+            "kept unreached bypass routes in routes.state for retry"
+        );
+        write_routes_state_atomic(path, &remaining);
+    }
     Ok(removed)
 }
 
@@ -975,9 +1047,18 @@ fn install_host_bypass(ip: IpAddr, gw: Option<&str>, dev: &str) -> io::Result<()
 }
 
 fn remove_host_bypass(ip: IpAddr, gw: Option<&str>, dev: &str) -> io::Result<()> {
+    remove_host_bypass_with_deadline(ip, gw, dev, Instant::now() + IP_CHILD_DEADLINE)
+}
+
+fn remove_host_bypass_with_deadline(
+    ip: IpAddr,
+    gw: Option<&str>,
+    dev: &str,
+    deadline: Instant,
+) -> io::Result<()> {
     match ip {
-        IpAddr::V4(v4) => remove_v4_bypass(&format!("{v4}/32"), gw, dev),
-        IpAddr::V6(v6) => remove_v6_bypass(&format!("{v6}/128"), gw, dev),
+        IpAddr::V4(v4) => remove_v4_bypass_with_deadline(&format!("{v4}/32"), gw, dev, deadline),
+        IpAddr::V6(v6) => remove_v6_bypass_with_deadline(&format!("{v6}/128"), gw, dev, deadline),
     }
 }
 
@@ -990,10 +1071,22 @@ fn install_v4_bypass(prefix: &str, gw: Option<&str>, dev: &str) -> io::Result<()
 }
 
 fn remove_v4_bypass(prefix: &str, gw: Option<&str>, dev: &str) -> io::Result<()> {
+    remove_v4_bypass_with_deadline(prefix, gw, dev, Instant::now() + IP_CHILD_DEADLINE)
+}
+
+fn remove_v4_bypass_with_deadline(
+    prefix: &str,
+    gw: Option<&str>,
+    dev: &str,
+    deadline: Instant,
+) -> io::Result<()> {
     if let Some(gw) = gw {
-        run_ip(&["-4", "route", "del", prefix, "via", gw, "dev", dev])
+        run_ip_with_deadline(
+            &["-4", "route", "del", prefix, "via", gw, "dev", dev],
+            deadline,
+        )
     } else {
-        run_ip(&["-4", "route", "del", prefix, "dev", dev])
+        run_ip_with_deadline(&["-4", "route", "del", prefix, "dev", dev], deadline)
     }
 }
 
@@ -1006,10 +1099,22 @@ fn install_v6_bypass(prefix: &str, gw: Option<&str>, dev: &str) -> io::Result<()
 }
 
 fn remove_v6_bypass(prefix: &str, gw: Option<&str>, dev: &str) -> io::Result<()> {
+    remove_v6_bypass_with_deadline(prefix, gw, dev, Instant::now() + IP_CHILD_DEADLINE)
+}
+
+fn remove_v6_bypass_with_deadline(
+    prefix: &str,
+    gw: Option<&str>,
+    dev: &str,
+    deadline: Instant,
+) -> io::Result<()> {
     if let Some(gw) = gw {
-        run_ip(&["-6", "route", "del", prefix, "via", gw, "dev", dev])
+        run_ip_with_deadline(
+            &["-6", "route", "del", prefix, "via", gw, "dev", dev],
+            deadline,
+        )
     } else {
-        run_ip(&["-6", "route", "del", prefix, "dev", dev])
+        run_ip_with_deadline(&["-6", "route", "del", prefix, "dev", dev], deadline)
     }
 }
 
@@ -1058,26 +1163,101 @@ fn resolve_ip_binary(
     Ok(found)
 }
 
-fn run_ip(args: &[&str]) -> io::Result<()> {
-    let output = Command::new(ip_binary()?).args(args).output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        if detail.is_empty() {
-            Err(io::Error::other(format!(
-                "`ip {}` exited with {}",
-                args.join(" "),
-                output.status
-            )))
-        } else {
-            Err(io::Error::other(format!(
-                "`ip {}` exited with {}: {detail}",
-                args.join(" "),
-                output.status
-            )))
+fn read_bounded_ip_output<R: io::Read + Send + 'static>(
+    reader: R,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = reader.take(MAX_IP_OUTPUT_BYTES).read_to_end(&mut out);
+        out
+    })
+}
+
+/// Spawns one `ip` child, polls it without spinning, and kills and reaps it
+/// when `deadline` passes. Both pipes are drained by bounded reader threads.
+fn spawn_ip_child(bin: &str, args: &[&str], deadline: Instant) -> io::Result<Output> {
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("`ip {}` deadline exhausted", args.join(" ")),
+        ));
+    }
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().map(read_bounded_ip_output);
+    let stderr = child.stderr.take().map(read_bounded_ip_output);
+
+    let status = loop {
+        let polled = match child.try_wait() {
+            Ok(status) => status,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(reader) = stdout {
+                    let _ = reader.join();
+                }
+                if let Some(reader) = stderr {
+                    let _ = reader.join();
+                }
+                return Err(err);
+            }
+        };
+        match polled {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(reader) = stdout {
+                    let _ = reader.join();
+                }
+                if let Some(reader) = stderr {
+                    let _ = reader.join();
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("`ip {}` timed out", args.join(" ")),
+                ));
+            }
+            None => std::thread::sleep(IP_CHILD_POLL_INTERVAL),
         }
+    };
+    Ok(Output {
+        status,
+        stdout: stdout
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default(),
+        stderr: stderr
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default(),
+    })
+}
+
+fn run_ip(args: &[&str]) -> io::Result<()> {
+    run_ip_with_deadline(args, Instant::now() + IP_CHILD_DEADLINE)
+}
+
+fn run_ip_with_deadline(args: &[&str], deadline: Instant) -> io::Result<()> {
+    let output = spawn_ip_child(ip_binary()?, args, deadline)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        Err(io::Error::other(format!(
+            "`ip {}` exited with {}",
+            args.join(" "),
+            output.status
+        )))
+    } else {
+        Err(io::Error::other(format!(
+            "`ip {}` exited with {}: {detail}",
+            args.join(" "),
+            output.status
+        )))
     }
 }
 
@@ -1126,10 +1306,8 @@ fn has_exact_route(family_flag: &str, prefix: &str) -> RouteCheck {
         Ok(ip) => ip,
         Err(err) => return route_check_error(prefix, err),
     };
-    let output = match Command::new(ip)
-        .args([family_flag, "route", "show", "exact", prefix])
-        .output()
-    {
+    let args = [family_flag, "route", "show", "exact", prefix];
+    let output = match spawn_ip_child(ip, &args, Instant::now() + IP_CHILD_DEADLINE) {
         Ok(output) => output,
         Err(err) => return route_check_error(prefix, err),
     };
@@ -1222,10 +1400,9 @@ fn detect_default_gateway(
     family_flag: &str,
     exclude_ifname: &str,
 ) -> Option<(Option<String>, String)> {
-    let output = Command::new(ip_binary().ok()?)
-        .args([family_flag, "route", "show", "default"])
-        .output()
-        .ok()?;
+    let args = [family_flag, "route", "show", "default"];
+    let output =
+        spawn_ip_child(ip_binary().ok()?, &args, Instant::now() + IP_CHILD_DEADLINE).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1621,6 +1798,40 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
         assert!(!log.contains("route del 203.0.113.0/24"), "{log}");
         assert!(!log.contains("route del 198.51.100.10/32"), "{log}");
         assert!(!log.contains("route del 203.0.113.1/32"), "{log}");
+    }
+
+    #[test]
+    fn hanging_ip_child_is_killed_and_reaped() {
+        let dir = test_dir("deadline");
+        let pid_path = dir.join("pid");
+        let fake = FakeIp::new_in(
+            dir,
+            &format!(
+                "#!/bin/sh\necho $$ > \"{}\"\nexec sleep 30\n",
+                pid_path.display()
+            ),
+        );
+        let start = Instant::now();
+        let err = spawn_ip_child(
+            ip_binary().expect("fake ip"),
+            &["route", "show", "default"],
+            Instant::now() + Duration::from_millis(200),
+        )
+        .expect_err("hanging ip child must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        let pid = std::fs::read_to_string(&pid_path)
+            .expect("child pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric pid");
+        assert!(
+            !Path::new("/proc").join(pid.to_string()).exists(),
+            "timed-out child must be reaped"
+        );
+        drop(fake);
     }
 
     #[test]
