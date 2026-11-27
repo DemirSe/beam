@@ -216,6 +216,7 @@ static HICON icon_for_state(TrayState state)
         icon = g_icon_green;
         break;
     case TRAY_STATE_CONNECTING:
+    case TRAY_STATE_IDLE: /* reachable, but not dial-verified */
     case TRAY_STATE_RECONNECTING:
     case TRAY_STATE_WAITING_NETWORK:
     case TRAY_STATE_STOPPING:

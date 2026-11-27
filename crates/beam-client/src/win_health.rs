@@ -265,7 +265,6 @@ pub fn spawn_windows_network_monitor(
         let mut route_retry_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
         let mut offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
         let mut generation: u64 = 0;
-        let mut is_connected = false;
         let mut last_reset_at: Option<Instant> = None;
         let mut probe_seq: u64 = u64::from(std::process::id());
 
@@ -360,7 +359,6 @@ pub fn spawn_windows_network_monitor(
                 if gw_changed || slept_from_suspend {
                     generation = generation.wrapping_add(1);
                     let _ = network_reset_tx.send(generation);
-                    is_connected = false;
                     last_reset_at = Some(Instant::now());
                 }
                 offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
@@ -386,14 +384,9 @@ pub fn spawn_windows_network_monitor(
                 } else {
                     activity.recent_failure_streak(degraded_window)
                 };
-                let recent_rtt = if is_connected && !recent_window.is_zero() {
-                    activity.recent_rtt(recent_window)
-                } else {
-                    None
-                };
                 let no_gateway = auto_route && !server_has_gw && !server_addr.ip().is_loopback();
                 let (state, reason, rtt_ms) = if let Some(decision) =
-                    probe_tick_decision(no_gateway, failure_streak, recent_rtt)
+                    activity_tick_decision(no_gateway, failure_streak, recent_window, &activity)
                 {
                     decision
                 } else {
@@ -407,12 +400,10 @@ pub fn spawn_windows_network_monitor(
                 };
                 let probe_ok = state == STATE_CONNECTED || state == STATE_IDLE;
                 if probe_ok {
-                    is_connected = state == STATE_CONNECTED;
                     offline_backoff_secs = INITIAL_OFFLINE_BACKOFF_SECS;
                     probe_seq = probe_seq.wrapping_add(1);
                     next_probe_at = Instant::now() + next_healthy_probe_interval(probe_seq);
                 } else {
-                    is_connected = false;
                     if reason == "dial_failures"
                         && let Some(suppressed) = DEGRADED_LOG.allow()
                     {
@@ -564,6 +555,25 @@ fn tun_v4_exclusion(tun_net: IpNet) -> Option<(Ipv4Addr, u8)> {
     }
 }
 
+/// Decides one probe tick from the live activity tracker and route state.
+///
+/// A recent authenticated dial is enough on its own; requiring a prior
+/// `connected` tick here would keep a newly started client in `idle` forever.
+/// Mirrors `activity_tick_decision` in `health.rs`.
+fn activity_tick_decision(
+    no_gateway: bool,
+    failure_streak: u64,
+    recent_window: Duration,
+    activity: &TunnelActivity,
+) -> Option<(&'static str, &'static str, Option<u64>)> {
+    let recent_rtt = if recent_window.is_zero() {
+        None
+    } else {
+        activity.recent_rtt(recent_window)
+    };
+    probe_tick_decision(no_gateway, failure_streak, recent_rtt)
+}
+
 /// Decides the link state for one probe tick without doing any I/O.
 ///
 /// Returns `None` when the tick must fall back to a reachability probe. A
@@ -697,6 +707,52 @@ mod tests {
             Some((STATE_CONNECTED, "dial_activity", Some(10)))
         );
         assert_eq!(probe_tick_decision(false, 0, None), None);
+    }
+
+    #[test]
+    fn fresh_dial_moves_a_startup_client_through_the_health_states() {
+        let activity = TunnelActivity::new();
+        let tick = |no_gateway| {
+            activity_tick_decision(
+                no_gateway,
+                activity.recent_failure_streak(DEGRADED_WINDOW),
+                RECENT_ACTIVITY_WINDOW,
+                &activity,
+            )
+        };
+
+        // Startup: only a bare probe can succeed, so the tick falls back to
+        // reachability and must report idle, never connected.
+        assert_eq!(tick(false), None);
+        let (state, reason, _) = bare_probe_tick_decision(12);
+        assert_eq!((state, reason), (STATE_IDLE, "probe_ok"));
+
+        // A fresh authenticated dial after startup is enough for green; it
+        // must not need a previous connected tick to open the gate.
+        activity.record_dial_success(21);
+        assert_eq!(
+            tick(false),
+            Some((STATE_CONNECTED, "dial_activity", Some(21)))
+        );
+
+        // Fresh dial failures override the still-recent RTT.
+        for _ in 0..DEGRADED_DIAL_FAILURE_STREAK {
+            activity.record_dial_failure(beam_tun::DialFailure {
+                stage: beam_tun::DialFailureStage::TcpConnect,
+                kind: beam_tun::DialFailureKind::Refused,
+            });
+        }
+        assert_eq!(activity.recent_rtt(RECENT_ACTIVITY_WINDOW), Some(21));
+        assert_eq!(
+            tick(false),
+            Some((STATE_RECONNECTING, "dial_failures", None))
+        );
+
+        // A missing gateway wins over every other signal.
+        assert_eq!(
+            tick(true),
+            Some((STATE_WAITING_NETWORK, "no_gateway", None))
+        );
     }
 
     #[test]
