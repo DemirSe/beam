@@ -1819,6 +1819,7 @@ mod tests {
         let initial_body = first_block[..split_at].to_vec();
         let remaining_first = first_block[split_at..].to_vec();
 
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let client_task = tokio::spawn(async move {
             let tcp = TcpStream::connect(addr).await.unwrap();
             let connector = tokio_rustls::TlsConnector::from(client_cfg);
@@ -1829,6 +1830,9 @@ mod tests {
             tls.write_all(b"-raw").await.unwrap();
             tls.flush().await.unwrap();
             tls.shutdown().await.unwrap();
+            // Keep the client socket open until the server finishes reading so
+            // Windows does not emit TCP RST for unread server NewSessionTicket bytes.
+            let _ = done_rx.await;
         });
 
         let (server_tcp, _) = listener.accept().await.unwrap();
@@ -1843,6 +1847,7 @@ mod tests {
             .read_to_end(&mut output)
             .await
             .expect("Vision over real TlsStream must decode split first block");
+        let _ = done_tx.send(());
         client_task.await.unwrap();
         assert_eq!(output, b"hello-over-tls-tail-raw");
     }

@@ -15,6 +15,8 @@ pub mod reality;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod relay;
 pub mod tls;
+// `udp` is the server-side legacy/packetaddr UDP relay (Linux/Android only).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod udp;
 pub mod vision;
 pub mod vless;

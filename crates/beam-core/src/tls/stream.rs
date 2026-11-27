@@ -1005,6 +1005,9 @@ mod tests {
         server.await.expect("server task");
     }
 
+    // Windows loopback auto-tunes TCP buffers past 8 MiB, so this test's
+    // fixed 8 MiB write does not trigger `Poll::Pending` backpressure there.
+    #[cfg(unix)]
     #[tokio::test]
     async fn outgoing_queue_stays_within_cap_under_backpressure() {
         // The client finishes the handshake and then stops reading, so the
