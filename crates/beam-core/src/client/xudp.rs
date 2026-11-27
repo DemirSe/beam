@@ -220,8 +220,8 @@ impl SessionTable {
 /// iteration and written on its own, and a frame larger than the cap is written
 /// in one call by itself. `flush` runs only when nothing else is queued, which
 /// keeps interactive latency at zero while removing one syscall per queued
-/// frame during bursts. Returns the number of already-queued frames lost when
-/// a write or flush hits [`WRITE_TIMEOUT`].
+/// frame during bursts. Returns the number of frames lost when the writer exits
+/// before all of them are written.
 pub async fn run_writer<W: AsyncWriteExt + Unpin>(
     write_half: &mut W,
     outbound_rx: &mut mpsc::Receiver<Vec<u8>>,
@@ -278,7 +278,9 @@ pub async fn run_writer<W: AsyncWriteExt + Unpin>(
             timeout(WRITE_TIMEOUT, write_half.write_all(&batch)).await,
             Ok(Ok(()))
         ) {
-            return batch_frames;
+            return batch_frames
+                .saturating_add(usize::from(carry.is_some()))
+                .saturating_add(outbound_rx.len());
         }
         // `carry` is a frame already popped from the queue, so the channel may
         // look empty while bytes are still pending.
@@ -286,13 +288,13 @@ pub async fn run_writer<W: AsyncWriteExt + Unpin>(
             && outbound_rx.is_empty()
             && !matches!(timeout(WRITE_TIMEOUT, write_half.flush()).await, Ok(Ok(())))
         {
-            return batch_frames;
+            return batch_frames.saturating_add(outbound_rx.len());
         }
         if disconnected && carry.is_none() {
             return 0;
         }
     }
-    0
+    usize::from(carry.is_some()).saturating_add(outbound_rx.len())
 }
 
 /// Runs the mux writer task, publishing any timed-out frames as session drops.
@@ -463,6 +465,34 @@ impl XudpClient {
             writer_task: Some(writer_task),
             dropped_frames: writer_drops,
         })
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn new_for_test(
+        max_sessions: usize,
+        reply_queue: usize,
+        outbound_queue: usize,
+    ) -> (Self, mpsc::Receiver<Vec<u8>>) {
+        let closed = Arc::new(AtomicBool::new(false));
+        let table = Arc::new(Mutex::new(SessionTable::new(
+            max_sessions.max(1),
+            Arc::clone(&closed),
+        )));
+        let (outbound_tx, outbound_rx) = mpsc::channel(outbound_queue.max(1));
+        let reader_task = tokio::spawn(std::future::pending::<()>());
+        (
+            Self {
+                table,
+                closed,
+                outbound_tx: Some(outbound_tx),
+                reply_queue: reply_queue.max(1),
+                reader_task,
+                writer_task: None,
+                dropped_frames: Arc::new(AtomicU64::new(0)),
+            },
+            outbound_rx,
+        )
     }
 
     /// Returns `true` if the underlying mux stream is still open.
@@ -1481,6 +1511,49 @@ mod tests {
             2,
             "both queued frames were lost on the write timeout"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_writer_counts_carry_and_remaining_frames() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let payload = vec![0x5a_u8; MAX_PAYLOAD_LEN];
+        let frames = 9usize;
+        for id in 1..=frames as u16 {
+            tx.send(encode_test_frame(id, SessionStatus::New, &payload))
+                .await
+                .expect("queue frame");
+        }
+        drop(tx);
+        let (_closed_tx, mut closed_rx) = watch::channel(false);
+        let mut sink = StalledSink;
+
+        let lost = timeout(
+            Duration::from_secs(WRITE_TIMEOUT.as_secs() + 2),
+            run_writer(&mut sink, &mut rx, &mut closed_rx),
+        )
+        .await
+        .expect("writer must hit its bounded timeout");
+        assert_eq!(
+            lost, frames,
+            "carry and queued frames must be counted with the timed-out batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_writer_counts_frames_left_in_the_queue() {
+        let (tx, mut rx) = mpsc::channel(4);
+        for id in 1..=3u16 {
+            tx.send(encode_test_frame(id, SessionStatus::New, b"lost"))
+                .await
+                .expect("queue frame");
+        }
+        drop(tx);
+        let (closed_tx, mut closed_rx) = watch::channel(false);
+        closed_tx.send(true).expect("publish writer close");
+        let mut sink = CountingSink::default();
+
+        let lost = run_writer(&mut sink, &mut rx, &mut closed_rx).await;
+        assert_eq!(lost, 3, "a closed writer must count every queued frame");
     }
 
     #[test]
