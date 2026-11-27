@@ -137,13 +137,25 @@ function Measure-HttpsTtfbMs {
     return ([math]::Round((Get-MedianDouble -Values $samples.ToArray()), 0)).ToString('F0', $inv)
 }
 
+# Last bulk-download probe diagnostics (secret-free: exit code + HTTP code only).
+$script:LastCurlExit = -1
+$script:LastHttpCode = 'n/a'
+
 function Measure-DownloadMbps {
+    $script:LastCurlExit = -1
+    $script:LastHttpCode = 'n/a'
     try {
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
-        $out = & curl.exe -sS -o NUL -w '%{speed_download}' --max-time 30 $DownUrl 2>$null
+        $out = & curl.exe -sS -o NUL -w '%{http_code} %{speed_download}' --max-time 30 $DownUrl 2>$null
+        $script:LastCurlExit = $LASTEXITCODE
+        $parts = @(((($out | Out-String).Trim()) -split '\s+'))
+        if ($parts.Count -ge 1) { $script:LastHttpCode = $parts[0] }
+        $speedText = ''
+        if ($parts.Count -ge 2) { $speedText = $parts[1] }
         $bps = 0.0
-        if (-not [double]::TryParse(($out | Out-String).Trim(), [System.Globalization.NumberStyles]::Float, $inv, [ref]$bps)) { return 'fail' }
+        if (-not [double]::TryParse($speedText, [System.Globalization.NumberStyles]::Float, $inv, [ref]$bps)) { return 'fail' }
         if ($bps -le 0) { return 'fail' }
+        if ($script:LastCurlExit -ne 0) { return 'fail' }
         return ([math]::Round($bps * 8.0 / 1000000.0, 1)).ToString('F1', $inv)
     } catch {
         return 'fail'
@@ -165,6 +177,8 @@ function Measure-DnsMs {
     return ([math]::Round((Get-MedianDouble -Values $samples.ToArray()), 0)).ToString('F0')
 }
 
+# Shared by both runs so the comparison stays strictly fair: same URL and
+# same curl.exe flags for beam-client and sing-box.
 function Measure-ConnectedMetrics {
     param([string]$VpsIpv4, [int]$RamPid = 0, [string]$RamName = '')
     $ram = Get-ProcessRamMb -ProcessId $RamPid -ProcessName $RamName
@@ -271,6 +285,17 @@ function Run-BeamClient {
         $Row['connect_ms'] = ([math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 0)).ToString('F0', [System.Globalization.CultureInfo]::InvariantCulture)
         $metrics = Measure-ConnectedMetrics -VpsIpv4 $VpsIpv4 -RamName 'beam-client'
         foreach ($k in $metrics.Keys) { $Row[$k] = $metrics[$k] }
+        if ($Row['download_mbps'] -eq 'fail') {
+            # STATUS before DISCONNECT: drops are a sanitized secret-free token.
+            $drops = 'none'
+            try {
+                $stDiag = Read-BeamStatus
+                if (($stDiag['drops'] -ne $null) -and ($stDiag['drops'] -ne '')) { $drops = $stDiag['drops'] }
+            } catch {
+            }
+            Write-Host ('download_diag curl_exit=' + $script:LastCurlExit + ' http_code=' + $script:LastHttpCode + ' beam_drops=' + $drops)
+            throw 'download_failed'
+        }
         if ($Row['egress_via_vps'] -ne 'true') { throw 'egress_not_via_vps' }
         $null = Invoke-Ipc -Line 'DISCONNECT'
     } catch {
@@ -359,6 +384,10 @@ function Run-Singbox {
         $Row['connect_ms'] = ([math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 0)).ToString('F0', [System.Globalization.CultureInfo]::InvariantCulture)
         $metrics = Measure-ConnectedMetrics -VpsIpv4 $VpsIpv4 -RamPid $proc.Id
         foreach ($k in $metrics.Keys) { $Row[$k] = $metrics[$k] }
+        if ($Row['download_mbps'] -eq 'fail') {
+            Write-Host ('download_diag curl_exit=' + $script:LastCurlExit + ' http_code=' + $script:LastHttpCode)
+            throw 'download_failed'
+        }
         if ($Row['egress_via_vps'] -ne 'true') { throw 'egress_not_via_vps' }
     } catch {
         $Row['error'] = $_.Exception.Message

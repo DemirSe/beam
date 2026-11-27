@@ -65,13 +65,14 @@ address = "172.19.0.1/30"
 mtu = 1500
 auto_route = true
 reject_quic = true
-reject_ipv6 = false
+reject_ipv6 = true
 strict_kill_switch = true
 auto_connect = true
 
 [dns]
 enabled = true
 upstream = "https://1.1.1.1/dns-query"
+ipv4_only = true
 
 [log]
 level = "info"
@@ -807,6 +808,17 @@ mod tests {
         assert!(cfg.auto_route);
         assert!(cfg.strict_kill_switch);
         assert!(cfg.auto_connect);
+        // IPv4-only upstream egress (mirrors sing-box `strategy: ipv4_only`):
+        // AAAA answers are suppressed and IPv6 SYNs fail fast with RST so
+        // dual-stack downloads use IPv4 instead of stalling on IPv6 dials.
+        assert!(cfg.engine.route.reject_ipv6);
+        assert!(
+            cfg.engine
+                .dns
+                .as_ref()
+                .expect("windows default enables dns")
+                .ipv4_only
+        );
         assert!(cfg.engine.dns.is_some());
         assert!(
             text.contains("user_id"),
