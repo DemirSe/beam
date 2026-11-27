@@ -43,6 +43,10 @@ class ProfilesAdapter(
             true
         }
         binding.profileDelete.setOnClickListener { onDelete(profile) }
+        binding.profileDelete.contentDescription = holder.itemView.context.getString(
+            R.string.profiles_delete_content_description,
+            profile.name,
+        )
     }
 
     class Holder(val binding: ItemProfileBinding) : RecyclerView.ViewHolder(binding.root)

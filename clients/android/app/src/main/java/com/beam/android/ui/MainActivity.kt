@@ -10,13 +10,13 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
-import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.isVisible
 import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.commitNow
@@ -29,6 +29,7 @@ import com.beam.android.storage.EncryptedProfileStore
 import com.beam.android.vpn.BeamVpnService
 import com.beam.android.vpn.VpnState
 import com.google.android.material.snackbar.Snackbar
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -60,13 +61,21 @@ class MainActivity : AppCompatActivity() {
     private var isBound = false
     private var pendingProfileId: String? = null
 
+    // Serialises state pushes from the service against snapshot reads and local
+    // banner updates so an older read cannot overwrite a newer callback.
+    private val statusLock = Any()
+    private val callbackSeq = AtomicLong(0L)
+
     private val binderDeathRecipient = IBinder.DeathRecipient {
         runOnUiThread { handleBinderDied() }
     }
 
     private val stateCallback = object : IBeamStateCallback.Stub() {
         override fun onStateChanged(state: Int, detail: String?) {
-            _status.value = BeamStatus(state, detail?.takeIf { it.isNotBlank() })
+            synchronized(statusLock) {
+                callbackSeq.incrementAndGet()
+                _status.value = BeamStatus(state, detail?.takeIf { it.isNotBlank() })
+            }
         }
     }
 
@@ -78,12 +87,17 @@ class MainActivity : AppCompatActivity() {
             runCatching { binder.linkToDeath(binderDeathRecipient, 0) }
             beam = service
             runCatching { service.registerCallback(stateCallback) }
+            val seqBefore = callbackSeq.get()
             lifecycleScope.launch {
                 // Binder reads are I/O: the service polls the engine for state.
                 val snapshot = withContext(Dispatchers.IO) {
                     runCatching { service.getState() to service.getStateDetail() }.getOrNull()
                 } ?: return@launch
-                _status.value = BeamStatus(snapshot.first, snapshot.second?.takeIf { it.isNotBlank() })
+                // A callback that landed during the read is newer than the snapshot.
+                synchronized(statusLock) {
+                    if (callbackSeq.get() != seqBefore || beam !== service) return@launch
+                    _status.value = BeamStatus(snapshot.first, snapshot.second?.takeIf { it.isNotBlank() })
+                }
             }
             val pending = pendingProfileId
             if (pending != null) {
@@ -96,8 +110,11 @@ class MainActivity : AppCompatActivity() {
             // Ignore a stale disconnect from a previous dead binding after rebind succeeded.
             if (boundBinder?.isBinderAlive == true) return
             unlinkBinderDeath()
-            beam = null
-            _status.value = BeamStatus(VpnState.DISCONNECTED)
+            synchronized(statusLock) {
+                beam = null
+                callbackSeq.incrementAndGet()
+                _status.value = BeamStatus(VpnState.DISCONNECTED)
+            }
         }
 
         override fun onBindingDied(name: ComponentName?) {
@@ -111,7 +128,10 @@ class MainActivity : AppCompatActivity() {
         val profileId = pendingProfileId
         pendingProfileId = null
         if (result.resultCode != RESULT_OK) {
-            showMessage(R.string.vpn_consent_denied)
+            synchronized(statusLock) {
+                callbackSeq.incrementAndGet()
+                _status.value = BeamStatus(VpnState.DISCONNECTED, getString(R.string.vpn_consent_denied))
+            }
         } else if (profileId != null) {
             requestConnect(profileId)
         }
@@ -133,13 +153,27 @@ class MainActivity : AppCompatActivity() {
             val bars = insets.getInsets(
                 WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
             )
-            binding.fragmentContainer.updatePadding(left = bars.left, top = bars.top, right = bars.right)
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            val imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
+            // Edge-to-edge: the window no longer resizes behind the keyboard, so
+            // hide the bar and lift the content over the IME by hand.
+            binding.bottomNav.isVisible = !imeVisible
+            binding.fragmentContainer.updatePadding(
+                left = bars.left,
+                top = bars.top,
+                right = bars.right,
+                bottom = if (imeVisible) maxOf(ime.bottom, bars.bottom) else 0,
+            )
             binding.bottomNav.updatePadding(left = bars.left, right = bars.right, bottom = bars.bottom)
             WindowInsetsCompat.CONSUMED
         }
         binding.bottomNav.setOnItemSelectedListener { item ->
-            showTab(item.itemId)
-            true
+            if (supportFragmentManager.isStateSaved) {
+                false
+            } else {
+                showTab(item.itemId)
+                true
+            }
         }
         if (supportFragmentManager.fragments.isEmpty()) {
             val restored = binding.bottomNav.selectedItemId
@@ -178,8 +212,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleBinderDied() {
         unlinkBinderDeath()
-        beam = null
-        _status.value = BeamStatus(VpnState.DISCONNECTED)
+        synchronized(statusLock) {
+            beam = null
+            callbackSeq.incrementAndGet()
+            _status.value = BeamStatus(VpnState.DISCONNECTED)
+        }
         if (isBound) {
             runCatching { unbindService(serviceConnection) }
             isBound = false
@@ -191,6 +228,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Connect with [profileId], after the Android VPN consent dialog when needed. */
     fun requestConnect(profileId: String) {
+        clearErrorDetail()
         if (beam == null) {
             pendingProfileId = profileId
             ensureBound()
@@ -211,33 +249,55 @@ class MainActivity : AppCompatActivity() {
         return s == VpnState.CONNECTED || s == VpnState.DEGRADED || s == VpnState.CONNECTING
     }
 
-    fun showReconnectHint() {
-        if (!isTunnelActive()) return
-        Snackbar.make(binding.fragmentContainer, R.string.reconnect_to_apply, Snackbar.LENGTH_LONG)
-            .setAnchorView(binding.bottomNav)
-            .setAction(R.string.action_reconnect) {
-                lifecycleScope.launch {
-                    val activeId = withContext(Dispatchers.IO) {
-                        runCatching { beam?.disconnect() }
-                        runCatching { EncryptedProfileStore(this@MainActivity).getActiveProfileId() }.getOrNull()
-                    } ?: return@launch
-                    requestConnect(activeId)
-                }
+    /** Drop a stale failure message so the next attempt starts from a clean banner. */
+    fun clearErrorDetail() {
+        synchronized(statusLock) {
+            val current = _status.value
+            if (current.state == VpnState.DISCONNECTED && current.detail != null) {
+                _status.value = BeamStatus(VpnState.DISCONNECTED)
             }
-            .show()
+        }
+    }
+
+    fun showReconnectHint() {
+        if (!isTunnelActive() || isFinishing || isDestroyed ||
+            !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED) ||
+            !binding.fragmentContainer.isAttachedToWindow
+        ) {
+            return
+        }
+        val snackbar = Snackbar.make(
+            binding.fragmentContainer,
+            R.string.reconnect_to_apply,
+            Snackbar.LENGTH_LONG,
+        )
+        if (binding.bottomNav.isVisible) {
+            snackbar.setAnchorView(binding.bottomNav)
+        }
+        snackbar.setAction(R.string.action_reconnect) {
+            lifecycleScope.launch {
+                val activeId = withContext(Dispatchers.IO) {
+                    runCatching { beam?.disconnect() }
+                    runCatching { EncryptedProfileStore(this@MainActivity).getActiveProfileId() }.getOrNull()
+                } ?: return@launch
+                requestConnect(activeId)
+            }
+        }.show()
     }
 
     fun openProfiles() {
+        if (supportFragmentManager.isStateSaved) return
         binding.bottomNav.selectedItemId = R.id.nav_profiles
     }
 
     private fun startVpn(profileId: String) {
-        requestNotificationPermission()
         lifecycleScope.launch {
             val consent = withContext(Dispatchers.IO) {
                 runCatching { VpnService.prepare(this@MainActivity) }.getOrNull()
             }
-            if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
+            if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED) ||
+                supportFragmentManager.isStateSaved
+            ) {
                 pendingProfileId = profileId
                 return@launch
             }
@@ -252,10 +312,18 @@ class MainActivity : AppCompatActivity() {
                 ensureBound()
                 return@launch
             }
+            // Ask for notifications only when the tunnel is about to start, so the
+            // permission dialog never stacks on top of the VPN consent dialog.
+            requestNotificationPermission()
             val connected = withContext(Dispatchers.IO) {
                 runCatching { service.connect(profileId) }.isSuccess
             }
-            if (!connected) showMessage(R.string.connect_failed)
+            if (!connected) {
+                synchronized(statusLock) {
+                    callbackSeq.incrementAndGet()
+                    _status.value = BeamStatus(_status.value.state, getString(R.string.connect_failed))
+                }
+            }
         }
     }
 
@@ -268,7 +336,10 @@ class MainActivity : AppCompatActivity() {
         )
         if (!isBound) {
             pendingProfileId = null
-            showMessage(R.string.connect_failed)
+            synchronized(statusLock) {
+                callbackSeq.incrementAndGet()
+                _status.value = BeamStatus(_status.value.state, getString(R.string.connect_failed))
+            }
         }
     }
 
@@ -285,6 +356,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun showTab(itemId: Int) {
         val tag = TAB_TAGS[itemId] ?: return
+        // commitNow throws once the activity state is saved.
+        if (supportFragmentManager.isStateSaved) return
         val manager = supportFragmentManager
         manager.commitNow {
             setReorderingAllowed(true)
@@ -302,10 +375,6 @@ class MainActivity : AppCompatActivity() {
         R.id.nav_profiles -> ProfilesFragment()
         R.id.nav_settings -> SettingsFragment()
         else -> DashboardFragment()
-    }
-
-    private fun showMessage(resId: Int) {
-        Toast.makeText(this, resId, Toast.LENGTH_SHORT).show()
     }
 
     private companion object {
