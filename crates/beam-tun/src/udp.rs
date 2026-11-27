@@ -191,6 +191,16 @@ impl UdpNatBridge {
                 .add(self.pending_initial.len() as u64);
             self.pending_initial.clear();
         }
+        // The bridge never reserves sender permits, so the capacity gap is
+        // exactly the number of datagrams still queued for each session.
+        let queued: u64 = self
+            .sessions
+            .values()
+            .map(|entry| entry.tx.max_capacity().saturating_sub(entry.tx.capacity()) as u64)
+            .sum();
+        if queued > 0 {
+            self.drops.udp_dropped.add(queued);
+        }
         for (_, entry) in self.sessions.drain() {
             entry.task.abort();
         }
@@ -290,6 +300,7 @@ impl UdpNatBridge {
             }
         };
 
+        let task_mux = Arc::clone(&mux);
         let first_dest = socket_to_netloc(dst);
         let mut session = match mux.open_session(first_dest) {
             Ok(session) => session,
@@ -328,6 +339,9 @@ impl UdpNatBridge {
             // No idle timer here: `sweep_idle` expires the session and aborts
             // this task, so per-datagram timer churn is not needed.
             loop {
+                // Includes the datagram `recv` is about to return; when the
+                // session is dead, that datagram and every queued one are lost.
+                let queued = rx.len() as u64;
                 tokio::select! {
                     maybe_out = rx.recv() => {
                         let Some((target, data)) = maybe_out else {
@@ -343,7 +357,13 @@ impl UdpNatBridge {
                         match session.try_send_owned(socket_to_netloc(target), data) {
                             Ok(()) => {}
                             Err(XudpClientError::OutboundQueueFull) => task_drops.udp_mux_q.incr(),
+                            Err(XudpClientError::Closed) => {
+                                task_drops.udp_dropped.add(queued.max(1));
+                                debug!(%target, "xudp session ended; dropping datagrams");
+                                break;
+                            }
                             Err(err) => {
+                                task_drops.udp_dropped.add(queued.max(1));
                                 warn!(%target, error = %err, "xudp session send_to failed");
                                 break;
                             }
@@ -369,11 +389,11 @@ impl UdpNatBridge {
                         {
                             task_drops.tun_tx_full.incr();
                         }
-                        sync_mux_drops(&session, &task_drops);
+                        sync_mux_drops(&session, &task_mux, &task_drops);
                     }
                 }
             }
-            sync_mux_drops(&session, &task_drops);
+            sync_mux_drops(&session, &task_mux, &task_drops);
             let _ = session.close().await;
         });
 
@@ -522,11 +542,15 @@ fn queued_payload(payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Moves the mux-level reply drops observed for this session into `udp_mux_q`.
-fn sync_mux_drops(session: &XudpSession, drops: &DropCounters) {
+/// Moves mux-level reply and writer-timeout drops into the status counters.
+fn sync_mux_drops(session: &XudpSession, mux: &XudpClient, drops: &DropCounters) {
     let dropped = session.take_dropped_replies();
     if dropped > 0 {
         drops.udp_mux_q.add(dropped);
+    }
+    let writer_dropped = mux.take_dropped_frames();
+    if writer_dropped > 0 {
+        drops.udp_dropped.add(writer_dropped);
     }
 }
 
@@ -925,6 +949,46 @@ mod tests {
         assert!(
             drops.snapshot().udp_pending_full >= pending_drops_before + queued as u64,
             "every cleared pending datagram must be counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_counts_every_queued_datagram_as_dropped() {
+        let (tun_tx, _tun_rx) = mpsc::channel(8);
+        let drops = dummy_drops();
+        let mut bridge = UdpNatBridge::new(
+            dummy_client_config(),
+            UdpBridgeConfig::default(),
+            tun_tx,
+            Arc::new(Notify::new()),
+            Arc::clone(&drops),
+        );
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+        let mut receivers = Vec::new();
+        for i in 0..2u16 {
+            let (tx, rx) = mpsc::channel(PER_SESSION_SEND_QUEUE);
+            tx.try_send((dst, vec![i as u8])).expect("queued datagram");
+            receivers.push(rx);
+            let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 60_100 + i);
+            let task = tokio::spawn(std::future::pending::<()>());
+            bridge.sessions.insert(
+                src,
+                NatEntry {
+                    tx,
+                    last_active_ms: Arc::new(AtomicU64::new(bridge.now_ms())),
+                    task,
+                },
+            );
+        }
+
+        bridge.reset();
+
+        assert!(bridge.sessions.is_empty());
+        drop(receivers);
+        assert_eq!(
+            drops.snapshot().udp_dropped,
+            2,
+            "each aborted session queue loses one datagram"
         );
     }
 

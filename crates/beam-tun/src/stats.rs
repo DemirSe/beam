@@ -54,6 +54,8 @@ pub struct DropCounters {
     pub udp_payload_invalid: Counter,
     /// UDP NAT session table full after the lazy idle sweep.
     pub udp_session_table_full: Counter,
+    /// UDP datagrams lost on reset, mux writer timeout, or a dead session.
+    pub udp_dropped: Counter,
 }
 
 /// Immutable snapshot of [`DropCounters`].
@@ -70,6 +72,7 @@ pub struct DropSnapshot {
     pub udp_pending_full: u64,
     pub udp_payload_invalid: u64,
     pub udp_session_table_full: u64,
+    pub udp_dropped: u64,
 }
 
 impl DropCounters {
@@ -87,6 +90,7 @@ impl DropCounters {
             udp_pending_full: self.udp_pending_full.get(),
             udp_payload_invalid: self.udp_payload_invalid.get(),
             udp_session_table_full: self.udp_session_table_full.get(),
+            udp_dropped: self.udp_dropped.get(),
         }
     }
 }
@@ -100,7 +104,7 @@ impl DropSnapshot {
     /// Compact `key:value` form for the `beam-client` status file.
     pub fn as_status_value(&self) -> String {
         format!(
-            "tun_tx_full:{},ip_parse:{},frag:{},route:{},tcp_limit:{},tcp_rx_ovf:{},udp_mux_q:{},udp_sess_q:{},udp_pending:{},udp_payload:{},udp_sess_tbl:{}",
+            "tun_tx_full:{},ip_parse:{},frag:{},route:{},tcp_limit:{},tcp_rx_ovf:{},udp_mux_q:{},udp_sess_q:{},udp_pending:{},udp_payload:{},udp_sess_tbl:{},udp_dropped:{}",
             self.tun_tx_full,
             self.ip_parse,
             self.fragment,
@@ -111,7 +115,8 @@ impl DropSnapshot {
             self.udp_session_queue_full,
             self.udp_pending_full,
             self.udp_payload_invalid,
-            self.udp_session_table_full
+            self.udp_session_table_full,
+            self.udp_dropped
         )
     }
 }
@@ -202,18 +207,21 @@ mod tests {
         counters.tcp_limit.incr();
         counters.tcp_rx_overflow.add(3);
         counters.udp_mux_q.add(4);
+        counters.udp_dropped.add(5);
         let snap = counters.snapshot();
         assert_eq!(snap.tun_tx_full, 1);
         assert_eq!(snap.route, 2);
         assert_eq!(snap.tcp_limit, 1);
         assert_eq!(snap.tcp_rx_overflow, 3);
         assert_eq!(snap.udp_mux_q, 4);
+        assert_eq!(snap.udp_dropped, 5);
         assert!(!snap.is_empty());
         assert!(snap.as_status_value().starts_with("tun_tx_full:1,"));
         assert!(snap.as_status_value().contains("route:2"));
         assert!(snap.as_status_value().contains("tcp_limit:1"));
         assert!(snap.as_status_value().contains("tcp_rx_ovf:3"));
         assert!(snap.as_status_value().contains("udp_mux_q:4"));
+        assert!(snap.as_status_value().contains("udp_dropped:5"));
 
         let dns = DnsCounters::default();
         dns.hits.incr();

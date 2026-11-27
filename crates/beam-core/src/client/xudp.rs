@@ -175,6 +175,8 @@ impl SessionTable {
     fn remove(&mut self, id: u16) {
         if let Some(entry) = self.sessions.remove(&id) {
             entry.live.store(false, Ordering::Release);
+            // Dropping the entry closes its reply sender, so the NAT bridge
+            // task waiting on `session.recv()` exits instead of lingering.
         }
     }
 
@@ -218,12 +220,13 @@ impl SessionTable {
 /// iteration and written on its own, and a frame larger than the cap is written
 /// in one call by itself. `flush` runs only when nothing else is queued, which
 /// keeps interactive latency at zero while removing one syscall per queued
-/// frame during bursts.
+/// frame during bursts. Returns the number of already-queued frames lost when
+/// a write or flush hits [`WRITE_TIMEOUT`].
 pub async fn run_writer<W: AsyncWriteExt + Unpin>(
     write_half: &mut W,
     outbound_rx: &mut mpsc::Receiver<Vec<u8>>,
     writer_closed_rx: &mut watch::Receiver<bool>,
-) {
+) -> usize {
     let mut batch: Vec<u8> = Vec::with_capacity(WRITE_COALESCE_CAP);
     let mut carry: Option<Vec<u8>> = None;
 
@@ -249,6 +252,7 @@ pub async fn run_writer<W: AsyncWriteExt + Unpin>(
 
         batch.clear();
         batch.extend_from_slice(&first);
+        let mut batch_frames = 1usize;
         drop(first);
 
         let mut disconnected = false;
@@ -260,6 +264,7 @@ pub async fn run_writer<W: AsyncWriteExt + Unpin>(
                         break;
                     }
                     batch.extend_from_slice(&next);
+                    batch_frames += 1;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -273,7 +278,7 @@ pub async fn run_writer<W: AsyncWriteExt + Unpin>(
             timeout(WRITE_TIMEOUT, write_half.write_all(&batch)).await,
             Ok(Ok(()))
         ) {
-            return;
+            return batch_frames;
         }
         // `carry` is a frame already popped from the queue, so the channel may
         // look empty while bytes are still pending.
@@ -281,11 +286,32 @@ pub async fn run_writer<W: AsyncWriteExt + Unpin>(
             && outbound_rx.is_empty()
             && !matches!(timeout(WRITE_TIMEOUT, write_half.flush()).await, Ok(Ok(())))
         {
-            return;
+            return batch_frames;
         }
         if disconnected && carry.is_none() {
-            return;
+            return 0;
         }
+    }
+    0
+}
+
+/// Runs the mux writer task, publishing any timed-out frames as session drops.
+async fn run_mux_writer<W: AsyncWriteExt + Unpin>(
+    mut write_half: W,
+    mut outbound_rx: mpsc::Receiver<Vec<u8>>,
+    mut writer_closed_rx: watch::Receiver<bool>,
+    writer_closed_tx: watch::Sender<bool>,
+    writer_table: Arc<Mutex<SessionTable>>,
+    dropped_frames: Arc<AtomicU64>,
+) {
+    let lost = run_writer(&mut write_half, &mut outbound_rx, &mut writer_closed_rx).await;
+    if lost > 0 {
+        dropped_frames.fetch_add(lost as u64, Ordering::Relaxed);
+    }
+    let _ = timeout(Duration::from_secs(1), write_half.shutdown()).await;
+    let _ = writer_closed_tx.send(true);
+    if let Ok(mut guard) = writer_table.lock() {
+        guard.close_all();
     }
 }
 
@@ -299,6 +325,7 @@ pub struct XudpClient {
     reply_queue: usize,
     reader_task: JoinHandle<()>,
     writer_task: Option<JoinHandle<()>>,
+    dropped_frames: Arc<AtomicU64>,
 }
 
 impl XudpClient {
@@ -308,28 +335,27 @@ impl XudpClient {
         xudp_config: XudpClientConfig,
     ) -> Result<Self, XudpClientError> {
         let stream = dial_vless(config, Command::Mux, Addons::empty(), None).await?;
-        let (mut read_half, mut write_half) = tokio::io::split(stream);
+        let (mut read_half, write_half) = tokio::io::split(stream);
 
         let closed = Arc::new(AtomicBool::new(false));
         let table = Arc::new(Mutex::new(SessionTable::new(
             xudp_config.max_sessions,
             Arc::clone(&closed),
         )));
-        let (outbound_tx, mut outbound_rx) =
+        let (outbound_tx, outbound_rx) =
             mpsc::channel::<Vec<u8>>(xudp_config.outbound_queue.max(1));
-        let (closed_tx, mut writer_closed_rx) = watch::channel(false);
+        let (closed_tx, writer_closed_rx) = watch::channel(false);
         let mut reader_closed_rx = closed_tx.subscribe();
 
-        let writer_table = Arc::clone(&table);
-        let writer_closed_tx = closed_tx.clone();
-        let writer_task = tokio::spawn(async move {
-            run_writer(&mut write_half, &mut outbound_rx, &mut writer_closed_rx).await;
-            let _ = timeout(Duration::from_secs(1), write_half.shutdown()).await;
-            let _ = writer_closed_tx.send(true);
-            if let Ok(mut guard) = writer_table.lock() {
-                guard.close_all();
-            }
-        });
+        let writer_drops = Arc::new(AtomicU64::new(0));
+        let writer_task = tokio::spawn(run_mux_writer(
+            write_half,
+            outbound_rx,
+            writer_closed_rx,
+            closed_tx.clone(),
+            Arc::clone(&table),
+            Arc::clone(&writer_drops),
+        ));
 
         let reader_table = Arc::clone(&table);
         let idle_timeout = effective_mux_idle_timeout(config.idle_timeout);
@@ -435,6 +461,7 @@ impl XudpClient {
             reply_queue: xudp_config.reply_queue.max(1),
             reader_task,
             writer_task: Some(writer_task),
+            dropped_frames: writer_drops,
         })
     }
 
@@ -470,6 +497,11 @@ impl XudpClient {
             live,
             header_buf: Vec::with_capacity(FRAME_HEADER_RESERVE),
         })
+    }
+
+    /// Returns and clears the frames lost to a mux writer timeout.
+    pub fn take_dropped_frames(&self) -> u64 {
+        self.dropped_frames.swap(0, Ordering::Relaxed)
     }
 
     /// Gracefully flushes queued frames and sends TLS `close_notify` before closing.
@@ -1204,6 +1236,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_removal_closes_the_reply_channel() {
+        let table = Arc::new(Mutex::new(SessionTable::new(
+            1,
+            Arc::new(AtomicBool::new(false)),
+        )));
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        let (id, _dropped, _live) = table
+            .lock()
+            .expect("table")
+            .allocate(reply_tx)
+            .expect("allocate");
+
+        table.lock().expect("table").remove(id);
+
+        assert!(
+            timeout(Duration::from_millis(50), reply_rx.recv())
+                .await
+                .expect("closed channel must wake the receiver")
+                .is_none(),
+            "the bridge task exits when the session is removed"
+        );
+    }
+
+    #[tokio::test]
     async fn is_open_tracks_shutdown_without_the_table_lock() {
         let closed = Arc::new(AtomicBool::new(false));
         let table = Arc::new(Mutex::new(SessionTable::new(1, Arc::clone(&closed))));
@@ -1217,6 +1273,7 @@ mod tests {
             reply_queue: 1,
             reader_task,
             writer_task: None,
+            dropped_frames: Arc::new(AtomicU64::new(0)),
         };
         assert!(client.is_open());
 
@@ -1359,6 +1416,7 @@ mod tests {
             reply_queue: 1,
             reader_task,
             writer_task: Some(writer_task),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
         };
 
         client.close_with_timeout(Duration::from_millis(20)).await;
@@ -1366,6 +1424,62 @@ mod tests {
         assert!(
             writer_dropped.load(Ordering::SeqCst),
             "stalled writer task must be aborted on close timeout rather than detached"
+        );
+    }
+
+    struct StalledSink;
+
+    impl tokio::io::AsyncWrite for StalledSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_writer_counts_the_whole_lost_batch() {
+        let (tx, rx) = mpsc::channel(4);
+        for id in 1..=2u16 {
+            tx.send(encode_test_frame(id, SessionStatus::New, b"lost"))
+                .await
+                .expect("queue frame");
+        }
+        drop(tx);
+
+        let (closed_tx, closed_rx) = watch::channel(false);
+        let table = Arc::new(Mutex::new(SessionTable::new(
+            1,
+            Arc::new(AtomicBool::new(false)),
+        )));
+        let dropped_frames = Arc::new(AtomicU64::new(0));
+        let writer = tokio::spawn(run_mux_writer(
+            StalledSink,
+            rx,
+            closed_rx,
+            closed_tx.clone(),
+            Arc::clone(&table),
+            Arc::clone(&dropped_frames),
+        ));
+
+        timeout(Duration::from_secs(WRITE_TIMEOUT.as_secs() + 2), writer)
+            .await
+            .expect("writer must hit its bounded timeout")
+            .expect("writer task");
+        assert_eq!(
+            dropped_frames.load(Ordering::Relaxed),
+            2,
+            "both queued frames were lost on the write timeout"
         );
     }
 
