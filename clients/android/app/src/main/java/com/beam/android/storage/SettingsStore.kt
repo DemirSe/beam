@@ -65,8 +65,13 @@ class SettingsStore(context: Context) {
     private val file = File(dir, "settings.json")
     private val lockFile = File(dir, "settings.lock")
 
+    /**
+     * Returns null only when the load failed for a transient reason. The file
+     * is kept, so a later load can still succeed and the UI must not overwrite
+     * it with defaults.
+     */
     @Synchronized
-    fun load(): AppSettings = withFileLock(lockFile) {
+    fun loadOrNull(): AppSettings? = withFileLock(lockFile) {
         if (!file.exists()) return@withFileLock AppSettings()
         try {
             loadFile(file)
@@ -76,9 +81,12 @@ class SettingsStore(context: Context) {
         } catch (e: Exception) {
             // Transient I/O: keep the file so a later load can still succeed.
             Log.w(TAG, "settings.json load failed", e)
-            AppSettings()
+            null
         }
     }
+
+    @Synchronized
+    fun load(): AppSettings = loadOrNull() ?: AppSettings()
 
     @Synchronized
     fun save(settings: AppSettings) = withFileLock(lockFile) {

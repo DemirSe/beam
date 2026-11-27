@@ -4,7 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import java.io.File
 import java.io.FileOutputStream
-import javax.crypto.AEADBadTagException
+import javax.crypto.BadPaddingException
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -45,7 +45,11 @@ class EncryptedProfileStore(context: Context) {
     fun saveProfileAndActivateIfNone(profile: VlessProfile) = withFileLock(lockFile) {
         val payload = readPayload()
         val all = readAll(payload).filterNot { it.id == profile.id } + profile
-        val active = resolveActiveIdAfterSave(activeIdOf(payload), profile.id)
+        val active = resolveActiveIdAfterSave(
+            activeIdOf(payload),
+            profile.id,
+            all.mapTo(HashSet()) { it.id },
+        )
         writeAll(all, active)
     }
 
@@ -149,14 +153,24 @@ class EncryptedProfileStore(context: Context) {
      * the next save writes a fresh one instead of failing forever.
      */
     private fun quarantineCorruptStore() {
-        val target = File(dir, "profiles.enc.corrupt-${System.currentTimeMillis()}")
+        val prefix = "${dataFile.name}.corrupt-"
+        val target = File(dir, "$prefix${System.currentTimeMillis()}")
         val moved = runCatching { dataFile.renameTo(target) }.getOrDefault(false)
         if (!moved) runCatching { dataFile.delete() }
+        // Keep only the newest snapshots; an unreadable file must not fill the disk.
+        val snapshots = dir.listFiles { f -> f.name.startsWith(prefix) } ?: return
+        if (snapshots.size > MAX_QUARANTINE_FILES) {
+            snapshots.sortedByDescending { it.name }
+                .drop(MAX_QUARANTINE_FILES)
+                .forEach { it.delete() }
+        }
     }
 
     internal companion object {
+        private const val MAX_QUARANTINE_FILES = 3
+
         fun isPermanentCorruption(e: Throwable): Boolean =
-            e is AEADBadTagException ||
+            e is BadPaddingException ||
                 e is KeyPermanentlyInvalidatedException ||
                 e is IllegalArgumentException ||
                 e is JSONException
@@ -167,8 +181,12 @@ class EncryptedProfileStore(context: Context) {
         fun parseProfilesWithActiveId(payload: JSONObject?): Pair<List<VlessProfile>, String?> =
             parseProfiles(payload) to activeIdOf(payload)
 
-        fun resolveActiveIdAfterSave(currentActiveId: String?, savedProfileId: String): String =
-            currentActiveId?.ifBlank { null } ?: savedProfileId
+        fun resolveActiveIdAfterSave(
+            currentActiveId: String?,
+            savedProfileId: String,
+            existingIds: Set<String>,
+        ): String = currentActiveId?.takeIf { it.isNotBlank() && it in existingIds }
+            ?: savedProfileId
 
         fun parseProfiles(payload: JSONObject?): List<VlessProfile> {
             if (payload == null) return emptyList()

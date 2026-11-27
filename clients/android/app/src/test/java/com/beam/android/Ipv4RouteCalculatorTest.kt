@@ -80,6 +80,28 @@ class Ipv4RouteCalculatorTest {
     }
 
     @Test
+    fun `tun subnet overlap and subtraction cover the edges`() {
+        assertTrue(Ipv4RouteCalculator.overlapsTunSubnet(VpnConfigBuilder.TUN_NETWORK_CIDR))
+        assertTrue(Ipv4RouteCalculator.overlapsTunSubnet("128.0.0.0/1"))
+        assertTrue(Ipv4RouteCalculator.overlapsTunSubnet("198.19.0.2/32"))
+        assertFalse(Ipv4RouteCalculator.overlapsTunSubnet("192.168.0.0/16"))
+
+        // Every overlapping prefix is ignored, so the TUN DNS stays routed.
+        assertEquals(
+            listOf("0.0.0.0" to 0),
+            Ipv4RouteCalculator.subtractCidrs(
+                listOf("198.19.0.0/30", "128.0.0.0/1", "198.19.0.2/32"),
+            ),
+        )
+
+        // A LAN prefix that does not overlap is subtracted from the tunnel routes.
+        val ranges = Ipv4RouteCalculator.subtractCidrs(listOf("192.168.0.0/16")).map(::rangeOf)
+        val lan = ipToLong("192.168.0.0")..ipToLong("192.168.255.255")
+        assertFalse(ranges.any { it.first <= lan.last && lan.first <= it.last })
+        assertEquals((1L shl 32) - 65536, ranges.sumOf { it.last - it.first + 1 })
+    }
+
+    @Test
     fun `default bypass complement is disjoint, sorted and complete`() {
         val ranges = Ipv4RouteCalculator.subtractCidrs(AppSettings.DEFAULT_BYPASS_CIDRS)
             .map(::rangeOf)

@@ -49,13 +49,21 @@ class ProfilesFragment : Fragment() {
     private var reloadJob: Job? = null
     private var activeProfileId: String? = null
 
+    private enum class SaveOutcome { SAVED, INVALID_LINK, STORAGE_ERROR }
+
     private val scanLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
         if (result.resultCode != Activity.RESULT_OK) return@registerForActivityResult
         val scanned = result.data?.getStringExtra(QrScannerActivity.EXTRA_RESULT)
         if (scanned != null) {
-            saveProfile(scanned) { ok -> if (!ok) toast(R.string.profiles_add_invalid) }
+            saveProfile(scanned) { outcome ->
+                when (outcome) {
+                    SaveOutcome.SAVED -> Unit
+                    SaveOutcome.INVALID_LINK -> toast(R.string.profiles_add_invalid)
+                    SaveOutcome.STORAGE_ERROR -> toast(R.string.profiles_save_failed)
+                }
+            }
         }
     }
 
@@ -129,14 +137,23 @@ class ProfilesFragment : Fragment() {
         val main = activity as? MainActivity
         viewLifecycleOwner.lifecycleScope.launch {
             val saved = withContext(Dispatchers.IO) {
-                runCatching { store.setActiveProfileId(profile.id) }.isSuccess
+                try {
+                    store.setActiveProfileIdIfExists(profile.id)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
             }
-            if (saved) {
-                main?.clearErrorDetail()
-                reload()
-                main?.showReconnectHint()
-            } else {
-                toast(R.string.profiles_save_failed)
+            when (saved) {
+                true -> {
+                    main?.clearErrorDetail()
+                    reload()
+                    main?.showReconnectHint()
+                }
+                // Removed between the list load and the tap: just refresh.
+                false -> reload()
+                null -> toast(R.string.profiles_save_failed)
             }
         }
     }
@@ -230,12 +247,17 @@ class ProfilesFragment : Fragment() {
             val positiveButton = dialog.getButton(DialogInterface.BUTTON_POSITIVE)
             positiveButton.setOnClickListener {
                 positiveButton.isEnabled = false
-                saveProfile(input.text?.toString().orEmpty()) { saved ->
-                    if (saved) {
-                        dialog.dismiss()
-                    } else {
-                        positiveButton.isEnabled = true
-                        layout.error = getString(R.string.profiles_add_invalid)
+                saveProfile(input.text?.toString().orEmpty()) { outcome ->
+                    when (outcome) {
+                        SaveOutcome.SAVED -> dialog.dismiss()
+                        SaveOutcome.INVALID_LINK -> {
+                            positiveButton.isEnabled = true
+                            layout.error = getString(R.string.profiles_add_invalid)
+                        }
+                        SaveOutcome.STORAGE_ERROR -> {
+                            positiveButton.isEnabled = true
+                            layout.error = getString(R.string.profiles_save_failed)
+                        }
                     }
                 }
             }
@@ -254,13 +276,17 @@ class ProfilesFragment : Fragment() {
         }
     }
 
-    /** Validates and stores [raw]; [onSaved] gets false and nothing is saved when invalid. */
-    private fun saveProfile(raw: String, onSaved: (Boolean) -> Unit = {}) {
-        val uri = raw.trim().take(MAX_LINK_LENGTH)
+    /** Stores [raw]; [onResult] reports the outcome and nothing is saved when invalid. */
+    private fun saveProfile(raw: String, onResult: (SaveOutcome) -> Unit = {}) {
+        val uri = raw.trim()
+        if (uri.length > MAX_LINK_LENGTH || uri.toByteArray(Charsets.UTF_8).size > MAX_LINK_LENGTH) {
+            onResult(SaveOutcome.INVALID_LINK)
+            return
+        }
         viewLifecycleOwner.lifecycleScope.launch {
             val link = withContext(Dispatchers.IO) { parseLink(uri) }
             if (link == null) {
-                onSaved(false)
+                onResult(SaveOutcome.INVALID_LINK)
                 return@launch
             }
             val profile = VlessProfile(
@@ -275,13 +301,12 @@ class ProfilesFragment : Fragment() {
                 runCatching { store.saveProfileAndActivateIfNone(profile) }.isSuccess
             }
             if (!saved) {
-                toast(R.string.profiles_save_failed)
-                onSaved(false)
+                onResult(SaveOutcome.STORAGE_ERROR)
                 return@launch
             }
             if (_binding != null) reload()
             toast(R.string.profiles_saved)
-            onSaved(true)
+            onResult(SaveOutcome.SAVED)
         }
     }
 
@@ -299,18 +324,20 @@ class ProfilesFragment : Fragment() {
     }.getOrNull()
 
     /** Safe fallback so the UI still works when the native library is missing. */
-    private fun parseWithUri(uri: String): LinkInfo? {
-        if (!uri.startsWith("vless://", ignoreCase = true)) return null
-        val parsed = runCatching { android.net.Uri.parse(uri) }.getOrNull() ?: return null
+    private fun parseWithUri(uri: String): LinkInfo? = runCatching {
+        if (!uri.startsWith("vless://", ignoreCase = true)) return@runCatching null
+        val parsed = android.net.Uri.parse(uri)
         // Same strictness as the beam-core parser: REALITY with key and SNI.
-        if (!parsed.getQueryParameter("security").equals("reality", ignoreCase = true)) return null
-        if (parsed.getQueryParameter("pbk").isNullOrBlank()) return null
-        if (parsed.getQueryParameter("sni").isNullOrBlank()) return null
-        val host = parsed.host?.takeIf { it.isNotBlank() } ?: return null
+        if (!parsed.getQueryParameter("security").equals("reality", ignoreCase = true)) {
+            return@runCatching null
+        }
+        if (parsed.getQueryParameter("pbk").isNullOrBlank()) return@runCatching null
+        if (parsed.getQueryParameter("sni").isNullOrBlank()) return@runCatching null
+        val host = parsed.host?.takeIf { it.isNotBlank() } ?: return@runCatching null
         val port = parsed.port.takeIf { it in 1..65535 } ?: DEFAULT_PORT
         val fragment = parsed.fragment?.takeIf { it.isNotBlank() && it != "null" }
-        return LinkInfo(fragment?.let { android.net.Uri.decode(it) } ?: host, host, port)
-    }
+        LinkInfo(fragment?.let { android.net.Uri.decode(it) } ?: host, host, port)
+    }.getOrNull()
 
     private fun clipVlessLink(context: Context): String? {
         val manager = context.getSystemService(ClipboardManager::class.java) ?: return null

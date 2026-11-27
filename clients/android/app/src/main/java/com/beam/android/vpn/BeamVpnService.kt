@@ -361,10 +361,16 @@ class BeamVpnService : VpnService() {
             // post-establish, avoiding a redundant Keystore decrypt on the connect path.
 
             // A bypass CIDR that covers the TUN /30 would bypass the TUN DNS.
-            val bypass = settings.bypassCidrs.filterNot(Ipv4RouteCalculator::overlapsTunSubnet)
+            val rawBypass = settings.bypassCidrs
+            val bypass = VpnConfigBuilder.sanitizeBypassCidrs(rawBypass)
+            if (bypass.size != rawBypass.size) {
+                Log.w(TAG, "dropped ${rawBypass.size - bypass.size} unsupported bypass CIDRs")
+            }
+            val (dohUrl, dohFellBack) = VpnConfigBuilder.sanitizeDohUrl(settings.dohUrl)
+            if (dohFellBack) Log.w(TAG, "invalid stored DoH URL; using the default")
             val configJson = VpnConfigBuilder.buildConfigJson(
                 vlessUri = profile.uri,
-                dohUrl = settings.dohUrl,
+                dohUrl = dohUrl,
                 ipv4Only = settings.ipv4Only,
                 rejectQuic = settings.rejectQuic,
                 bypassCidrs = bypass,

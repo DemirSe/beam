@@ -411,6 +411,32 @@ mod tests {
     }
 
     #[test]
+    fn bypass_cidr_limit_accepts_the_boundary_and_rejects_one_more() {
+        let at_limit = AndroidEngineConfig {
+            vless_uri: TEST_VLESS_URI.to_owned(),
+            bypass_cidrs: vec!["192.168.0.0/16".to_owned(); MAX_BYPASS_CIDRS],
+            ..AndroidEngineConfig::default()
+        };
+        assert_eq!(at_limit.bypass_cidrs.len(), MAX_BYPASS_CIDRS);
+        at_limit.validate().expect("the limit itself must validate");
+        at_limit
+            .build_engine_config(None, None)
+            .expect("engine config at the limit");
+
+        let over_limit = AndroidEngineConfig {
+            bypass_cidrs: vec!["192.168.0.0/16".to_owned(); MAX_BYPASS_CIDRS + 1],
+            ..AndroidEngineConfig::default()
+        };
+        match over_limit.build_engine_config(None, None) {
+            Err(ConfigError::Invalid(message)) => {
+                assert!(message.contains("bypass_cidrs"), "{message}");
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("MAX_BYPASS_CIDRS + 1 entries must be rejected"),
+        }
+    }
+
+    #[test]
     fn server_ip_skips_hostname_resolution() {
         let cfg = AndroidEngineConfig {
             vless_uri: TEST_VLESS_URI.replace("203.0.113.10", "server.invalid"),
@@ -428,6 +454,20 @@ mod tests {
                 .route
                 .exclude_ips
                 .contains("203.0.113.10".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn server_ip_is_trimmed_before_parsing() {
+        let cfg = AndroidEngineConfig {
+            vless_uri: TEST_VLESS_URI.replace("203.0.113.10", "server.invalid"),
+            server_ip: Some(" 203.0.113.10 ".to_owned()),
+            ..AndroidEngineConfig::default()
+        };
+        let engine = cfg.build_engine_config(None, None).expect("engine config");
+        assert_eq!(
+            engine.client.server_addr,
+            "203.0.113.10:443".parse().unwrap()
         );
     }
 

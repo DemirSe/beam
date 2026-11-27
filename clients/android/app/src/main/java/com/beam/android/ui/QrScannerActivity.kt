@@ -184,13 +184,17 @@ class QrScannerActivity : AppCompatActivity() {
             }
         if (text.isNullOrBlank()) return
 
-        if (!text.startsWith("vless://", ignoreCase = true)) {
+        val trimmed = text.trim()
+        if (!trimmed.startsWith("vless://", ignoreCase = true) ||
+            trimmed.length > MAX_RESULT_LENGTH ||
+            trimmed.toByteArray(Charsets.UTF_8).size > MAX_RESULT_LENGTH
+        ) {
             notifyInvalidQr()
             return
         }
         if (!handled.compareAndSet(false, true)) return
         runOnUiThread {
-            setResult(RESULT_OK, Intent().putExtra(EXTRA_RESULT, text.take(MAX_RESULT_LENGTH)))
+            setResult(RESULT_OK, Intent().putExtra(EXTRA_RESULT, trimmed))
             finish()
         }
     }
