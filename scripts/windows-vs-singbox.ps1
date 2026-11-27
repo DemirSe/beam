@@ -240,12 +240,11 @@ function Parse-VlessLink {
 }
 
 function Run-BeamClient {
-    param([string]$Link, [string]$VpsIpv4, [string]$PkgDir)
-    $row = New-ResultRow -Name 'beam-client'
+    param([string]$Link, [string]$VpsIpv4, [string]$PkgDir, [hashtable]$Row)
     try {
         $installPs1 = Join-Path $PkgDir 'install.ps1'
         if (-not (Test-Path -LiteralPath $installPs1)) { throw "install.ps1 not found under $PkgDir." }
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installPs1 -NoAutoStart -NoStart -NonInteractive
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installPs1 -NoAutoStart -NoStart -NonInteractive 2>&1 | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "install_failed exit=$LASTEXITCODE" }
         $running = $false
         for ($i = 0; $i -lt 20; $i++) {
@@ -269,30 +268,28 @@ function Run-BeamClient {
             if ($st['state'] -eq 'error') { break }
         }
         if (-not $connected) { throw 'never_connected' }
-        $row['connect_ms'] = ([math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 0)).ToString('F0')
+        $Row['connect_ms'] = ([math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 0)).ToString('F0', [System.Globalization.CultureInfo]::InvariantCulture)
         $metrics = Measure-ConnectedMetrics -VpsIpv4 $VpsIpv4 -RamName 'beam-client'
-        foreach ($k in $metrics.Keys) { $row[$k] = $metrics[$k] }
-        if ($row['egress_via_vps'] -ne 'true') { throw 'egress_not_via_vps' }
+        foreach ($k in $metrics.Keys) { $Row[$k] = $metrics[$k] }
+        if ($Row['egress_via_vps'] -ne 'true') { throw 'egress_not_via_vps' }
         $null = Invoke-Ipc -Line 'DISCONNECT'
     } catch {
-        $row['error'] = $_.Exception.Message
+        $Row['error'] = $_.Exception.Message
     } finally {
         try { $null = Invoke-Ipc -Line 'DISCONNECT' } catch {
         }
         try {
             $uninstallPs1 = Join-Path $PkgDir 'install.ps1'
             if (Test-Path -LiteralPath $uninstallPs1) {
-                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $uninstallPs1 -Uninstall -NonInteractive
+                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $uninstallPs1 -Uninstall -NonInteractive 2>&1 | Out-Host
             }
         } catch {
         }
     }
-    return $row
 }
 
 function Run-Singbox {
-    param([object]$Parts, [string]$VpsIpv4, [string]$Exe)
-    $row = New-ResultRow -Name 'sing-box'
+    param([object]$Parts, [string]$VpsIpv4, [string]$Exe, [hashtable]$Row)
     $cfgPath = ''
     $proc = $null
     try {
@@ -359,17 +356,17 @@ function Run-Singbox {
             }
         }
         if (-not $connected) { throw 'singbox_never_connected' }
-        $row['connect_ms'] = ([math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 0)).ToString('F0')
+        $Row['connect_ms'] = ([math]::Round(([DateTime]::UtcNow - $t0).TotalMilliseconds, 0)).ToString('F0', [System.Globalization.CultureInfo]::InvariantCulture)
         $metrics = Measure-ConnectedMetrics -VpsIpv4 $VpsIpv4 -RamPid $proc.Id
-        foreach ($k in $metrics.Keys) { $row[$k] = $metrics[$k] }
-        if ($row['egress_via_vps'] -ne 'true') { throw 'egress_not_via_vps' }
+        foreach ($k in $metrics.Keys) { $Row[$k] = $metrics[$k] }
+        if ($Row['egress_via_vps'] -ne 'true') { throw 'egress_not_via_vps' }
     } catch {
-        $row['error'] = $_.Exception.Message
+        $Row['error'] = $_.Exception.Message
     } finally {
         try {
             if (($null -ne $proc) -and (-not $proc.HasExited)) {
                 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                $proc.WaitForExit(10000)
+                $null = $proc.WaitForExit(10000)
             }
         } catch {
         }
@@ -385,7 +382,6 @@ function Run-Singbox {
         } catch {
         }
     }
-    return $row
 }
 
 $exitCode = 0
@@ -421,7 +417,7 @@ try {
     Write-Host ('baseline_egress_reachable=' + ($baseline -ne '').ToString().ToLowerInvariant())
 
     # Run 1: beam-client (its finally block uninstalls and restores baseline).
-    $beamRow = Run-BeamClient -Link $link -VpsIpv4 $vpsIpv4 -PkgDir $PackageDir
+    Run-BeamClient -Link $link -VpsIpv4 $vpsIpv4 -PkgDir $PackageDir -Row $beamRow
     if ($beamRow['error'] -ne '') {
         Write-Host ('beam_error=' + $beamRow['error'])
     }
@@ -436,7 +432,7 @@ try {
             if ($null -ne $found) { $SingboxExe = $found.Source }
         }
         # Run 2: sing-box, strictly after beam cleanup (never concurrent).
-        $sbRow = Run-Singbox -Parts $parts -VpsIpv4 $vpsIpv4 -Exe $SingboxExe
+        Run-Singbox -Parts $parts -VpsIpv4 $vpsIpv4 -Exe $SingboxExe -Row $sbRow
         if ($sbRow['error'] -ne '') {
             Write-Host ('singbox_error=' + $sbRow['error'])
         }
