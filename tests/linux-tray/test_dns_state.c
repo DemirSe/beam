@@ -66,6 +66,10 @@ uid_t beam_test_geteuid(void)
     return fake_euid ? (uid_t)1 : (uid_t)0;
 }
 
+#ifndef RELOAD_LOG
+#define RELOAD_LOG "/dev/null"
+#endif
+
 #define main beam_helper_main
 #include "../../clients/linux-tray/helper.c"
 #undef main
@@ -155,8 +159,34 @@ static ino_t inode_of(const char *path)
     return stat(path, &st) == 0 ? st.st_ino : 0;
 }
 
+/* The fake systemctl appends each command here; reset it per case. */
+static void reset_reload_log(void)
+{
+    FILE *f = fopen(RELOAD_LOG, "w");
+
+    if (f)
+        fclose(f);
+}
+
+static int reload_calls(void)
+{
+    char line[512];
+    int calls = 0;
+    FILE *f = fopen(RELOAD_LOG, "r");
+
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strstr(line, "reload systemd-resolved"))
+            calls++;
+    }
+    fclose(f);
+    return calls;
+}
+
 static void reset_state(void)
 {
+    reset_reload_log();
     unlink(CTRL_DROPIN);
     unlink(CTRL_SAVED);
     unlink(BEAM_DROPIN);
@@ -552,6 +582,25 @@ int main(void)
     unlink(RELOAD_FAIL);
     CHECK(dns_off() == 0);
     CHECK(!exists(BEAM_RELOAD_PENDING));
+
+    /* ctrld-off with no drop-in runs no reload, so it must not claim a
+     * previous reload failure was fixed. */
+    reset_state();
+    write_file(BEAM_RELOAD_PENDING, "reload failed\n");
+    CHECK(ctrld_off() == 0);
+    CHECK(exists(BEAM_RELOAD_PENDING));
+    CHECK(reload_calls() == 0);
+
+    /* dns-on can fail before its first reload. A failed rollback reload must
+     * still leave the boot-reset trigger. */
+    reset_state();
+    write_file(BEAM_SAVED, USER_DNS);
+    write_file(BEAM_DROPIN, OTHER_DNS);
+    write_file(RELOAD_FAIL, "");
+    CHECK(dns_on() == 1);
+    CHECK(file_is(BEAM_RELOAD_PENDING, "reload failed\n"));
+    CHECK(reload_calls() == 1);
+    unlink(RELOAD_FAIL);
 
     /* A ctrld conflict does not block the host-file restore. The live host
      * file comes back, the saved beam copy is consumed, and the ctrld

@@ -158,9 +158,11 @@ resolvectl status
 | A marker or saved file remains after a clean restore | A delete or rename failed. Check ownership and permissions. Run `sudo /usr/local/libexec/beam-helper restore-dns` again. |
 
 If the journal names `could not reload systemd-resolved`, the helper wrote
-`99-beam.conf.beam-reload`. The failing command can be `dns-on`, `dns-off`, or
-`ctrld-off`. The boot reset runs for that file and retries the reload. A later
-successful DNS switch clears the trigger. To fix it now, run
+`99-beam.conf.beam-reload`. The failing command can be `dns-on`, `dns-off`,
+`ctrld-off`, or a reload during `dns-on` rollback. The boot reset runs for that
+file and retries the reload. Only a reload that actually runs and succeeds
+clears the trigger. `ctrld-off` with no ctrld drop-in leaves it in place. To
+fix it now, run
 `sudo systemctl reload systemd-resolved`, then run
 `sudo /usr/local/libexec/beam-helper restore-dns`. That run clears the
 trigger.

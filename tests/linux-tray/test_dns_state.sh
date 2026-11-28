@@ -539,8 +539,11 @@ count=$(find "$bak_dir" -maxdepth 1 -type f \
 }
 
 # reload_resolved() execs this absolute path. The marker makes a reload fail.
+RELOAD_LOG="$TMP/systemctl.log"
+: > "$RELOAD_LOG"
 cat > "$BIN_DIR/systemctl" <<EOF
 #!/bin/sh
+printf '%s\n' "\$*" >> "$RELOAD_LOG"
 [ -e "$DNS_DIR/reload.fail" ] && exit 1
 exit 0
 EOF
@@ -551,6 +554,7 @@ CC="${CC:-cc}"
   -DDNS_DIR="\"$DNS_DIR\"" \
   -DLOCK_PATH="\"$TMP/beam-helper.lock\"" \
   -DSYSTEMCTL="\"$BIN_DIR/systemctl\"" \
+  -DRELOAD_LOG="\"$RELOAD_LOG\"" \
   -DTUN_IFACE='"lo"' \
   -DALLOWED_USER="\"$TMP/allowed-user\"" \
   -Dsyslog=beam_test_syslog \

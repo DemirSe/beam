@@ -533,6 +533,7 @@ static int dns_on(void)
 {
     int lock = state_lock();
     int reload_failed = 0;
+    int rollback_reload_failed = 0;
     int rc = -1;
 
     if (lock < 0)
@@ -549,9 +550,10 @@ static int dns_on(void)
     if (rc != 0) {
         syslog(LOG_ERR, "dns-on did not complete; restoring the previous DNS state");
         (void)restore_dns();
-        (void)reload_resolved();
+        if (reload_resolved() != 0)
+            rollback_reload_failed = 1;
     }
-    if (reload_failed)
+    if (reload_failed || rollback_reload_failed)
         record_reload_result(1);
     else if (rc == 0)
         record_reload_result(0);
@@ -592,6 +594,7 @@ static int ctrld_off(void)
 {
     int lock = state_lock();
     int reload_failed = 0;
+    int reload_ok = 0;
     int rc = 0;
 
     if (lock < 0)
@@ -606,11 +609,13 @@ static int ctrld_off(void)
             (void)restore_dns();
             (void)reload_resolved();
             rc = -1;
+        } else {
+            reload_ok = 1;
         }
     }
     if (reload_failed)
         record_reload_result(1);
-    else if (rc == 0)
+    else if (reload_ok)
         record_reload_result(0);
     close(lock);
     return rc == 0 ? 0 : 1;
