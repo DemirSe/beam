@@ -2075,6 +2075,13 @@ impl DnsInterceptor {
                     counters.servfail_upstream.incr();
                     build_servfail_response_bounded(&wire_owned, max_query_bytes)
                 }
+                Err(err)
+                    if err
+                        .get_ref()
+                        .is_some_and(|source| source.is::<CountedMismatch>()) =>
+                {
+                    build_servfail_response_bounded(&wire_owned, max_query_bytes)
+                }
                 Err(err) => {
                     counters.servfail_upstream.incr();
                     let stage = if err.kind() == io::ErrorKind::TimedOut {
@@ -2291,13 +2298,26 @@ async fn resolve_tunneled(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tunneled DNS query timed out"))?
 }
 
+/// Marks a response mismatch whose `servfail_mismatch` was counted at rejection.
+#[derive(Debug)]
+struct CountedMismatch;
+
+impl std::fmt::Display for CountedMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DNS response mismatch")
+    }
+}
+
+impl std::error::Error for CountedMismatch {}
+
+fn counted_mismatch_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, CountedMismatch)
+}
+
 fn validate_tcp_dns_response(query: &[u8], resp: &[u8], counters: &DnsCounters) -> io::Result<()> {
     let Some(parsed) = parse_dns_query_bounded(query, MAX_DOH_RESPONSE_BYTES) else {
         counters.servfail_mismatch.incr();
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid DNS-over-TCP query",
-        ));
+        return Err(counted_mismatch_error());
     };
     if !response_question_matches(&parsed, resp, Some(parsed.tx_id)) {
         counters.servfail_mismatch.incr();
@@ -2305,10 +2325,7 @@ fn validate_tcp_dns_response(query: &[u8], resp: &[u8], counters: &DnsCounters) 
             qname = %parsed.qname,
             "DNS-over-TCP response ID or question mismatch; dropping stream"
         );
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS-over-TCP response mismatch",
-        ));
+        return Err(counted_mismatch_error());
     }
     Ok(())
 }
@@ -5428,7 +5445,14 @@ mod tests {
             .expect("udp");
         assert_eq!(u16::from_be_bytes([udp.payload[0], udp.payload[1]]), 0x1234);
         assert_eq!(udp.payload[3] & 0x0f, 2, "mismatch must be SERVFAIL");
-        assert_eq!(interceptor.stats().servfail_mismatch, 1);
+        assert_eq!(
+            interceptor.stats(),
+            DnsSnapshot {
+                misses: 1,
+                servfail_mismatch: 1,
+                ..DnsSnapshot::default()
+            }
+        );
         assert_eq!(cache.lock().expect("cache").len, 0);
         assert_eq!(
             interceptor.tcp_pool.len(),
