@@ -467,7 +467,6 @@ impl XudpClient {
         })
     }
 
-    #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     pub fn new_for_test(
         max_sessions: usize,
