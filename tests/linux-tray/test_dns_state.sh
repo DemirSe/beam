@@ -563,9 +563,6 @@ CC="${CC:-cc}"
   -DRELOAD_LOG="\"$RELOAD_LOG\"" \
   -DTUN_IFACE='"lo"' \
   -DALLOWED_USER="\"$TMP/allowed-user\"" \
-  -Dsyslog=beam_test_syslog \
-  -Dopenlog=beam_test_openlog \
-  -Dgeteuid=beam_test_geteuid \
   -DUNLINK=beam_test_unlink \
   -DRENAME=beam_test_rename \
   -o "$TMP/test-dns-state" "$HERE/test_dns_state.c"

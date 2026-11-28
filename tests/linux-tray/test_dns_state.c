@@ -18,10 +18,18 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <sys/types.h>
+#include <syslog.h>
 #include <unistd.h>
 
-/* Injected by -DUNLINK=beam_test_unlink and -DRENAME=beam_test_rename in
- * test_dns_state.sh. */
+/* The system headers must be seen before the test doubles replace these
+ * names; otherwise an inline/fortified declaration is rewritten into a
+ * second definition of the double. UNLINK/RENAME are helper.c macros and
+ * stay on the command line. */
+#define syslog beam_test_syslog
+#define openlog beam_test_openlog
+#define geteuid beam_test_geteuid
+
+/* Injected by -DUNLINK/-DRENAME and the macros above. */
 int beam_test_unlink(const char *path);
 int beam_test_rename(const char *from, const char *to);
 
