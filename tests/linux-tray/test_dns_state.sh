@@ -445,6 +445,12 @@ FAKE_PARENT_PATH="$TMP/core-parent"
 FAKE_PARENT_MODE='-rwxrwxr-x'
 CORE_TEST_DIR="$TMP/core-parent/core"
 check_core_dir 1 0 '-rwxr-xr-x' 'group or world writable'
+# A root-owned sticky ancestor (the real /tmp) is safe: non-owners cannot
+# rename entries inside it.
+FAKE_PARENT_PATH=/tmp
+FAKE_PARENT_MODE='-rwxrwxrwt'
+CORE_TEST_DIR="$TMP/core-dir"
+check_core_dir 0 0 '-rwxr-xr-x'
 unset FAKE_PARENT_PATH FAKE_PARENT_MODE
 CORE_TEST_DIR="$TMP/core-dir"
 ln -s "$TMP/core-dir/LICENSE" "$TMP/core-dir/LICENSE.link"

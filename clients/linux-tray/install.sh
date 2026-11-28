@@ -115,8 +115,15 @@ validate_core_dir() {
         perms=$(stat -c %A -- "$path") || return 1
         case "${perms:5:1}${perms:8:1}" in
             *w*)
-                echo "CORE_DIR must not be group or world writable: $path" >&2
-                return 1
+                # A root-owned sticky directory (for example /tmp) still
+                # protects its entries from rename by non-owners.
+                case "${perms:9:1}" in
+                    t|T) ;;
+                    *)
+                        echo "CORE_DIR must not be group or world writable: $path" >&2
+                        return 1
+                        ;;
+                esac
                 ;;
         esac
     }

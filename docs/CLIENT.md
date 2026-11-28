@@ -225,7 +225,7 @@ before it stages, stops, or replaces anything when one is missing:
 |---|---|
 | `CONFIG_SRC` | Path to the client profile (sing-box JSON). Required when `/etc/beam/config.json` does not exist; a reinstall reuses that file when `CONFIG_SRC` is unset. It is the client profile, not the server `beam.toml`. |
 | `python3` | Normalizes the QUIC policy and validates the normalized profile. |
-| `CORE_DIR` | Real, root-owned directory that holds the pinned core. Group and other users must not write to it or to any parent up to `/`. Symlinks are rejected, including a trailing slash that hides a symlink. Default `/tmp/beam-core`; it is not a download cache. |
+| `CORE_DIR` | Real, root-owned directory that holds the pinned core. Group and other users must not write to it or to any parent up to `/`, except a root-owned sticky directory such as `/tmp`, whose entries non-owners cannot rename. Symlinks are rejected, including a trailing slash that hides a symlink. Default `/tmp/beam-core`; it is not a download cache. |
 | `$CORE_DIR/sing-box` | Executable core. SHA-256 `1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a`. |
 | `$CORE_DIR/libcronet.so` | Shared library next to the core. SHA-256 `23109c55b08829bb1a68682a61a64852b1bbf243753b153cbd8f6e4ea2c05294`. |
 | `$CORE_DIR/LICENSE` | Root-owned regular file, not a symlink. Copied to `/usr/local/lib/beam/LICENSE` with mode 0644; not hash-pinned. |
