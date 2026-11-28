@@ -2655,8 +2655,8 @@ mod tests {
         assert!(tx.is_empty(), "small window growth must stay silent");
 
         let conn = stack.conns.values().next().expect("conn");
-        // A persist probe is sent in the peer's receive sequence space: its
-        // seq is one before the next byte it expects from us (`rcv_nxt`).
+        // A persist probe carries the peer's send sequence space: its
+        // seq is one before the next byte we expect from it (`rcv_nxt`).
         let probe_seq = conn.rcv_nxt.wrapping_sub(1);
         let unrelated_seq = conn.rcv_nxt.wrapping_sub(2);
         stack.push_ip_tcp(&make_seg(unrelated_seq, srv_nxt, TCP_ACK, 0, &[], &[]));
