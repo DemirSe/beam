@@ -1695,19 +1695,18 @@ fn route_check_error(prefix: &str, err: io::Error) -> RouteCheck {
 /// absent.
 fn parse_exact_route_check(stdout: &str) -> RouteCheck {
     let mut present = false;
+    let mut any_usable = false;
     for line in stdout.lines() {
         if line.trim().is_empty() {
             continue;
         }
         present = true;
-        if route_line_is_unusable(line) {
-            return RouteCheck::Unusable;
-        }
+        any_usable |= !route_line_is_unusable(line);
     }
-    if present {
-        RouteCheck::Present
-    } else {
-        RouteCheck::Absent
+    match (present, any_usable) {
+        (_, true) => RouteCheck::Present,
+        (true, false) => RouteCheck::Unusable,
+        (false, false) => RouteCheck::Absent,
     }
 }
 
@@ -1913,6 +1912,14 @@ default via 192.168.88.1 dev wlan0 proto dhcp metric 600
             .is_unusable()
         );
         assert!(parse_exact_route_check("203.0.113.10 via 192.168.1.1 dev wlan0\n").is_present());
+        // One usable sibling wins over a linkdown line, whatever the order.
+        assert!(
+            parse_exact_route_check(
+                "172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown\n\
+                 172.17.0.0/16 dev eth0 proto kernel scope link src 172.17.0.2\n"
+            )
+            .is_present()
+        );
     }
 
     #[test]
