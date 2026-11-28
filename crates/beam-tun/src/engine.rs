@@ -22,7 +22,7 @@ use crate::packet::{
 };
 use crate::ratelimit::RateLimiter;
 use crate::router::{RouteDecision, RoutePolicy};
-use crate::stack::{AcceptedTcpStream, NetStack};
+use crate::stack::{AcceptedTcpStream, NetStack, TunTcpReader};
 use crate::stats::{DnsCounters, DnsSnapshot, DropCounters, DropSnapshot};
 use crate::udp::{UdpBridgeConfig, UdpNatBridge};
 
@@ -1032,6 +1032,89 @@ impl RelayIdle {
     }
 }
 
+/// Drains client bytes into the upstream socket until EOF or a write failure.
+/// Write failures only wake the download half; the final path closes upstream
+/// after the flow permit is released, so a stalled write cannot hold the permit.
+#[allow(clippy::too_many_arguments)]
+async fn relay_c2s<W: AsyncWriteExt + Unpin>(
+    mut tun_r: TunTcpReader,
+    up_w: &mut W,
+    dst: SocketAddr,
+    relay_idle: Option<Duration>,
+    relay_activity: Option<&RelayIdle>,
+    tracker: Option<Arc<TunnelActivity>>,
+    write_idle: Duration,
+    c2s_aborted: &Notify,
+    upstream_shutdown: &mut UpstreamShutdown,
+) {
+    // Reused across iterations so coalescing never grows a fresh Vec per
+    // write; stays empty (zero allocation) when no coalescing is needed.
+    let mut scratch: Vec<u8> = Vec::new();
+    loop {
+        let chunk = match relay_read(relay_activity, tun_r.recv_chunk()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => {
+                upstream_shutdown.once(up_w).await;
+                break;
+            }
+            Err(_) => {
+                if let Some(budget) = relay_idle {
+                    warn_relay_timeout(dst, "read", budget);
+                }
+                upstream_shutdown.once(up_w).await;
+                break;
+            }
+        };
+        touch_relay(relay_activity);
+        // Coalesce immediately-queued small chunks up to C2S_COALESCE_TARGET
+        // so multi-flow uploads write full TLS records with fewer syscalls.
+        let coalesced = coalesce_c2s(&chunk, &mut scratch, || tun_r.try_recv_chunk());
+        let out: &[u8] = if coalesced { &scratch } else { &chunk };
+        match with_relay_idle(Some(write_idle), up_w.write_all(out)).await {
+            Ok(Ok(())) => {
+                if let Some(tracker) = tracker.as_ref() {
+                    tracker.record_bytes_tx(out.len() as u64);
+                }
+                touch_relay(relay_activity);
+            }
+            Ok(Err(err)) => {
+                warn_relay_io(dst, "write", &err);
+                c2s_aborted.notify_one();
+                break;
+            }
+            Err(_) => {
+                warn_relay_timeout(dst, "write", write_idle);
+                c2s_aborted.notify_one();
+                break;
+            }
+        }
+        // Do not retain more than one coalescing window after an oversize
+        // chunk grew the scratch buffer.
+        if scratch.capacity() > C2S_COALESCE_TARGET {
+            scratch.shrink_to(C2S_COALESCE_TARGET);
+        }
+        // Flush only when no further chunk is already queued, preserving
+        // 0 ms interactive latency while avoiding per-chunk flush stalls
+        // during bulk uploads.
+        if tun_r.has_queued() {
+            continue;
+        }
+        match with_relay_idle(Some(write_idle), up_w.flush()).await {
+            Ok(Ok(())) => touch_relay(relay_activity),
+            Ok(Err(err)) => {
+                warn_relay_io(dst, "flush", &err);
+                c2s_aborted.notify_one();
+                break;
+            }
+            Err(_) => {
+                warn_relay_timeout(dst, "flush", write_idle);
+                c2s_aborted.notify_one();
+                break;
+            }
+        }
+    }
+}
+
 /// Sends one bounded upstream half-close, even when several relay exits race.
 #[derive(Default)]
 struct UpstreamShutdown {
@@ -1455,7 +1538,7 @@ fn spawn_tcp_relay(
         // directions. Writes keep a bounded deadline in both modes.
         let relay_activity = relay_idle.map(RelayIdle::new);
         let write_idle = relay_write_idle(relay_idle, client_config.idle_timeout);
-        let (mut tun_r, mut tun_w) = conn.stream.into_split();
+        let (tun_r, mut tun_w) = conn.stream.into_split();
         let (mut up_r, mut up_w) = tokio::io::split(upstream);
 
         // Fires only on an abnormal client-to-server exit (write/flush error or
@@ -1464,78 +1547,17 @@ fn spawn_tcp_relay(
         let c2s_aborted = Notify::new();
         let mut upstream_shutdown = UpstreamShutdown::default();
 
-        let c2s = async {
-            // Reused across iterations so coalescing never grows a fresh Vec per
-            // write; stays empty (zero allocation) when no coalescing is needed.
-            let mut scratch: Vec<u8> = Vec::new();
-            loop {
-                let chunk = match relay_read(relay_activity.as_ref(), tun_r.recv_chunk()).await {
-                    Ok(Some(chunk)) => chunk,
-                    Ok(None) => {
-                        upstream_shutdown.once(&mut up_w).await;
-                        break;
-                    }
-                    Err(_) => {
-                        if let Some(budget) = relay_idle {
-                            warn_relay_timeout(conn.dst, "read", budget);
-                        }
-                        upstream_shutdown.once(&mut up_w).await;
-                        break;
-                    }
-                };
-                touch_relay(relay_activity.as_ref());
-                // Coalesce immediately-queued small chunks up to C2S_COALESCE_TARGET
-                // so multi-flow uploads write full TLS records with fewer syscalls.
-                let coalesced = coalesce_c2s(&chunk, &mut scratch, || tun_r.try_recv_chunk());
-                let out: &[u8] = if coalesced { &scratch } else { &chunk };
-                match with_relay_idle(Some(write_idle), up_w.write_all(out)).await {
-                    Ok(Ok(())) => {
-                        if let Some(tracker) = c2s_tracker.as_ref() {
-                            tracker.record_bytes_tx(out.len() as u64);
-                        }
-                        touch_relay(relay_activity.as_ref());
-                    }
-                    Ok(Err(err)) => {
-                        warn_relay_io(conn.dst, "write", &err);
-                        c2s_aborted.notify_one();
-                        upstream_shutdown.once(&mut up_w).await;
-                        break;
-                    }
-                    Err(_) => {
-                        warn_relay_timeout(conn.dst, "write", write_idle);
-                        c2s_aborted.notify_one();
-                        upstream_shutdown.once(&mut up_w).await;
-                        break;
-                    }
-                }
-                // Do not retain more than one coalescing window after an oversize
-                // chunk grew the scratch buffer.
-                if scratch.capacity() > C2S_COALESCE_TARGET {
-                    scratch.shrink_to(C2S_COALESCE_TARGET);
-                }
-                // Flush only when no further chunk is already queued, preserving
-                // 0 ms interactive latency while avoiding per-chunk flush stalls
-                // during bulk uploads.
-                if tun_r.has_queued() {
-                    continue;
-                }
-                match with_relay_idle(Some(write_idle), up_w.flush()).await {
-                    Ok(Ok(())) => touch_relay(relay_activity.as_ref()),
-                    Ok(Err(err)) => {
-                        warn_relay_io(conn.dst, "flush", &err);
-                        c2s_aborted.notify_one();
-                        upstream_shutdown.once(&mut up_w).await;
-                        break;
-                    }
-                    Err(_) => {
-                        warn_relay_timeout(conn.dst, "flush", write_idle);
-                        c2s_aborted.notify_one();
-                        upstream_shutdown.once(&mut up_w).await;
-                        break;
-                    }
-                }
-            }
-        };
+        let c2s = relay_c2s(
+            tun_r,
+            &mut up_w,
+            conn.dst,
+            relay_idle,
+            relay_activity.as_ref(),
+            c2s_tracker,
+            write_idle,
+            &c2s_aborted,
+            &mut upstream_shutdown,
+        );
 
         let s2c = async {
             loop {
@@ -1709,6 +1731,7 @@ mod tests {
     use super::*;
     use crate::device::MemoryTun;
     use crate::packet::build_ip_tcp_packet_slices;
+    use crate::stack::{RelayBufPool, TunTcpStream};
     use std::collections::VecDeque;
 
     fn test_failure() -> DialFailure {
@@ -2467,6 +2490,108 @@ mod tests {
             calls.load(Ordering::Relaxed),
             1,
             "a cancelled shutdown must not be attempted twice"
+        );
+    }
+
+    struct StalledUpstream {
+        calls: Arc<AtomicU64>,
+        armed: AtomicU64,
+    }
+
+    impl StalledUpstream {
+        fn new(calls: Arc<AtomicU64>) -> Self {
+            Self {
+                calls,
+                armed: AtomicU64::new(1),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for StalledUpstream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.armed.swap(0, Ordering::AcqRel) == 1 {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn c2s_write_timeout_releases_permit_before_upstream_shutdown() {
+        let write_idle = Duration::from_millis(50);
+        let (stack_tx, stack_rx) = mpsc::channel(4);
+        stack_tx
+            .try_send(vec![0x11; 16])
+            .expect("one test chunk fits the channel");
+        let (to_stack_tx, _to_stack_rx) = mpsc::channel(4);
+        let stream = TunTcpStream::new_with_accounting(
+            stack_rx,
+            to_stack_tx,
+            Arc::new(Notify::new()),
+            None,
+            None,
+            None,
+            RelayBufPool::new(),
+        );
+        let (tun_r, _tun_w) = stream.into_split();
+
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = permits.clone().acquire_owned().await.expect("test permit");
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut sink = StalledUpstream::new(Arc::clone(&calls));
+        let c2s_aborted = Notify::new();
+        let mut shutdown = UpstreamShutdown::default();
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        let relay = tokio::spawn(async move {
+            relay_c2s(
+                tun_r,
+                &mut sink,
+                dst,
+                None,
+                None,
+                None,
+                write_idle,
+                &c2s_aborted,
+                &mut shutdown,
+            )
+            .await;
+            finish_tcp_relay(permit, TcpRelayExit::Complete, &mut shutdown, &mut sink).await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(write_idle + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            permits.try_acquire().is_ok(),
+            "c2s write timeout must release the permit without awaiting shutdown"
+        );
+        tokio::time::advance(SHUTDOWN_TIMEOUT).await;
+        timeout(Duration::from_millis(1), relay)
+            .await
+            .expect("final shutdown must finish within the bounded timeout")
+            .expect("relay task");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the final path must close upstream once"
         );
     }
 
