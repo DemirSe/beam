@@ -500,10 +500,10 @@ impl TcpConn {
             return;
         }
 
-        // A zero-window persist probe uses the peer's receive sequence space:
-        // `seq = rcv_nxt - 1` from our side. Answer it once when our window has
-        // reopened, even below the ordinary update threshold, so the peer does
-        // not stay stalled after a small drain.
+        // A zero-window persist probe uses the peer's send / our receive
+        // sequence space: `seq = rcv_nxt - 1` from our side. Answer it once when
+        // our window has reopened, even below the ordinary update threshold, so
+        // the peer does not stay stalled after a small drain.
         if self.last_advertised_wnd == 0
             && seg.seq == self.rcv_nxt.wrapping_sub(1)
             && seg.payload.is_empty()

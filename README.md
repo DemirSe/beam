@@ -588,9 +588,9 @@ VLESS with `xtls-rprx-vision` is expected to work.
 - Ordinary receive-window updates use the RFC 1122 / Linux threshold: a
   reopening from below 128 KiB to at least 128 KiB, or 128 KiB of growth, emits
   an ACK at the default socket-buffer size. A zero-window peer's persist probe
-  (`seq = rcv_nxt - 1` in the peer's receive sequence space) instead gets one
-  ACK as soon as the window is above zero, so a single freed 64 KiB chunk does
-  not leave the peer stalled.
+  (`seq = rcv_nxt - 1` in the peer's send / our receive sequence space) instead
+  gets one ACK as soon as the window is above zero, so a single freed 64 KiB
+  chunk does not leave the peer stalled.
 - The local TCP handshake can finish before the upstream dial. An app then sees
   a successful `connect()` even when the upstream dial has not succeeded. This
   result stops Happy Eyeballs and connect-timeout code from trying another
@@ -622,11 +622,12 @@ platform-independent core shared with the Android `VpnService` backend.
   dependencies, IPv4 + IPv6, RFC 7323 Window Scaling (socket buffers derived
   from a 256 MiB aggregate budget — 512 KiB/direction at the default 256
   connections, clamped to `64 KiB..=4 MiB` to stay under `MemoryMax=512M`), a
-  relay reply queue capped at 64 KiB/flow (16 MiB at 256 flows, so 272 MiB
-  socket-plus-queue total; a second 64 KiB chunk can also be in flight to the
-  stack, and `tx_buf` keeps capacity slack, so this is not a hard RSS cap),
-  zero-copy `VecDeque::as_slices()` TX
-  segmentation, immediate dup-ACKs on
+  relay reply queue capped at 64 KiB/flow. On Linux, a slow reader at CAP 1
+  (one queued chunk) can also hold one 64 KiB chunk in `relay_pending` and one
+  in the in-flight `send_chunk`. The three chunks per flow reach 48 MiB at 256
+  flows. With 256 MiB of socket buffers, the worst case is 304 MiB. `tx_buf`
+  keeps capacity slack, so this is not a hard RSS cap. The stack uses zero-copy
+  `VecDeque::as_slices()` TX segmentation, immediate dup-ACKs on
   out-of-order segments, and prompt window updates. The packet parser walks
   IPv6 extension headers (Hop-by-Hop, Routing, Destination Options) and drops
   fragmented IPv4 and IPv6 packets. No throughput result is claimed for the
